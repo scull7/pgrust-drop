@@ -27,16 +27,24 @@
 
 pub mod checks;
 pub mod diff;
+pub mod files;
 pub mod gate;
 pub mod normalize;
 pub mod outcome;
+pub mod pattern;
 pub mod reference;
 pub mod run;
 
 pub use checks::Violation;
+pub use files::{Entry, EntryKind, ModeViolation, slurp_file};
 pub use gate::{Gate, GateError, GateReport, RcCheck, Side, StreamDiff};
 pub use normalize::Normalizer;
 pub use outcome::CommandOutcome;
+pub use pattern::{Pattern, PatternError};
 pub use run::{
-    program_help_ok, program_options_handling_ok, program_version_ok, run, run_with_stdin,
+    command_fails, command_fails_like, command_like, command_ok, program_help_ok,
+    program_options_handling_ok, program_version_ok, run, run_with_stdin,
 };
+
+#[cfg(unix)]
+pub use files::{check_mode_recursive, check_mode_recursive_ok};

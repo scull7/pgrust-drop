@@ -28,6 +28,7 @@ use crate::cli::Options;
 use crate::encoding::{self, Encoding};
 use crate::error::{DirRole, InitdbError, LocaleProvider, NotEmpty};
 use crate::file_perm::DataDirPerm;
+use crate::sync::{self, SyncMethod};
 
 /// What `pg_check_dir` (`src/port/pgcheckdir.c:32`) reports about a directory.
 ///
@@ -177,7 +178,9 @@ pub enum DirAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPlan {
     pub pgdata: PathBuf,
-    /// `--no-sync-data-files` (`initdb.c:3348`).
+    /// `--sync-method` (`initdb.c:3389`).
+    pub sync_method: SyncMethod,
+    /// `--no-sync-data-files` (`initdb.c:3396`).
     pub sync_data_files: bool,
 }
 
@@ -201,6 +204,13 @@ pub struct CreatePlan {
     pub username: Option<String>,
     /// `-c NAME=VALUE`, split and kept in command-line order (`initdb.c:3277`).
     pub gucs: Vec<(String, String)>,
+    /// `do_sync` (`initdb.c:164`): false under `--no-sync`, which prints the
+    /// note at `:3516` instead of syncing.
+    pub do_sync: bool,
+    /// `--sync-method` (`initdb.c:3389`).
+    pub sync_method: SyncMethod,
+    /// `--no-sync-data-files` (`initdb.c:3396`).
+    pub sync_data_files: bool,
 }
 
 /// What one validated command line asks for.
@@ -223,6 +233,8 @@ pub fn validate(
     // --- the getopt_long switch arms that can fail, in command-line order ---
     let gucs = split_gucs(&options.set)?;
     let locale_provider = parse_locale_provider(options.locale_provider.as_deref())?;
+    // initdb.c:3389, the `case 19:` arm.
+    let sync_method = sync::parse_sync_method(options.sync_method.as_deref())?;
 
     // --- immediately after the loop (initdb.c:3416) ---
     let datadir = options.resolve_datadir()?;
@@ -244,6 +256,7 @@ pub fn validate(
         }
         return Ok(Plan::Sync(SyncPlan {
             pgdata,
+            sync_method,
             sync_data_files: !options.no_sync_data_files,
         }));
     }
@@ -298,6 +311,9 @@ pub fn validate(
         encoding,
         username,
         gucs,
+        do_sync: !options.no_sync,
+        sync_method,
+        sync_data_files: !options.no_sync_data_files,
     }))
 }
 
@@ -714,6 +730,7 @@ mod tests {
             plan,
             Ok(Plan::Sync(SyncPlan {
                 pgdata: PathBuf::from("/tmp/data"),
+                sync_method: SyncMethod::Fsync,
                 sync_data_files: true,
             }))
         );
@@ -727,6 +744,7 @@ mod tests {
             plan,
             Ok(Plan::Sync(SyncPlan {
                 pgdata: PathBuf::from("/tmp/data"),
+                sync_method: SyncMethod::Fsync,
                 sync_data_files: false,
             }))
         );

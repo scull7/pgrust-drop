@@ -88,6 +88,25 @@ fn fails_with(argv: &[OsString], expected_stderr: &str) {
     );
 }
 
+/// `command_ok(...)` plus the exact stdout C writes for the same line, and an
+/// empty stderr.
+fn succeeds_with(argv: &[OsString], expected_stdout: &str) {
+    testkit::command_ok(Path::new(RINITDB), argv);
+    let outcome = testkit::run(Path::new(RINITDB), argv).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(0), "{argv:?}");
+    assert_eq!(outcome.stdout_text(), expected_stdout, "{argv:?}");
+    assert_eq!(outcome.stderr_text(), String::new(), "{argv:?}");
+}
+
+/// `[ 'initdb', @before, $datadir, @after ]`, keeping upstream's word order:
+/// `001_initdb.pl:86` puts `--sync-method` *after* the data directory.
+fn sync_argv(before: &[&str], datadir: &Path, after: &[&str]) -> Vec<OsString> {
+    let mut argv = args(before);
+    argv.push(OsString::from(datadir));
+    argv.extend(args(after));
+    argv
+}
+
 /// The byte-diff gate for an invocation where C prints nothing on stdout
 /// either, so nothing is out of scope.
 fn gate_strictly(argv: &[OsString]) {
@@ -566,6 +585,49 @@ fn the_data_directory_tree_matches_reference_initdb() {
     }
 }
 
+/// `command_ok([ 'initdb', '--sync-only', $datadir ], 'sync only');`
+/// — 001_initdb.pl:78.
+///
+/// `initdb.c:3439`: `setup_pgdata`, `pg_check_dir > 0`, the progress line at
+/// `:3447`, `sync_pgdata` (`src/common/file_utils.c:99`) and `check_ok`.
+///
+/// Upstream syncs the cluster the `successful creation` case left behind; this
+/// runs over the directory tree `build_layout` makes, which is what this port
+/// creates so far. `sync_pgdata` does not care what is in the tree — it walks
+/// whatever is there — and the gate walks the very same tree through C initdb,
+/// so the comparison is exact either way. It widens to a finished cluster with
+/// Linear NAT-387.
+#[cfg(unix)]
+#[test]
+fn sync_only() {
+    let tempdir = TempDir::new("sync-only");
+    let datadir = build_layout(&args(&[&tempdir.join("data").to_string_lossy()]));
+    let argv = sync_argv(&["--sync-only"], &datadir, &[]);
+
+    succeeds_with(&argv, "syncing data to disk ... ok\n");
+    gate_strictly(&argv);
+}
+
+/// `command_ok([ 'initdb', '--sync-only', '--no-sync-data-files', $datadir ],
+/// '--no-sync-data-files');` — 001_initdb.pl:79.
+///
+/// `initdb.c:3396` clears `sync_data_files`, which `file_utils.c:190` turns
+/// into an `exclude_dir` of `$PGDATA/base` and `:219` into a skipped
+/// `pg_tblspc`. Neither shows up in the output, which is the point: the case
+/// pins that the option is accepted and changes nothing a user can see. What
+/// it excludes is pinned by the unit test
+/// `sync::tests::no_sync_data_files_excludes_base_and_skips_pg_tblspc`.
+#[cfg(unix)]
+#[test]
+fn no_sync_data_files() {
+    let tempdir = TempDir::new("sync-no-data-files");
+    let datadir = build_layout(&args(&[&tempdir.join("data").to_string_lossy()]));
+    let argv = sync_argv(&["--sync-only", "--no-sync-data-files"], &datadir, &[]);
+
+    succeeds_with(&argv, "syncing data to disk ... ok\n");
+    gate_strictly(&argv);
+}
+
 /// `command_fails([ 'initdb', $datadir ], 'existing data directory');`
 /// — 001_initdb.pl:81, with a cluster already in `$datadir`.
 ///
@@ -586,6 +648,45 @@ fn existing_data_directory() {
         ),
     );
     gate_diagnostics(&argv);
+}
+
+/// ```perl
+/// if ($supports_syncfs)
+/// {
+///     command_ok(
+///         [ 'initdb', '--sync-only', $datadir, '--sync-method' => 'syncfs' ],
+///         'sync method syncfs');
+/// }
+/// else
+/// {
+///     command_fails(
+///         [ 'initdb', '--sync-only', $datadir, '--sync-method' => 'syncfs' ],
+///         'sync method syncfs');
+/// }
+/// ```
+/// — 001_initdb.pl:83. `$supports_syncfs` is `check_pg_config("#define
+/// HAVE_SYNCFS 1")` (`:19`); [`rinitdb::sync::HAVE_SYNCFS`] is the same answer
+/// for this build, so the same branch runs here and in the C reference.
+///
+/// The failing half is `parse_sync_method`'s `#else`
+/// (`src/fe_utils/option_utils.c:99`) followed by `exit(1)` at
+/// `initdb.c:3390`.
+#[cfg(unix)]
+#[test]
+fn sync_method_syncfs() {
+    let tempdir = TempDir::new("sync-method-syncfs");
+    let datadir = build_layout(&args(&[&tempdir.join("data").to_string_lossy()]));
+    let argv = sync_argv(&["--sync-only"], &datadir, &["--sync-method", "syncfs"]);
+
+    if rinitdb::sync::HAVE_SYNCFS {
+        succeeds_with(&argv, "syncing data to disk ... ok\n");
+    } else {
+        fails_with(
+            &argv,
+            "initdb: error: this build does not support sync method \"syncfs\"",
+        );
+    }
+    gate_strictly(&argv);
 }
 
 /// `command_fails([ 'initdb', '--no-sync', '--locale-provider' => 'icu',

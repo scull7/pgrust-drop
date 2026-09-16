@@ -314,12 +314,23 @@ mod tests {
         assert_eq!(encrypted.len(), 35);
         assert!(encrypted.starts_with(b"md5"));
         assert_eq!(&encrypted[3..], &md5_hash(b"secretuser")[..]);
-        // The documented two-step: md5(md5(password||user) hex, then salt).
-        let first = md5_encrypt(b"secret", b"user");
-        let second = md5_encrypt(&first[3..], &[1, 2, 3, 4]);
+        // Fixed vectors, so the two-step hash `AUTH_REQ_MD5` sends is pinned
+        // by values this code did not produce: md5("secretalice") and then
+        // md5 of that hex string followed by the four salt bytes, both from
+        // the system `md5sum`. Deriving the second from the first through
+        // these same functions would have asserted nothing.
         assert_eq!(
-            &second[3..],
-            &md5_hash(&[&first[3..], &[1, 2, 3, 4][..]].concat())[..]
+            String::from_utf8(md5_encrypt(b"secret", b"alice")).unwrap(),
+            "md54a0a68b43b6cd5cf266fa02f196e2371"
+        );
+        let first = md5_encrypt(b"secret", b"alice");
+        assert_eq!(
+            String::from_utf8(md5_encrypt(&first[3..], &[0xde, 0xad, 0xbe, 0xef])).unwrap(),
+            "md53e1d73ba00a55e8805aa0277d29996c5"
+        );
+        assert_eq!(
+            String::from_utf8(md5_encrypt(&first[3..], &[1, 2, 3, 4])).unwrap(),
+            "md598a0412b9c31436fc53776e863350083"
         );
     }
 }

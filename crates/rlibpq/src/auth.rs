@@ -479,11 +479,10 @@ mod tests {
     fn an_md5_password_is_hashed_twice() {
         let mut auth = Authenticator::new(b"alice", Some(b"secret"), &[0; 18]);
         let step = auth.respond(&AuthRequest::Md5Password([0xde, 0xad, 0xbe, 0xef]));
-        let inner = md5::md5_hash(b"secretalice");
-        let mut outer_input = inner.clone();
-        outer_input.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let mut expected = b"md5".to_vec();
-        expected.extend_from_slice(&md5::md5_hash(&outer_input));
+        // The fixed vector from `md5.rs`: md5("secretalice"), then md5 of
+        // that hex string followed by the four salt bytes — from the system
+        // `md5sum`, not from the code under test.
+        let expected = b"md53e1d73ba00a55e8805aa0277d29996c5".to_vec();
         assert_eq!(
             step,
             Ok(AuthStep::Send(Frontend::PasswordMessage(expected.clone())))

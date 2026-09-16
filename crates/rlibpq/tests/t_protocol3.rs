@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use rlibpq::conninfo::{Env, parse_conninfo};
-use rlibpq::{Connection, ExecStatus};
+use rlibpq::{Connection, ContextVisibility, ExecStatus, Verbosity};
 use testkit::reference;
 
 /// The three C tools a live gate needs.
@@ -56,12 +56,23 @@ impl Cluster {
         let pwfile = dir.join("pwfile");
         std::fs::write(&pwfile, "gatepassword\n").ok()?;
 
+        // PostgreSQL 18 defaults `password_encryption` to scram-sha-256, so a
+        // cluster whose pg_hba.conf says `md5` would still store a SCRAM
+        // verifier and still answer AUTH_REQ_SASL — the md5 case would quietly
+        // test SCRAM twice. The verifier has to be built for the method.
+        let encryption = if auth_method == "md5" {
+            "md5"
+        } else {
+            "scram-sha-256"
+        };
         let status = Command::new(bin.join("initdb"))
             .args(["-D".as_ref(), data.as_os_str()])
             .args(["-U", "gateuser", "--auth-local", auth_method, "--auth-host"])
             .arg(auth_method)
             .arg("--pwfile")
             .arg(&pwfile)
+            .arg("-c")
+            .arg(format!("password_encryption={encryption}"))
             .arg("--no-sync")
             .env("LC_ALL", "C")
             .output()
@@ -103,10 +114,12 @@ impl Cluster {
     }
 
     /// `psql -tAq -c query` — the reference rendering, unaligned and
-    /// untitled, so only the values differ from ours.
-    fn psql(&self, query: &str) -> (Vec<u8>, Vec<u8>, i32) {
+    /// untitled, so only the values differ from ours. `verbosity` is passed
+    /// through as psql's `VERBOSITY` variable.
+    fn psql(&self, query: &str, verbosity: &str) -> (Vec<u8>, Vec<u8>, i32) {
         let out = Command::new(self.bin.join("psql"))
-            .args(["-tAq", "-c", query, "-d", &self.conninfo()])
+            .args(["-tAq", "-v", &format!("VERBOSITY={verbosity}")])
+            .args(["-c", query, "-d", &self.conninfo()])
             .env("LC_ALL", "C")
             .env("PGPASSWORD", "gatepassword")
             .output()
@@ -138,7 +151,7 @@ fn select_version_matches_the_reference_psql() {
     assert_eq!(results[0].ntuples(), 1);
     assert_eq!(results[0].nfields(), 1);
 
-    let (stdout, _, code) = cluster.psql("select version()");
+    let (stdout, _, code) = cluster.psql("select version()", "default");
     assert_eq!(code, 0);
     let mut ours = results[0].value(0, 0).expect("a value").to_vec();
     ours.push(b'\n');
@@ -159,14 +172,38 @@ fn an_error_carries_the_fields_the_reference_reports() {
     let error = results[0].error().expect("an error result");
     assert_eq!(error.sqlstate(), Some(&b"42601"[..]));
 
-    let (_, stderr, code) = cluster.psql("selct 1");
+    // The comparison is made at VERBOSITY terse, and that is not a
+    // convenience: at every other verbosity C libpq puts the position on a
+    // syntax-cursor display over the query it kept (`res->errQuery`,
+    // `fe-protocol3.c:966`, filled for a simple query at `fe-exec.c:1484`),
+    // printing `LINE 1: selct 1` and a caret line that `reportErrorPosition`
+    // (`:1202`) draws and this port does not — the divergence
+    // `docs/divergences.md` records. Terse is the one verbosity where upstream
+    // renders the position as text (`:1099`), which is exactly what this port
+    // renders, so this is a real byte-for-byte gate over the same fields
+    // rather than a comparison the port is documented to fail.
+    let (_, stderr, code) = cluster.psql("selct 1", "terse");
     assert_ne!(code, 0);
-    let rendered = results[0].error_message();
-    assert_eq!(
-        String::from_utf8_lossy(&rendered).trim_end(),
-        String::from_utf8_lossy(&stderr).trim_end(),
-        "the rendered error must match psql's"
+    let rendered = error.message(
+        ExecStatus::FatalError,
+        Verbosity::Terse,
+        ContextVisibility::Errors,
     );
+    assert_eq!(
+        rendered, stderr,
+        "the terse rendering must be psql's, byte for byte"
+    );
+
+    // What is *not* judged, said out loud rather than left out: the default
+    // verbosity, where psql adds the two cursor lines.
+    let (_, default_stderr, _) = cluster.psql("selct 1", "default");
+    if default_stderr != results[0].error_message() {
+        reference::announce_skip(
+            "OUT OF SCOPE (flagged, not silent): the default-verbosity rendering differs by \
+             the syntax-cursor display (reportErrorPosition, fe-protocol3.c:1202); see \
+             docs/divergences.md",
+        );
+    }
 }
 
 /// A notice reaches the client as a notice, not as a result.

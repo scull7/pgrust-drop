@@ -3,6 +3,66 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-389 review fixes
+
+**What** (all six findings were real; two were holes, four were tests or
+harnesses claiming more than they checked)
+- `NegotiateProtocolVersion` read the unsupported-parameter count as `u32` and
+  handed it to `Vec::with_capacity`. `pqGetNegotiateProtocolVersion3` reads it
+  into an `int` and refuses a negative one (`fe-protocol3.c:1475`); read
+  unsigned, the frame `76 00 00 00 0C 00 03 00 00 FF FF FF FF` asks for 103 GB
+  and aborts the process where C libpq reports a connection error. The count is
+  now signed and refused when negative, with upstream's message, and nothing
+  reserves capacity from it at all — the strings are pushed one at a time and
+  `cstring` stops at the end of the body, so a large *positive* count costs
+  only the bytes that are there. The arm moved into
+  `decode_negotiate_protocol_version`, which also kept `decode` under clippy's
+  line limit. Checked both ways: the reviewer's exact frame, and `7f ff ff ff`
+  with one string, which now ends as `insufficient data in "v" message`.
+- The `PG_DIAG_INTERNAL_POSITION` arm appended ` at character %s`
+  unconditionally. `pqBuildErrorMessage3` suppresses that text whenever the
+  verbosity is not terse *and* `PG_DIAG_INTERNAL_QUERY` is present
+  (`fe-protocol3.c:1112`), because it draws a cursor over that query instead —
+  so every error inside a PL/pgSQL `EXECUTE` read differently here than through
+  C libpq. Suppressed now; the query still reaches the reader on the `QUERY:`
+  line, which no test had been exercising either.
+- The error gate asserted that `error_message()` equals psql's stderr byte for
+  byte, which `docs/divergences.md` says in the same breath is impossible: for
+  a simple query libpq *does* keep the query (`fe-exec.c:1484`), so C psql
+  prints `LINE 1:` and a caret this port does not draw. It was green only
+  because no machine here can run it. The gate now compares at
+  `VERBOSITY terse` — the one setting where upstream renders the position as
+  text (`:1099`), which is exactly what this port renders — so it is a real
+  byte comparison over the same fields, and the default-verbosity difference is
+  printed as `OUT OF SCOPE (flagged, not silent)` rather than dropped.
+- The md5 gate never exercised md5: PostgreSQL 18 defaults
+  `password_encryption` to scram-sha-256, so the `--pwfile` verifier was a
+  SCRAM verifier and an `md5` pg_hba line still drew `AUTH_REQ_SASL`. The
+  cluster is now built with `-c password_encryption=md5` for that case.
+- A BackendKeyData arriving mid-query reported the character `R`; it reports
+  `K` now.
+- `md5_encrypt_is_the_hash_of_password_then_salt` re-derived `md5_encrypt` from
+  `md5_hash` and asserted nothing about the two-step auth hash. It, the
+  authenticator test and the md5 wire test now all assert fixed strings from
+  the system `md5sum` — `md5("secretalice")` and the two salted digests — so
+  the bytes on the wire are checked against values this code did not produce.
+
+**Divergence row rewritten**. The cursor-display row named only
+`PG_DIAG_STATEMENT_POSITION`; it now states both cases — the statement position
+still renders as text because the result carries no query to point at, the
+internal position no longer does — and says the gate compares at terse.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 471 tests (469 before), 27 SKIP-flagged
+gate lines, unchanged.
+
+**Risks**. The gates still have never executed; the terse comparison is
+reasoned from the C, not observed. The negotiation checks upstream makes around
+the count — downgrade to a higher version, to pre-3.0, to the non-existent 3.1,
+and "negotiated but asks for no changes" (`fe-protocol3.c:1456`-`:1484`) — are
+still not made: this port requests 3.0 and ignores the reply's version. That is
+a follow-up, not part of these findings.
+
 ## 2026-09-16 — NAT-389 rlibpq protocol v3 core
 
 **What**. `rlibpq` can now connect, authenticate and run simple queries.

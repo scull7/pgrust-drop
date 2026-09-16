@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use testkit::Gate;
+use testkit::{Gate, GateError, Side, reference};
 
 const CAT: &str = "/bin/cat";
 const ECHO: &str = "/bin/echo";
@@ -26,7 +26,10 @@ fn available(tools: &[&str]) -> bool {
     if missing.is_empty() {
         return true;
     }
-    println!("SKIP (flagged, not silent): {missing:?} not present on this machine");
+    reference::announce_skip(&format!(
+        "{}: {missing:?} not present on this machine",
+        reference::SKIP_FLAG
+    ));
     false
 }
 
@@ -52,7 +55,7 @@ fn stdin_actually_reaches_both_children() {
         .with_stdin(b"only cat repeats this\n".to_vec())
         .run()
         .expect("run cat and echo");
-    let diff = report.stdout_diff.as_ref().expect("stdout differs");
+    let diff = report.stdout_diff.text().expect("stdout differs as text");
     assert!(diff.contains("-only cat repeats this"), "{diff}");
     assert!(report.rc.matches(), "{report}");
 }
@@ -74,10 +77,23 @@ fn a_large_stdin_does_not_deadlock() {
     assert!(report.is_clean(), "{report}");
 }
 
+/// A gate that cannot run is never a pass, and the error says which of the two
+/// binaries was missing: "the reference is not installed" and "the candidate is
+/// not built" need different fixes.
 #[test]
-fn a_missing_binary_is_an_error_not_a_pass() {
-    let error = Gate::new("/nonexistent/reference/initdb", CAT)
+fn a_missing_binary_is_an_error_naming_its_side() {
+    let GateError::Spawn { side, path, source } = Gate::new("/nonexistent/reference/initdb", CAT)
         .run()
-        .expect_err("spawning a missing binary must fail");
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        .expect_err("spawning a missing reference must fail");
+    assert_eq!(side, Side::Reference);
+    assert_eq!(path, Path::new("/nonexistent/reference/initdb"));
+    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+
+    if !available(&[CAT]) {
+        return;
+    }
+    let GateError::Spawn { side, .. } = Gate::new(CAT, "/nonexistent/candidate/rinitdb")
+        .run()
+        .expect_err("spawning a missing candidate must fail");
+    assert_eq!(side, Side::Candidate);
 }

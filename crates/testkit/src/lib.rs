@@ -34,7 +34,7 @@ pub mod reference;
 pub mod run;
 
 pub use checks::Violation;
-pub use gate::{Gate, GateReport, RcCheck};
+pub use gate::{Gate, GateError, GateReport, RcCheck, Side, StreamDiff};
 pub use normalize::Normalizer;
 pub use outcome::CommandOutcome;
 pub use run::{

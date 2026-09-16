@@ -102,13 +102,23 @@ fn pid(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(MARKER) {
+        // "RAPID 42" is not a PID: the marker only counts at a word boundary,
+        // or a normalizer would erase real numbers and mask a difference.
+        let preceding = if at > 0 {
+            rest[..at].chars().last()
+        } else {
+            out.chars().last()
+        };
+        let boundary = preceding.is_none_or(|before| !before.is_alphanumeric() && before != '_');
         let (head, tail) = rest.split_at(at + MARKER.len());
         out.push_str(head);
         let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if digits > 0 {
+        if boundary && digits > 0 {
             out.push_str(PID_PLACEHOLDER);
+            rest = &tail[digits..];
+        } else {
+            rest = tail;
         }
-        rest = &tail[digits..];
     }
     out.push_str(rest);
     out
@@ -183,6 +193,15 @@ mod tests {
             pid("PID 1 and PID 22 and PID x"),
             "PID <pid> and PID <pid> and PID x"
         );
+    }
+
+    /// Reviewer's case: the marker must not fire inside a longer word.
+    #[test]
+    fn pid_does_not_fire_inside_a_word() {
+        assert_eq!(pid("RAPID 42 rows"), "RAPID 42 rows");
+        assert_eq!(pid("rapid 42"), "rapid 42");
+        assert_eq!(pid("_PID 42"), "_PID 42");
+        assert_eq!(pid("(PID 42)"), "(PID <pid>)");
     }
 
     #[test]

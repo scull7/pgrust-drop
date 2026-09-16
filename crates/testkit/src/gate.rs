@@ -21,16 +21,52 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::normalize::{self, Normalizer};
 use crate::outcome::CommandOutcome;
 use crate::{diff, reference, run};
 
-/// How the reference side is labelled in a diff.
-const REFERENCE_LABEL: &str = "reference";
-/// How our side is labelled in a diff.
-const CANDIDATE_LABEL: &str = "candidate";
+/// Which of the two binaries a message is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The C PostgreSQL 18 tool, the authority.
+    Reference,
+    /// Our Rust tool.
+    Candidate,
+}
+
+impl Side {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Reference => "reference",
+            Side::Candidate => "candidate",
+        }
+    }
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Why a gate could not produce a verdict.
+///
+/// Both binaries fail to spawn with the same bare `NotFound`, so the side and
+/// the path are part of the error: "the candidate is not built" and "the
+/// reference is not installed" need different fixes.
+#[derive(Debug, thiserror::Error)]
+pub enum GateError {
+    #[error("could not run the {side} binary {}: {source}", path.display())]
+    Spawn {
+        side: Side,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// One invocation to run through both binaries.
 #[derive(Debug, Clone)]
@@ -115,11 +151,19 @@ impl Gate {
     /// Action: run both binaries on this invocation and compare them.
     ///
     /// # Errors
-    /// The `io::Error` from spawning either binary.
-    pub fn run(&self) -> std::io::Result<GateReport> {
-        let reference = run::run_with_stdin(&self.reference, &self.args, &self.stdin)?;
-        let candidate = run::run_with_stdin(&self.candidate, &self.args, &self.stdin)?;
+    /// [`GateError::Spawn`], naming which binary could not be run.
+    pub fn run(&self) -> Result<GateReport, GateError> {
+        let reference = self.spawn(Side::Reference, &self.reference)?;
+        let candidate = self.spawn(Side::Candidate, &self.candidate)?;
         Ok(compare(&reference, &candidate, &self.normalizers))
+    }
+
+    fn spawn(&self, side: Side, bin: &Path) -> Result<CommandOutcome, GateError> {
+        run::run_with_stdin(bin, &self.args, &self.stdin).map_err(|source| GateError::Spawn {
+            side,
+            path: bin.to_path_buf(),
+            source,
+        })
     }
 
     /// Run the gate and fail the test with the full report unless it is clean.
@@ -159,6 +203,64 @@ impl fmt::Display for Gate {
     }
 }
 
+/// What a gate made of one output stream.
+///
+/// An enum rather than an `Option<String>`: "matched", "differs, here is the
+/// diff" and "differs but cannot be diffed as text" are three outcomes a
+/// caller may want to branch on, and AGENTS.md rules out stringly-typed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDiff {
+    /// Identical bytes, or identical after the justified normalizations.
+    Match,
+    /// Differs; the rendered `diff -U3`.
+    Text(String),
+    /// Differs, and at least one side is not valid UTF-8, so it cannot be
+    /// diffed as text without `from_utf8_lossy` possibly mapping two different
+    /// byte strings onto one.
+    Binary {
+        /// Offset of the first differing byte.
+        at: usize,
+        reference_len: usize,
+        candidate_len: usize,
+    },
+}
+
+impl StreamDiff {
+    /// The two sides agree on this stream.
+    #[must_use]
+    pub fn matches(&self) -> bool {
+        matches!(self, StreamDiff::Match)
+    }
+
+    /// The rendered diff, when there is one to show.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            StreamDiff::Text(diff) => Some(diff),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StreamDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamDiff::Match => Ok(()),
+            StreamDiff::Text(diff) => f.write_str(diff),
+            StreamDiff::Binary {
+                at,
+                reference_len,
+                candidate_len,
+            } => write!(
+                f,
+                "differs and is not valid UTF-8, so it cannot be diffed as text: \
+                 first difference at byte {at} (reference {reference_len} bytes, \
+                 candidate {candidate_len} bytes)"
+            ),
+        }
+    }
+}
+
 /// The two exit statuses, `None` when a process was killed by a signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RcCheck {
@@ -192,8 +294,8 @@ fn describe_status(status: Option<i32>) -> String {
 /// matched) and the two exit statuses.
 #[derive(Debug, Clone)]
 pub struct GateReport {
-    pub stdout_diff: Option<String>,
-    pub stderr_diff: Option<String>,
+    pub stdout_diff: StreamDiff,
+    pub stderr_diff: StreamDiff,
     pub rc: RcCheck,
 }
 
@@ -201,7 +303,7 @@ impl GateReport {
     /// Both streams identical (after normalization) and the same exit status.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.stdout_diff.is_none() && self.stderr_diff.is_none() && self.rc.matches()
+        self.stdout_diff.matches() && self.stderr_diff.matches() && self.rc.matches()
     }
 }
 
@@ -213,11 +315,12 @@ impl fmt::Display for GateReport {
         if !self.rc.matches() {
             writeln!(f, "{}", self.rc)?;
         }
-        for diff in [self.stdout_diff.as_ref(), self.stderr_diff.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            writeln!(f, "{diff}")?;
+        for (stream, diff) in [("stdout", &self.stdout_diff), ("stderr", &self.stderr_diff)] {
+            match diff {
+                StreamDiff::Match => {}
+                StreamDiff::Text(text) => writeln!(f, "{text}")?,
+                StreamDiff::Binary { .. } => writeln!(f, "{stream} {diff}")?,
+            }
         }
         Ok(())
     }
@@ -251,37 +354,36 @@ fn compare_stream(
     reference: &[u8],
     candidate: &[u8],
     normalizers: &[Normalizer],
-) -> Option<String> {
+) -> StreamDiff {
     if reference == candidate {
-        return None;
+        return StreamDiff::Match;
     }
     let (Ok(reference_text), Ok(candidate_text)) =
         (str::from_utf8(reference), str::from_utf8(candidate))
     else {
-        return Some(binary_mismatch(stream, reference, candidate));
+        return binary_mismatch(reference, candidate);
     };
     let reference_text = normalize::apply_all(reference_text, normalizers);
     let candidate_text = normalize::apply_all(candidate_text, normalizers);
     diff::unified(
         &reference_text,
         &candidate_text,
-        &format!("{REFERENCE_LABEL} {stream}"),
-        &format!("{CANDIDATE_LABEL} {stream}"),
+        &format!("{} {stream}", Side::Reference),
+        &format!("{} {stream}", Side::Candidate),
     )
+    .map_or(StreamDiff::Match, StreamDiff::Text)
 }
 
-fn binary_mismatch(stream: &str, reference: &[u8], candidate: &[u8]) -> String {
-    let at = reference
-        .iter()
-        .zip(candidate)
-        .position(|(left, right)| left != right)
-        .unwrap_or_else(|| reference.len().min(candidate.len()));
-    format!(
-        "{stream} differs and is not valid UTF-8, so it cannot be diffed as text: \
-         first difference at byte {at} ({REFERENCE_LABEL} {} bytes, {CANDIDATE_LABEL} {} bytes)",
-        reference.len(),
-        candidate.len()
-    )
+fn binary_mismatch(reference: &[u8], candidate: &[u8]) -> StreamDiff {
+    StreamDiff::Binary {
+        at: reference
+            .iter()
+            .zip(candidate)
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| reference.len().min(candidate.len())),
+        reference_len: reference.len(),
+        candidate_len: candidate.len(),
+    }
 }
 
 #[cfg(test)]
@@ -298,8 +400,8 @@ mod tests {
         let theirs = outcome(0, "initdb (PostgreSQL) 18.6\n", "");
         let report = compare(&theirs, &theirs.clone(), &[]);
         assert!(report.is_clean(), "{report}");
-        assert_eq!(report.stdout_diff, None);
-        assert_eq!(report.stderr_diff, None);
+        assert_eq!(report.stdout_diff, StreamDiff::Match);
+        assert_eq!(report.stderr_diff, StreamDiff::Match);
         assert!(report.rc.matches());
     }
 
@@ -309,7 +411,7 @@ mod tests {
         let ours = outcome(0, "rinitdb (PostgreSQL) 18.6\n", "");
         let report = compare(&theirs, &ours, &[]);
         assert!(!report.is_clean());
-        let diff = report.stdout_diff.expect("stdout differs");
+        let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(
             diff.starts_with("--- reference stdout\n+++ candidate stdout\n"),
             "{diff}"
@@ -323,8 +425,8 @@ mod tests {
         let theirs = outcome(1, "", "initdb: error: invalid option\n");
         let ours = outcome(1, "", "error: unexpected argument\n");
         let report = compare(&theirs, &ours, &[]);
-        assert_eq!(report.stdout_diff, None);
-        assert!(report.stderr_diff.is_some());
+        assert_eq!(report.stdout_diff, StreamDiff::Match);
+        assert!(!report.stderr_diff.matches());
         assert!(report.rc.matches());
         assert!(!report.is_clean());
     }
@@ -334,8 +436,8 @@ mod tests {
         let theirs = outcome(1, "", "");
         let ours = outcome(2, "", "");
         let report = compare(&theirs, &ours, &[]);
-        assert_eq!(report.stdout_diff, None);
-        assert_eq!(report.stderr_diff, None);
+        assert_eq!(report.stdout_diff, StreamDiff::Match);
+        assert_eq!(report.stderr_diff, StreamDiff::Match);
         assert!(!report.rc.matches());
         assert!(!report.is_clean());
         assert!(
@@ -374,7 +476,7 @@ mod tests {
         let ours = outcome(0, "Timing is off.\nTime: 2.0 ms\n", "");
         let report = compare(&theirs, &ours, &DEFAULT);
         assert!(!report.is_clean());
-        let diff = report.stdout_diff.expect("stdout differs");
+        let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(diff.contains("-Timing is on."), "{diff}");
         assert!(
             !diff.contains("Time: 1.0 ms"),
@@ -388,7 +490,7 @@ mod tests {
         let ours = outcome(0, "initdb (PostgreSQL) 18.6", "");
         let report = compare(&theirs, &ours, &DEFAULT);
         assert!(!report.is_clean());
-        let diff = report.stdout_diff.expect("stdout differs");
+        let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(diff.contains("\\ No newline at end of file"), "{diff}");
     }
 
@@ -400,9 +502,19 @@ mod tests {
         let ours = CommandOutcome::new(Some(0), vec![0xfe], Vec::new());
         let report = compare(&theirs, &ours, &DEFAULT);
         assert!(!report.is_clean());
-        let message = report.stdout_diff.expect("stdout differs");
-        assert!(message.contains("not valid UTF-8"), "{message}");
-        assert!(message.contains("byte 0"), "{message}");
+        assert_eq!(
+            report.stdout_diff,
+            StreamDiff::Binary {
+                at: 0,
+                reference_len: 1,
+                candidate_len: 1
+            }
+        );
+        let shown = report.to_string();
+        assert!(
+            shown.contains("stdout differs and is not valid UTF-8"),
+            "{shown}"
+        );
     }
 
     #[test]

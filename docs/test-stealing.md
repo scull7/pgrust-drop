@@ -29,7 +29,11 @@ pgrust-drop copies that *method* for every crate (the method, not pgrust's corpu
 3. Every normalizer (`Time: XXX ms`, `PID NNN`, system identifier, …) is a pure
    function with a one-line justification next to it.
 4. Missing reference binary → `SKIP (flagged, not silent)`. CI installs the
-   PGDG 18 packages so the gate is real there.
+   PGDG 18 packages so the gate is real there. Announce the skip with
+   `testkit::reference::skip` / `announce_skip`, never `println!` or
+   `eprintln!`: libtest captures both and replays them only for a failing test
+   or under `--nocapture`, so a skip announced that way is invisible in the log
+   of a passing CI run — a silently narrowed gate.
 5. A divergence we accept on purpose goes in `docs/divergences.md` with the
    test that pins the divergent behaviour.
 

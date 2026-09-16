@@ -211,6 +211,29 @@ pub fn tree_listing(plan: &CreatePlan) -> Vec<(PathBuf, u32)> {
     listing
 }
 
+/// Pure: the directories `pg_mkdir_p` has to create for `path`, outermost
+/// first, given a predicate that says which ones are already there.
+///
+/// `pg_mkdir_p` (`src/port/pgmkdirp.c:57`) walks the *components* of the path
+/// and mkdirs each prefix, so it never touches anything outside `path`. Walking
+/// `Path::ancestors` instead is the same set of prefixes with one trap: the
+/// last ancestor of a relative path is the empty path, which no `mkdir` may
+/// ever be handed, and which `Path::exists` reports as absent. `initdb -D
+/// mydata` is a legal relative data directory (`initdb.c:2634` canonicalizes
+/// it, it does not require an absolute one), so this is reachable; the empty
+/// path is dropped here rather than in the caller.
+#[must_use]
+pub fn missing_ancestors(path: &Path, exists: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !exists(dir))
+        .map(Path::to_path_buf)
+        .collect();
+    // `ancestors` yields deepest first; mkdir needs the outermost first.
+    missing.reverse();
+    missing
+}
+
 #[cfg(unix)]
 mod unix {
     use std::fs::{DirBuilder, OpenOptions, Permissions};
@@ -265,21 +288,19 @@ mod unix {
         if !parents {
             return mkdir(path, mode).map_err(|err| fail(path, &err));
         }
-        // pg_mkdir_p (`src/port/pgmkdirp.c:57`) walks down from the first
-        // component that does not exist. Every level it creates gets the same
-        // `mode` — see the note on `FsOp::CreateDir` — and "on failure, the
-        // path arg has been modified to show the particular directory level we
-        // had problems with", so the failing level is what gets named.
-        let missing: Vec<&Path> = path.ancestors().take_while(|dir| !dir.exists()).collect();
-        for dir in missing.iter().rev() {
-            match mkdir(dir, mode) {
+        // Every level pg_mkdir_p creates gets the same `mode` — see the note
+        // on `FsOp::CreateDir` — and "on failure, the path arg has been
+        // modified to show the particular directory level we had problems
+        // with", so the failing level is what gets named.
+        for dir in super::missing_ancestors(path, &|dir| dir.exists()) {
+            match mkdir(&dir, mode) {
                 Ok(()) => {}
                 // pgmkdirp.c:129 — "If we got EEXIST because there's already a
                 // directory there, don't complain", and leave its mode alone.
                 // Only pg_mkdir_p forgives this; the plain `mkdir` above does
                 // not, which is how `initdb $existing_datadir` still fails.
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
-                Err(err) => return Err(fail(dir, &err)),
+                Err(err) => return Err(fail(&dir, &err)),
             }
         }
         Ok(())
@@ -318,9 +339,12 @@ mod unix {
                 path: path.display().to_string(),
                 reason: strerror(&err),
             })?;
+        // No fsync here: C's write_version_file only fprintf's and fclose's,
+        // and initdb's one durability pass is the end-of-run fsync that
+        // --no-sync suppresses (`sync_pgdata`, `initdb.c:3512`, guarded by
+        // `do_sync` at `:3508`), which is its own issue.
         let written = file
             .write_all(contents.as_bytes())
-            .and_then(|()| file.sync_all())
             .and_then(|()| std::fs::set_permissions(path, Permissions::from_mode(mode)));
         written.map_err(|err| InitdbError::CouldNotWriteFile {
             path: path.display().to_string(),
@@ -361,11 +385,77 @@ mod tests {
 
     #[test]
     fn the_subdirs_table_is_upstreams_in_upstream_order() {
-        // initdb.c:231-255, transcribed. pg_wal is deliberately absent.
-        assert_eq!(SUBDIRS.len(), 23);
-        assert_eq!(SUBDIRS[0], "global");
-        assert_eq!(SUBDIRS[SUBDIRS.len() - 1], "pg_logical/mappings");
+        // A second, independent transcription of initdb.c:231-255. Checking
+        // only the length and the ends would let a typo or a dropped row
+        // through, and the gate cannot catch that: it compares this port's
+        // idea of the tree against C's cluster using this same table.
+        // pg_wal is deliberately absent — create_xlog_or_symlink has made it.
+        assert_eq!(
+            SUBDIRS,
+            [
+                "global",
+                "pg_wal/archive_status",
+                "pg_wal/summaries",
+                "pg_commit_ts",
+                "pg_dynshmem",
+                "pg_notify",
+                "pg_serial",
+                "pg_snapshots",
+                "pg_subtrans",
+                "pg_twophase",
+                "pg_multixact",
+                "pg_multixact/members",
+                "pg_multixact/offsets",
+                "base",
+                "base/1",
+                "pg_replslot",
+                "pg_tblspc",
+                "pg_stat",
+                "pg_stat_tmp",
+                "pg_xact",
+                "pg_logical",
+                "pg_logical/snapshots",
+                "pg_logical/mappings",
+            ]
+        );
         assert!(!SUBDIRS.contains(&"pg_wal"));
+    }
+
+    #[test]
+    fn pg_mkdir_p_is_never_handed_the_empty_path() {
+        // Path::ancestors ends a relative path with "", which Path::exists
+        // reports as absent; mkdir("") is ENOENT. `initdb -D mydata` is a
+        // legal command line, so this is a real input, not a curiosity.
+        let nothing_exists = |_: &Path| false;
+        assert_eq!(
+            missing_ancestors(Path::new("mydata"), &nothing_exists),
+            [PathBuf::from("mydata")]
+        );
+        assert_eq!(
+            missing_ancestors(Path::new("a/b"), &nothing_exists),
+            [PathBuf::from("a"), PathBuf::from("a/b")]
+        );
+        for path in ["mydata", "a/b", "./data", "/tmp/x/y", ""] {
+            assert!(
+                missing_ancestors(Path::new(path), &nothing_exists)
+                    .iter()
+                    .all(|dir| !dir.as_os_str().is_empty()),
+                "{path:?} would mkdir the empty path"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_absent_ancestors_are_created_outermost_first() {
+        // /tmp exists, /tmp/x and /tmp/x/y do not: pg_mkdir_p makes the two
+        // missing levels, parent before child, and leaves /tmp alone.
+        let exists = |dir: &Path| dir == Path::new("/tmp") || dir == Path::new("/");
+        assert_eq!(
+            missing_ancestors(Path::new("/tmp/x/y"), &exists),
+            [PathBuf::from("/tmp/x"), PathBuf::from("/tmp/x/y")]
+        );
+        // Nothing to do when the target is already there.
+        assert!(missing_ancestors(Path::new("/tmp"), &exists).is_empty());
     }
 
     #[test]

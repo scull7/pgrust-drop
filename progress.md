@@ -3,6 +3,144 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — Review of the nightshift branch, and the gates run for the first time
+
+**What**
+
+A two-part code review of the `nightshift/2026-09-16` branch (style and
+architecture), then six PRs against that branch, one reviewable chunk each:
+
+| PR | Branch | Chunk |
+| -- | ------ | ----- |
+| #4 | `claude/fix-ci-gates`     | CI installs PGDG 18; `PGDROP_REQUIRE_REF` strict mode |
+| #5 | `claude/fix-rlibpq-style` | named `AUTH_REQ_*`; cast invariants; `pg_config` cfg arms |
+| #6 | `claude/fix-records`      | ADR-0001/0004 amendments; `AGENTS.md` notes; license field |
+| #7 | `claude/fix-test-gates`   | `Gate::for_tool_or_skip`; two weak tests replaced |
+| #8 | `claude/fix-rpsql-bytes`  | byte-exact error path; dispatch dedup; borrowing `VarView` |
+| #9 | `claude/fix-rlibpq-port`  | `port` validated with upstream's two messages |
+
+**Why**
+
+The branch was green everywhere and proving nothing. `.github/workflows/ci.yml`
+never installed PostgreSQL, so all 31 byte-diff gates printed
+`SKIP (flagged, not silent)` and passed. `docs/test-stealing.md` rule 4 claimed
+the opposite ("CI installs the PGDG 18 packages so the gate is real there"),
+which is the sentence a future reviewer would have trusted. AGENTS.md's "never
+weaken a gate to get green" was honoured inside the gate code and defeated by
+the pipeline around it.
+
+**The gates ran for the first time (PR #4, job 104943279701): 30 passed, 4 failed**
+
+- `help_and_version_match_reference_initdb` — PGDG builds with
+  `--with-extra-version`, so C prints `18.6 (Ubuntu 18.6-1.pgdg24.04+2)` where
+  `help.rs:5` has the stock `18.6`. Harness gap, not a port bug; wants a fourth
+  justified normalizer in `testkit/src/normalize.rs`. **The `--help` half passed
+  byte-for-byte** — the 41-option usage text is now proven against a real C
+  binary for the first time.
+- `existing_nonempty_xlog_directory` and `relative_xlog_directory_not_allowed` —
+  one underlying gap. C's `initialize_data_directory()` creates PGDATA first
+  (`made_new_pgdata`, `initdb.c:2907`) and checks `--waldir` second, so on exit
+  `cleanup_directories_atexit()` (`initdb.c:771`) logs
+  `initdb: removing data directory "…"`. rinitdb validates in a pure pre-flight
+  before any mkdir, so there is nothing to remove and no line to print.
+  Corroboration: the sibling `existing_data_directory` passed, because there C
+  also bails before `made_new_pgdata`. Note this is an *ordering* divergence —
+  porting the handler alone will not produce the bytes; PGDATA must be created
+  before `--waldir` is validated, which `validate.rs:1056` currently pins the
+  other way. NAT-385/NAT-387.
+- `the_configuration_files_match_reference_initdb` — two hunks, nothing else
+  differs in `postgresql.conf` (the other 886 lines are byte-identical):
+  1. `unix_socket_directories` — Debian's `--with-socketdir=/var/run/postgresql`
+     against our stock `/tmp`. **Pre-declared**: `docs/divergences.md:21` already
+     said "the byte-diff gate against it is what would surface it." The
+     whitespace difference (space vs TAB before the comment) is also correct —
+     `replace_guc_value` tabs to column 40, which fits a tab after the 33-column
+     `'/tmp'` but only one space after the 48-column `'/var/run/postgresql'`.
+     That our renderer got the `/tmp` case exactly right is evidence the
+     algorithm port is faithful.
+  2. A 41-line `# PGRUST` tail. See below — this one is serious.
+
+**Finding: pgrust content is vendored inside an MIT crate**
+
+`crates/rinitdb/share/postgresql.conf.sample` lines 890-930 are a
+`# PGRUST` section of pgrust-specific GUCs (`pgrust.admission_bypass`,
+`shared_catalog_cache`, `preload_contrib`, …). The file itself says "Settings
+specific to pgrust (not present in PostgreSQL)."
+
+The vendoring was faithful; the source was not. All three samples are
+byte-identical to pgrust's `crates/postgres-18.6-reference/` tree (verified by
+sha256 against a fresh clone of `malisper/pgrust`), and **that tree is not a
+pristine PostgreSQL 18.6 checkout** — pgrust added its own settings to it.
+`pg_hba.conf.sample` and `pg_ident.conf.sample` are clean.
+
+Two consequences:
+- **Licensing.** pgrust is AGPL-3.0. ADR-0003 says never copy pgrust code,
+  comments or test corpora into the MIT crates. `share/README.md` asserts these
+  files are "copied **byte for byte** from the PostgreSQL 18.6 source tree" and
+  carry the PostgreSQL licence. That claim is false for this file. Owner
+  decision needed.
+- **Correctness.** rinitdb writes pgrust-only GUCs into every cluster it
+  creates. Real initdb does not.
+
+Nothing caught it because `conf.rs:711`
+(`the_embedded_templates_are_the_postgresql_18_6_bytes_we_vendored`) pins
+length + digest, so it pins the *contaminated* bytes and passes. It proves
+"unchanged since we vendored"; its name claims "is PostgreSQL 18.6". Those are
+different assertions, and the gap was invisible until something diffed against a
+real PostgreSQL. Neither of the two code reviews found it; the gate did, on its
+first run.
+
+**Checks run** (Rust 1.96.0, gating on exit status, never on grepped output)
+
+- Branch head `15891ca` re-verified independently: `cargo fmt --all --check`,
+  pedantic clippy and `cargo test --all-features` all exit 0; 644 passed,
+  1 ignored, 31 flagged SKIPs. The branch's own claims were accurate.
+- Every one of the six PRs passes all three gates on its own head.
+- Strict mode proved to bite: `PGDROP_REQUIRE_REF=1 cargo test --all-features`
+  exits 101 with 29 gates failing instead of skipping; without it, 0.
+
+**Risks / open questions**
+
+- The `# PGRUST` block: strip and re-vendor from pristine 18.6, or re-license?
+  Recommendation is to strip, re-pin the digest, fix `share/README.md`, and
+  re-derive the other two samples, since that tree's provenance is now suspect.
+- Anything else in the MIT crates sourced from `postgres-18.6-reference/` has
+  the same uncertain provenance and wants an audit.
+- PR #4's CI is red by design. Merging locks in enforcement so no future gate
+  can silently skip; holding keeps the branch green and the hole open.
+- `QuoteType::ShellArg` folds into `Plain` in `rpsql`. Confirmed unreachable —
+  nothing in the workspace produces it — so it is latent, not live. It is still
+  a trap: whoever implements backquote expansion gets an unquoted substitution
+  where C shell-quotes.
+- PR #5's Windows `#[cfg]` arm for `DEFAULT_PGSOCKET_DIR` is the only behaviour
+  change across the six PRs that nothing in CI builds.
+- PR #9 now refuses a comma-separated `port` list, which the URI parser really
+  does produce. It was already broken (silently port 5432 against a literal host
+  `a,b`); it now fails loudly. Full fidelity needs multi-host support.
+- The config gate panics on first mismatch, so `postgresql.auto.conf`,
+  `pg_hba.conf` and `pg_ident.conf` were never compared this run, and only the
+  `conf-trust` case ran. "Config files match" is not yet established.
+
+**Follow-ups**
+
+- NAT-374: `libpq_uri_regress` ships in no PGDG package, so its two gates still
+  skip; `UNSHIPPED_TOOLS` exempts it by name.
+- NAT-399: `psql --help`. Note there is no `--help`/`--version` byte-diff gate
+  against C psql at all — ADR-0004's claim described a gate that does not exist.
+- Six `Gate::for_tool` call sites remain to migrate to `for_tool_or_skip`
+  (3 in `rinitdb/tests`, 3 in `rpsql/tests`); `for_tool` can go private after.
+- `rinitdb::validate::strerror` is borrowed by `pgdrop`; the `%m` formatter
+  wants a shared home.
+- A cross-crate assertion that `rlibpq` and `rinitdb` agree on
+  `DEFAULT_PGSOCKET_DIR` — `pgdrop` depends on both and is the natural host.
+- Corrections found by the implementing agents, recorded because the review was
+  wrong and the code is right: `invalid port number` lives at `fe-connect.c:3046`
+  (not `connectOptions2`), and `port=abc` yields `invalid integer value …` from
+  `pqParseIntParam` (`:8231`) instead; upstream's `001_uri.pl` genuinely repeats
+  `postgresql://host/db`, so "all URIs distinct" would have been a wrong
+  invariant; `scan::step`'s `too_many_lines` allow was stale (25 lines) and was
+  deleted rather than justified.
+
 ## 2026-09-16 — NAT-385 review fixes
 
 **One correction to the record, three real fixes.**

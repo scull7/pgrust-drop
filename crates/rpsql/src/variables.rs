@@ -10,7 +10,7 @@
 
 use std::fmt::Write as _;
 
-use crate::scan::is_variable_char;
+use crate::scan::{QuoteType, VariableSource, is_variable_char};
 use crate::settings::{
     CompCase, DEFAULT_PROMPT1, DEFAULT_PROMPT2, DEFAULT_PROMPT3, DEFAULT_WATCH_INTERVAL,
     DEFAULT_WATCH_INTERVAL_MAX, Echo, EchoHidden, ErrorRollback, HistControl, PsqlSettings,
@@ -471,6 +471,30 @@ impl VariableSpace {
             }
         }
         pset
+    }
+}
+
+/// A read-only view of the variable space for the lexer's `:name` callback.
+///
+/// This is upstream's `psql_get_variable()` (`startup.c:1127`), the one
+/// `PsqlScanCallbacks.get_variable` psql installs: it reads `pset.vars` and
+/// quotes the value the way the caller asked. It borrows because the lexer
+/// only ever reads; a caller that needs the snapshot to outlive a concurrent
+/// write clones the space and lends *that*.
+pub(crate) struct VarView<'a>(pub &'a VariableSpace);
+
+impl VariableSource for VarView<'_> {
+    fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String> {
+        let value = self.0.get(name)?.to_string();
+        Some(match quote {
+            // `PQUOTE_SHELL_ARG` is upstream's fourth case. Nothing asks for
+            // it here: the only lexer state that requests it is
+            // `<xslashbackquote>`, and this port refuses a backquote rather
+            // than running a shell (`slash.rs:8`).
+            QuoteType::Plain | QuoteType::ShellArg => value,
+            QuoteType::SqlLiteral => escape_literal(&value),
+            QuoteType::SqlIdent => escape_identifier(&value),
+        })
     }
 }
 
@@ -944,5 +968,26 @@ mod tests {
     fn escaping_matches_libpq() {
         assert_eq!(escape_literal("a'b"), "'a''b'");
         assert_eq!(escape_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn the_lexer_view_quotes_the_way_each_request_asks() {
+        let mut vars = VariableSpace::new();
+        vars.set("x", Some("a'b")).unwrap();
+        let view = VarView(&vars);
+
+        assert_eq!(
+            view.get_variable("x", QuoteType::Plain).as_deref(),
+            Some("a'b")
+        );
+        assert_eq!(
+            view.get_variable("x", QuoteType::SqlLiteral).as_deref(),
+            Some("'a''b'")
+        );
+        assert_eq!(
+            view.get_variable("x", QuoteType::SqlIdent).as_deref(),
+            Some("\"a'b\"")
+        );
+        assert_eq!(view.get_variable("nosuch", QuoteType::Plain), None);
     }
 }

@@ -43,7 +43,7 @@ const SECS_PER_REPEAT: i64 = YEARS_PER_REPEAT * AVG_SECS_PER_YEAR;
 
 /// `localtime.c:61`. Used whenever a POSIX TZ string names a DST zone but no
 /// rules; upstream reaches for `TZDEFRULES` first and this port, like
-/// PostgreSQL's own (`localtime.c:983`), never does.
+/// PostgreSQL's own (`localtime.c:984`), never does.
 const TZ_DEFRULESTRING: &str = ",M3.2.0,M11.1.0";
 
 /// `struct state`'s `chars` member is
@@ -54,13 +54,13 @@ const CHARS_CAP: usize = 2 * (TZ_STRLEN_MAX + 1);
 /// The fixed part of a TZif file: `struct tzhead` (`tzfile.h:38`).
 const TZHEADSIZE: usize = 44;
 
-/// `localtime.c:625`.
+/// `localtime.c:626`.
 const MON_LENGTHS: [[i64; MONS_PER_YEAR]; 2] = [
     [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
     [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
 ];
 
-/// `localtime.c:630`.
+/// `localtime.c:631`.
 const YEAR_LENGTHS: [i64; 2] = [DAYS_PER_NYEAR, DAYS_PER_LYEAR];
 
 /// `private.h:133`.
@@ -92,7 +92,7 @@ struct TtInfo {
     ttisut: bool,
 }
 
-/// `init_ttinfo` (`localtime.c:107`).
+/// `init_ttinfo` (`localtime.c:108`).
 fn init_ttinfo(utoff: i32, isdst: bool, desigidx: usize) -> TtInfo {
     TtInfo {
         utoff,
@@ -151,12 +151,15 @@ impl Default for State {
     }
 }
 
-/// `struct pg_tm` (`include/pgtime.h:33`), with `tm_zone` owned.
+/// `struct pg_tm` (`include/pgtime.h:33`).
 ///
 /// The field names keep upstream's `tm_` meanings: `mon` counts from 0 and
-/// `year` is relative to 1900 (`pgtime.h:27`).
+/// `year` is relative to 1900 (`pgtime.h:27`). `zone` borrows out of the
+/// [`State`] it was computed from, as upstream's `tm_zone` points into
+/// `sp->chars` (`localtime.c:1337`), and it is bytes because that is what
+/// `strcmp` compares there.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PgTm {
+pub struct PgTm<'a> {
     pub sec: i32,
     pub min: i32,
     pub hour: i32,
@@ -167,10 +170,10 @@ pub struct PgTm {
     pub yday: i32,
     pub isdst: i32,
     pub gmtoff: i64,
-    pub zone: String,
+    pub zone: &'a [u8],
 }
 
-impl PgTm {
+impl PgTm<'_> {
     /// The calendar year, as `identify_system_timezone` reads it
     /// (`findtimezone.c:372`: `tm->tm_year + 1900`).
     #[must_use]
@@ -183,8 +186,15 @@ impl PgTm {
     ///
     /// Upstream compares a system `struct tm` against a `struct pg_tm`; here
     /// both sides are `pg_tm`, so the two comparisons fold into one.
+    /// The abbreviation as text. Only callers that must render it pay for
+    /// this; the comparisons above are over the bytes.
     #[must_use]
-    pub fn matches(&self, other: &Self) -> bool {
+    pub fn zone_name(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.zone)
+    }
+
+    #[must_use]
+    pub fn matches(&self, other: &PgTm<'_>) -> bool {
         self.sec == other.sec
             && self.min == other.min
             && self.hour == other.hour
@@ -202,13 +212,13 @@ impl PgTm {
 // Calculations: reading a TZif image
 // --------------------------------------------------------------------------
 
-/// `detzcode` (`localtime.c:117`). Every machine this runs on is two's
+/// `detzcode` (`localtime.c:118`). Every machine this runs on is two's
 /// complement, so upstream's sign reconstruction is `i32::from_be_bytes`.
 fn detzcode(b: &[u8]) -> i32 {
     i32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// `detzcode64` (`localtime.c:143`).
+/// `detzcode64` (`localtime.c:144`).
 fn detzcode64(b: &[u8]) -> i64 {
     i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
@@ -221,13 +231,13 @@ fn c_str(chars: &[u8], idx: usize) -> &[u8] {
     &rest[..end]
 }
 
-/// `differ_by_repeat` (`localtime.c:169`). `pg_time_t` is `int64`, so the
+/// `differ_by_repeat` (`localtime.c:170`). `pg_time_t` is `int64`, so the
 /// width test at `:172` is always false and only the subtraction survives.
 fn differ_by_repeat(t1: i64, t0: i64) -> bool {
     t1.checked_sub(t0) == Some(SECS_PER_REPEAT)
 }
 
-/// `typesequiv` (`localtime.c:601`).
+/// `typesequiv` (`localtime.c:602`).
 fn typesequiv(sp: &State, a: usize, b: usize) -> bool {
     match (sp.ttis.get(a), sp.ttis.get(b)) {
         (Some(ap), Some(bp)) => {
@@ -241,7 +251,7 @@ fn typesequiv(sp: &State, a: usize, b: usize) -> bool {
     }
 }
 
-/// `leapcorr` (`localtime.c:1573`).
+/// `leapcorr` (`localtime.c:1574`).
 fn leapcorr(sp: &State, t: i64) -> i64 {
     sp.lsis
         .iter()
@@ -250,7 +260,7 @@ fn leapcorr(sp: &State, t: i64) -> i64 {
         .map_or(0, |lp| lp.corr)
 }
 
-/// `increment_overflow_time` (`localtime.c:1556`), over `pg_time_t`.
+/// `increment_overflow_time` (`localtime.c:1557`), over `pg_time_t`.
 fn increment_overflow_time(tp: &mut i64, j: i64) -> bool {
     match tp.checked_add(j) {
         Some(v) => {
@@ -261,7 +271,7 @@ fn increment_overflow_time(tp: &mut i64, j: i64) -> bool {
     }
 }
 
-/// `increment_overflow` (`localtime.c:1538`), over `int`.
+/// `increment_overflow` (`localtime.c:1539`), over `int`.
 fn increment_overflow(ip: &mut i32, j: i32) -> bool {
     match ip.checked_add(j) {
         Some(v) => {
@@ -272,7 +282,7 @@ fn increment_overflow(ip: &mut i32, j: i32) -> bool {
     }
 }
 
-/// `tzload` (`localtime.c:585`) over the file image rather than a file
+/// `tzload` (`localtime.c:586`) over the file image rather than a file
 /// descriptor: the `open`/`read` upstream does at `:230`-`:236` is the caller's
 /// action. `None` is upstream's nonzero return.
 ///
@@ -285,7 +295,7 @@ pub fn load(image: &[u8], doextend: bool) -> Option<State> {
     Some(sp)
 }
 
-/// `tzloadbody` (`localtime.c:210`).
+/// `tzloadbody` (`localtime.c:211`).
 #[allow(clippy::too_many_lines)] // One upstream function, kept in one piece.
 fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
     if image.len() < TZHEADSIZE {
@@ -306,7 +316,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
         let typecnt = detzcode(&buf[36..]);
         let charcnt = detzcode(&buf[40..]);
 
-        // localtime.c:259 — the header's own bounds. The conversion standing
+        // localtime.c:264 — the header's own bounds. The conversion standing
         // in for upstream's six `0 <=` tests fails on exactly the values they
         // reject.
         let (Ok(ttisutcnt), Ok(ttisstdcnt), Ok(leapcnt), Ok(timecnt), Ok(typecnt), Ok(charcnt)) = (
@@ -329,7 +339,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
             return None;
         }
 
-        // localtime.c:268 — and the size the counts imply.
+        // localtime.c:271 — and the size the counts imply.
         if buf.len()
             < TZHEADSIZE
                 + timecnt * stored
@@ -345,9 +355,9 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
 
         let mut p = TZHEADSIZE;
 
-        // localtime.c:284 — read transitions. A 64-bit pg_time_t holds every
-        // value the file can carry, so upstream's out-of-range discard (`:290`,
-        // `:293`) never fires and only its duplicate-transition rule survives.
+        // localtime.c:287 — read transitions. A 64-bit pg_time_t holds every
+        // value the file can carry, so upstream's out-of-range discard (`:297`,
+        // `:302`) never fires and only its duplicate-transition rule survives.
         // `keep` is upstream's re-use of `sp->types[i]` as that flag.
         let mut keep = vec![true; timecnt];
         let mut ats: Vec<i64> = Vec::with_capacity(timecnt);
@@ -363,7 +373,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
                 if at < ats[ats.len() - 1] {
                     return None;
                 }
-                // Upstream drops the *earlier* of the pair (`localtime.c:305`).
+                // Upstream drops the *earlier* of the pair (`localtime.c:308`).
                 if i > 0 {
                     keep[i - 1] = false;
                 }
@@ -407,7 +417,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
         chars[..charcnt].copy_from_slice(&buf[p..p + charcnt]);
         p += charcnt;
 
-        // localtime.c:345 — leap seconds, with upstream's sanity rule.
+        // localtime.c:349 — leap seconds, with upstream's sanity rule.
         let mut lsis: Vec<LsInfo> = Vec::with_capacity(leapcnt);
         let mut prevtr = 0i64;
         let mut prevcorr = 0i32;
@@ -460,7 +470,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
         sp.charcnt = charcnt;
         sp.lsis = lsis;
 
-        // localtime.c:411 — an old file has no second block.
+        // localtime.c:410 — an old file has no second block.
         if buf[4] == 0 {
             break;
         }
@@ -471,7 +481,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
         stored = 8;
     }
 
-    // localtime.c:417 — splice in the footer's POSIX TZ string.
+    // localtime.c:415 — splice in the footer's POSIX TZ string.
     if doextend && buf.len() > 2 && buf[0] == b'\n' && buf[buf.len() - 1] == b'\n' {
         extend(sp, &buf[1..buf.len() - 1]);
     }
@@ -506,7 +516,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
     Some(())
 }
 
-/// `tzloadbody`'s extension block (`localtime.c:417`-`:485`), split out.
+/// `tzloadbody`'s extension block (`localtime.c:415`-`:485`), split out.
 fn extend(sp: &mut State, footer: &[u8]) {
     if sp.ttis.len() + 2 > TZ_MAX_TYPES {
         return;
@@ -518,7 +528,7 @@ fn extend(sp: &mut State, footer: &[u8]) {
         return;
     };
 
-    // localtime.c:428 — reuse abbreviations already in sp->chars where we can.
+    // localtime.c:425 — reuse abbreviations already in sp->chars where we can.
     let mut gotabbr = 0usize;
     let mut charcnt = sp.charcnt;
     for i in 0..ts.ttis.len() {
@@ -543,7 +553,7 @@ fn extend(sp: &mut State, footer: &[u8]) {
     }
     sp.charcnt = charcnt;
 
-    // localtime.c:455 — drop zic's trailing no-op transitions.
+    // localtime.c:469 — drop zic's trailing no-op transitions.
     while sp.ats.len() > 1 && sp.types[sp.ats.len() - 1] == sp.types[sp.ats.len() - 2] {
         sp.ats.pop();
         sp.types.pop();
@@ -561,7 +571,7 @@ fn extend(sp: &mut State, footer: &[u8]) {
         let at = ts.ats[i] + leapcorr(sp, ts.ats[i]);
         sp.ats.push(at);
         // typecnt_before + ts->types[i] is at most 255; see the TZ_MAX_TYPES
-        // guard above (`localtime.c:420`).
+        // guard above (`localtime.c:417`).
         sp.types
             .push(u8::try_from(typecnt_before + usize::from(ts.types[i])).unwrap_or(u8::MAX));
         i += 1;
@@ -569,7 +579,7 @@ fn extend(sp: &mut State, footer: &[u8]) {
     sp.ttis.extend(ts.ttis);
 }
 
-/// `tzloadbody`'s `defaulttype` heuristics (`localtime.c:521`-`:580`), which
+/// `tzloadbody`'s `defaulttype` heuristics (`localtime.c:517`-`:575`), which
 /// work around 32-bit data from tzdb 2018e or earlier. For any recent release
 /// the answer is zero.
 fn infer_default_type(sp: &State) -> usize {
@@ -593,7 +603,7 @@ fn infer_default_type(sp: &State) -> usize {
 // Calculations: parsing a POSIX TZ string
 // --------------------------------------------------------------------------
 
-/// `struct rule`'s `r_type` (`localtime.c:64`).
+/// `struct rule`'s `r_type` (`localtime.c:65`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuleKind {
     /// `JULIAN_DAY`: `Jn`, 1 == January 1 even in leap years.
@@ -619,7 +629,7 @@ fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
-/// `getzname` (`localtime.c:641`).
+/// `getzname` (`localtime.c:642`).
 fn getzname(b: &[u8], mut i: usize) -> usize {
     while let Some(&c) = b.get(i) {
         if is_digit(c) || c == b',' || c == b'-' || c == b'+' {
@@ -630,7 +640,7 @@ fn getzname(b: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// `getqzname` (`localtime.c:662`).
+/// `getqzname` (`localtime.c:663`).
 fn getqzname(b: &[u8], mut i: usize, delim: u8) -> usize {
     while let Some(&c) = b.get(i) {
         if c == delim {
@@ -641,7 +651,7 @@ fn getqzname(b: &[u8], mut i: usize, delim: u8) -> usize {
     i
 }
 
-/// `getnum` (`localtime.c:679`).
+/// `getnum` (`localtime.c:680`).
 fn getnum(b: &[u8], mut i: usize, min: i64, max: i64) -> Option<(usize, i64)> {
     if !b.get(i).copied().is_some_and(is_digit) {
         return None;
@@ -663,7 +673,7 @@ fn getnum(b: &[u8], mut i: usize, min: i64, max: i64) -> Option<(usize, i64)> {
     Some((i, num))
 }
 
-/// `getsecs` (`localtime.c:709`).
+/// `getsecs` (`localtime.c:710`).
 fn getsecs(b: &[u8], i: usize) -> Option<(usize, i64)> {
     // `HOURSPERDAY * DAYSPERWEEK - 1` allows quasi-POSIX rules like "M10.4.6/26".
     let (mut i, num) = getnum(b, i, 0, HOURS_PER_DAY * DAYS_PER_WEEK - 1)?;
@@ -684,7 +694,7 @@ fn getsecs(b: &[u8], i: usize) -> Option<(usize, i64)> {
     Some((i, secs))
 }
 
-/// `getoffset` (`localtime.c:750`).
+/// `getoffset` (`localtime.c:751`).
 fn getoffset(b: &[u8], mut i: usize) -> Option<(usize, i64)> {
     let mut neg = false;
     match b.get(i) {
@@ -699,7 +709,7 @@ fn getoffset(b: &[u8], mut i: usize) -> Option<(usize, i64)> {
     Some((i, if neg { -secs } else { secs }))
 }
 
-/// `getrule` (`localtime.c:777`).
+/// `getrule` (`localtime.c:778`).
 fn getrule(b: &[u8], mut i: usize) -> Option<(usize, Rule)> {
     let mut rule = Rule {
         kind: RuleKind::DayOfYear,
@@ -756,7 +766,7 @@ fn getrule(b: &[u8], mut i: usize) -> Option<(usize, Rule)> {
     Some((i, rule))
 }
 
-/// `transtime` (`localtime.c:838`).
+/// `transtime` (`localtime.c:839`).
 fn transtime(year: i32, rule: &Rule, offset: i64) -> i64 {
     let leap = leap_index(year);
     let value = match rule.kind {
@@ -803,7 +813,7 @@ fn transtime(year: i32, rule: &Rule, offset: i64) -> i64 {
     value + rule.time + offset
 }
 
-/// `tzparse` (`localtime.c:935`): a POSIX section 8-style TZ string.
+/// `tzparse` (`localtime.c:936`): a POSIX section 8-style TZ string.
 ///
 /// `lastditch` is upstream's: take the whole string as the standard-zone name
 /// at offset zero, which is how `"GMT"` is loaded (`pgtz.c` via `gmtload`).
@@ -850,9 +860,9 @@ pub fn parse(name: &str, lastditch: bool) -> Option<State> {
     }
 
     // localtime.c:984 — upstream deliberately never loads TZDEFRULES, so
-    // `load_ok` is false from here on and the `else` arm at `:1121` is dead:
+    // `load_ok` is false from here on and the `else` arm at `:1127` is dead:
     // it is reached only when the string has unparsed trailing text, which its
-    // own first statement (`:1128`) rejects.
+    // own first statement (`:1136`) rejects.
     sp.goback = false;
     sp.goahead = false;
     sp.lsis.clear();
@@ -894,7 +904,7 @@ pub fn parse(name: &str, lastditch: bool) -> Option<State> {
             stdoffset - SECS_PER_HOUR
         };
 
-        // localtime.c:1024 — with no rules and no TZDEFRULES, use the US ones.
+        // localtime.c:1027 — with no rules and no TZDEFRULES, use the US ones.
         let rest: Vec<u8> = if i >= b.len() {
             TZ_DEFRULESTRING.as_bytes().to_vec()
         } else {
@@ -987,7 +997,7 @@ pub fn parse(name: &str, lastditch: bool) -> Option<State> {
             sp.goahead = true;
         }
     } else {
-        // `dstlen = 0` (`:1216`) — already so here; in C the variable is
+        // `dstlen = 0` (`:1225`) — already so here; in C the variable is
         // uninitialized until this point.
         sp.ttis = vec![init_ttinfo(clamp_offset(-stdoffset), false, 0)];
         sp.ats.clear();
@@ -1014,7 +1024,7 @@ fn clamp_offset(secs: i64) -> i32 {
 // Calculations: an instant as a local time
 // --------------------------------------------------------------------------
 
-/// `leaps_thru_end_of` (`localtime.c:1405`).
+/// `leaps_thru_end_of` (`localtime.c:1406`).
 fn leaps_thru_end_of(y: i64) -> i64 {
     if y < 0 {
         -1 - leaps_thru_end_of_nonneg(-1 - y)
@@ -1023,14 +1033,14 @@ fn leaps_thru_end_of(y: i64) -> i64 {
     }
 }
 
-/// `leaps_thru_end_of_nonneg` (`localtime.c:1399`).
+/// `leaps_thru_end_of_nonneg` (`localtime.c:1400`).
 fn leaps_thru_end_of_nonneg(y: i64) -> i64 {
     y / 4 - y / 100 + y / 400
 }
 
-/// `timesub` (`localtime.c:1413`).
+/// `timesub` (`localtime.c:1414`).
 #[allow(clippy::cast_possible_truncation)] // Every value is bounded below.
-fn timesub(t: i64, offset: i64, sp: &State) -> Option<PgTm> {
+fn timesub(t: i64, offset: i64, sp: &State) -> Option<PgTm<'_>> {
     let mut corr = 0i64;
     let mut hit = false;
     for (idx, lp) in sp.lsis.iter().enumerate().rev() {
@@ -1091,7 +1101,7 @@ fn timesub(t: i64, offset: i64, sp: &State) -> Option<PgTm> {
     }
     let yday = idays;
 
-    // The "extra" mods avoid overflow, as upstream's comment says (`:1495`).
+    // The "extra" mods avoid overflow, as upstream's comment says (`:1501`).
     let mut wday = EPOCH_WDAY
         + i64::from((y - EPOCH_YEAR) % (DAYS_PER_WEEK as i32)) * (DAYS_PER_NYEAR % DAYS_PER_WEEK)
         + leaps_thru_end_of(i64::from(y) - 1)
@@ -1126,13 +1136,13 @@ fn timesub(t: i64, offset: i64, sp: &State) -> Option<PgTm> {
         yday: yday as i32,
         isdst: 0,
         gmtoff: offset,
-        zone: String::new(),
+        zone: b"",
     })
 }
 
-/// `localsub` (`localtime.c:1258`) / `pg_localtime` (`:1343`).
+/// `localsub` (`localtime.c:1259`) / `pg_localtime` (`:1344`).
 #[must_use]
-pub fn localtime(sp: &State, t: i64) -> Option<PgTm> {
+pub fn localtime(sp: &State, t: i64) -> Option<PgTm<'_>> {
     if sp.ats.len() > 1 {
         let last = sp.ats.len() - 1;
         if (sp.goback && t < sp.ats[0]) || (sp.goahead && t > sp.ats[last]) {
@@ -1158,7 +1168,7 @@ pub fn localtime(sp: &State, t: i64) -> Option<PgTm> {
     let i = if sp.ats.is_empty() || t < sp.ats[0] {
         sp.defaulttype
     } else {
-        // Upstream's binary search (`:1307`).
+        // Upstream's binary search (`:1312`).
         let mut lo = 1usize;
         let mut hi = sp.ats.len();
         while lo < hi {
@@ -1174,11 +1184,11 @@ pub fn localtime(sp: &State, t: i64) -> Option<PgTm> {
     let ttisp = *sp.ttis.get(i)?;
     let mut result = timesub(t, i64::from(ttisp.utoff), sp)?;
     result.isdst = i32::from(ttisp.isdst);
-    result.zone = String::from_utf8_lossy(c_str(&sp.chars, ttisp.desigidx)).into_owned();
+    result.zone = c_str(&sp.chars, ttisp.desigidx);
     Some(result)
 }
 
-/// `pg_tz_acceptable` (`localtime.c:2003`): reject leap-second timekeeping by
+/// `pg_tz_acceptable` (`localtime.c:2004`): reject leap-second timekeeping by
 /// insisting that GMT midnight, 2000-01-01 has `tm_sec == 0`.
 #[must_use]
 pub fn acceptable(sp: &State) -> bool {
@@ -1293,7 +1303,7 @@ pub(crate) mod tests {
         tzif(0, &[], &[(utoff, false, 0)], &chars, "")
     }
 
-    fn at(state: &State, t: i64) -> PgTm {
+    fn at(state: &State, t: i64) -> PgTm<'_> {
         localtime(state, t).expect("an instant inside the zone's range")
     }
 
@@ -1310,7 +1320,7 @@ pub(crate) mod tests {
         );
         assert_eq!(tm.wday, 6, "2000-01-01 was a Saturday");
         assert_eq!(tm.yday, 0);
-        assert_eq!(tm.zone, "UTC");
+        assert_eq!(tm.zone_name(), "UTC");
         assert_eq!(tm.gmtoff, 0);
         assert_eq!(tm.isdst, 0);
     }
@@ -1341,9 +1351,9 @@ pub(crate) mod tests {
         );
         let state = load(&image, true).expect("load");
         let before = at(&state, Y2K - 1);
-        assert_eq!((before.zone.as_str(), before.isdst), ("AAA", 0));
+        assert_eq!((before.zone_name().as_ref(), before.isdst), ("AAA", 0));
         let after = at(&state, Y2K);
-        assert_eq!((after.zone.as_str(), after.isdst), ("BBB", 1));
+        assert_eq!((after.zone_name().as_ref(), after.isdst), ("BBB", 1));
         assert_eq!(after.hour, 1, "the wall clock jumped forward an hour");
     }
 
@@ -1362,11 +1372,11 @@ pub(crate) mod tests {
         let state = load(&image, true).expect("load a slim file");
         // 2024-07-04T12:00:00Z is inside the US daylight window.
         let july = at(&state, 1_720_094_400);
-        assert_eq!((july.zone.as_str(), july.isdst), ("EDT", 1));
+        assert_eq!((july.zone_name().as_ref(), july.isdst), ("EDT", 1));
         assert_eq!(july.hour, 8);
         // 2024-01-04T12:00:00Z is not.
         let january = at(&state, 1_704_369_600);
-        assert_eq!((january.zone.as_str(), january.isdst), ("EST", 0));
+        assert_eq!((january.zone_name().as_ref(), january.isdst), ("EST", 0));
         assert_eq!(january.hour, 7);
     }
 
@@ -1382,7 +1392,7 @@ pub(crate) mod tests {
         let state = load(&image, false).expect("load");
         let july = at(&state, 1_720_094_400);
         assert_eq!(
-            (july.zone.as_str(), july.isdst),
+            (july.zone_name().as_ref(), july.isdst),
             ("EST", 0),
             "the stored type runs to the end of time"
         );
@@ -1391,18 +1401,18 @@ pub(crate) mod tests {
     #[test]
     fn a_posix_tz_string_parses_into_the_same_rules() {
         let state = parse("EST5EDT,M3.2.0,M11.1.0", false).expect("parse the US eastern rules");
-        assert_eq!(at(&state, 1_720_094_400).zone, "EDT");
-        assert_eq!(at(&state, 1_704_369_600).zone, "EST");
+        assert_eq!(at(&state, 1_720_094_400).zone_name(), "EDT");
+        assert_eq!(at(&state, 1_704_369_600).zone_name(), "EST");
         // The 2024 US transitions: 2024-03-10 07:00Z and 2024-11-03 06:00Z.
-        assert_eq!(at(&state, 1_710_054_000 - 1).zone, "EST");
-        assert_eq!(at(&state, 1_710_054_000).zone, "EDT");
-        assert_eq!(at(&state, 1_730_613_600 - 1).zone, "EDT");
-        assert_eq!(at(&state, 1_730_613_600).zone, "EST");
+        assert_eq!(at(&state, 1_710_054_000 - 1).zone_name(), "EST");
+        assert_eq!(at(&state, 1_710_054_000).zone_name(), "EDT");
+        assert_eq!(at(&state, 1_730_613_600 - 1).zone_name(), "EDT");
+        assert_eq!(at(&state, 1_730_613_600).zone_name(), "EST");
     }
 
     #[test]
     fn a_dst_name_without_rules_gets_the_us_ones() {
-        // localtime.c:1024 — TZDEFRULESTRING stands in, because upstream never
+        // localtime.c:1026 — TZDEFRULESTRING stands in, because upstream never
         // loads TZDEFRULES.
         let implied = parse("EST5EDT", false).expect("parse");
         let spelled = parse("EST5EDT,M3.2.0,M11.1.0", false).expect("parse");
@@ -1423,7 +1433,7 @@ pub(crate) mod tests {
         assert_eq!(state.ttis.len(), 1);
         let tm = at(&state, Y2K);
         assert_eq!(
-            (tm.zone.as_str(), tm.gmtoff, tm.isdst),
+            (tm.zone_name().as_ref(), tm.gmtoff, tm.isdst),
             ("MST", -7 * 3600, 0)
         );
     }
@@ -1433,7 +1443,7 @@ pub(crate) mod tests {
         // pg_load_tz sends "GMT" here rather than to tzload (`findtimezone.c:99`).
         let state = parse("GMT", true).expect("parse GMT");
         let tm = at(&state, Y2K);
-        assert_eq!((tm.zone.as_str(), tm.gmtoff), ("GMT", 0));
+        assert_eq!((tm.zone_name().as_ref(), tm.gmtoff), ("GMT", 0));
         // Without lastditch, "GMT" has no offset to read and is refused.
         assert_eq!(parse("GMT", false), None);
     }
@@ -1442,7 +1452,10 @@ pub(crate) mod tests {
     fn a_quoted_abbreviation_is_taken_between_the_angle_brackets() {
         let state = parse("<+0530>-5:30", false).expect("parse");
         let tm = at(&state, Y2K);
-        assert_eq!((tm.zone.as_str(), tm.gmtoff), ("+0530", 5 * 3600 + 1800));
+        assert_eq!(
+            (tm.zone_name().as_ref(), tm.gmtoff),
+            ("+0530", 5 * 3600 + 1800)
+        );
     }
 
     #[test]
@@ -1471,7 +1484,7 @@ pub(crate) mod tests {
 
     #[test]
     fn leap_seconds_make_a_zone_unacceptable() {
-        // pg_tz_acceptable insists tm_sec is 0 at Y2K (`localtime.c:2003`). A
+        // pg_tz_acceptable insists tm_sec is 0 at Y2K (`localtime.c:2004`). A
         // leap-second-aware zone counts the corrections as elapsed seconds, so
         // its clock lags: with one correction on the books Y2K reads 23:59:59
         // of the day before, and a real right/ zone (32 corrections by 2000)
@@ -1562,7 +1575,7 @@ pub(crate) mod tests {
             "",
         );
         let state = load(&image, true).expect("load");
-        assert_eq!(at(&state, 0).zone, "GMT");
-        assert_eq!(at(&state, Y2K).zone, "BST");
+        assert_eq!(at(&state, 0).zone_name(), "GMT");
+        assert_eq!(at(&state, Y2K).zone_name(), "BST");
     }
 }

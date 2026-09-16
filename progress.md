@@ -3,11 +3,58 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-385 review fixes
+
+**One correction to the record, three real fixes.**
+
+- **The record.** 7a43f8c's commit message opens "`timezone` and `log_timezone`
+  were a hard-coded GMT. They now come from `select_default_timezone`", and the
+  progress.md entry it landed said the same. That is false: the commit does not
+  touch `conf.rs`, `Settings::default()` still carries `Some("GMT")`
+  (`conf.rs:221`), and nothing outside the two tests calls
+  `select_default_timezone` — the entry's own Follow-ups paragraph said so, so
+  it contradicted its own **What**. The commit message cannot be amended; this
+  entry and the corrected **What** below it are the correction. What 7a43f8c
+  actually landed is the selection as a library, with its gate and its pin.
+  Wiring it in is `test_config_settings` (`initdb.c:1140`), which is NAT-381's
+  and is not started.
+- **The `/etc/localtime` pin did not bite.** It asserted
+  `target.ends_with(&chosen)`, which on this machine
+  (`/etc/localtime -> /usr/share/zoneinfo/Etc/UTC`) also passes for `"UTC"` —
+  and `"UTC"` is exactly what a regression would produce, because the
+  brute-force scan's `zone_name_pref` prefers the bare name over `Etc/UTC`
+  (measured: the scan really does answer `"UTC"` here). It now reconstructs the
+  tails `check_system_link_file` walks (`findtimezone.c:566`) and asserts the
+  answer is the *first* one whose file carries `/etc/localtime`'s bytes, which
+  is `"Etc/UTC"`. The pin passing while the scan answers `"UTC"` is what shows
+  it is no longer vacuous.
+- **`localtime()` allocated per call.** `PgTm::zone` was a `String`, where
+  upstream's `tm_zone` is a `const char *` into `sp->chars`
+  (`localtime.c:1337`). `Probe::score` calls `localtime` once per test time, so
+  a brute-force scan paid up to 5200 allocations per candidate. `PgTm` now
+  borrows `&[u8]` out of its `State` — bytes, because `strcmp` is what upstream
+  compares — with `zone_name()` for the two callers that render it. The scan
+  over all 506 zones went from 186 ms to 14.8 ms.
+- **Citation drift.** Sixteen `localtime.c` citations named lines 1-16 off the
+  code they describe (the transitions loop, the leap-second loop, the
+  trailing-no-op `while`, the `tm_wday` computation and a dozen function
+  headers), which blunts the grep-ability the porting rule exists for. Every
+  `localtime.c:` line in `tz.rs` was then re-resolved against the reference
+  tree; all 45 now land on the statement, comment or declaration they name.
+  The `findtimezone.c` citations were already exact and are unchanged.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 644 tests, unchanged, 31 SKIP-flagged gate
+lines, unchanged. No behaviour changed: the borrowed abbreviation compares the
+same bytes, and the pin is strictly stronger.
+
 ## 2026-09-16 — NAT-385 rinitdb default timezone selection
 
-**What**. `timezone` and `log_timezone` now come from a port of
-`select_default_timezone` (`src/bin/initdb/findtimezone.c`) rather than a
-hard-coded `GMT`. Two modules:
+**What**. A port of `select_default_timezone`
+(`src/bin/initdb/findtimezone.c`), as a library with its gate. It is not yet
+wired into config rendering — see Follow-ups: `Settings::default()` still
+carries `Some("GMT")` (`conf.rs:221`) and the only callers of
+`select_default_timezone` are the two tests. Two modules:
 
 - `rinitdb::tz` is the read half of PostgreSQL's timezone library
   (`src/timezone/localtime.c`): `tzload` over a TZif image, `tzparse` for a

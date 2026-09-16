@@ -3,6 +3,56 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-416 pgdrop install-links
+
+**What**. `pgdrop install-links DIR` creates one symlink per applet —
+`DIR/initdb`, `DIR/psql`, `DIR/postgres` — pointing at
+`std::env::current_exe()`, so a directory on `PATH` and a ported TAP suite see
+the plain tool names the dispatcher has answered to since NAT-406.
+`crates/pgdrop/src/install.rs` is the command; `dispatch` gained the
+`install-links` usage-rs subcommand (`dir: PathBuf`, `--force`), a
+`Dispatch::InstallLinks` arm, and `Applet::ALL` so the list of names to install
+is the dispatcher's own rather than a second copy of it. `thiserror` (approved)
+joins pgdrop's dependencies for `InstallError`.
+
+**Why this shape**. The command has no counterpart in the PostgreSQL tree —
+upstream installs three executables, not one multicall binary — so there is no
+C behaviour to port, no stolen test to steal and no byte-diff gate that could
+judge it, and nothing to record in `docs/divergences.md`: nothing here diverges
+from an upstream that has no opinion. The tests are therefore this command's
+own, and they are the issue's Acceptance list verbatim.
+
+The house split still applies: `LinkOp` is the data, `link_plan` is the whole
+decision as a pure function of the executable path, the directory and a
+`LinkProbe`, unit-tested against a map of fake entries with no temporary files,
+and `apply` is the only function that touches a disk. `link_plan` refuses the
+*whole* plan at the first name held by something that is not a symlink, before
+`apply` has created anything: a directory that already holds a real `psql` is
+one this command has no business writing into, and refusing it whole means the
+next run starts from the state the operator inspected rather than from a
+half-installed one. `--force` replaces symlinks and only symlinks; it never
+removes a file or a directory. `current_exe()` must come back absolute, because
+a relative link target resolves against the link's directory, not the caller's.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 361 tests (was 344), 19 gates still
+`SKIP (flagged, not silent)` and no new one. Non-vacuity checked by two
+perturbations of `link_plan`: making `--force` a no-op fails
+`force_replaces_a_link_that_points_elsewhere` and nothing else, and letting a
+regular file be replaced like a link fails
+`a_regular_file_in_the_way_is_an_error_naming_the_path` and nothing else.
+
+**Risks**. `Replace` is `remove_file` then `symlink`, not a rename: there is a
+window in which the name is absent rather than pointing at the old binary.
+`install-links` is an installation step, not something a running suite races
+with, and the alternative trades that window for a stray temporary name in a
+directory on `PATH`.
+
+**Follow-ups**. The integration tests are `#![cfg(unix)]`; the Windows arm of
+`symlink` (`symlink_file`, which needs developer mode or a privilege) is
+written but untested here. `pgdrop start` (NAT-409) is the natural user of
+these links and can reuse `link_plan` for its ephemeral bin directory.
+
 ## 2026-09-16 — NAT-384 review fixes
 
 **What** (one finding was a real bug, two were real cleanups)

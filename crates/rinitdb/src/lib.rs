@@ -8,8 +8,10 @@
 //!
 //! Layout: [`cli`] is data + pure parsing, [`validate`] is the pure pre-flight
 //! calculation over an [`validate::FsProbe`], [`encoding`] and [`error`] are
-//! the tables and messages they need, [`help`] is the upstream text, and
-//! [`run`] is the only function that writes to a stream.
+//! the tables and messages they need, [`conf`] renders the configuration files
+//! from the vendored templates over [`pg_config`]'s build-time constants,
+//! [`help`] is the upstream text, and [`run`] is the only function that writes
+//! to a stream.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -20,11 +22,13 @@
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
 pub mod cli;
+pub mod conf;
 pub mod encoding;
 pub mod error;
 pub mod file_perm;
 pub mod help;
 pub mod layout;
+pub mod pg_config;
 pub mod validate;
 
 use std::ffi::OsString;
@@ -32,6 +36,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 pub use cli::{Invocation, Options};
+pub use conf::{AuthMethods, DateOrder, Settings};
 pub use error::{InitdbError, LocaleProvider};
 pub use file_perm::DataDirPerm;
 pub use layout::{FsOp, layout};

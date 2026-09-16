@@ -757,3 +757,195 @@ fn fails_for_invalid_option_combination() {
     );
     gate_strictly(&argv);
 }
+
+/// `command_ok([ 'initdb', '--no-sync', '--set' => 'work_mem=128',
+/// '--set' => 'Work_Mem=256', '--set' => 'WORK_MEM=512', "$tempdir/dataY" ],
+/// 'multiple --set options with different case');` plus the three assertions
+/// over the slurped file — 001_initdb.pl:298-313.
+///
+/// The `command_ok` half needs a finished cluster and lands with it
+/// (NAT-381 … NAT-387). What the case is *about* — that three `-c` switches
+/// spelled three different ways collapse onto the file's one `work_mem`, last
+/// one winning — is here in full: the command line goes through the real
+/// parser and the real `validate`, and the three stolen `qr//` patterns are run
+/// verbatim against the bytes `setup_config` would have written.
+#[test]
+fn multiple_set_options_with_different_case() {
+    let tempdir = TempDir::new("dataY");
+    let argv = args(&[
+        "--no-sync",
+        "--set",
+        "work_mem=128",
+        "--set",
+        "Work_Mem=256",
+        "--set",
+        "WORK_MEM=512",
+    ])
+    .into_iter()
+    .chain([OsString::from(tempdir.join("dataY"))])
+    .collect::<Vec<_>>();
+
+    let plan = create_plan(&argv);
+    let settings = rinitdb::conf::Settings {
+        gucs: plan.gucs.clone(),
+        ..rinitdb::conf::Settings::default()
+    };
+    let conf =
+        rinitdb::conf::render_postgresql_conf(rinitdb::conf::POSTGRESQL_CONF_SAMPLE, &settings);
+
+    for (source, expected, what) in [
+        (
+            "(?m)^WORK_MEM = ",
+            false,
+            "WORK_MEM should not be configured",
+        ),
+        (
+            "(?m)^Work_Mem = ",
+            false,
+            "Work_Mem should not be configured",
+        ),
+        ("(?m)^work_mem = 512", true, "work_mem should be in config"),
+    ] {
+        let pattern = testkit::Pattern::new(source).expect("compile the stolen pattern");
+        assert_eq!(pattern.is_match(&conf), expected, "{what}");
+    }
+}
+
+/// Gate: the four files `setup_config` writes, diffed byte for byte against
+/// the ones C initdb writes, for `-A trust`, `-A md5` and
+/// `--auth-host scram-sha-256` (the issue's three cases).
+///
+/// `setup_config` writes values it probed the machine for — the DSM
+/// implementation, `max_connections`, `shared_buffers` and the time zone
+/// (`test_config_settings`, `initdb.c:1140`). Probing is a separate stage and
+/// is not ported yet, so those four arrive here from C's own stdout, which is
+/// where it announces each one (`selecting default "max_connections" ... 100`).
+/// They are read from the *progress output*, never from the files under
+/// comparison, so nothing about the rendering is taken from the answer: the
+/// template, the order of the replacements, the quoting, the comment columns,
+/// the commented-out compile-time defaults and the `-c` overrides are all still
+/// judged against C's bytes. `autovacuum_worker_slots` is not announced and is
+/// recomputed from `AV_SLOTS_FOR_CONNS` (`initdb.c:1135`).
+///
+/// Everything else is pinned on the command line instead: `--no-locale` fixes
+/// the four `lc_*` values and the date order, `-T simple` the text search
+/// configuration, `TZ` gives `select_default_timezone` an answer to find, and
+/// two `--set`s of one parameter gate the second, re-aligning application of
+/// `replace_guc_value` that an override causes.
+///
+/// The superuser password the md5 case needs reaches only the bootstrap SQL
+/// (`initdb.c:1650`); none of the four files under comparison mentions it.
+///
+/// Missing reference binary → `SKIP (flagged, not silent)`.
+#[cfg(unix)]
+#[test]
+fn the_configuration_files_match_reference_initdb() {
+    let Some(reference) = reference::find("initdb") else {
+        reference::skip("initdb");
+        return;
+    };
+    for (tag, auth, needs_password) in [
+        ("conf-trust", ["-A", "trust"], false),
+        // `-A md5` puts md5 on both sides, and `check_need_password`
+        // (`initdb.c:2597`) refuses that without a superuser password.
+        ("conf-md5", ["-A", "md5"], true),
+        ("conf-scram", ["--auth-host", "scram-sha-256"], false),
+    ] {
+        let tempdir = TempDir::new(tag);
+        let datadir = tempdir.join("data");
+
+        let mut common = args(&auth);
+        if needs_password {
+            let pwfile = tempdir.join("pwfile");
+            std::fs::write(&pwfile, "gate\n").expect("write the password file");
+            common.push(OsString::from("--pwfile"));
+            common.push(OsString::from(&pwfile));
+        }
+        common.extend(args(&[
+            "--no-sync",
+            "--no-locale",
+            "-T",
+            "simple",
+            "--set",
+            "work_mem=128",
+            "--set",
+            "WORK_MEM=512",
+        ]));
+
+        let mut argv = common.clone();
+        argv.push(OsString::from(&datadir));
+        let output = std::process::Command::new(&reference)
+            .args(&argv)
+            .env("TZ", "UTC")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the reference initdb");
+        assert!(
+            output.status.success(),
+            "reference initdb {argv:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let progress = String::from_utf8(output.stdout).expect("initdb progress is UTF-8");
+
+        // Each probe result, from the line where C announces it.
+        let announced = |prefix: &str| -> String {
+            progress
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("C initdb did not announce {prefix:?} ({tag})"))
+                .trim()
+                .to_owned()
+        };
+        let max_connections: u32 = announced("selecting default \"max_connections\" ... ")
+            .parse()
+            .expect("max_connections is a number");
+        let shared_buffers = announced("selecting default \"shared_buffers\" ... ");
+        let timezone = announced("selecting default time zone ... ");
+        let dsm = announced("selecting dynamic shared memory implementation ... ");
+
+        // `shared_buffers` is announced in the units it is written in, so it
+        // converts straight back to the block count `Settings` carries.
+        let kb_per_block = rinitdb::pg_config::BLCKSZ / 1024;
+        let shared_buffers_blocks = if let Some(mb) = shared_buffers.strip_suffix("MB") {
+            mb.parse::<u32>().expect("shared_buffers MB") * 1024 / kb_per_block
+        } else {
+            shared_buffers
+                .strip_suffix("kB")
+                .expect("shared_buffers is MB or kB")
+                .parse::<u32>()
+                .expect("shared_buffers kB")
+                / kb_per_block
+        };
+
+        // The same command line, pointed at a directory that does not exist,
+        // so `validate` sees what it saw before C initdb built the cluster.
+        let mut plan_argv = common;
+        plan_argv.push(OsString::from(tempdir.join("mine")));
+        let rinitdb::Invocation::Init(options) = rinitdb::cli::plan(&plan_argv) else {
+            panic!("{plan_argv:?} should be a cluster-creation command line");
+        };
+        let plan = create_plan(&plan_argv);
+
+        let settings = rinitdb::conf::Settings {
+            max_connections,
+            // AV_SLOTS_FOR_CONNS(nconns), initdb.c:1135 — not announced.
+            autovacuum_worker_slots: max_connections / 6,
+            shared_buffers_blocks,
+            default_timezone: Some(timezone),
+            dynamic_shared_memory_type: dsm,
+            auth: rinitdb::conf::AuthMethods::resolve(&options),
+            gucs: plan.gucs.clone(),
+            perm: plan.perm,
+            ..rinitdb::conf::Settings::default()
+        };
+
+        for (name, ours) in rinitdb::conf::render_all(&settings) {
+            let theirs = testkit::slurp_file(&datadir.join(name), None)
+                .unwrap_or_else(|err| panic!("slurp C initdb's {name} ({tag}): {err}"));
+            let theirs = String::from_utf8(theirs).expect("a config file is UTF-8");
+            if let Some(diff) = testkit::diff::unified(&theirs, &ours, "C initdb", "rinitdb") {
+                panic!("{name} differs from C initdb's ({tag})\n{diff}");
+            }
+        }
+    }
+}

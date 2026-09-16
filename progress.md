@@ -3,6 +3,71 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-379 rinitdb config generation
+
+**What**. `setup_config()` (`initdb.c:1283`) as pure functions over the three
+`.sample` templates, vendored byte for byte into `crates/rinitdb/share/` with
+their provenance and the PostgreSQL licence in a README beside them (ADR-0003
+allows PostgreSQL files here; pgrust's Rust is what may not come). New
+`rinitdb::conf`: upstream's two string surgeons transcribed rather than
+reimagined — `replace_token` (`:473`, first occurrence *per line*) and
+`replace_guc_value` (`:528`, case-insensitive match, the file's spelling of the
+name kept, the trailing comment carried over at its original de-tabified
+column) — plus `guc_value_requires_quotes` (`:644`), `escape_quotes`
+(`src/port/quotes.c:34`), `pretty_wal_size` (`:1266`), the `shared_buffers`
+MB/kB choice, `AuthMethods` (the `-A` arm at `:3246` with its ident↔peer
+mirrors, then `check_authmethod_unspecified`), and `render_*` for all four
+files in `setup_config`'s order. New `rinitdb::pg_config` holds the constants C
+gets from `pg_config.h` / `pg_config_manual.h`, each with its defining line.
+
+**Why this shape**. The probe results (`max_connections`, `shared_buffers`, the
+time zone, the DSM implementation) are `test_config_settings`' business, and
+that needs a backend; they arrive as `Settings` fields so the rendering is a
+calculation now and does not have to wait for the probing. Order is part of the
+contract, not a detail: a `-c` override re-aligns the comment on a line an
+earlier replacement has already rewritten, so `replace_guc_value` is applied
+twice and the second alignment depends on the first's output length. The render
+therefore replays upstream's exact sequence.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 257 tests (was 219). All 15 gates print
+`SKIP (flagged, not silent)`; the new one is
+`the_configuration_files_match_reference_initdb`.
+
+**How the renderer was verified without a PostgreSQL 18 reference**. The box has
+Ubuntu's PostgreSQL *16* initdb, which is not a reference binary and is not
+wired into any gate. Off to the side, and then deleted, it was used to check the
+*algorithm*: run C initdb 16 against its own `share/` templates, then feed each
+of the 17 lines it rewrote back through `replace_guc_value` with the value and
+the comment flag read off C's own output. All 17 came back byte-identical,
+including the doubly-applied `work_mem` that two `-c` switches cause, and
+`render_pg_hba_conf` / `render_pg_ident_conf` / `render_postgresql_auto_conf`
+reproduced C 16's three files exactly for trust, md5 and scram-sha-256. That is
+evidence about the arithmetic, not about PostgreSQL 18; the real gate is still
+skipped and still flagged.
+
+**Risks**. The new gate has never run green against a real PostgreSQL 18, only
+been reasoned about, and it takes four values from C's progress output because
+the probing stage is not ported — the comment on it says so at length. Two of
+them landed a bug worth naming: `-A md5` puts md5 on *both* sides and C refuses
+that without a superuser password (`check_need_password`, `:2597`), so that case
+carries a `--pwfile`. `locale_date_order` (`:2143`) is `setlocale` + `strftime`
+and is not reachable from the standard library, so `DateOrder` is an input with
+upstream's `DATEORDER_MDY` default rather than something computed.
+
+**Follow-ups**
+- `check_authmethod_valid` (`:2582`) and `check_need_password` (`:2597`) are
+  still unported: `initdb -A bogus` is accepted by `validate` today and would
+  only fail later. They belong with the rest of the pre-flight (NAT-378's
+  ground), and their two error strings are the whole of the work.
+- No gate can run as root — C initdb refuses to (`:2504`), which is how this
+  session found the md5 case. If CI runs as root, every gate that builds a
+  cluster will skip for a *different* reason than a missing binary, and that
+  reason is not flagged anywhere. A `SKIP (flagged, not silent)` for it would
+  keep the distinction honest.
+- `locale_date_order`, `select_default_timezone`, `choose_dsm_implementation`
+  and `find_matching_ts_config` are the four actions `Settings` is waiting for.
+
 ## 2026-09-16 — NAT-380 review fixes
 
 **What** (all four reviewer findings were real)

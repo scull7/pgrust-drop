@@ -1329,3 +1329,241 @@ fn the_configuration_files_match_reference_initdb() {
         }
     }
 }
+
+// --- default time zone (Linear NAT-385) -------------------------------------
+
+/// `grep -E '^(log_)?timezone'` over a rendered or written `postgresql.conf`.
+fn timezone_lines(conf: &str) -> Vec<&str> {
+    conf.lines()
+        .filter(|line| line.starts_with("timezone") || line.starts_with("log_timezone"))
+        .collect()
+}
+
+/// The timezone database C initdb would search: its own `share/timezone` when
+/// the installation carries one, else the system database a
+/// `--with-system-tzdata` build (Debian's, Ubuntu's) is pointed at.
+fn reference_tzdir(initdb: &Path) -> Option<PathBuf> {
+    let prefix = initdb.parent()?.parent()?;
+    for candidate in ["share/postgresql/timezone", "share/timezone"] {
+        let dir = prefix.join(candidate);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `select_default_timezone` over the real machine must name a zone the reader
+/// accepts, and — with `TZ` out of the way, which is the case `001_initdb.pl`
+/// goes out of its way to run (`t/001_initdb.pl:42`) — it must be the zone
+/// `/etc/localtime` points at.
+///
+/// This is the reader-side stand-in for the gate below: it pins the answer on a
+/// machine that has a timezone database but no PostgreSQL 18 to compare with.
+/// No timezone database at all → `SKIP (flagged, not silent)`.
+#[cfg(unix)]
+#[test]
+fn the_default_time_zone_is_the_one_etc_localtime_names() {
+    let Some(src) = rinitdb::RealTzSource::from_env() else {
+        reference::announce_skip(&format!(
+            "{}: no timezone database at {} or any system location; \
+             select_default_timezone has nothing to search",
+            reference::SKIP_FLAG,
+            rinitdb::findtimezone::TZDIR_ENV
+        ));
+        return;
+    };
+    let chosen = rinitdb::select_default_timezone(&src);
+
+    if let Some(tz) = std::env::var_os("TZ") {
+        // findtimezone.c:1769 — TZ wins outright when it names a zone.
+        let tz = tz.to_string_lossy().into_owned();
+        assert_eq!(
+            chosen,
+            Some(tz.clone()),
+            "TZ={tz} names a zone, so it is the answer"
+        );
+        return;
+    }
+
+    let chosen = chosen.expect("a machine with a timezone database has a default zone");
+    assert!(
+        rinitdb::findtimezone::TzSource::read_tzfile(&src, &chosen).is_some()
+            || rinitdb::tz::parse(&chosen, false).is_some(),
+        "the chosen zone {chosen:?} is neither a file in {} nor a POSIX TZ string",
+        src.tzdir().display()
+    );
+
+    match std::fs::read_link(rinitdb::findtimezone::TZDEFAULT) {
+        Ok(target) => {
+            let target = target.to_string_lossy().into_owned();
+            assert!(
+                target.ends_with(&chosen),
+                "{} points at {target}, but the default zone is {chosen:?}",
+                rinitdb::findtimezone::TZDEFAULT
+            );
+        }
+        Err(_) => reference::announce_skip(&format!(
+            "{}: {} is not a symlink, so the brute-force scan chose {chosen:?} \
+             and there is no second opinion on this machine",
+            reference::SKIP_FLAG,
+            rinitdb::findtimezone::TZDEFAULT
+        )),
+    }
+}
+
+/// Gate: the issue's acceptance criterion. `grep -E '^(log_)?timezone'` over
+/// the `postgresql.conf` C initdb writes and over the one this port renders
+/// must be identical, byte for byte.
+///
+/// The first case is `001_initdb.pl`'s own: `TZ` deleted, which is what that
+/// file says it exists for ("make sure we run one successful test without a TZ
+/// setting so we test initdb's time zone setting code", `t/001_initdb.pl:42`)
+/// — on this machine that exercises the `/etc/localtime` shortcut. The others
+/// pin the `TZ` arm against a named zone, a POSIX-style name and a
+/// GMT-offset name.
+///
+/// Both sides are pointed at the same timezone database, because the answer is
+/// a property of that database and not of the code: C searches its own
+/// `share/timezone`, and `PGRUST_TZDIR` is how this port is aimed at the same
+/// one.
+///
+/// Missing reference binary → `SKIP (flagged, not silent)`.
+#[cfg(unix)]
+#[test]
+fn the_time_zone_lines_match_reference_initdb() {
+    let Some(reference) = reference::find("initdb") else {
+        reference::skip("initdb");
+        return;
+    };
+    let Some(tzdir) = reference_tzdir(&reference) else {
+        reference::announce_skip(&format!(
+            "{}: the reference initdb at {} has no share/timezone beside it, \
+             so there is no database both sides can be aimed at",
+            reference::SKIP_FLAG,
+            reference.display()
+        ));
+        return;
+    };
+
+    for (tag, tz) in [
+        ("tz-unset", None),
+        ("tz-named", Some("America/New_York")),
+        ("tz-posix", Some("EST5EDT")),
+        ("tz-offset", Some("Etc/GMT+5")),
+    ] {
+        let tempdir = TempDir::new(tag);
+        let datadir = tempdir.join("data");
+        let argv = args(&[
+            "--no-sync",
+            "--no-locale",
+            "-A",
+            "trust",
+            "-U",
+            "postgres",
+            "-D",
+        ])
+        .into_iter()
+        .chain([OsString::from(&datadir)])
+        .collect::<Vec<_>>();
+
+        let mut command = std::process::Command::new(&reference);
+        command.args(&argv).stdin(std::process::Stdio::null());
+        match tz {
+            Some(tz) => command.env("TZ", tz),
+            None => command.env_remove("TZ"),
+        };
+        let output = command.output().expect("run the reference initdb");
+        assert!(
+            output.status.success(),
+            "reference initdb {argv:?} failed ({tag}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let theirs = std::fs::read_to_string(datadir.join("postgresql.conf"))
+            .expect("read C initdb's postgresql.conf");
+
+        // The same question, asked of this port against the same database.
+        let source = TzdirSource {
+            tzdir: tzdir.clone(),
+            tz: tz.map(str::to_owned),
+        };
+        let settings = rinitdb::conf::Settings {
+            default_timezone: rinitdb::select_default_timezone(&source),
+            ..rinitdb::conf::Settings::default()
+        };
+        let ours =
+            rinitdb::conf::render_postgresql_conf(rinitdb::conf::POSTGRESQL_CONF_SAMPLE, &settings);
+
+        assert_eq!(
+            timezone_lines(&theirs),
+            timezone_lines(&ours),
+            "the time zone lines differ from C initdb's ({tag})"
+        );
+    }
+}
+
+/// A [`rinitdb::TzSource`] aimed at a chosen directory with a chosen `TZ`, so
+/// the gate can ask this port the question C initdb was asked without changing
+/// the test process's own environment.
+#[cfg(unix)]
+struct TzdirSource {
+    tzdir: PathBuf,
+    tz: Option<String>,
+}
+
+#[cfg(unix)]
+impl rinitdb::TzSource for TzdirSource {
+    fn read_tzfile(&self, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.tzdir.join(name)).ok()
+    }
+
+    fn zone_names(&self) -> Vec<String> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let sub = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &sub, out);
+                } else {
+                    out.push(sub);
+                }
+            }
+        }
+        let mut names = Vec::new();
+        walk(&self.tzdir, "", &mut names);
+        names.sort_unstable();
+        names
+    }
+
+    fn read_link(&self, linkname: &str) -> Option<String> {
+        std::fs::read_link(linkname)
+            .ok()
+            .and_then(|t| t.to_str().map(str::to_owned))
+    }
+
+    fn read_path(&self, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
+    }
+
+    fn tz_env(&self) -> Option<String> {
+        self.tz.clone()
+    }
+
+    fn now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    }
+}

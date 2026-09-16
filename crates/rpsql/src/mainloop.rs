@@ -58,6 +58,8 @@ pub struct Session<'a> {
 }
 
 /// `MainLoop()` (`mainloop.c:32`). Returns the process exit status.
+// The body is one `for (;;)` of upstream's, statement for statement; cutting
+// it up would hide that correspondence without removing a single branch.
 #[allow(clippy::too_many_lines)]
 pub fn main_loop(
     source: &mut dyn LineSource,

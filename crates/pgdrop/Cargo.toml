@@ -7,8 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 # Links pgrust (AGPL-3.0), so this crate is AGPL too; see ADR-0003 and ./LICENSE.
+# `license` only: AGPL-3.0-only is a standard SPDX expression, and setting
+# `license-file` as well makes cargo warn on every build. The AGPL text stays at
+# ./LICENSE, where ADR-0003 and NOTICE.md point.
 license = "AGPL-3.0-only"
-license-file = "LICENSE"
 
 [lib]
 path = "src/lib.rs"

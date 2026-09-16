@@ -3,6 +3,75 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-380 rinitdb datadir layout, permissions, --waldir symlink
+
+**What**
+- `rinitdb::layout`: a pure `layout(&CreatePlan) -> Vec<FsOp>` holding
+  everything `initialize_data_directory` (`initdb.c:3049`) does before it
+  starts a backend — `create_data_directory` (`:2890`),
+  `create_xlog_or_symlink` (`:2948`), the 23-entry `subdirs[]` loop (`:3068`)
+  and the top-level `write_version_file(NULL)` (`:3086`) — plus one action,
+  `apply`, that carries the ops out. `tree_listing` is the same data as
+  names-and-modes relative to PGDATA, which is what the acceptance gate
+  compares.
+- `rinitdb::file_perm`: `PG_DIR_MODE_*` / `PG_FILE_MODE_*` / `PG_MODE_MASK_*`
+  and `SetDataDirectoryCreatePerm` (`src/common/file_perm.c:34`) as one
+  `DataDirPerm` value on the plan, instead of C's three process globals. `-g`
+  (`initdb.c:3359`) is the only thing that moves it, and it moves every mode in
+  the tree at once.
+- Five more `InitdbError` variants, one per `pg_fatal` site `apply` can reach:
+  `mkdir` (`:2903`, `:2974`, `:3022`, `:3079`), `chmod` (`:2917`, `:2989`),
+  `symlink` (`:3015`), and the open and the write in `write_version_file`
+  (`:1035`, `:1038`).
+- Stolen cases: `check_pgdata_permissions` (001_initdb.pl:67),
+  `check_pgdata_permissions_with_group_access` (:105 and :108) and
+  `waldir_becomes_a_pg_wal_symlink` (:56), each driving the real path — parse,
+  validate, lay out, apply — over a temporary directory.
+
+**Why the modes are set, not umasked.** C calls `umask(pg_mode_mask)` once
+(`initdb.c:3057`) and passes `pg_dir_create_mode` to every `mkdir`. `umask` is
+not reachable from the standard library and no libc dependency is approved, so
+each op names the mode the entry must end up with and `apply` creates it at
+that mode and then chmods it to exactly that mode. The end state is identical —
+the mask only ever clears bits the create mode does not carry, which
+`the_mask_never_touches_the_create_modes` pins — and creating at the mode first
+means the process umask can only make an entry stricter, never laxer, in the
+window before the chmod. Both permission cases were re-run under umask 022,
+077, 070 and 000; 070 is the one that would have caught a naive `DirBuilder`
+(it masks `0750` down to `0700`), and 000 is the one that would have caught a
+missing chmod. The divergence is recorded in `docs/divergences.md`.
+
+**The gate.** `the_data_directory_tree_matches_reference_initdb` runs C initdb
+twice, default and `--allow-group-access`, and requires every entry
+`tree_listing` claims — PGDATA itself, the 23 subdirectories, `pg_wal` and
+`PG_VERSION` — to exist in C's cluster as the same kind with C's mode, plus
+`PG_VERSION` byte-identical. It is one entry at a time rather than a whole-tree
+diff because C's finished cluster is a strict superset of this stage (the
+backend adds `base/4`, `base/5` and every relation file); an entry rinitdb
+invents still fails it. There is no PostgreSQL 18 on this box so it prints
+`SKIP (flagged, not silent)`, so it was proved non-vacuous against a stand-in
+reference that builds the same tree: it passes on a correct tree while ignoring
+the superset entries, and fails on a wrong subdirectory mode, a missing
+subdirectory, a wrong PGDATA mode and a `PG_VERSION` reading `17`.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 215 tests (was 195). All 14 gates print
+`SKIP (flagged, not silent)`.
+
+**Risks**: `layout`/`apply` are not yet wired into `run()`, which still stops
+after validation with its "not implemented yet" message. Wiring it in now would
+leave a half-built data directory behind on every invocation, and C's cleanup
+path (`made_new_pgdata`, `--no-clean`, `initdb.c:3125`) is not ported; `run()`
+gets the whole success path in one piece when there is a cluster to finish.
+
+**Follow-ups**
+- `canonicalize_path` (`src/port/path.c:337`) is still unported, so the
+  `pg_wal` symlink target is the string typed rather than the cleaned one. The
+  existing divergence row now names the symlink; NAT-381's config files are
+  what will force the port.
+- The cleanup path (`made_new_pgdata` / `found_existing_pgdata` and the
+  `--no-clean` switch) has no port yet and belongs with the `run()` wiring.
+
 ## 2026-09-16 — NAT-378 review fixes
 
 **What** (all three reviewer findings were real)

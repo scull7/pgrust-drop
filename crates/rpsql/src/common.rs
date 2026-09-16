@@ -28,12 +28,18 @@ pub trait Executor {
     fn connected(&self) -> bool;
 }
 
-/// What `ECHO` prints before a query runs (`common.c:1215`), or `None`.
+/// What `ECHO` prints before a query runs, or `None`.
+///
+/// Only `PSQL_ECHO_QUERIES` echoes here (`common.c:1158`). `ECHO=all` is *not*
+/// this function's job: it echoes each line of input in `MainLoop`
+/// (`mainloop.c:360`) and each action in `main` (`startup.c:386`), both of
+/// which happen before the query reaches `SendQuery`. Echoing it here as well
+/// printed every query twice under `-a`.
 #[must_use]
 pub fn echo_line(query: &[u8], pset: &PsqlSettings) -> Option<Vec<u8>> {
     match pset.echo {
-        Echo::All | Echo::Queries => Some(query.to_vec()),
-        Echo::None | Echo::Errors => None,
+        Echo::Queries => Some(query.to_vec()),
+        Echo::None | Echo::Errors | Echo::All => None,
     }
 }
 
@@ -268,6 +274,20 @@ mod tests {
         assert_eq!(echo_line(b"select 1", &pset), Some(b"select 1".to_vec()));
         let (_, out, _) = run(one_row(), &pset);
         assert!(out.starts_with("select 1\n ?column?"), "{out}");
+    }
+
+    #[test]
+    fn echo_all_does_not_echo_here_because_its_caller_already_did() {
+        // `common.c:1158`: SendQuery echoes only for PSQL_ECHO_QUERIES.
+        // MainLoop and the `-c` action loop own the ECHO=all echo, so doing it
+        // here too printed the query twice.
+        let pset = PsqlSettings {
+            echo: Echo::All,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(echo_line(b"select 1", &pset), None);
+        let (_, out, _) = run(one_row(), &pset);
+        assert!(out.starts_with(" ?column?"), "{out}");
     }
 
     #[test]

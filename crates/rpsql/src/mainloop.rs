@@ -422,12 +422,17 @@ mod tests {
     }
 
     #[test]
-    fn echo_all_prints_every_input_line() {
+    fn echo_all_prints_every_input_line_exactly_once() {
+        // `mainloop.c:360` echoes the input line and `SendQuery` does not
+        // (`common.c:1158`); echoing in both printed every query twice, and a
+        // `starts_with` assertion did not notice.
         let pset = PsqlSettings {
             echo: crate::settings::Echo::All,
             ..PsqlSettings::default()
         };
-        let out = run("select 1;\n", pset);
+        let out = run("select 1;\nselect 2;\n", pset);
+        assert_eq!(out.stdout.matches("select 1;").count(), 1, "{}", out.stdout);
+        assert_eq!(out.stdout.matches("select 2;").count(), 1, "{}", out.stdout);
         assert!(out.stdout.starts_with("select 1;\n"), "{}", out.stdout);
     }
 

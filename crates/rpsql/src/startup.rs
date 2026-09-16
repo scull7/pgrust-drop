@@ -592,6 +592,29 @@ mod tests {
     }
 
     #[test]
+    fn no_psqlrc_is_recorded_but_the_startup_file_is_never_read() {
+        // `-X` sets `options->no_psqlrc` (`startup.c:634`), which upstream
+        // then consults at `startup.c:441` to decide whether to call
+        // `process_psqlrc`. This port records the flag and has no
+        // `process_psqlrc` to call, so *every* invocation behaves as if `-X`
+        // had been given — the divergence `docs/divergences.md` records.
+        // This test pins the flag; when `process_psqlrc` lands it gains the
+        // behavioural half and the divergence row goes away.
+        assert!(session(&["-X", "-c", "select 1"]).no_psqlrc);
+        assert!(session(&["--no-psqlrc", "-c", "select 1"]).no_psqlrc);
+        assert!(!session(&["-c", "select 1"]).no_psqlrc);
+        // Nothing in the crate reads a startup file, so there is no path the
+        // flag could change: `Session` carries it and `run_session` never
+        // branches on it.
+        assert!(
+            !std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+                .expect("read the crate root")
+                .contains("psqlrc_file"),
+            "a psqlrc reader landed; update docs/divergences.md and this test"
+        );
+    }
+
+    #[test]
     fn output_mode_switches_reach_the_print_options() {
         assert_eq!(
             session(&["-A"]).pset.popt.topt.format,

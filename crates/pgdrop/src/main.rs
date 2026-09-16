@@ -5,6 +5,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use pgdrop::dispatch::{self, Applet, Dispatch};
+use pgdrop::install;
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
+        Dispatch::InstallLinks(link_args) => install::run(&link_args, &mut stdout, &mut stderr),
         Dispatch::Start(_) => {
             let _ = writeln!(
                 stderr,

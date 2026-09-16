@@ -15,7 +15,7 @@
 
 #![allow(clippy::doc_markdown)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rlibpq::conninfo::{Env, parse_conninfo};
@@ -24,6 +24,30 @@ use testkit::reference;
 
 /// The three C tools a live gate needs.
 const TOOLS: [&str; 3] = ["initdb", "pg_ctl", "psql"];
+
+/// Calculation: the `bin` directory holding all of [`TOOLS`], given where the
+/// reference `initdb` was found and a predicate answering whether a path is an
+/// executable file.
+///
+/// A gate needs all three from *one* PostgreSQL 18 installation — an `initdb`
+/// from one tree driven by a `pg_ctl` from another would be comparing two
+/// servers. `Err` names the first tool that is missing, which is the tool the
+/// caller then announces the skip for; naming it matters because "no
+/// PostgreSQL 18 at all" and "a client-only package with no `pg_ctl`" are
+/// different things to go and fix.
+///
+/// `exists` is injected for the same reason `testkit::reference::locate` takes
+/// it: the search is then a pure function with a unit test and no filesystem.
+fn bin_dir_with_every_tool(
+    initdb: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, &'static str> {
+    let bin = initdb.parent().ok_or(TOOLS[0])?.to_path_buf();
+    match TOOLS.into_iter().find(|tool| !exists(&bin.join(tool))) {
+        Some(missing) => Err(missing),
+        None => Ok(bin),
+    }
+}
 
 /// A PostgreSQL 18 cluster, started for one gate and stopped with it.
 struct Cluster {
@@ -40,13 +64,13 @@ impl Cluster {
             reference::skip(TOOLS[0]);
             return None;
         };
-        let bin = initdb.parent()?.to_path_buf();
-        for tool in TOOLS {
-            if !bin.join(tool).is_file() {
-                reference::skip(tool);
+        let bin = match bin_dir_with_every_tool(&initdb, Path::is_file) {
+            Ok(bin) => bin,
+            Err(missing) => {
+                reference::skip(missing);
                 return None;
             }
-        }
+        };
 
         let dir = std::env::temp_dir().join(format!("rlibpq-gate-{port}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -238,15 +262,25 @@ fn every_authentication_method_connects() {
     }
 }
 
-/// The gate is skipped, not narrowed, when there is no PostgreSQL 18 here:
-/// each gate above announces its own `SKIP (flagged, not silent)` through
-/// `testkit::reference::skip`, which writes to the process's own stderr so the
-/// line survives libtest's capture in a passing run.
+/// The gate is skipped, not narrowed, when this machine's PostgreSQL 18 is
+/// incomplete: an installation missing any one of [`TOOLS`] is refused, and
+/// refused by the name of the tool that is missing, so the gates above go on
+/// to announce a `SKIP (flagged, not silent)` that says what to install.
+///
+/// Every arm is exercised because the silent narrowing this repo exists to
+/// prevent lives in the arm nobody looks at: a `bin` directory holding
+/// `initdb` and `psql` but no `pg_ctl` is a real client-only package, and the
+/// mistake to catch is a lookup that shrugs at it and lets `Cluster::start`
+/// run half a gate.
 #[test]
-fn the_reference_tools_are_looked_for_by_name() {
-    for tool in TOOLS {
-        // Only that the lookup is by these three names; whether it finds them
-        // is the machine's business, and the gates handle both answers.
-        let _ = reference::find(tool);
+fn an_installation_missing_any_one_tool_is_refused_by_name() {
+    let complete = bin_dir_with_every_tool(Path::new("/ref/bin/initdb"), |_| true);
+    assert_eq!(complete, Ok(PathBuf::from("/ref/bin")));
+
+    for absent in TOOLS {
+        let found = bin_dir_with_every_tool(Path::new("/ref/bin/initdb"), |path| {
+            path != Path::new("/ref/bin").join(absent)
+        });
+        assert_eq!(found, Err(absent), "a bin directory without {absent}");
     }
 }

@@ -61,6 +61,12 @@ divergence. See ADR-0004.
 - Newtypes and enums for domain invariants; no stringly-typed state machines.
 - Each PR is one reviewable chunk (~10 minutes). Keep changes atomic.
 
+## Unattended runs
+
+`docs/nightshift/ORCHESTRATOR.md` is the prompt for an overnight session: a
+Fable orchestrator that only dispatches Opus workers issue by issue on a
+`nightshift/<date>` branch and opens one PR. Workers follow this file.
+
 ## Change hygiene
 
 - Update `progress.md` for every meaningful change (what, why, checks run,

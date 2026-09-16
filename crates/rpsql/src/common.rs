@@ -7,10 +7,55 @@
 
 use std::io::Write;
 
-use rlibpq::{ExecStatus, QueryResult};
+use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
 use crate::print::print_query;
 use crate::settings::{Echo, PsqlSettings};
+
+/// The bytes libpq left in `conn->errorMessage`, kept as bytes.
+///
+/// `PQerrorMessage()` hands back a `char *` that psql writes with `%s`, so a
+/// token the server sent in a non-UTF-8 client encoding reaches stderr as the
+/// bytes C would have written. `rlibpq` goes to deliberate trouble to keep
+/// them that way ([`rlibpq::ConnectionError::message`]); decoding them here
+/// would replace every such byte with U+FFFD at the crate boundary.
+///
+/// This is rpsql's own error type rather than `rlibpq`'s so that an
+/// [`Executor`] test double owes nothing to the transport — which is the
+/// reason the trait exists at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorMessage(Vec<u8>);
+
+impl ErrorMessage {
+    /// Wrap libpq's error buffer, without the `psql: error: ` prefix.
+    #[must_use]
+    pub fn new(message: impl Into<Vec<u8>>) -> Self {
+        Self(message.into())
+    }
+
+    /// The message alone, as libpq left it.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The bytes psql writes to stderr: `pg_log_error`'s prefix, the message,
+    /// and the newline that call adds (`logging.c:224`).
+    #[must_use]
+    pub fn rendered(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.0.len() + 14);
+        out.extend_from_slice(b"psql: error: ");
+        out.extend_from_slice(&self.0);
+        out.push(b'\n');
+        out
+    }
+}
+
+impl From<ConnectionError> for ErrorMessage {
+    fn from(err: ConnectionError) -> Self {
+        Self(err.message())
+    }
+}
 
 /// What psql can do with a query. An [`Executor`] is the only thing in the
 /// crate that holds a connection, which keeps every other module testable
@@ -20,9 +65,10 @@ pub trait Executor {
     /// back every result it produced.
     ///
     /// # Errors
-    /// The connection broke. A *failed query* is not an error: it comes back
-    /// as a `PGRES_FATAL_ERROR` result, as in libpq.
-    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, String>;
+    /// The connection broke, and [`ErrorMessage`] is libpq's error buffer. A
+    /// *failed query* is not an error: it comes back as a `PGRES_FATAL_ERROR`
+    /// result, as in libpq.
+    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage>;
 
     /// `pset.db != NULL` (`mainloop.c:557`).
     fn connected(&self) -> bool;
@@ -85,8 +131,8 @@ pub fn send_query(
 
     let results = match executor.exec(query) {
         Ok(results) => results,
-        Err(message) => {
-            let _ = write!(stderr, "{message}");
+        Err(err) => {
+            let _ = stderr.write_all(&err.rendered());
             return false;
         }
     };
@@ -144,7 +190,7 @@ mod tests {
     struct Replay(Vec<Vec<QueryResult>>);
 
     impl Executor for Replay {
-        fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, String> {
+        fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
             Ok(self.0.remove(0))
         }
         fn connected(&self) -> bool {
@@ -302,10 +348,65 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_connection_reaches_stderr_with_its_bytes_unchanged() {
+        // The whole reason `ErrorMessage` carries bytes: `0xC3 0x28` is not
+        // valid UTF-8, and C psql writes those two bytes. Decoding the message
+        // anywhere between the socket and stderr turns them into U+FFFD.
+        struct Broken;
+        impl Executor for Broken {
+            fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+                Err(ErrorMessage::new(b"no such database \"\xc3\x28\"".to_vec()))
+            }
+            fn connected(&self) -> bool {
+                false
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ok = send_query(
+            &mut Broken,
+            b"select 1",
+            &PsqlSettings::default(),
+            &mut out,
+            &mut err,
+        );
+
+        assert!(!ok);
+        assert_eq!(err, b"psql: error: no such database \"\xc3\x28\"\n");
+        assert!(!err.contains(&0xEF), "no U+FFFD may appear: {err:?}");
+    }
+
+    #[test]
+    fn a_libpq_error_keeps_its_bytes_on_the_way_into_an_error_message() {
+        // `rlibpq` keeps the server's tokens as bytes on purpose; the
+        // conversion at this crate's boundary must not undo that.
+        let error = ResultError::new(vec![
+            (b'S', b"FATAL".to_vec()),
+            (b'C', b"3D000".to_vec()),
+            (b'M', b"database \"\xff\xfe\" does not exist".to_vec()),
+        ]);
+
+        let message = ErrorMessage::from(rlibpq::ConnectionError::Server(Box::new(error)));
+
+        assert!(
+            message.as_bytes().windows(2).any(|w| w == b"\xff\xfe"),
+            "{:?}",
+            message.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_rendered_error_is_the_prefix_the_message_and_one_newline() {
+        let message = ErrorMessage::new(b"connection refused".to_vec());
+        assert_eq!(message.rendered(), b"psql: error: connection refused\n");
+    }
+
+    #[test]
     fn an_all_whitespace_query_is_not_sent() {
         struct Never;
         impl Executor for Never {
-            fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, String> {
+            fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
                 panic!("an empty query must not reach the server");
             }
             fn connected(&self) -> bool {

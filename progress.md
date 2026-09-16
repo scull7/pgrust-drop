@@ -129,10 +129,65 @@ weakened to accommodate the fix.
 
 - `AGENTS.md` still defines "upstream" as the tree vendored in pgrust at
   `crates/postgres-18.6-reference/`. That definition is what let the
-  contamination in, and it governs every port, citation and stolen test in the
-  MIT crates — not just the one sample file. A repo-wide provenance audit
-  against pristine 18.6 is in progress; the definition itself should be changed
-  to name genuine upstream.
+  contamination in and should name genuine upstream (`REL_18_6` @
+  `724edf9bde9d356724ad384a2e196edc3c9f80f7`, or the tarball with its published
+  sha256). `share/README.md` and ADR-0003 carry the same instruction.
+
+**Provenance audit: the blast radius is one file**
+
+Against two independent pristine sources that agree (tarball sha256
+`555610c2…` verified, and `REL_18_6` @ `724edf9b`), pgrust's reference tree is
+**7 282 of 7 284 files byte-identical**. Only two differ:
+`postgresql.conf.sample` (the `# PGRUST` block, fixed in #11) and
+`src/test/regress/data/streets.data` (one word on line 1378, collateral from a
+rename, referenced nowhere here). Of the 63 distinct upstream paths cited across
+the MIT crates, exactly one intersects that divergent set — the sample file. For
+the other 62, pgrust's copy and pristine are bit-identical, so "which tree was
+followed" is moot and no divergence could have leaked.
+
+So the earlier worry that every port and citation rested on suspect content was
+the right precaution and the wrong prediction. The definition was dangerous in
+principle; in practice it cost exactly one file.
+
+Also verified clean against pristine 18.6: `pg_hba`/`pg_ident` samples, the
+crc32c table (generated from the polynomial, not transcribed; its 16 pinned
+literals match), `initdb`'s `subdirs[]` (23), `PG_ENV_KEYS` (30),
+`PQconninfoOptions[]` (50 rows, field by field), the `001_uri.pl` corpus (63
+rows x 3 fields, byte-identical and in order), `MON_LENGTHS`/`YEAR_LENGTHS`, and
+the `initdb --help` text (reassembled from the C `printf` literals; identical
+but for placeholder spelling).
+
+No pgrust **Rust** code, comments or test data is present in the MIT crates,
+established four ways: highest normalized-line overlap anywhere is 19%
+(`hmac.rs`, i.e. RFC 4231 vectors and standard round arithmetic); of comment
+lines >= 40 chars, pgrust has 197 227 distinct and this repo 3 824, sharing
+**two** — one a `------` rule, one a verbatim PostgreSQL C comment both projects
+copied from the same source; citation sets share 3 of 5 571 vs 856; and pgrust's
+URI test corpus shares **zero** lines with `t_001_uri.rs`. The two
+near-identical functions (`is_create_routine`, `is_copy_from_stdin`) are
+transliterations of 6-line C predicates in `psqlscan.l:1006`/`:1019` that any
+competent port must converge on.
+
+**New defect found by the audit: ~32 wrong `file:line` citations**
+
+Not contamination — transcription errors. They match neither pgrust's tree
+(identical to pristine for these files) nor PG 15/16/17, and the deltas are
+irregular, which rules out a version shift. Of the 241 citations that could be
+mechanically anchored to a named C function, 209 (87%) land inside it; the
+failures cluster hard. `crates/rlibpq/src/result.rs` is the worst: **11 of 11
+anchored citations are wrong**. Spot-verified independently: `:309` cites
+`fe-exec.c:3432` for `PQntuples`, which is a comment terminator (real: 3512);
+`:303` cites `:3441` for `PQnfields`, which is the line `ExecStatusType` (real:
+3520); `:297` cites `:3219` for `PQresultStatus`, which is
+`case PGASYNC_READY_MORE:` (real: 3442). Also `rlibpq/src/md5.rs:94` names
+`src/include/md5_int.h`, a path that does not exist (real:
+`src/include/common/md5_int.h`).
+
+This matters because the porting rule's whole value is that a reviewer can
+follow a citation to the C and check the port. A citation that lands on a
+comment terminator cannot be checked, and silently wastes the reviewer's time.
+The ~748 citations with no backticked identifier near them could not be
+mechanically anchored and remain unverified.
 - PR #4's CI is red by design. Merging locks in enforcement so no future gate
   can silently skip; holding keeps the branch green and the hole open.
 - `QuoteType::ShellArg` folds into `Plain` in `rpsql`. Confirmed unreachable —

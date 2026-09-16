@@ -101,7 +101,9 @@ impl ClassItem {
             // the TAP suite applies them to ASCII tool output.
             ClassItem::Digit(positive) => c.is_ascii_digit() == positive,
             ClassItem::Word(positive) => (c.is_ascii_alphanumeric() || c == '_') == positive,
-            ClassItem::Space(positive) => c.is_ascii_whitespace() == positive,
+            // Perl's \s has included the vertical tab since 5.18;
+            // `is_ascii_whitespace` still leaves it out.
+            ClassItem::Space(positive) => (c.is_ascii_whitespace() || c == '\x0b') == positive,
         }
     }
 }
@@ -279,10 +281,14 @@ impl Pattern {
         }
     }
 
-    /// Perl `^`: the start of the text, and after any `\n` under `/m`
-    /// (perlre, "Metacharacters").
+    /// Perl `^`: the start of the text, and after any `\n` under `/m` — but
+    /// not after a `\n` that ends the text. Perl's `MBOL` opcode requires
+    /// `!NEXTCHR_IS_EOS` (`regexec.c`), so `"a\n" =~ /^$/m` does not match;
+    /// without that guard a stolen `/m`-anchored empty-line pattern would pass
+    /// on output Perl rejects, which is exactly the fidelity this module
+    /// promises.
     fn at_start(&self, pos: usize, chars: &[char]) -> bool {
-        pos == 0 || (self.flags.multiline && chars[pos - 1] == '\n')
+        pos == 0 || (self.flags.multiline && pos < chars.len() && chars[pos - 1] == '\n')
     }
 
     /// Perl `$`: the end of the text, or just before a newline that ends the
@@ -862,6 +868,37 @@ mod tests {
             "unexpected PQresultStatus: 8$",
             "client: unexpected PQresultStatus: 80\n"
         ));
+    }
+
+    #[test]
+    fn multiline_start_refuses_the_position_after_a_trailing_newline() {
+        // perl -e 'exit("a\n" =~ /^$/m ? 0 : 1)' is nomatch: /m anchors at the
+        // start of a *line*, and the position past the final newline starts no
+        // line. Matching there would let an empty-line pattern pass on output
+        // Perl rejects.
+        assert!(!matches("(?m)^$", "a\n"));
+        assert!(!matches(r"(?m)^\s*$", "a\n"));
+        // A genuinely empty line in the middle still matches, both ways.
+        assert!(matches("(?m)^$", "a\n\nb\n"));
+        assert!(matches("(?m)^$", "a\n\n"));
+        // And an ordinary /m anchor is unaffected.
+        assert!(matches("(?m)^b", "a\nb\n"));
+        assert!(matches("(?m)^a", "a\n"));
+        // Without /m the empty pattern still matches at position 0.
+        assert!(matches("^$", "\n"));
+    }
+
+    #[test]
+    fn perl_whitespace_includes_the_vertical_tab() {
+        // perl -e 'exit("\x0b" =~ /\s/ ? 0 : 1)' matches.
+        assert!(matches(r"\s", "\u{b}"));
+        assert!(matches(r"[\s]", "\u{b}"));
+        assert!(!matches(r"\S", "\u{b}"));
+        // The rest of the ASCII set is unchanged.
+        for space in [" ", "\t", "\n", "\r", "\u{c}"] {
+            assert!(matches(r"\s", space), "{space:?}");
+        }
+        assert!(!matches(r"\s", "x"));
     }
 
     #[test]

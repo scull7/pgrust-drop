@@ -3,6 +3,46 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-384 review fixes
+
+**What** (one finding was a real bug, two were real cleanups)
+- `walkdir` has two failure sites and the port had folded them into one.
+  `opendir` failing means the directory is skipped whole —
+  `could not open directory` (`file_utils.c:304`) and an early return that
+  never reaches the trailing `fsync` at `:347`. A `readdir` that fails
+  part-way is a different message in a different place: C acts on the names it
+  did read, prints `could not read directory` (`:337`) after them, and still
+  fsyncs the directory. `RealFs::read_dir` used `?` on the failing item, so
+  the second became the first: `$PGDATA/base` on an NFS mount going stale
+  mid-walk was reported with the wrong text and left both the names already
+  read and `base` itself unsynced. The message existed nowhere in the port.
+  `read_dir` now returns a `DirListing` — the names, plus the `readdir` error
+  as its own field — and only `opendir` is the `Err`. Sixth `InitdbError` of
+  the walk; the new test pins all three parts (entry synced, warning after it,
+  directory synced last) and fails when the two messages are swapped back.
+- `succeeds_with` called `testkit::command_ok` and then `testkit::run` on the
+  same argv, so each of the three stolen cases spawned rinitdb twice and
+  fsynced its tree twice. One spawn now, with `testkit::checks::command_ok`
+  — the pure check the helper wraps — applied to that outcome, so the stolen
+  assertion is still there and the work is done once.
+- The `match` on `SyncMethod` in `plan()` reads as prose but is load-bearing:
+  it is the exhaustiveness guard that stops a third `DataDirSyncMethod`
+  inheriting the fsync walk by accident. Kept, and the comment now says that
+  is what it is rather than restating the divergence.
+
+**Not a divergence**. The `readdir` split is upstream's behaviour, now
+implemented, so no `docs/divergences.md` row: the two rows that issue added
+are unchanged and still accurate.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 344 tests (was 343), 19 gates still
+`SKIP (flagged, not silent)`. Non-vacuity checked by pointing the `readdir`
+warning back at `CouldNotOpenDirectory`: the new test fails.
+
+**Follow-ups**: `Sync to disk skipped.` is now on NAT-387's Acceptance list
+explicitly, with the constant and the `CreatePlan` flag it needs named there,
+rather than living only as a unit test here.
+
 ## 2026-09-16 — NAT-384 rinitdb sync options
 
 **What**. `--sync-only` stops being a validation-only path: `rinitdb::sync`

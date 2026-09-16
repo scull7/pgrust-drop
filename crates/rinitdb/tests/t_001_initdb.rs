@@ -769,6 +769,13 @@ fn fails_for_invalid_option_combination() {
 /// one winning — is here in full: the command line goes through the real
 /// parser and the real `validate`, and the three stolen `qr//` patterns are run
 /// verbatim against the bytes `setup_config` would have written.
+///
+/// Nothing in the case is platform-specific; the guard is `create_plan`'s,
+/// which is `cfg(unix)` like every other helper here that touches a real
+/// filesystem. Without it this test target does not compile off Unix, and the
+/// crate is deliberately kept buildable there (`layout.rs:360`,
+/// `pg_config.rs`'s `cfg(windows)` arms).
+#[cfg(unix)]
 #[test]
 fn multiple_set_options_with_different_case() {
     let tempdir = TempDir::new("dataY");

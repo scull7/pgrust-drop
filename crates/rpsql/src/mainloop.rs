@@ -250,6 +250,7 @@ pub fn prompt_status_for(result: ScanResult) -> PromptStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::ErrorMessage;
     use rlibpq::{Backend, QueryResult, QueryRunner, TransactionStatus};
 
     /// An executor that records the queries it was asked to run and answers
@@ -271,7 +272,7 @@ mod tests {
     }
 
     impl Executor for Recorder {
-        fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, String> {
+        fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
             let fails = self.fail.first().copied().unwrap_or(false);
             if !self.fail.is_empty() {

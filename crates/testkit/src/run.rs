@@ -1,12 +1,13 @@
 //! Actions: spawn a binary and hand its outcome to the pure checks.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::CommandOutcome;
 use crate::checks::{self, Violation};
+use crate::pattern::Pattern;
 
 /// Run `bin` with `args`, capturing both streams. stdin is closed so a tool
 /// that would otherwise read a terminal (psql) does not hang.
@@ -72,7 +73,7 @@ where
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_help_ok(bin: &Path) {
-    let outcome = must_run(bin, ["--help"]);
+    let outcome = must_run(bin, &[OsString::from("--help")]);
     assert_clean(bin, "--help", &checks::program_help(&outcome));
 }
 
@@ -81,7 +82,7 @@ pub fn program_help_ok(bin: &Path) {
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_version_ok(bin: &Path) {
-    let outcome = must_run(bin, ["--version"]);
+    let outcome = must_run(bin, &[OsString::from("--version")]);
     assert_clean(bin, "--version", &checks::program_version(&outcome));
 }
 
@@ -90,7 +91,7 @@ pub fn program_version_ok(bin: &Path) {
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_options_handling_ok(bin: &Path) {
-    let outcome = must_run(bin, ["--not-a-valid-option"]);
+    let outcome = must_run(bin, &[OsString::from("--not-a-valid-option")]);
     assert_clean(
         bin,
         "--not-a-valid-option",
@@ -98,7 +99,94 @@ pub fn program_options_handling_ok(bin: &Path) {
     );
 }
 
-fn must_run<const N: usize>(bin: &Path, args: [&str; N]) -> CommandOutcome {
+/// `command_ok([ 'initdb', '--sync-only', $datadir ], 'sync only')`
+/// (Utils.pm:866): the command must exit 0.
+///
+/// # Panics
+/// When the binary cannot be spawned or the command fails.
+pub fn command_ok<I, S>(bin: &Path, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = collect(args);
+    let outcome = must_run(bin, &args);
+    assert_clean(bin, &describe(&args), &checks::command_ok(&outcome));
+}
+
+/// `command_fails([ 'initdb', '--sync-only', "$tempdir/nonexistent" ], …)`
+/// (Utils.pm:883): the command must exit nonzero.
+///
+/// # Panics
+/// When the binary cannot be spawned or the command succeeds.
+pub fn command_fails<I, S>(bin: &Path, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = collect(args);
+    let outcome = must_run(bin, &args);
+    assert_clean(bin, &describe(&args), &checks::command_fails(&outcome));
+}
+
+/// `command_like($cmd, $expected_stdout, $test_name)` (Utils.pm:1006): exit 0,
+/// an empty stderr and a stdout matching the pattern the stolen test carries.
+///
+/// # Panics
+/// When the binary cannot be spawned or any of the three fails.
+pub fn command_like<I, S>(bin: &Path, args: I, expected_stdout: &Pattern)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = collect(args);
+    let outcome = must_run(bin, &args);
+    assert_clean(
+        bin,
+        &describe(&args),
+        &checks::command_like(&outcome, expected_stdout),
+    );
+}
+
+/// `command_fails_like($cmd, $expected_stderr, $test_name)` (Utils.pm:1059):
+/// a nonzero exit and a stderr matching the pattern.
+///
+/// # Panics
+/// When the binary cannot be spawned, the command succeeds, or stderr does
+/// not match.
+pub fn command_fails_like<I, S>(bin: &Path, args: I, expected_stderr: &Pattern)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = collect(args);
+    let outcome = must_run(bin, &args);
+    assert_clean(
+        bin,
+        &describe(&args),
+        &checks::command_fails_like(&outcome, expected_stderr),
+    );
+}
+
+fn collect<I, S>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect()
+}
+
+/// The command line as the upstream `print("# Running: …")` would show it.
+fn describe(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn must_run(bin: &Path, args: &[OsString]) -> CommandOutcome {
     run(bin, args).unwrap_or_else(|err| panic!("could not run {}: {err}", bin.display()))
 }
 

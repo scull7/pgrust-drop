@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::Options;
 use crate::encoding::{self, Encoding};
 use crate::error::{DirRole, InitdbError, LocaleProvider, NotEmpty};
+use crate::file_perm::DataDirPerm;
 
 /// What `pg_check_dir` (`src/port/pgcheckdir.c:32`) reports about a directory.
 ///
@@ -187,6 +188,8 @@ pub struct CreatePlan {
     pub pgdata_action: DirAction,
     /// `--waldir`, with what will be done to it.
     pub waldir: Option<(PathBuf, DirAction)>,
+    /// What `-g` left `pg_dir_create_mode` and friends at (`initdb.c:3360`).
+    pub perm: DataDirPerm,
     pub locale_provider: LocaleProvider,
     /// The canonical `datlocale` (`initdb.c:2483`), `None` for `libc`.
     pub datlocale: Option<String>,
@@ -289,6 +292,7 @@ pub fn validate(
         pgdata,
         pgdata_action,
         waldir,
+        perm: DataDirPerm::for_allow_group_access(options.allow_group_access),
         locale_provider,
         datlocale,
         encoding,

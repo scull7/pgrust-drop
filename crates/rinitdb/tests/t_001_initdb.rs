@@ -11,7 +11,10 @@
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -239,6 +242,217 @@ fn role_names_cannot_begin_with_pg_() {
          role names cannot begin with \"pg_\"",
     );
     gate_strictly(&argv);
+}
+
+/// Parse and validate a cluster-creation command line the way `run` does, and
+/// hand back the plan the layout is calculated from.
+///
+/// # Panics
+/// When the command line is not a create, or does not validate.
+#[cfg(unix)]
+fn create_plan(argv: &[OsString]) -> rinitdb::validate::CreatePlan {
+    let rinitdb::Invocation::Init(options) = rinitdb::cli::plan(argv) else {
+        panic!("{argv:?} should be a cluster-creation command line");
+    };
+    match rinitdb::validate(&options, &rinitdb::Environment::default(), &rinitdb::RealFs) {
+        Ok(rinitdb::Plan::Create(create)) => create,
+        Ok(rinitdb::Plan::Sync(_)) => panic!("{argv:?} should not be --sync-only"),
+        Err(err) => panic!("{argv:?}: {}", err.render()),
+    }
+}
+
+/// The chunk of `initdb` this port has: everything
+/// `initialize_data_directory` (`initdb.c:3049`) does before it starts a
+/// backend. The real path — parse, validate, lay out, apply — not a fixture.
+///
+/// # Panics
+/// When any op fails.
+#[cfg(unix)]
+fn build_layout(argv: &[OsString]) -> PathBuf {
+    let plan = create_plan(argv);
+    rinitdb::layout::apply(&rinitdb::layout::layout(&plan))
+        .unwrap_or_else(|err| panic!("{argv:?}: {}", err.render()));
+    plan.pgdata
+}
+
+/// `ok(check_mode_recursive($datadir, 0700, 0600), "check PGDATA
+/// permissions");` — 001_initdb.pl:67, inside the `SKIP` block upstream takes
+/// on Windows only, which is why this is `cfg(unix)` too.
+///
+/// Upstream runs it over a *finished* cluster; rinitdb has the directory tree
+/// (`initdb.c:2890` … `:3086`) and not yet what the backend writes into it, so
+/// the walk covers the entries `layout()` makes — which is all of what this
+/// port creates, so nothing is excluded from it. The case widens to the
+/// finished cluster with Linear NAT-381 … NAT-387, and the comparison against
+/// C initdb's own tree is `the_data_directory_tree_matches_reference_initdb`.
+#[cfg(unix)]
+#[test]
+fn check_pgdata_permissions() {
+    let tempdir = TempDir::new("perm-default");
+    let datadir = build_layout(&args(&[&tempdir.join("data").to_string_lossy()]));
+    testkit::check_mode_recursive_ok(
+        &datadir,
+        testkit::files::PGDATA_DIR_MODE,
+        testkit::files::PGDATA_FILE_MODE,
+        &[],
+    );
+}
+
+/// `command_ok([ 'initdb', '--allow-group-access', $datadir_group ],
+/// 'successful creation with group access');` and the
+/// `ok(check_mode_recursive($datadir_group, 0750, 0640), 'check PGDATA
+/// permissions');` that follows it — 001_initdb.pl:105 and :108.
+///
+/// Same scope note as [`check_pgdata_permissions`]. `-g` is one switch arm
+/// (`initdb.c:3359`) and it moves every mode in the tree at once, which is
+/// what this pins.
+#[cfg(unix)]
+#[test]
+fn check_pgdata_permissions_with_group_access() {
+    let tempdir = TempDir::new("perm-group");
+    let datadir = build_layout(&args(&[
+        "--allow-group-access",
+        &tempdir.join("data_group").to_string_lossy(),
+    ]));
+    testkit::check_mode_recursive_ok(
+        &datadir,
+        testkit::files::GROUP_DIR_MODE,
+        testkit::files::GROUP_FILE_MODE,
+        &[],
+    );
+}
+
+/// `'--waldir' => $xlogdir` in the 'successful creation' case
+/// (001_initdb.pl:56), from the success side this time; the two
+/// `command_fails` cases above cover a relative and a non-empty `--waldir`.
+///
+/// `initdb.c:3015` — `$PGDATA/pg_wal` becomes a symbolic link to the directory
+/// given, and the `subdirs[]` loop then makes `archive_status` and `summaries`
+/// through it (`:3068`).
+#[cfg(unix)]
+#[test]
+fn waldir_becomes_a_pg_wal_symlink() {
+    let tempdir = TempDir::new("waldir-symlink");
+    let xlogdir = tempdir.join("pgxlog");
+    let datadir = build_layout(&args(&[
+        "--waldir",
+        &xlogdir.to_string_lossy(),
+        &tempdir.join("data").to_string_lossy(),
+    ]));
+
+    let pg_wal = datadir.join("pg_wal");
+    let link = std::fs::symlink_metadata(&pg_wal).expect("stat $PGDATA/pg_wal");
+    assert!(link.file_type().is_symlink(), "$PGDATA/pg_wal is a symlink");
+    assert_eq!(
+        std::fs::read_link(&pg_wal).expect("read the link"),
+        xlogdir,
+        "the link names the --waldir argument"
+    );
+    for through in ["archive_status", "summaries"] {
+        assert!(
+            xlogdir.join(through).is_dir(),
+            "{through} was created through the link"
+        );
+    }
+    // check_mode_recursive stats through the link (`Utils.pm:601`), so the
+    // same modes cover the WAL directory wherever it lives.
+    testkit::check_mode_recursive_ok(
+        &datadir,
+        testkit::files::PGDATA_DIR_MODE,
+        testkit::files::PGDATA_FILE_MODE,
+        &[],
+    );
+}
+
+/// The acceptance gate for this port (Linear NAT-380): the tree listing —
+/// names and modes — that `layout()` produces is exactly what C initdb leaves
+/// behind, for a default run and for an `--allow-group-access` run.
+///
+/// C's finished cluster is a superset of this stage (the backend adds
+/// `base/4`, `base/5` and every relation file), so the gate is checked one
+/// entry at a time rather than as a whole-tree diff: every entry this port
+/// claims must exist in C's tree, as the same kind, with C's mode. An entry
+/// rinitdb invents, or gives the wrong mode, fails it. Nothing is normalized.
+///
+/// Missing reference binary → `SKIP (flagged, not silent)`.
+#[cfg(unix)]
+#[test]
+fn the_data_directory_tree_matches_reference_initdb() {
+    let Some(reference) = reference::find("initdb") else {
+        reference::skip("initdb");
+        return;
+    };
+    for (tag, extra) in [
+        ("tree-default", Vec::new()),
+        ("tree-group", vec!["--allow-group-access"]),
+    ] {
+        let tempdir = TempDir::new(tag);
+        let datadir = tempdir.join("data");
+
+        let mut argv = args(&extra);
+        argv.push(OsString::from("--no-sync"));
+        argv.push(OsString::from("-D"));
+        argv.push(OsString::from(&datadir));
+        let outcome = testkit::run(&reference, &argv).expect("run the reference initdb");
+        assert!(
+            outcome.succeeded(),
+            "reference initdb {argv:?} failed: {}",
+            outcome.stderr_text()
+        );
+
+        let reference_tree: BTreeMap<PathBuf, (testkit::EntryKind, u32)> =
+            testkit::files::walk(&datadir, &[])
+                .expect("walk the reference cluster")
+                .into_iter()
+                .filter_map(|entry| {
+                    let relative = entry.path.strip_prefix(&datadir).ok()?.to_path_buf();
+                    Some((relative, (entry.kind, entry.mode)))
+                })
+                .collect();
+
+        // The same command line, validated against a directory that does not
+        // exist yet, then pointed at the cluster C just built.
+        let mut plan_argv = args(&extra);
+        plan_argv.push(OsString::from(tempdir.join("mine")));
+        let mut plan = create_plan(&plan_argv);
+        plan.pgdata.clone_from(&datadir);
+
+        // `tree_listing` is relative to PGDATA, so PGDATA's own mode — the one
+        // `create_data_directory` sets (`initdb.c:2902`) — is checked here.
+        assert_eq!(
+            std::fs::metadata(&datadir)
+                .expect("stat the reference PGDATA")
+                .mode()
+                & 0o7777,
+            plan.perm.masked_dir_mode(),
+            "PGDATA mode differs from C initdb's ({tag})"
+        );
+
+        for (relative, mode) in rinitdb::layout::tree_listing(&plan) {
+            let Some((kind, found)) = reference_tree.get(&relative) else {
+                panic!("C initdb did not create {} ({tag})", relative.display());
+            };
+            let expected_kind = if relative == Path::new("PG_VERSION") {
+                testkit::EntryKind::File
+            } else {
+                testkit::EntryKind::Dir
+            };
+            assert_eq!(*kind, expected_kind, "{} ({tag})", relative.display());
+            assert_eq!(
+                *found,
+                mode,
+                "{} mode differs from C initdb's ({tag})",
+                relative.display()
+            );
+        }
+
+        // PG_VERSION is the one file this stage writes; the bytes are C's too.
+        assert_eq!(
+            testkit::slurp_file(&datadir.join("PG_VERSION"), None).expect("slurp PG_VERSION"),
+            rinitdb::layout::version_file_contents().into_bytes(),
+            "PG_VERSION content ({tag})"
+        );
+    }
 }
 
 /// `command_fails([ 'initdb', $datadir ], 'existing data directory');`

@@ -5,12 +5,15 @@
 //! usage-rs parser: an applet is selected either by `argv[0]`'s basename (a
 //! symlink named `initdb`) or by the first word (`pgdrop initdb`), and every
 //! remaining word is handed over verbatim. Only pgdrop's own surface —
-//! `start`, `--help`, `--version` — is a usage-rs command (ADR-0004).
+//! `start`, `install-links`, `--help`, `--version` — is a usage-rs command
+//! (ADR-0004).
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use usage::{Args, Cli, Subcommands};
+
+use crate::install::InstallLinks;
 
 /// The tools pgdrop can stand in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +24,10 @@ pub enum Applet {
 }
 
 impl Applet {
+    /// Every applet, in the order the help page lists them and
+    /// [`crate::install`] creates their links.
+    pub const ALL: [Applet; 3] = [Applet::Initdb, Applet::Psql, Applet::Postgres];
+
     /// The executable name each applet answers to, as `argv[0]` or first word.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -62,6 +69,8 @@ enum Command {
     Postgres,
     /// Start an ephemeral cluster for a test suite
     Start(Start),
+    /// Create initdb, psql and postgres symlinks to this binary in DIR
+    InstallLinks(InstallLinks),
 }
 
 /// Options for `pgdrop start` (NAT-409); the shape is declared now so the
@@ -83,6 +92,8 @@ pub enum Dispatch {
     Applet(Applet, Vec<OsString>),
     /// `pgdrop start …`
     Start(Start),
+    /// `pgdrop install-links DIR`
+    InstallLinks(InstallLinks),
     /// Rendered root help page.
     PrintHelp(String),
     PrintVersion,
@@ -139,6 +150,9 @@ fn root(words: &[OsString]) -> Dispatch {
         Ok(Pgdrop {
             command: Command::Start(start),
         }) => Dispatch::Start(start),
+        Ok(Pgdrop {
+            command: Command::InstallLinks(args),
+        }) => Dispatch::InstallLinks(args),
         Err(usage::Error::Help { cmd, long }) => {
             Dispatch::PrintHelp(Pgdrop::render_help(cmd, long).unwrap_or_default())
         }
@@ -225,10 +239,39 @@ mod tests {
     }
 
     #[test]
+    fn install_links_parses_its_directory_and_force() {
+        match dispatch(&argv(&["pgdrop", "install-links", "/tmp/bin"])) {
+            Dispatch::InstallLinks(args) => assert_eq!(
+                args,
+                InstallLinks {
+                    dir: std::path::PathBuf::from("/tmp/bin"),
+                    force: false,
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&argv(&["pgdrop", "install-links", "--force", "/tmp/bin"])) {
+            Dispatch::InstallLinks(args) => assert_eq!(
+                args,
+                InstallLinks {
+                    dir: std::path::PathBuf::from("/tmp/bin"),
+                    force: true,
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        // The directory is required; usage-rs reports the missing operand.
+        assert!(matches!(
+            dispatch(&argv(&["pgdrop", "install-links"])),
+            Dispatch::Unparsable(_)
+        ));
+    }
+
+    #[test]
     fn root_help_version_and_errors() {
         match dispatch(&argv(&["pgdrop", "--help"])) {
             Dispatch::PrintHelp(text) => {
-                for name in ["initdb", "psql", "postgres", "start"] {
+                for name in ["initdb", "psql", "postgres", "start", "install-links"] {
                     assert!(text.contains(name), "help lacks {name}:\n{text}");
                 }
             }
@@ -259,7 +302,7 @@ mod tests {
 
     #[test]
     fn applet_names_round_trip() {
-        for applet in [Applet::Initdb, Applet::Psql, Applet::Postgres] {
+        for applet in Applet::ALL {
             assert_eq!(Applet::from_name(OsStr::new(applet.name())), Some(applet));
         }
         assert_eq!(Applet::from_name(OsStr::new("pgdrop")), None);

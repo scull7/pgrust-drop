@@ -5,6 +5,9 @@
 //! from `argv[0]` (Linear NAT-406). Applet arguments pass through untouched so
 //! the upstream test suites see the upstream command lines.
 //!
+//! `pgdrop install-links DIR` ([`install`], Linear NAT-416) is what creates
+//! those symlinks.
+//!
 //! The pgrust server (NAT-407) and `start` (NAT-409) are not embedded yet.
 
 #![deny(unsafe_code)]
@@ -16,3 +19,4 @@
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
 pub mod dispatch;
+pub mod install;

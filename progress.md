@@ -3,6 +3,55 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-382 review fixes
+
+**What** (three of the four findings were real; the fourth was real but its
+prescribed line numbers were not)
+- The stolen `checksums are enabled in control file` passed the literal
+  `DataChecksums::Enabled`, so nothing on its path read the default it exists
+  to pin — `001_initdb.pl:72` says checksums are enabled *by default*, and
+  `$datadir` is the cluster `successful creation` (`:51`-`:59`) makes with no
+  checksum switch on its command line. The case now goes through the real
+  parser on a command line that names neither switch, asserts neither flag is
+  set, and takes its setting from `DataChecksums::resolve([])`. Checked
+  non-vacuous by flipping `#[default]` onto `Disabled`: the case fails, and its
+  two siblings — which name `--no-data-checksums` explicitly — keep passing,
+  which is the split that says the default is what this one is reading.
+- Five hunks of re-indented string continuations in tests this issue does not
+  touch (`the_data_directory_tree_matches_reference_initdb`,
+  `existing_data_directory`, the three `--locale-provider builtin` cases) are
+  reverted. Rust strips leading whitespace after a line-continuation `\`, so
+  the gated messages never changed and nothing was failing; it was diff noise
+  from a `cargo fmt` pass that reflowed the enclosing calls, and it left
+  byte-exact assertions visually misaligned. `cargo fmt --all --check` is exit
+  0 with the original indentation restored, so rustfmt was never asking for it.
+  The only deletions this commit makes against be4a45a are now inside the one
+  test it means to change.
+- `crc_is_valid` built the whole 8192-byte image through `to_bytes()` and then
+  read four bytes back out of it with `u32_at`; it now compares against
+  `crc32c(&self.to_bytes()[..offset::CRC])` directly, which is also the
+  expression `WriteControlFile` uses (`xlog.c:4290`).
+
+**What the reviewer got half right**. The two `pg_controldata` citations in
+`testkit::control` were indeed inconsistent (`:74`/`:323` in one, `:75`/`:324`
+in the other). But the correction offered — ":74 and :324" — pairs an argv line
+with a `qr//` line: in `001_initdb.pl`, `:74` and `:323` are the
+`[ 'pg_controldata', $datadir… ]` arguments and `:75` and `:324` are the two
+`qr/Data page checksum version:…/` patterns. Since both comments are about the
+patterns, both now cite **`:75` and `:324`**. Verified against the file rather
+than taken on the finding's word; the porting rule makes these the grep path
+back to upstream, so a confidently wrong pair would be worse than the
+inconsistency it replaced.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 392 tests, 23 gate lines
+`SKIP (flagged, not silent)`, both unchanged. `cargo build --locked
+--all-targets` exit 0.
+
+**Risks**. None new; no behaviour changed. `crc_is_valid` computes the same
+checksum over the same bytes, and the reverted hunks are whitespace inside
+string literals that the language discards.
+
 ## 2026-09-16 — NAT-382 rinitdb pg_control rewrite
 
 **What**. `rinitdb::control` is `ControlFileData` (`src/include/catalog/pg_control.h:101`)

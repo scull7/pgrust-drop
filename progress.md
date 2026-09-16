@@ -3,10 +3,47 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-378 review fixes
+
+**What** (all three reviewer findings were real)
+- `help::try_help` now holds the message of
+  `pg_log_error_hint("Try \"%s --help\" for more information.", progname)`,
+  and both users build on it: `help::try_help_hint` prefixes it for the bare
+  hint `lib.rs` prints on the `getopt_long` `default:` arm, and
+  `error::InitdbError::hints` returns it for the three `pg_log_error` sites
+  that add it (`initdb.c:3274`, `:3400`, `:3420`). It had been written out as
+  two independent `format!` literals, identical today and free to drift
+  tomorrow, which for a byte-diff gate is the whole ballgame.
+  `the_try_help_hint_is_the_same_text_the_bare_hint_path_prints` asserts the
+  rendered error ends with the bare-hint line, so the two cannot separate
+  without a test failing.
+- Counts corrected: twelve cases landed from `001_initdb.pl`, not eleven (the
+  file has sixteen tests, four of them from NAT-373/NAT-374). The entry below
+  and `docs/nightshift/2026-09-16.md` both said eleven; 1eaeb94 fixed the two
+  other counts in the same sentence and missed this one.
+- The gate-scope paragraph below was left with an orphaned word on its own
+  line and a 109-column line by 1eaeb94's reflow; rewrapped, along with the
+  one other over-wide line in the entry.
+
+**Why the process note.** 1eaeb94 existed only to fix numbers that were
+written before the last tests landed, and it introduced the formatting damage
+the reviewer caught. The order that avoids both: run the checks first, then
+write the counts into the log, then commit once.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 195 tests (was 194; +1 for the hint
+test). All 13 gates still print `SKIP (flagged, not silent)`.
+
+**Risks**: none. The dedup is a pure refactor with a test pinning the shared
+result, and the rest is prose.
+
+**Follow-ups**: unchanged from the entry below.
+
 ## 2026-09-16 — NAT-378 rinitdb pre-flight validation
 
 **What**
-- `rinitdb::validate`: `validate(&Options, &Environment, &dyn FsProbe) -> Result<Plan, InitdbError>`,
+- `rinitdb::validate`: a pure
+  `validate(&Options, &Environment, &dyn FsProbe) -> Result<Plan, InitdbError>`,
   the whole of `initdb.c`'s `main()` from the getopt switch arms down to
   `create_xlog_or_symlink`, as one pure calculation. The only thing it asks of
   the outside world is `FsProbe::check_dir`, a port of `pg_check_dir`
@@ -25,7 +62,7 @@ Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
   `--builtin-locale=C.UTF-8` rule turns on the encoding's *identity*, so
   `UTF8`, `UTF-8` and `Unicode` must all pass and `SJIS` (a client-only
   encoding, not an unknown name) must fail.
-- `crates/rinitdb/tests/t_001_initdb.rs`: eleven more cases from
+- `crates/rinitdb/tests/t_001_initdb.rs`: twelve more cases from
   `001_initdb.pl`, upstream names and upstream order, each asserting both the
   stolen `command_fails` and the exact stderr C writes, then running the gate.
 
@@ -38,20 +75,20 @@ PGDATA outranks a bad `--waldir`. Five unit tests pin orderings rather than
 messages.
 
 **Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
-`cargo test --all-features` exit 0 — 194 tests (was 125). Every gate prints
+`cargo test --all-features` exit 0 — 195 tests (was 125). Every gate prints
 `SKIP (flagged, not silent)`: there is no PostgreSQL 18 on this box
 (`docs/nightshift/2026-09-16.md`).
 
 **Gate scope.** Six of the twelve new gates are judged on stderr and the exit
 status only, through a new `testkit::Scope`. By the time C reaches those six
-errors
-it has already printed "The files belonging to this database system will be
-owned by …" and its `creating directory … ok` progress, which rinitdb produces
-only when cluster creation exists (NAT-379 … NAT-387); the issue's Acceptance
-scopes them to "stderr + rc" for exactly that reason. This is not a quiet
-narrowing: the stdout difference is still compared, still rendered, and
+errors it has already printed "The files belonging to this database system
+will be owned by …" and its `creating directory … ok` progress, which rinitdb
+produces only when cluster creation exists (NAT-379 … NAT-387); the issue's
+Acceptance scopes them to "stderr + rc" for exactly that reason. This is not a
+quiet narrowing: the stdout difference is still compared, still rendered, and
 `assert_clean` prints it behind `OUT OF SCOPE (flagged, not silent)`. The other
-six stay strict, because C prints nothing on stdout before those errors either. Row in `docs/divergences.md`.
+six stay strict, because C prints nothing on stdout before those errors
+either. Row in `docs/divergences.md`.
 
 **Risks**
 - The transcribed stderr is only as good as the transcription until a

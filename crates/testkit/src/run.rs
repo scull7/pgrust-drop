@@ -73,8 +73,8 @@ where
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_help_ok(bin: &Path) {
-    let outcome = must_run(bin, &[OsString::from("--help")]);
-    assert_clean(bin, "--help", &checks::program_help(&outcome));
+    let outcome = must_run(bin, ["--help"]);
+    assert_clean_flag(bin, "--help", &checks::program_help(&outcome));
 }
 
 /// `program_version_ok('initdb')`: runs `bin --version`.
@@ -82,8 +82,8 @@ pub fn program_help_ok(bin: &Path) {
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_version_ok(bin: &Path) {
-    let outcome = must_run(bin, &[OsString::from("--version")]);
-    assert_clean(bin, "--version", &checks::program_version(&outcome));
+    let outcome = must_run(bin, ["--version"]);
+    assert_clean_flag(bin, "--version", &checks::program_version(&outcome));
 }
 
 /// `program_options_handling_ok('initdb')`: runs `bin --not-a-valid-option`.
@@ -91,8 +91,8 @@ pub fn program_version_ok(bin: &Path) {
 /// # Panics
 /// When the binary cannot be spawned or any check fails.
 pub fn program_options_handling_ok(bin: &Path) {
-    let outcome = must_run(bin, &[OsString::from("--not-a-valid-option")]);
-    assert_clean(
+    let outcome = must_run(bin, ["--not-a-valid-option"]);
+    assert_clean_flag(
         bin,
         "--not-a-valid-option",
         &checks::program_options_handling(&outcome),
@@ -110,8 +110,8 @@ where
     S: AsRef<OsStr>,
 {
     let args = collect(args);
-    let outcome = must_run(bin, &args);
-    assert_clean(bin, &describe(&args), &checks::command_ok(&outcome));
+    let outcome = must_run_args(bin, &args);
+    assert_clean(bin, &args, &checks::command_ok(&outcome));
 }
 
 /// `command_fails([ 'initdb', '--sync-only', "$tempdir/nonexistent" ], …)`
@@ -125,8 +125,8 @@ where
     S: AsRef<OsStr>,
 {
     let args = collect(args);
-    let outcome = must_run(bin, &args);
-    assert_clean(bin, &describe(&args), &checks::command_fails(&outcome));
+    let outcome = must_run_args(bin, &args);
+    assert_clean(bin, &args, &checks::command_fails(&outcome));
 }
 
 /// `command_like($cmd, $expected_stdout, $test_name)` (Utils.pm:1006): exit 0,
@@ -140,12 +140,8 @@ where
     S: AsRef<OsStr>,
 {
     let args = collect(args);
-    let outcome = must_run(bin, &args);
-    assert_clean(
-        bin,
-        &describe(&args),
-        &checks::command_like(&outcome, expected_stdout),
-    );
+    let outcome = must_run_args(bin, &args);
+    assert_clean(bin, &args, &checks::command_like(&outcome, expected_stdout));
 }
 
 /// `command_fails_like($cmd, $expected_stderr, $test_name)` (Utils.pm:1059):
@@ -160,10 +156,10 @@ where
     S: AsRef<OsStr>,
 {
     let args = collect(args);
-    let outcome = must_run(bin, &args);
+    let outcome = must_run_args(bin, &args);
     assert_clean(
         bin,
-        &describe(&args),
+        &args,
         &checks::command_fails_like(&outcome, expected_stderr),
     );
 }
@@ -179,6 +175,8 @@ where
 }
 
 /// The command line as the upstream `print("# Running: …")` would show it.
+/// Only ever built on the failure path: a passing assertion must not pay for
+/// a diagnostic nobody reads.
 fn describe(args: &[OsString]) -> String {
     args.iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -186,19 +184,37 @@ fn describe(args: &[OsString]) -> String {
         .join(" ")
 }
 
-fn must_run(bin: &Path, args: &[OsString]) -> CommandOutcome {
+fn must_run<const N: usize>(bin: &Path, args: [&str; N]) -> CommandOutcome {
     run(bin, args).unwrap_or_else(|err| panic!("could not run {}: {err}", bin.display()))
 }
 
-fn assert_clean(bin: &Path, arg: &str, violations: &[Violation]) {
-    assert!(
-        violations.is_empty(),
-        "{} {arg}:\n{}",
+fn must_run_args(bin: &Path, args: &[OsString]) -> CommandOutcome {
+    run(bin, args).unwrap_or_else(|err| panic!("could not run {}: {err}", bin.display()))
+}
+
+fn assert_clean(bin: &Path, args: &[OsString], violations: &[Violation]) {
+    if !violations.is_empty() {
+        fail(bin, &describe(args), violations);
+    }
+}
+
+/// The same assertion for the single-flag helpers, which have no `OsString`
+/// to build in the first place.
+fn assert_clean_flag(bin: &Path, flag: &str, violations: &[Violation]) {
+    if !violations.is_empty() {
+        fail(bin, flag, violations);
+    }
+}
+
+#[cold]
+fn fail(bin: &Path, command_line: &str, violations: &[Violation]) -> ! {
+    panic!(
+        "{} {command_line}:\n{}",
         bin.display(),
         violations
             .iter()
             .map(|v| format!("  - {v}"))
             .collect::<Vec<_>>()
             .join("\n")
-    );
+    )
 }

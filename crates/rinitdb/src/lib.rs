@@ -10,7 +10,8 @@
 //! calculation over an [`validate::FsProbe`], [`encoding`] and [`error`] are
 //! the tables and messages they need, [`conf`] renders the configuration files
 //! from the vendored templates over [`pg_config`]'s build-time constants,
-//! [`sync`] plans and performs `sync_pgdata`, [`help`] is the upstream text,
+//! [`sync`] plans and performs `sync_pgdata`, [`control`] parses and rewrites
+//! `pg_control` over [`crc32c`], [`help`] is the upstream text,
 //! and [`run`] is the only function that writes to a stream.
 
 #![deny(unsafe_code)]
@@ -23,6 +24,8 @@
 
 pub mod cli;
 pub mod conf;
+pub mod control;
+pub mod crc32c;
 pub mod encoding;
 pub mod error;
 pub mod file_perm;
@@ -38,6 +41,10 @@ use std::process::ExitCode;
 
 pub use cli::{Invocation, Options};
 pub use conf::{AuthMethods, DateOrder, Settings};
+pub use control::{
+    CheckPoint, ChecksumSwitch, ControlFile, ControlFileError, DataChecksums, DbState,
+    SystemIdentifier,
+};
 pub use error::{InitdbError, LocaleProvider};
 pub use file_perm::DataDirPerm;
 pub use layout::{FsOp, layout};

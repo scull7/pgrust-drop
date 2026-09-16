@@ -26,6 +26,7 @@
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
 pub mod checks;
+pub mod control;
 pub mod diff;
 pub mod env;
 pub mod files;
@@ -37,6 +38,7 @@ pub mod reference;
 pub mod run;
 
 pub use checks::Violation;
+pub use control::{ControlData, XLOG_CONTROL_FILE, control_file_path, read_control_file};
 pub use env::{Environment, PG_ENV_KEYS};
 pub use files::{Entry, EntryKind, ModeViolation, slurp_file};
 pub use gate::{Gate, GateError, GateReport, RcCheck, Scope, Side, StreamDiff};

@@ -3,6 +3,99 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-382 rinitdb pg_control rewrite
+
+**What**. `rinitdb::control` is `ControlFileData` (`src/include/catalog/pg_control.h:101`)
+as Rust data plus `parse` / `to_bytes`, and `rewrite` — the one pure function
+this issue is about: a template cluster's `pg_control` bytes in, the new
+cluster's bytes out, with a fresh `SystemIdentifier`, the asked-for
+`data_checksum_version` and a recomputed CRC. `rinitdb::crc32c` is the CRC-32C
+underneath it, ported from `src/port/pg_crc32c_sb8.c` and the four macros in
+`pg_crc32c.h`. `testkit::control` gains `read_control_file`, the small reader
+the stolen `pg_controldata` assertions need on a machine without PostgreSQL 18.
+
+**Why this shape**. `pg_control` is written as raw struct memory —
+`WriteControlFile` memcpys `ControlFileData` into a zeroed 8192-byte buffer
+(`xlog.c:4333`) — so the file *is* the C ABI's layout, interior padding
+included. The port is therefore an offset table (`control::offset`) plus the
+ten padding runs (`control::PADDING`) that no field owns, and the two are
+required to tile `[0, sizeof(ControlFileData))` exactly. Every offset was taken
+from `pg_control.h` under the C rules for a 64-bit build and then checked
+against the compiler: a standalone C file repeating upstream's declarations
+prints `sizeof(ControlFileData) == 296`, `offsetof(…, crc) == 292` and every
+field position the table claims. The first three offsets were checked a second
+way, against a real `pg_control` on this box (a PostgreSQL 16 cluster's), which
+reads `pg_control_version` 1300 at byte 8 — the native byte order the port
+relies on, confirmed on a file this port did not write.
+
+ADR-0002 is why `rewrite` exists at all: a cluster is an unpack of a pre-minted
+image, so the two fields `InitControlFile` derives per cluster
+(`system_identifier`, `xlog.c:4217`; `data_checksum_version`, `:4231`) have to
+be replaced afterwards rather than computed during a bootstrap that does not
+happen here.
+
+The CRC-32C table is generated from the reflected Castagnoli polynomial in a
+`const fn` rather than transcribed as 2048 literals, and pinned against the
+sixteen values upstream prints at `pg_crc32c_sb8.c:112`-`:115` plus the
+canonical `"123456789"` check value.
+
+`testkit` gets its own small reader instead of calling `rinitdb::control`,
+because `testkit` must not depend on the crate it tests. The duplication is
+four offsets, and `t_001_initdb.rs::the_two_control_file_readers_agree` is the
+test that stops them drifting — checked non-vacuous by moving testkit's
+`data_checksum_version` offset, which fails that test and the stolen
+`checksums are enabled in control file` with it.
+
+**Divergences** (both new rows in `docs/divergences.md`). `generate` forces each
+system identifier past the last one this process handed out; upstream derives
+one per `initdb` process and would repeat inside a microsecond, which ADR-0002's
+unpack reaches easily and the issue's acceptance forbids. When the clock has
+moved the value is upstream's unchanged; when it has not, the previous value
+plus one, spending only the 12 pid bits `xlog.c:5090` calls "a little extra
+uniqueness". And `crc32c` is the portable per-byte recurrence, not the SSE 4.2 /
+ARMv8 / slicing-by-8 implementation the build would have picked — same function,
+and intrinsics are out of reach under `#![deny(unsafe_code)]`.
+
+**Stolen tests**. `checksums are enabled in control file` (001_initdb.pl:72-76),
+`successful creation without data checksums` / `checksums are disabled in
+control file` (:315-325) and `pg_checksums fails with data checksum disabled`
+(:327-332). The `command_ok` halves need a finished cluster and land with it
+(NAT-381 … NAT-387); the `command_like` halves are made here twice — against
+the C `pg_controldata` when the box has one, and against the control file this
+port wrote either way, with the stolen `qr//` run unchanged over the line
+`pg_controldata.c:337` prints. `pg_checksums` has no port and is the C tool or a
+flagged skip.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 392 tests (was 363), 23 gate lines
+`SKIP (flagged, not silent)` (was 19: `pg_controldata` twice, `pg_checksums`
+once, and the new real-`pg_control` round trip). `cargo build --locked
+--all-targets` exit 0. Non-vacuity checked four ways: moving
+`DATA_CHECKSUM_VERSION` by four bytes fails the round trip, the tiling test and
+the rewrite test; moving testkit's copy fails the two cross-reader tests;
+dropping the forcing in `generate` fails
+`generate_never_repeats_within_a_process`.
+
+**Risks**. The acceptance criterion "round-trip is byte-identical on a *real*
+pg_control" cannot be exercised here — there is no PostgreSQL 18 on this box —
+so `a_real_control_file_round_trips_byte_for_byte` is a gate that skips,
+flagged, and takes its cluster either from `PGDROP_REF_PGDATA` or from running
+a reference `initdb`. What runs unconditionally is the same round trip over an
+image this port synthesized, which cannot catch a layout this port and
+PostgreSQL disagree about; the compiler check described above is the substitute
+and it is not in the test suite. The offset table is a 64-bit `MAXIMUM_ALIGNOF
+8` layout only, which is what `maxAlign` makes upstream reject too.
+
+**Follow-ups**. `InitControlFile` also mints a fresh
+`mock_authentication_nonce` with `pg_strong_random` (`xlog.c:4205`); `rewrite`
+leaves the template's in place, so every cluster expanded from one image would
+share a nonce that is meant to be cluster-unique. That needs a
+`pg_strong_random` port (`/dev/urandom` through the standard library) and is
+outside this issue's Acceptance, so it is a finding for NAT-381's reviewer
+rather than a change made here. Nothing wires `rewrite` into `run` yet — `Plan::Create`
+still reports that cluster initialization is unimplemented — because there is no
+template to rewrite until NAT-381 lands.
+
 ## 2026-09-16 — NAT-416 review fixes
 
 **What** (two findings were real, the third is a history the branch cannot undo)

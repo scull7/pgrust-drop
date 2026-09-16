@@ -26,7 +26,9 @@ Per-crate licensing:
   seeded from pgrust's Rust psql. pgrust's port may be *read* to learn how a C
   idiom was handled, but no code, comments or test corpora are copied from it
   into an MIT crate. The same rule holds for `rlibpq` (port `fe-auth-scram.c`
-  and friends from C; do not lift `pgclient`).
+  and friends from C; do not lift `pgclient`). This wall is what reversed
+  ADR-0001's plan to take the six auth primitives as pgrust git dependencies —
+  see that ADR's 2026-09-16 amendment.
 - The root `LICENSE` stays MIT; `crates/pgdrop/LICENSE` carries the AGPL-3.0
   text; `NOTICE.md` explains the split and credits PostgreSQL and pgrust.
 - `Cargo.toml` `license` fields state the per-crate license so `cargo

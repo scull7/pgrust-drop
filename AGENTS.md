@@ -32,6 +32,19 @@ never silently narrows.
 Porting rule: keep upstream test names as Rust test names (grep-able), keep the
 order, and cite the upstream file and line in a comment.
 
+**Accepted gap, NAT-374.** `crates/rinitdb/src/control.rs` carries hand-computed
+byte offsets (`offset`) and padding runs (`PADDING`) for `ControlFileData` on a
+64-bit `MAXIMUM_ALIGNOF 8` build. Today they are proved only *self-consistent*:
+`the_fields_and_the_padding_tile_the_struct` checks that the two tile
+`[0, SIZEOF_CONTROL_FILE_DATA)` exactly. Nothing yet proves they match what a
+real C compiler lays out — the assertion that would is the stolen
+`command_like(['pg_controldata', $datadir], …)` run against the C binary
+(`assert_data_page_checksum_version`, `crates/rinitdb/tests/t_001_initdb.rs:654`),
+and it prints `SKIP (flagged, not silent)` because this box has no PostgreSQL 18.
+That is accepted for now. **Remove the skip once NAT-374 lands the reference
+binaries in CI** — not by weakening the gate, by letting it run. Until then,
+treat the offset tables as unverified against C.
+
 ## CLI framework
 
 All CLIs use **usage-rs** (`usage = { package = "usage-rs" }`). Constraint: the
@@ -64,11 +77,20 @@ container does not change that.
   `cargo test --all-features` must pass before a push. Run the musl lane too
   (`--target x86_64-unknown-linux-musl`); it is the one CI gates every push.
 - stdlib first. **No new dependencies without explicit approval.** Approved so
-  far: `usage-rs` (all CLIs), `thiserror` (typed errors), `rustls` (rlibpq TLS,
-  ADR-0006), `redox_liner` (rpsql line editing, ADR-0005) — owner, 2026-09-16;
-  `ring` (rustls crypto provider) and `webpki-roots` (root store) — owner,
-  2026-09-17. `anyhow` is not approved. `ring` needs a musl C toolchain:
-  `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`.
+  far (owner, 2026-09-16): `usage-rs` (all CLIs), `thiserror` (typed errors),
+  `rustls` (rlibpq TLS, ADR-0006), `redox_liner` (rpsql line editing,
+  ADR-0005). `anyhow` is not approved.
+- **`thiserror` is deliberately not universal.** It is used where an error's
+  text is a Rust string: `rinitdb` (`error.rs`, `control.rs`) and `testkit`
+  (`gate.rs`, `pattern.rs`). `rlibpq` and `rpsql` depend on it not at all and
+  hand-write `Display` + `impl std::error::Error`. That is on purpose, not an
+  oversight: every `rlibpq` error type exposes `message() -> Vec<u8>` and
+  `Display` is a thin `from_utf8_lossy` over it, because a server's bytes and a
+  user's conninfo token reach stderr unmangled only if the message is built as
+  bytes — which `#[error("…")]`, a `&str` format string over `Display` fields,
+  cannot express. Do not "unify" these on `thiserror`; it would break byte
+  fidelity against C libpq. (`rpsql`'s one error type, `print::PrintError`, is
+  hand-written for consistency with `rlibpq`, not for byte fidelity.)
 - Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rpsql` are MIT and are
   ported from PostgreSQL's C sources only. **Never copy code, comments or test
   corpora from pgrust into them.** `pgdrop` is AGPL-3.0 because it links pgrust.

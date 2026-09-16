@@ -1,0 +1,26 @@
+[package]
+name = "pgdrop"
+description = "pgrust in one self-contained binary: initdb, psql, postgres, start"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pgdrop"
+path = "src/main.rs"
+
+[dependencies]
+usage = { workspace = true }
+rinitdb = { workspace = true }
+rpsql = { workspace = true }
+
+[dev-dependencies]
+testkit = { workspace = true }
+
+[lints]
+workspace = true

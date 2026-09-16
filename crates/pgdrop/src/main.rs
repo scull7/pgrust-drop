@@ -1,0 +1,43 @@
+//! The `pgdrop` executable: route `argv`, then hand the streams to the applet.
+
+use std::ffi::OsString;
+use std::io::Write;
+use std::process::ExitCode;
+
+use pgdrop::dispatch::{self, Applet, Dispatch};
+
+fn main() -> ExitCode {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    match dispatch::dispatch(&argv) {
+        Dispatch::Applet(Applet::Initdb, args) => rinitdb::run(&args, &mut stdout, &mut stderr),
+        Dispatch::Applet(Applet::Psql, args) => rpsql::run(&args, &mut stdout, &mut stderr),
+        Dispatch::Applet(Applet::Postgres, _) => {
+            let _ = writeln!(
+                stderr,
+                "pgdrop: error: the pgrust server is not embedded yet (Linear NAT-407)"
+            );
+            ExitCode::FAILURE
+        }
+        Dispatch::Start(_) => {
+            let _ = writeln!(
+                stderr,
+                "pgdrop: error: `start` is not implemented yet (Linear NAT-409)"
+            );
+            ExitCode::FAILURE
+        }
+        Dispatch::PrintHelp(text) => {
+            let _ = stdout.write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Dispatch::PrintVersion => {
+            let _ = writeln!(stdout, "pgdrop {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Dispatch::Unparsable(text) => {
+            let _ = stderr.write_all(text.as_bytes());
+            ExitCode::from(2)
+        }
+    }
+}

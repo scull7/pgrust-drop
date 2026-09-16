@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 usage = { workspace = true }
+thiserror = { workspace = true }
 rinitdb = { workspace = true }
 rpsql = { workspace = true }
 

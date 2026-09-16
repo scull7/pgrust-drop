@@ -23,6 +23,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::env::Environment;
 use crate::normalize::{self, Normalizer};
 use crate::outcome::CommandOutcome;
 use crate::{diff, reference, run};
@@ -130,6 +131,11 @@ pub struct Gate {
     pub normalizers: Vec<Normalizer>,
     /// Which streams the verdict rests on; [`Scope::Everything`] by default.
     pub scope: Scope,
+    /// The environment both binaries are run in; inherited by default.
+    ///
+    /// Both sides get the same one — a gate whose two halves saw different
+    /// `PGHOST`s would be comparing two different questions.
+    pub env: Environment,
 }
 
 impl Gate {
@@ -144,6 +150,7 @@ impl Gate {
             stdin: Vec::new(),
             normalizers: Vec::new(),
             scope: Scope::Everything,
+            env: Environment::inherited(),
         }
     }
 
@@ -209,6 +216,13 @@ impl Gate {
         self
     }
 
+    /// Run both binaries in this environment instead of the inherited one.
+    #[must_use]
+    pub fn with_env(mut self, env: Environment) -> Self {
+        self.env = env;
+        self
+    }
+
     /// Action: run both binaries on this invocation and compare them.
     ///
     /// # Errors
@@ -225,7 +239,7 @@ impl Gate {
     }
 
     fn spawn(&self, side: Side, bin: &Path) -> Result<CommandOutcome, GateError> {
-        run::run_with_stdin(bin, &self.args, &self.stdin).map_err(|source| GateError::Spawn {
+        run::run_in(bin, &self.args, &self.stdin, &self.env).map_err(|source| GateError::Spawn {
             side,
             path: bin.to_path_buf(),
             source,
@@ -267,6 +281,9 @@ impl fmt::Display for Gate {
                 write!(f, " {}", normalizer.name)?;
             }
             write!(f, "]")?;
+        }
+        if !self.env.is_inherited() {
+            write!(f, " [env: {}]", self.env)?;
         }
         if !self.scope.judges_stdout() {
             write!(f, " [judged on: {}]", self.scope)?;

@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 use crate::CommandOutcome;
 use crate::checks::{self, Violation};
+use crate::env::Environment;
 use crate::pattern::Pattern;
 
 /// Run `bin` with `args`, capturing both streams. stdin is closed so a tool
@@ -19,11 +20,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(bin)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map(CommandOutcome::from)
+    run_in(bin, args, &[], &Environment::inherited())
 }
 
 /// Run `bin` with `args`, feeding `stdin` to it and capturing both streams.
@@ -46,11 +43,41 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_in(bin, args, stdin, &Environment::inherited())
+}
+
+/// Run `bin` with `args` and `stdin` in a deliberately shaped `env`.
+///
+/// The environment-aware form of [`run_with_stdin`]: a stolen test whose
+/// expectations were written against `Utils.pm`'s scrubbed environment
+/// (`PGHOST`, `PGPORT`, … deleted) has to run its command in that environment
+/// or it is asserting against whatever the developer happens to export.
+///
+/// # Errors
+/// The `io::Error` from spawning, or from writing to the child's stdin.
+///
+/// # Panics
+/// If the stdin-writing thread panics.
+pub fn run_in<I, S>(
+    bin: &Path,
+    args: I,
+    stdin: &[u8],
+    env: &Environment,
+) -> std::io::Result<CommandOutcome>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(bin);
+    command.args(args);
+    env.apply(&mut command);
     if stdin.is_empty() {
-        return run(bin, args);
+        return command
+            .stdin(Stdio::null())
+            .output()
+            .map(CommandOutcome::from);
     }
-    let mut child = Command::new(bin)
-        .args(args)
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -27,6 +27,7 @@
 
 pub mod checks;
 pub mod diff;
+pub mod env;
 pub mod files;
 pub mod gate;
 pub mod normalize;
@@ -36,6 +37,7 @@ pub mod reference;
 pub mod run;
 
 pub use checks::Violation;
+pub use env::{Environment, PG_ENV_KEYS};
 pub use files::{Entry, EntryKind, ModeViolation, slurp_file};
 pub use gate::{Gate, GateError, GateReport, RcCheck, Scope, Side, StreamDiff};
 pub use normalize::Normalizer;
@@ -43,7 +45,7 @@ pub use outcome::CommandOutcome;
 pub use pattern::{Pattern, PatternError};
 pub use run::{
     command_fails, command_fails_like, command_like, command_ok, program_help_ok,
-    program_options_handling_ok, program_version_ok, run, run_with_stdin,
+    program_options_handling_ok, program_version_ok, run, run_in, run_with_stdin,
 };
 
 #[cfg(unix)]

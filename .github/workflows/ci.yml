@@ -84,5 +84,49 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+      # The whole premise of this repo is byte-diffing our tools against the
+      # real C ones, so CI must actually have them. Without this step every
+      # byte-diff gate prints `SKIP (flagged, not silent)` and passes, and the
+      # suite is green while proving nothing.
+      #
+      # postgresql-18 + postgresql-client-18 put these under
+      # /usr/lib/postgresql/18/bin (PGDG's Debian/Ubuntu layout — versioned
+      # bindir, with /usr/bin holding only pg_wrapper symlinks):
+      #   initdb, pg_ctl, pg_controldata, pg_checksums, postgres  (server pkg)
+      #   psql                                                    (client pkg)
+      # so the gates driving those tools become real here.
+      #
+      # NOT covered: `libpq_uri_regress` is a PostgreSQL *test* program built
+      # from src/interfaces/libpq/test/ and is shipped by no PGDG package, so
+      # the rlibpq URI gate keeps flagged-skipping until something builds it
+      # from source (NAT-374). testkit's UNSHIPPED_TOOLS exempts it by name;
+      # every other tool is required below.
+      - name: install PostgreSQL 18 reference binaries (PGDG)
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-18 postgresql-client-18
+      # Fail here rather than three minutes later inside a gate, and branch on
+      # each command's exit status — never on grepped output (AGENTS.md).
+      - name: verify the reference binaries are where the gates look
+        run: |
+          set -euo pipefail
+          for tool in initdb pg_ctl pg_controldata pg_checksums psql; do
+            test -x "/usr/lib/postgresql/18/bin/$tool"
+          done
+          /usr/lib/postgresql/18/bin/initdb --version
+          /usr/lib/postgresql/18/bin/psql --version
+      # PGDROP_REQUIRE_REF turns a missing reference from a flagged skip that
+      # passes into a hard failure, so a gate can never silently stop running
+      # here. Not `-- --ignored`: the one #[ignore]d test (psql
+      # program_help_ok, NAT-399) is a known-unimplemented feature.
       - name: test
+        env:
+          PGDROP_REF_BIN: /usr/lib/postgresql/18/bin
+          PGDROP_REQUIRE_REF: "1"
         run: cargo test --all-features

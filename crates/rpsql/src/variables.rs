@@ -385,6 +385,8 @@ impl VariableSpace {
     /// Only the fields listed under "set by assign hooks" in `settings.h:159`
     /// are touched; everything else on `base` is left alone.
     #[must_use]
+    // One arm per assign hook `startup.c` installs, which is the same table
+    // `VariableSpace::new` lists; splitting it would only move the rows.
     #[allow(clippy::too_many_lines)]
     pub fn settings(&self, base: &PsqlSettings) -> PsqlSettings {
         let mut pset = base.clone();

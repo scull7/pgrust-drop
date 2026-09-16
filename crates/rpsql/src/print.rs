@@ -76,13 +76,13 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         .iter()
         .map(|f| column_type_alignment(f.typid))
         .collect();
-    let null_print = opt.null_print.clone().unwrap_or_default();
+    let null_print = opt.null_print.as_deref().unwrap_or("");
     let cells: Vec<Vec<Vec<u8>>> = (0..result.ntuples())
         .map(|r| {
             (0..result.nfields())
                 .map(|c| {
                     if result.is_null(r, c) {
-                        null_print.clone().into_bytes()
+                        null_print.as_bytes().to_vec()
                     } else {
                         result.value(r, c).unwrap_or(b"").to_vec()
                     }

@@ -407,7 +407,6 @@ impl Scanner {
     }
 
     /// One `yylex()` rule firing. `None` means "keep lexing".
-    #[allow(clippy::too_many_lines)]
     fn step(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> Option<LexRes> {
         if self.rest().is_empty() {
             // The `<<EOF>>` rule (`psqlscan.l:945`).
@@ -557,6 +556,9 @@ impl Scanner {
     }
 
     /// The `INITIAL` rules, in the order the `%%` section lists them.
+    // One block per flex rule, in the order flex would try them; the order is
+    // the semantics, so splitting the rules across functions would trade a
+    // long function for a lexer nobody can check against `psqlscan.l`.
     #[allow(clippy::too_many_lines)]
     fn step_initial(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> Option<LexRes> {
         let rest = self.rest();

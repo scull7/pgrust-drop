@@ -1,8 +1,8 @@
 //! Reading a cluster's `pg_control` without the C `pg_controldata`.
 //!
 //! Several `t/001_initdb.pl` assertions are `command_like(['pg_controldata',
-//! $datadir], qr/…/)` — `001_initdb.pl:74` and `:323` check the data-checksum
-//! version that way. `pg_controldata` is a PostgreSQL binary, so on a machine
+//! $datadir], qr/…/)` — the two `qr//`s at `001_initdb.pl:75` and `:324` check
+//! the data-checksum version that way. `pg_controldata` is a PostgreSQL binary, so on a machine
 //! without PostgreSQL 18 the byte-diff gate for those lines skips; the
 //! assertion itself must still be made, which is what [`read_control_file`] is
 //! for.

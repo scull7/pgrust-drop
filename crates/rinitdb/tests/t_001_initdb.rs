@@ -582,7 +582,7 @@ fn the_data_directory_tree_matches_reference_initdb() {
         assert_eq!(
             ours, c_owned,
             "the tree this port creates is not C initdb's, restricted to the \
-         entries this stage owns ({tag})"
+             entries this stage owns ({tag})"
         );
 
         // PG_VERSION is the one file this stage writes; the bytes are C's too.
@@ -661,14 +661,31 @@ fn assert_data_page_checksum_version(datadir: &Path, expected: u32) {
 /// qr/Data page checksum version:.*1/,
 /// 'checksums are enabled in control file');` — 001_initdb.pl:72-76.
 ///
-/// `initdb.c:167` starts `data_checksums` at `true`, so a PostgreSQL 18 cluster
-/// is checksummed unless the command line says otherwise; the version written
-/// is `PG_DATA_CHECKSUM_VERSION` (`src/include/storage/bufpage.h:208`).
+/// What upstream's comment at `001_initdb.pl:72` claims is that checksums are
+/// enabled *by default*: `$datadir` is the cluster `successful creation` made
+/// at `:51`-`:59`, whose command line names neither `-k` nor
+/// `--no-data-checksums`. So this names neither either — `--no-sync` is
+/// carried over from that command line and the rest of it is about text search
+/// configuration and `--waldir` — and the setting comes out of
+/// `DataChecksums::resolve` over an empty switch list, which is
+/// `initdb.c:167`'s `static bool data_checksums = true;` and nothing else.
+/// Passing `DataChecksums::Enabled` here instead would assert less than the
+/// Perl does: it would still pass with that default flipped.
+///
+/// The version written when it is on is `PG_DATA_CHECKSUM_VERSION`
+/// (`src/include/storage/bufpage.h:208`).
 #[test]
 fn checksums_are_enabled_in_control_file() {
     let tempdir = TempDir::new("checksums-on");
     let datadir = tempdir.join("data");
-    expand_control_file(&datadir, DataChecksums::Enabled);
+
+    let argv = sync_argv(&["--no-sync"], &datadir, &[]);
+    let rinitdb::Invocation::Init(options) = rinitdb::cli::plan(&argv) else {
+        panic!("{argv:?} should be a cluster-creation command line");
+    };
+    assert!(!options.data_checksums && !options.no_data_checksums);
+
+    expand_control_file(&datadir, DataChecksums::resolve([]));
     assert_data_page_checksum_version(&datadir, 1);
 }
 
@@ -729,8 +746,8 @@ fn existing_data_directory() {
         &argv,
         &format!(
             "initdb: error: directory \"{path}\" exists but is not empty\n\
-         initdb: hint: If you want to create a new database system, either remove or empty \
-         the directory \"{path}\" or run initdb with an argument other than \"{path}\".",
+             initdb: hint: If you want to create a new database system, either remove or empty \
+             the directory \"{path}\" or run initdb with an argument other than \"{path}\".",
             path = datadir.display()
         ),
     );
@@ -876,7 +893,7 @@ fn fails_for_locale_provider_builtin_with_icu_locale() {
     fails_with(
         &argv,
         "initdb: error: --icu-locale cannot be specified unless locale provider \
-     \"icu\" is chosen",
+         \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }
@@ -901,7 +918,7 @@ fn fails_for_locale_provider_builtin_with_icu_rules() {
     fails_with(
         &argv,
         "initdb: error: --icu-rules cannot be specified unless locale provider \
-     \"icu\" is chosen",
+         \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }
@@ -941,7 +958,7 @@ fn fails_for_invalid_option_combination() {
     fails_with(
         &argv,
         "initdb: error: --icu-locale cannot be specified unless locale provider \
-     \"icu\" is chosen",
+         \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }

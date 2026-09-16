@@ -3,6 +3,68 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-388 rlibpq conninfo and URI parsing
+
+**What**. The connection-string front end of libpq, ported from
+`src/interfaces/libpq/fe-connect.c`: `PQconninfoOptions[]` (`:200`) as
+`rlibpq::conninfo::CONNINFO_OPTIONS`, all fifty rows in upstream's order;
+`conninfo_parse` (`:6290`) and `conninfo_uri_parse_options` (`:6813`) with its
+netloc loop, the percent-decoder (`:7187`) and the query-parameter splitter
+(`:7054`); `conninfo_add_defaults` (`:6624`) over an explicit `Env`; and the
+`libpq_uri_regress` printer (`test/libpq_uri_regress.c:52`) as a pure function
+with a thin `src/bin/libpq_uri_regress.rs` around it. `tests/t_001_uri.rs` is
+all 63 rows of `t/001_uri.pl`, extracted from the Perl table rather than
+retyped, plus a byte-diff gate over the same rows.
+
+**Why this shape**. Values are bytes (`RawText`), not `String`. Percent-decoding
+is a byte operation — `?application_name=%C3` is a URI C accepts — so a `String`
+port would have to either reject it or map it to U+FFFD, and the error messages
+quote the offending token back with `%s`. For the same reason `ConnError`
+renders once, as bytes, in `ConnError::message`, and `Display` is derived from
+that: one spelling of each format string to drift, and a non-UTF-8 token still
+reaches stderr as the bytes C wrote. The parsers walk a slice through
+`cstr::at`, which reads past the end as NUL, so every loop bound is upstream's
+(`while (*p && *p != ':')`) instead of a restated `index < len`. Order in the
+option table is load-bearing, not cosmetic: the regress printer walks the parsed
+options and the defaults in lockstep and says so itself ("XXX this coding assumes
+that PQconninfoOption structs always have the keywords in the same order").
+Defaults take an `Env` value rather than calling `getenv`, which keeps
+`PQconndefaults` a calculation and lets each unit test state the environment it
+is talking about.
+
+`testkit` grew the environment control this needed: `testkit::Environment` is
+`Utils.pm:105`'s `BEGIN` block as data — the thirty `PG*` keys it deletes, in
+its order, `LC_MESSAGES=C` and `PGAPPNAME` — plus `run_in` and `Gate::with_env`.
+The stolen expectations were written against that scrubbed environment and mean
+nothing outside it; three of the rows then override `PGSSLROOTCERT` on top. The
+key list is copied including what upstream leaves off it (`PGOPTIONS`,
+`PGAPPNAME`, `PGSSLNEGOTIATION`, …), because adding keys would make our stolen
+tests pass where upstream's fail.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 328 tests (was 270). 16 gates print
+`SKIP (flagged, not silent)`; the new one is `libpq_uri_regress`, which is a
+PostgreSQL test program and not an installed one, so `PGDROP_REF_BIN` has to
+point at a built `src/interfaces/libpq/test/` for it to go live. The stolen
+table was checked non-vacuous by breaking `get_hexdigit`: one row fails and the
+failure names the URI.
+
+**Risks**: the three new `docs/divergences.md` rows. The `sslmode` default is
+`disable` here and `prefer` in any libpq built with SSL — no `001_uri.pl` row
+can see the difference, but the gate against a real helper would, on a case
+outside the table, until NAT-392 adds the `tls` feature. `parseServiceInfo` is
+absent (NAT-393). The default user is `USER`/`LOGNAME`, so a machine whose user
+is literally named `otheruser` or `uri-user` would fail rows that name those —
+the same exposure upstream has through `getpwuid`.
+
+**Follow-ups**: NAT-393 (service file, passfile) and NAT-394 (multi-host,
+`load_balance_hosts`, `target_session_attrs`) are the two issues that turn
+parsed values into behaviour; the comma-separated host and port lists this
+parser already builds have unit tests here but no stolen ones yet. `rinitdb`'s
+`Environment::from_process` treats an exported but empty `USER` as a user name
+where `rlibpq`'s now falls through to `LOGNAME`; worth reconciling when someone
+is next in `rinitdb::validate`.
+
 ## 2026-09-16 — NAT-379 review fixes
 
 **What** (one finding was a real build break, three were real cleanups)

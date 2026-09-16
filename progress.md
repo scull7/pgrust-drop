@@ -38,20 +38,20 @@ PGDATA outranks a bad `--waldir`. Five unit tests pin orderings rather than
 messages.
 
 **Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
-`cargo test --all-features` exit 0 — 191 tests (was 125). Every gate prints
+`cargo test --all-features` exit 0 — 194 tests (was 125). Every gate prints
 `SKIP (flagged, not silent)`: there is no PostgreSQL 18 on this box
 (`docs/nightshift/2026-09-16.md`).
 
-**Gate scope.** Five of the new gates are judged on stderr and the exit status
-only, through a new `testkit::Scope`. By the time C reaches those five errors
+**Gate scope.** Six of the twelve new gates are judged on stderr and the exit
+status only, through a new `testkit::Scope`. By the time C reaches those six
+errors
 it has already printed "The files belonging to this database system will be
 owned by …" and its `creating directory … ok` progress, which rinitdb produces
 only when cluster creation exists (NAT-379 … NAT-387); the issue's Acceptance
 scopes them to "stderr + rc" for exactly that reason. This is not a quiet
 narrowing: the stdout difference is still compared, still rendered, and
 `assert_clean` prints it behind `OUT OF SCOPE (flagged, not silent)`. The other
-six gates stay strict, because C prints nothing on stdout before those errors
-either. Row in `docs/divergences.md`.
+six stay strict, because C prints nothing on stdout before those errors either. Row in `docs/divergences.md`.
 
 **Risks**
 - The transcribed stderr is only as good as the transcription until a

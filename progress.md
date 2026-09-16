@@ -3,113 +3,65 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
-## 2026-09-17 — Target matrix: musl + Darwin primary (ADR-0002, 0006, 0007)
+## 2026-09-16 — testkit byte-diff gate runner (NAT-374)
 
 **What**
-- ADR-0007 (new): `*-unknown-linux-musl` (Omen devices) and `aarch64-apple-darwin`
-  (developer laptops) are the primary targets; glibc is a pull-request gate only.
-  A byte-diff gate is only valid when both sides link the same C library, so
-  `testkit::reference` derives `Libc` from `cfg!` at compile time and each lane
-  has its own variable (`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`).
-- ADR-0002 revised: the embedded template carries **bootstrap catalogs only**.
-  Locale is stamped at run time in the `postgres --single` phase from the host's
-  libc, so one image serves every libc and the locale matrix is not frozen at
-  mint time. Fallback if pgrust's `--single` cannot import collations: a single
-  image minted with `builtin` + `C.UTF-8`.
-- ADR-0006 completed: crypto provider is `ring` (owner decision), rustls with
-  `default-features = false`. Root store still undecided.
-- `scripts/fetch-ref-binaries.sh`: PostgreSQL 18.6.0 reference binaries per lane
-  and architecture from Maven Central, the only source covering musl and Darwin.
-- CI restructured into lanes: musl (`container: alpine:3.21`) on every push, gnu
-  and apple gated behind `needs: musl` and pull-request-only.
+- `testkit::gate`: `Gate { reference, candidate, args, stdin, normalizers }` →
+  `GateReport { stdout_diff, stderr_diff, rc }`. `gate::compare` is the whole
+  verdict as a pure function over two `CommandOutcome`s; `Gate::run` is the one
+  action that spawns. `Gate::for_tool` reuses the existing `PGDROP_REF_BIN` →
+  PGDG → Homebrew discovery and yields `None` so the caller prints
+  `SKIP (flagged, not silent)`.
+- `testkit::normalize`: three justified normalizers as pure
+  `fn(&str) -> String`, each citing the upstream printf it rewrites —
+  `Time: …` (`src/bin/psql/common.c:608`, covering all four duration forms),
+  `PID n` (`common.c:755`), system identifier
+  (`src/include/catalog/pg_control.h:107`). `DEFAULT` is the three in order.
+- `testkit::diff`: in-process Myers diff rendered as `diff -U3`, matching
+  pg_regress's `pretty_diff_opts` (`src/test/regress/pg_regress.c:65`), with
+  diff(1)'s `\ No newline at end of file` marker.
+- `testkit::run_with_stdin`: feeds stdin from a helper thread while the parent
+  drains both pipes, so a tool that writes more than a pipe buffer before
+  reading its input cannot deadlock a gate; `EPIPE` from a child that exits
+  early is the child's business, not a failure.
+- `rinitdb`'s `help_and_version_match_reference_initdb` now runs through the
+  gate instead of `assert_eq!` on two byte vectors.
 
 **Why**
-The product runs on Alpine and on Apple silicon; neither has glibc. Measured on
-one host, PostgreSQL 18.6 both sides:
+The gate is how every later issue proves itself (`docs/test-stealing.md`), so
+it had to exist before the ports that lean on it. The pure/action split is what
+makes the comparison testable here, where no C reference binary exists.
 
-| mint recipe (glibc initdb) | `datcollversion` | musl server on it |
-| --- | --- | --- |
-| `--no-locale` | `NULL` | clean |
-| `--locale-provider=builtin --builtin-locale=C.UTF-8` | `1` | clean |
-| `--locale=en_US.UTF-8` | `2.39` | warns on every connection |
+**Checks run** (Rust 1.96.0, this container, no PostgreSQL installed)
+- `cargo fmt --all --check` exit 0.
+- `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic`
+  exit 0. `tests/gate.rs` needs its own crate-level `doc_markdown` allow, like
+  the other integration tests: the CLI's `-W clippy::pedantic` outranks the
+  workspace `[lints]` table.
+- `cargo test --all-features` exit 0, 80 tests (was 46): +30 testkit unit
+  (8 diff, 10 normalize, 12 gate), +4 testkit integration.
+- The gate itself was proved non-vacuous by hand, since the byte-diff gate here
+  can only SKIP: with `PGDROP_REF_BIN` pointing at a directory whose `initdb`
+  is a symlink to `rinitdb`, the gate runs live and passes with no SKIP line;
+  pointing it at `/bin/echo` fails the test with the unified diff.
 
-`2.39` is the *mint host's glibc version*, so per-libc images would not have
-fixed it — it would take one image per libc version. Hence: bake no locale.
-
-Also measured: `initdb --help`/`--version` are byte-identical across libcs, but
-`initdb -D data` differs in the locale block, and `--locale=xx_ZZ.UTF-8` exits 1
-on glibc and **0 on musl** (musl's `setlocale` accepts any name). Both are now
-entries in `docs/divergences.md`.
-
-**Checks run** (this container, Rust 1.96.0)
-- gnu lane: `cargo fmt --all --check`, pedantic clippy, `cargo test --all-features`
-  — all clean, 49 tests.
-- musl lane: `rustup target add x86_64-unknown-linux-musl`, pedantic clippy and
-  `cargo test --all-features --target x86_64-unknown-linux-musl` — clean.
-- **The initdb byte-diff gate ran for real for the first time**, in both lanes,
-  against Maven's 18.6.0 builds: `rinitdb --help`/`--version` are byte-identical
-  to C initdb. Previously it always printed SKIP.
-- `ring` on musl: verified it fails without a musl C toolchain
-  (`failed to find tool "x86_64-linux-musl-gcc"`) and builds with `musl-tools`
-  plus `CC_x86_64_unknown_linux_musl=musl-gcc`. Recorded in ADR-0006.
-- Not run: the CI workflow itself. The Alpine container job (rustup on a musl
-  host, `actions/checkout` in a container) has never executed; first PR run is
-  its real test.
-
-**Resolved same day (owner, 2026-09-17)**
-- `webpki-roots` approved as rlibpq's root store (ADR-0006).
-- pgrust's `--single` **does** support `pg_import_system_collations()` (foid
-  3445) and `pg_collation_actual_version()` (foid 3448), and stamps
-  `collversion` as rows are created, so M1 commits to run-time stamping on the
-  gnu lane. A NULL libc `collversion` on macOS or musl is correct, not a bug.
-  NAT-376 only pins a rev containing the port; the `--single` script is NAT-383,
-  whose description now carries the statements, the provider table and the
-  failure modes.
-- Linear: NAT-383 and NAT-376 updated; NAT-425 (psql reference per lane, M3),
-  NAT-426 (arm image portability, v2), NAT-427 (Docker fixtures, v2) created.
-
-**CI, first real run (PR #15)**
-- All three lanes green on the first attempt, including the Alpine container
-  job: `actions/checkout` and rustup both work on a musl host, which was the
-  part nothing had ever exercised.
-- Green did not prove the gate *ran*, though: a missing reference binary makes
-  the byte-diff test print SKIP and pass, and the println is captured, so a lane
-  that silently stopped proving conformance looks identical to one that proved
-  it. `PGDROP_REQUIRE_REF=1` (set in CI) now turns that skip into a failure, via
-  `reference::find_or_skip`. A laptop without the binaries still skips.
-
-**Risks / open questions**
-- Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
-  guess; the Alpine lane fetches from Maven, so nothing depends on it yet.
-- The `main` ruleset is **not** applied: the classic branch-protection API
-  returns 403 `Resource not accessible by integration` for this session, and the
-  rulesets API (which does read back 200) could not be written to from here.
-  Owner action, see below.
-- Template image portability across architectures is untested → v2, via a
-  `pg_controldata` comparison on an arm runner.
-- `PGDROP_REF_BIN` (lane-agnostic) is still accepted and is an unchecked
-  assertion that the directory matches the compiled lane. A follow-up could read
-  the reference's ELF interpreter and refuse a cross-libc pairing outright.
-- No `psql` in the Maven bundles; the M3 rpsql gate needs its own reference.
+**Risks**
+- A mismatching stream that is not valid UTF-8 is reported as "differs and is
+  not valid UTF-8" with the first differing byte offset rather than diffed.
+  That is deliberate: `from_utf8_lossy` maps every invalid byte to U+FFFD and
+  could call two different outputs equal.
+- The diff renderer stops looking for a minimal edit script past
+  `MAX_EDIT_DISTANCE` (4096) and prints one whole-file replacement hunk. It
+  only affects how a failure reads; the verdict is always the byte comparison.
+- The gate hands both binaries the same environment but does not pin one
+  (`LC_ALL`, `TZ`, `PGCLIENTENCODING`). Both sides see the same values, so a
+  comparison stays honest, but two machines can gate on different text.
 
 **Follow-ups**
-- NAT-374 gate runner: now partly done (the fetch script and both lanes run).
-- **Owner action**: run `scripts/setup-branch-ruleset.sh` locally with an
-  admin-authenticated `gh` (`--dry-run` first). It creates or updates the `main`
-  ruleset requiring the `musl`, `apple` and `gnu` checks, deriving those names
-  from `ci.yml` so the two cannot drift. The equivalent UI path is
-  Settings > Rulesets > New branch ruleset, where the enforcement status
-  defaults to Disabled and must be set to Active. Until it is applied the lane
-  ordering is advisory: `needs: musl` gates execution, but nothing blocks a
-  merge.
-- Requiring all three is not belt and braces. GitHub treats `skipped` and
-  `neutral` as successful, and its own troubleshooting docs say a job skipped
-  because a `needs:` dependency failed "may not block merging". With only `gnu`
-  required, a red musl lane would skip `gnu` and the merge would be allowed.
-  CI job names were flattened to `musl`, `apple`, `gnu` for the same reason: the
-  required-check string has to match the check name exactly.
-- ELF-interpreter check on the reference binary, to turn the lane-agnostic
-  `PGDROP_REF_BIN` from a trusted assertion into an enforced one.
+- Pinning a gate environment is worth its own issue once a gate runs something
+  locale-sensitive (M3, rpsql).
+- `crates/pgdrop/Cargo.toml` sets both `license` and `license-file`, so every
+  cargo invocation warns. Pre-existing, one line, not touched here.
 
 ## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
 

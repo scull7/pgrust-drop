@@ -344,8 +344,12 @@ impl QueryRunner {
                 self.transaction_status = Some(status);
                 return Ok(Flow::Done);
             }
-            Backend::Authentication(_) | Backend::BackendKeyData { .. } => {
-                return Err(ProtocolError::UnexpectedResponse(b'R'));
+            // Both belong to the startup exchange; naming the byte that
+            // actually arrived is the whole point of upstream's message
+            // (`fe-protocol3.c:447`).
+            Backend::Authentication(_) => return Err(ProtocolError::UnexpectedResponse(b'R')),
+            Backend::BackendKeyData { .. } => {
+                return Err(ProtocolError::UnexpectedResponse(b'K'));
             }
             Backend::NegotiateProtocolVersion { .. } => {}
             Backend::Other { id, .. } => return Err(ProtocolError::UnexpectedResponse(id)),
@@ -864,8 +868,10 @@ mod tests {
         let info = conninfo("user=alice password=secret dbname=postgres");
         let conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
 
-        let first = crate::md5::md5_encrypt(b"secret", b"alice");
-        let expected = crate::md5::md5_encrypt(&first[3..], &[0x01, 0x02, 0x03, 0x04]);
+        // The fixed vector, so the bytes on the wire are checked against a
+        // value neither `md5_encrypt` nor this test computed (system
+        // `md5sum`: md5("secretalice"), then md5 of that hex plus the salt).
+        let expected = b"md598a0412b9c31436fc53776e863350083".to_vec();
         let startup_len = Frontend::Startup {
             version: PROTOCOL_VERSION_3_0,
             parameters: startup_parameters(&info),

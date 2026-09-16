@@ -43,6 +43,8 @@ pub enum ProtocolError {
     DataWithoutRowDescription,
     /// `fe-protocol3.c:447`.
     UnexpectedResponse(u8),
+    /// `pqGetNegotiateProtocolVersion3`, `fe-protocol3.c:1475`.
+    NegativeUnsupportedParameterCount,
 }
 
 impl ProtocolError {
@@ -76,6 +78,10 @@ impl ProtocolError {
                 *id as char
             )
             .into_bytes(),
+            ProtocolError::NegativeUnsupportedParameterCount => {
+                b"received invalid protocol negotiation message: server reported negative number of unsupported parameters"
+                    .to_vec()
+            }
         }
     }
 }
@@ -379,18 +385,7 @@ impl Backend {
                     payload: r.cstring()?.to_vec(),
                 }
             }
-            b'v' => {
-                let newest = r.u32()?;
-                let count = r.u32()? as usize;
-                let mut unrecognized = Vec::with_capacity(count);
-                for _ in 0..count {
-                    unrecognized.push(r.cstring()?.to_vec());
-                }
-                Backend::NegotiateProtocolVersion {
-                    newest,
-                    unrecognized,
-                }
-            }
+            b'v' => decode_negotiate_protocol_version(&mut r)?,
             _ => Backend::Other {
                 id,
                 body: body.to_vec(),
@@ -412,6 +407,29 @@ impl Backend {
         }
         Ok(message)
     }
+}
+
+/// `pqGetNegotiateProtocolVersion3`, `fe-protocol3.c:1444`.
+///
+/// The count is read with `pqGetInt(&num, 4, …)` into an `int` and a negative
+/// one is refused at `:1475`. Reading it unsigned instead would turn a hostile
+/// or corrupted `FF FF FF FF` into a four-billion-element allocation, so the
+/// count is signed here too — and nothing reserves capacity from it: the
+/// strings are pushed one at a time and `cstring` stops at the end of the body.
+fn decode_negotiate_protocol_version(r: &mut Reader<'_>) -> Result<Backend, ProtocolError> {
+    let newest = r.u32()?;
+    let count = r.i32()?;
+    if count < 0 {
+        return Err(ProtocolError::NegativeUnsupportedParameterCount);
+    }
+    let mut unrecognized = Vec::new();
+    for _ in 0..count {
+        unrecognized.push(r.cstring()?.to_vec());
+    }
+    Ok(Backend::NegotiateProtocolVersion {
+        newest,
+        unrecognized,
+    })
 }
 
 /// The field loop of `pqGetErrorNotice3`, `fe-protocol3.c:945`: one type byte
@@ -855,6 +873,50 @@ mod tests {
             ProtocolError::DataWithoutRowDescription.message(),
             b"server sent data (\"D\" message) without prior row description (\"T\" message)"
                 .to_vec()
+        );
+    }
+
+    /// A NegotiateProtocolVersion whose count is negative is refused with
+    /// upstream's message (`fe-protocol3.c:1475`) instead of being believed.
+    ///
+    /// Read as unsigned, `FF FF FF FF` is 4294967295, and reserving that many
+    /// `Vec`s asks for 103 GB and aborts the process — a server, a proxy or a
+    /// corrupted stream could kill the client where C libpq reports a
+    /// connection error. The count is never used as a capacity either, so a
+    /// large *positive* count costs only the bytes that are actually there.
+    #[test]
+    fn a_negative_unsupported_parameter_count_is_refused() {
+        let mut body = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            Backend::decode(b'v', &body),
+            Err(ProtocolError::NegativeUnsupportedParameterCount)
+        );
+        assert_eq!(
+            ProtocolError::NegativeUnsupportedParameterCount.message(),
+            b"received invalid protocol negotiation message: server reported negative number of unsupported parameters".to_vec()
+        );
+
+        // A large positive count is bounded by the body: it runs out of
+        // strings and says so, without allocating for the count.
+        let mut body = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
+        body.extend_from_slice(&0x7fff_ffffu32.to_be_bytes());
+        body.extend_from_slice(b"_pq_.one\0");
+        assert_eq!(
+            Backend::decode(b'v', &body),
+            Err(ProtocolError::InsufficientData(b'v'))
+        );
+
+        // And the whole frame the reviewer named parses as far as this error.
+        let frame = [
+            b'v', 0x00, 0x00, 0x00, 0x0c, 0x00, 0x03, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let Frame::Message { id, body } = next_frame(&frame) else {
+            panic!("not a whole message");
+        };
+        assert_eq!(
+            Backend::decode(id, &frame[body]),
+            Err(ProtocolError::NegativeUnsupportedParameterCount)
         );
     }
 

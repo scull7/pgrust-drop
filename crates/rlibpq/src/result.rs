@@ -164,14 +164,25 @@ impl ResultError {
         if let Some(val) = self.field(diag::MESSAGE_PRIMARY) {
             msg.extend_from_slice(val);
         }
-        // fe-protocol3.c:1089 — with no query text to point at, both the
-        // statement and the internal position render as text.
+        // fe-protocol3.c:1089 — a statement position always renders as text
+        // here, because this result never carries the query it would point at
+        // (`res->errQuery`); that is the divergence `docs/divergences.md`
+        // records.
         if let Some(val) = self.field(diag::STATEMENT_POSITION) {
             msg.extend_from_slice(b" at character ");
             msg.extend_from_slice(val);
         } else if let Some(val) = self.field(diag::INTERNAL_POSITION) {
-            msg.extend_from_slice(b" at character ");
-            msg.extend_from_slice(val);
+            // fe-protocol3.c:1112 — an *internal* position has its query right
+            // here in `PG_DIAG_INTERNAL_QUERY`, so upstream draws a cursor
+            // over it and emits no " at character" text at all. The cursor is
+            // not ported; suppressing the text is, because otherwise the
+            // primary line differs from C libpq's for every error inside a
+            // PL/pgSQL EXECUTE. The query itself still reaches the reader on
+            // the "QUERY:  " line below.
+            if verbosity == Verbosity::Terse || self.field(diag::INTERNAL_QUERY).is_none() {
+                msg.extend_from_slice(b" at character ");
+                msg.extend_from_slice(val);
+            }
         }
         msg.push(b'\n');
 
@@ -398,6 +409,64 @@ mod tests {
                 ContextVisibility::Errors
             ),
             b"ERROR:  syntax error at or near \"selct\" at character 1\n".to_vec()
+        );
+    }
+
+    /// An error raised inside PL/pgSQL's EXECUTE: the server sends the
+    /// position as `p` together with the statement as `q`, and upstream then
+    /// puts the position on a cursor display rather than in the primary line
+    /// (`fe-protocol3.c:1112`). The cursor is not ported, so the primary line
+    /// is all this must match — and it must match, or every such error reads
+    /// differently here than through C libpq.
+    #[test]
+    fn an_internal_position_stays_out_of_the_primary_line() {
+        let error = ResultError::new(vec![
+            (diag::SEVERITY, b"ERROR".to_vec()),
+            (diag::SQLSTATE, b"42601".to_vec()),
+            (
+                diag::MESSAGE_PRIMARY,
+                b"syntax error at or near \"selct\"".to_vec(),
+            ),
+            (diag::INTERNAL_POSITION, b"1".to_vec()),
+            (diag::INTERNAL_QUERY, b"selct 1".to_vec()),
+        ]);
+        assert_eq!(
+            String::from_utf8(error.message(
+                ExecStatus::FatalError,
+                Verbosity::Default,
+                ContextVisibility::Errors
+            ))
+            .unwrap(),
+            "ERROR:  syntax error at or near \"selct\"\nQUERY:  selct 1\n"
+        );
+
+        // PQERRORS_TERSE has no QUERY line to carry the statement, so there
+        // the position does go in the text (`fe-protocol3.c:1118`).
+        assert_eq!(
+            String::from_utf8(error.message(
+                ExecStatus::FatalError,
+                Verbosity::Terse,
+                ContextVisibility::Errors
+            ))
+            .unwrap(),
+            "ERROR:  syntax error at or near \"selct\" at character 1\n"
+        );
+
+        // With no internal query there is nothing to draw a cursor over, so
+        // the text is emitted whatever the verbosity.
+        let without_query = ResultError::new(vec![
+            (diag::SEVERITY, b"ERROR".to_vec()),
+            (diag::MESSAGE_PRIMARY, b"boom".to_vec()),
+            (diag::INTERNAL_POSITION, b"7".to_vec()),
+        ]);
+        assert_eq!(
+            String::from_utf8(without_query.message(
+                ExecStatus::FatalError,
+                Verbosity::Default,
+                ContextVisibility::Errors
+            ))
+            .unwrap(),
+            "ERROR:  boom at character 7\n"
         );
     }
 

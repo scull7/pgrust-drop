@@ -18,6 +18,8 @@ architecture), then six PRs against that branch, one reviewable chunk each:
 | #7 | `claude/fix-test-gates`   | `Gate::for_tool_or_skip`; two weak tests replaced |
 | #8 | `claude/fix-rpsql-bytes`  | byte-exact error path; dispatch dedup; borrowing `VarView` |
 | #9 | `claude/fix-rlibpq-port`  | `port` validated with upstream's two messages |
+| #10 | `claude/progress-log`     | this entry |
+| #11 | `claude/fix-vendored-samples` | strip the `# PGRUST` block; re-vendor all three samples from pristine 18.6 |
 
 **Why**
 
@@ -77,8 +79,7 @@ Two consequences:
 - **Licensing.** pgrust is AGPL-3.0. ADR-0003 says never copy pgrust code,
   comments or test corpora into the MIT crates. `share/README.md` asserts these
   files are "copied **byte for byte** from the PostgreSQL 18.6 source tree" and
-  carry the PostgreSQL licence. That claim is false for this file. Owner
-  decision needed.
+  carry the PostgreSQL licence. That claim was false for this file.
 - **Correctness.** rinitdb writes pgrust-only GUCs into every cluster it
   creates. Real initdb does not.
 
@@ -89,6 +90,31 @@ length + digest, so it pins the *contaminated* bytes and passes. It proves
 different assertions, and the gap was invisible until something diffed against a
 real PostgreSQL. Neither of the two code reviews found it; the gate did, on its
 first run.
+
+**Resolved by PR #11.** All three samples re-vendored wholesale from pristine
+PostgreSQL 18.6, verified two independent ways that agree byte for byte: the
+release tarball (published sha256
+`555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f`, checked) and
+the `REL_18_6` tag (`724edf9bde9d356724ad384a2e196edc3c9f80f7`). The diff proved
+to be a single hunk removing exactly the 41-line `# PGRUST` tail — zero drift in
+the other 889 lines, so nothing had to be quietly absorbed. `pg_hba.conf.sample`
+and `pg_ident.conf.sample` were genuinely pristine already; their pinned digests
+needed no change, which corroborates it independently. `postgresql.conf.sample`
+is now 32 652 B, digest re-pinned to `0x364a_ac11_a839_c67f`.
+
+The digest pin was kept and two assertions added beside it, both with
+expectations written *from upstream* rather than derived from the file — which
+is exactly what a digest cannot do, since it is computed from the file and so
+blessed the contaminated bytes: `the_conf_sample_carries_only_upstreams_sections`
+(the 15 banner titles PG 18.6 ships, in order — catches an appended or renamed
+vendor block, and a missing upstream section) and
+`no_setting_in_the_conf_sample_is_namespaced_like_an_extension` (no assigned
+name contains a `.`, since core GUCs are never namespaced — catches a vendor GUC
+hidden inside an existing section, where no new banner would appear). Both were
+proven non-vacuous by stashing the old bytes back: both fail, suite exits 101.
+
+No existing test had pinned the contaminated output, so nothing was deleted or
+weakened to accommodate the fix.
 
 **Checks run** (Rust 1.96.0, gating on exit status, never on grepped output)
 
@@ -101,11 +127,12 @@ first run.
 
 **Risks / open questions**
 
-- The `# PGRUST` block: strip and re-vendor from pristine 18.6, or re-license?
-  Recommendation is to strip, re-pin the digest, fix `share/README.md`, and
-  re-derive the other two samples, since that tree's provenance is now suspect.
-- Anything else in the MIT crates sourced from `postgres-18.6-reference/` has
-  the same uncertain provenance and wants an audit.
+- `AGENTS.md` still defines "upstream" as the tree vendored in pgrust at
+  `crates/postgres-18.6-reference/`. That definition is what let the
+  contamination in, and it governs every port, citation and stolen test in the
+  MIT crates — not just the one sample file. A repo-wide provenance audit
+  against pristine 18.6 is in progress; the definition itself should be changed
+  to name genuine upstream.
 - PR #4's CI is red by design. Merging locks in enforcement so no future gate
   can silently skip; holding keeps the branch green and the hole open.
 - `QuoteType::ShellArg` folds into `Plain` in `rpsql`. Confirmed unreachable —

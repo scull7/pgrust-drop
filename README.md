@@ -14,7 +14,7 @@ and the Linear project *pgrust-drop* for the plan.
 | ---------------- | ----------------------------------------------------------------- |
 | `crates/rinitdb` | Rust `initdb`, tracking PostgreSQL 18.6 `src/bin/initdb`          |
 | `crates/rlibpq`  | pure-Rust libpq client (native crate + C ABI), pgrust issue #40   |
-| `crates/rpsql`   | Rust `psql`, seeded from pgrust `crates/bin/psql`                 |
+| `crates/rpsql`   | Rust `psql`, ported fresh from PostgreSQL 18.6 `src/bin/psql`     |
 | `crates/pgdrop`  | the multicall binary: `pgdrop initdb | psql | postgres | start`   |
 | `crates/testkit` | ports of PostgreSQL's TAP helpers and byte-for-byte diff gates    |
 
@@ -33,3 +33,4 @@ cargo test
 ```
 
 Contributor rules: [`AGENTS.md`](AGENTS.md). Decisions: [`docs/adr/`](docs/adr/).
+Licensing: MIT for the ports, AGPL-3.0 for `pgdrop` (it links pgrust); see [`NOTICE.md`](NOTICE.md).

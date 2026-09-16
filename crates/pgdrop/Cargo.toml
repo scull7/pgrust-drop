@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
+# Links pgrust (AGPL-3.0), so this crate is AGPL too; see ADR-0003 and ./LICENSE.
+license = "AGPL-3.0-only"
+license-file = "LICENSE"
 
 [lib]
 path = "src/lib.rs"

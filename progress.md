@@ -3,6 +3,28 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
+
+**What**
+- ADR-0001 accepted: pgrust as a rev-pinned Cargo git dependency.
+- ADR-0003 accepted: per-crate licensing. `testkit`/`rinitdb`/`rlibpq`/`rpsql`
+  MIT, ported from PostgreSQL C only (no pgrust code copied); `pgdrop`
+  AGPL-3.0-only (`crates/pgdrop/LICENSE`, `NOTICE.md`, `license` fields).
+  rpsql will be written fresh from `src/bin/psql` C sources.
+- ADR-0005: rpsql line editing with `redox_liner` (`noline` rejected: no
+  completion hook, no history file, MPL-2.0).
+- ADR-0006: rlibpq TLS backend is `rustls` behind a `tls` feature with a
+  `NoTls` fallback; crypto provider chosen in NAT-392.
+- PR opened for the branch so CI runs.
+
+**Checks run**: `cargo fmt --check`, pedantic clippy, `cargo test` (46 tests)
+still green; the license text for pgdrop is the AGPL-3.0 file from pgrust's
+repository verbatim.
+
+**Follow-ups**: NAT-398 rewritten (port from C, not import); NAT-389/388/391
+now say "read pgrust for how, port from C"; M3 gains no new issue yet, the
+`describe.c`/`print.c` ports were already scoped as fresh work.
+
 ## 2026-09-16 — Project bootstrap (NAT-372, NAT-373, NAT-377, NAT-406)
 
 **What**

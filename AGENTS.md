@@ -1,6 +1,6 @@
 # AGENTS.md — rules for working in pgrust-drop
 
-Read this first, then `progress.md`, then the ADRs under `docs/adr/`.
+Read this first, then `progress.md`, then the ADRs under `docs/adr/` (0001 layout/vendoring, 0002 embedded-template initdb, 0003 licensing, 0004 usage-rs, 0005 line editor, 0006 TLS).
 
 ## What this repo is
 
@@ -15,7 +15,7 @@ Crates (`crates/`):
 | `testkit` | `src/test/perl/PostgreSQL/Test/Utils.pm` helpers + byte-diff gates     |
 | `rinitdb` | `src/bin/initdb/` (PostgreSQL 18.6)                                    |
 | `rlibpq`  | `src/interfaces/libpq/` (pure Rust, native crate + C ABI; pgrust #40)  |
-| `rpsql`   | `src/bin/psql/` seeded from pgrust `crates/bin/psql`                   |
+| `rpsql`   | `src/bin/psql/` ported fresh from C (ADR-0003)                         |
 | `pgdrop`  | the multicall binary: `pgdrop initdb | psql | postgres | start`        |
 
 "Upstream" means the PostgreSQL 18.6 tree vendored in pgrust at
@@ -48,8 +48,13 @@ divergence. See ADR-0004.
 - Toolchain pinned to 1.96.0 (pgrust's pin). `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic`,
   `cargo test --all-features` must pass before a push.
-- stdlib first. **No new dependencies without explicit approval.** Approved:
-  `usage-rs` (all CLIs), `thiserror` (typed errors). `anyhow` is not approved.
+- stdlib first. **No new dependencies without explicit approval.** Approved so
+  far (owner, 2026-09-16): `usage-rs` (all CLIs), `thiserror` (typed errors),
+  `rustls` (rlibpq TLS, ADR-0006), `redox_liner` (rpsql line editing,
+  ADR-0005). `anyhow` is not approved.
+- Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rpsql` are MIT and are
+  ported from PostgreSQL's C sources only. **Never copy code, comments or test
+  corpora from pgrust into them.** `pgdrop` is AGPL-3.0 because it links pgrust.
 - Separate Data / Calculations / Actions. Parsing, planning, rendering are pure
   functions with unit tests; process spawning, filesystem, sockets live at the
   edge in thin functions.

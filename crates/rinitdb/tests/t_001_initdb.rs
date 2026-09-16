@@ -2,6 +2,9 @@
 //! order. Only the server-free assertions exist so far; each later chunk adds
 //! the next block of the Perl file (Linear NAT-378 … NAT-386).
 
+// Integration tests are their own crate; see the library root for why this lint is off.
+#![allow(clippy::doc_markdown)]
+
 use std::path::Path;
 
 use testkit::reference;

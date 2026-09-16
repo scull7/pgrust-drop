@@ -63,3 +63,6 @@ divergence. See ADR-0004.
 - Record every deliberate divergence from upstream in `docs/divergences.md`
   with the reason and the test that pins it.
 - Never weaken a gate to get green. A failing stolen test is a bug report.
+- When scripting checks, branch on the command's exit status, not on grepped
+  output: `cargo clippy … 2>log && echo OK` — a pipeline through `grep` returns
+  grep's status and hides failures.

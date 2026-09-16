@@ -380,6 +380,9 @@ mod tests {
             encoding: None,
             username: Some("postgres".to_owned()),
             gucs: Vec::new(),
+            do_sync: true,
+            sync_method: crate::sync::SyncMethod::Fsync,
+            sync_data_files: true,
         }
     }
 

@@ -3,6 +3,66 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-385 rinitdb default timezone selection
+
+**What**. `timezone` and `log_timezone` now come from a port of
+`select_default_timezone` (`src/bin/initdb/findtimezone.c`) rather than a
+hard-coded `GMT`. Two modules:
+
+- `rinitdb::tz` is the read half of PostgreSQL's timezone library
+  (`src/timezone/localtime.c`): `tzload` over a TZif image, `tzparse` for a
+  POSIX TZ string, `localsub`/`timesub`, and `pg_tz_acceptable`. It is pure —
+  `tzload` takes the file's bytes, not a path — and it is the piece everything
+  else stands on, so it was checked against the machine's own C library before
+  anything was built on it: 4990 instants across all 499 zones of
+  `/usr/share/zoneinfo`, every field `compare_tm` compares, zero differences
+  against `date`. That covers the v2 footer splice (`localtime.c:417`), which
+  zic's "slim" output makes load-bearing: without it every DST zone freezes at
+  its last stored transition.
+- `rinitdb::findtimezone` is the selection itself over a `TzSource` trait — the
+  timezone directory, the `/etc/localtime` symlink, `getenv("TZ")` and the
+  clock are the only things it reads. `Probe` holds the test-date set and what
+  the system's zone makes of it; `score`, the `zone_name_pref` tie-break, the
+  symlink shortcut, the `STD<ofs>DST` constructed names and the `Etc/GMT±N`
+  last resort are all upstream's, cited line by line.
+
+**Why the scoring survives at all**. Upstream scores candidates against the C
+library's `localtime()`. This port cannot call it (no libc, `deny(unsafe_code)`),
+so it reads the definition the C library itself reads — `$TZ`, else
+`/etc/localtime` — with its own reader. That is the first of three divergence
+rows; the other two are the timezone directory (`PGRUST_TZDIR` or a system
+zoneinfo, which is upstream's own `SYSTEMTZDIR` arm) and `build_time_t`'s
+`mktime`. None of them touches the scoring, the tie-break or the shortcut, so
+on any machine whose C library resolves its zone from those two places — every
+Linux and macOS one — the answer is upstream's.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 644 tests (611 before; 33 added), 31
+SKIP-flagged gate lines (30 before; the new gate is the one).
+
+**Gate**: the issue's acceptance criterion, `grep -E '^(log_)?timezone'` over C
+initdb's `postgresql.conf` against this port's rendering, in four cases — `TZ`
+deleted (which is what `001_initdb.pl:42` says its "successful creation" case
+exists for, and on this machine the `/etc/localtime` path), then a named zone,
+a POSIX-style name and a GMT-offset name. No PostgreSQL 18 on this box, so it
+SKIP-flags. It is not the only pin: `the_default_time_zone_is_the_one_etc_localtime_names`
+runs the real search on the real machine and asserts the answer is the zone
+`/etc/localtime` points at, and it passes here.
+
+**Risks**. The brute-force scan is the path least exercised on this machine —
+`/etc/localtime` is a symlink, so the shortcut wins and the scan is only
+reached in the unit tests, over a `FakeTz` database. Its tie-break is a total
+order, so the answer does not depend on directory order, but a machine without
+that symlink is where a difference would first show.
+
+**Follow-ups**. Nothing calls `findtimezone::default_timezone()` yet:
+`Settings` is still built by hand, because `test_config_settings`
+(`initdb.c:1140`) — the probe stage that fills in `max_connections`,
+`shared_buffers`, the DSM implementation *and* the time zone — is NAT-381's.
+The function and its gate are ready for it. `Settings::default()` still carries
+`Some("GMT")`, which is what a machine with no timezone database lands on and
+what the struct's own doc comment calls a unit-test convenience.
+
 ## 2026-09-16 — NAT-398 review fixes
 
 **What** (four of the seven findings were real bugs, two were tests or docs

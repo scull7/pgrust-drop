@@ -11,7 +11,9 @@
 //! the tables and messages they need, [`conf`] renders the configuration files
 //! from the vendored templates over [`pg_config`]'s build-time constants,
 //! [`sync`] plans and performs `sync_pgdata`, [`control`] parses and rewrites
-//! `pg_control` over [`crc32c`], [`help`] is the upstream text,
+//! `pg_control` over [`crc32c`], [`tz`] reads the timezone database and
+//! [`findtimezone`] picks the default zone over it, [`help`] is the upstream
+//! text,
 //! and [`run`] is the only function that writes to a stream.
 
 #![deny(unsafe_code)]
@@ -29,10 +31,12 @@ pub mod crc32c;
 pub mod encoding;
 pub mod error;
 pub mod file_perm;
+pub mod findtimezone;
 pub mod help;
 pub mod layout;
 pub mod pg_config;
 pub mod sync;
+pub mod tz;
 pub mod validate;
 
 use std::ffi::OsString;
@@ -47,6 +51,7 @@ pub use control::{
 };
 pub use error::{InitdbError, LocaleProvider};
 pub use file_perm::DataDirPerm;
+pub use findtimezone::{RealTzSource, TzSource, select_default_timezone};
 pub use layout::{FsOp, layout};
 pub use sync::{SyncMethod, SyncOp};
 pub use validate::{CreatePlan, Environment, FsProbe, Plan, RealFs, SyncPlan, validate};

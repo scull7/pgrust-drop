@@ -10,8 +10,8 @@
 //! calculation over an [`validate::FsProbe`], [`encoding`] and [`error`] are
 //! the tables and messages they need, [`conf`] renders the configuration files
 //! from the vendored templates over [`pg_config`]'s build-time constants,
-//! [`help`] is the upstream text, and [`run`] is the only function that writes
-//! to a stream.
+//! [`sync`] plans and performs `sync_pgdata`, [`help`] is the upstream text,
+//! and [`run`] is the only function that writes to a stream.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -29,6 +29,7 @@ pub mod file_perm;
 pub mod help;
 pub mod layout;
 pub mod pg_config;
+pub mod sync;
 pub mod validate;
 
 use std::ffi::OsString;
@@ -40,7 +41,8 @@ pub use conf::{AuthMethods, DateOrder, Settings};
 pub use error::{InitdbError, LocaleProvider};
 pub use file_perm::DataDirPerm;
 pub use layout::{FsOp, layout};
-pub use validate::{Environment, FsProbe, Plan, RealFs, validate};
+pub use sync::{SyncMethod, SyncOp};
+pub use validate::{CreatePlan, Environment, FsProbe, Plan, RealFs, SyncPlan, validate};
 
 /// Exit status C initdb uses for its own errors (`pg_fatal`, `exit(1)`).
 const EXIT_FAILURE: u8 = 1;
@@ -75,15 +77,44 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
                     let _ = writeln!(stderr, "{}", err.render());
                     ExitCode::from(EXIT_FAILURE)
                 }
-                Ok(_plan) => {
+                // initdb.c:3439 — `--sync-only` does its one job and returns 0
+                // before any of the cluster-creation steps.
+                Ok(Plan::Sync(plan)) => sync_only(&plan, stdout, stderr),
+                Ok(Plan::Create(_)) => {
                     let _ = writeln!(
                         stderr,
-                        "{}: error: cluster initialization is not implemented yet (Linear NAT-379 … NAT-387)",
+                        "{}: error: cluster initialization is not implemented yet (Linear NAT-381 … NAT-387)",
                         help::PROGNAME
                     );
                     ExitCode::from(EXIT_FAILURE)
                 }
             }
+        }
+    }
+}
+
+/// `initdb.c:3439`: the whole of the `--sync-only` path.
+fn sync_only(plan: &SyncPlan, stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
+    // initdb.c:3447 — fputs then fflush, because check_ok finishes the line
+    // only once the syncing is done.
+    let _ = stdout.write_all(sync::SYNCING_PROGRESS.as_bytes());
+    let _ = stdout.flush();
+
+    let ops = sync::plan(
+        &plan.pgdata,
+        plan.sync_method,
+        plan.sync_data_files,
+        &sync::RealFs,
+    );
+    match sync::apply(&ops, stderr) {
+        // check_ok(), initdb.c:2127.
+        Ok(()) => {
+            let _ = stdout.write_all(sync::CHECK_OK.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "{}", err.render());
+            ExitCode::from(EXIT_FAILURE)
         }
     }
 }

@@ -179,6 +179,37 @@ pub enum InitdbError {
     /// `initdb.c:1038` (`write_version_file`).
     #[error("could not write file \"{path}\": {reason}")]
     CouldNotWriteFile { path: String, reason: String },
+
+    /// `src/fe_utils/option_utils.c:99`, reached from the `--sync-method`
+    /// switch arm at `initdb.c:3389`. The `%s` is always `syncfs`: `fsync` is
+    /// unconditional and any third spelling takes the variant below.
+    #[error("this build does not support sync method \"{name}\"")]
+    UnsupportedSyncMethod { name: &'static str },
+
+    /// `src/fe_utils/option_utils.c:106`. Unlike the line above, the value is
+    /// not quoted.
+    #[error("unrecognized sync method: {name}")]
+    UnrecognizedSyncMethod { name: String },
+
+    /// `src/common/file_utils.c:123` (the `pg_wal` `lstat` in `sync_pgdata`)
+    /// and `:588` (`get_dirent_type`). Both are reported and walked past.
+    #[error("could not stat file \"{path}\": {reason}")]
+    CouldNotStatFile { path: String, reason: String },
+
+    /// `src/common/file_utils.c:304` (`walkdir`). Reported, and the directory
+    /// is skipped.
+    #[error("could not open directory \"{path}\": {reason}")]
+    CouldNotOpenDirectory { path: String, reason: String },
+
+    /// `src/common/file_utils.c:428` (`fsync_fname`). Reported; the file is
+    /// not synced and the walk carries on.
+    #[error("could not open file \"{path}\": {reason}")]
+    CouldNotOpenFile { path: String, reason: String },
+
+    /// `src/common/file_utils.c:440` (`fsync_fname`), the one fatal site in
+    /// the walk: `pg_log_error` then `exit(EXIT_FAILURE)`.
+    #[error("could not fsync file \"{path}\": {reason}")]
+    CouldNotFsyncFile { path: String, reason: String },
 }
 
 impl InitdbError {

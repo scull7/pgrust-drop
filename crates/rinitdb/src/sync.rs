@@ -92,6 +92,24 @@ pub enum FileKind {
     Other,
 }
 
+/// What one `opendir` + `readdir` loop yielded (`file_utils.c:308`).
+///
+/// The two failures are different messages at different places, so they are
+/// different fields: `opendir` failing is the `Err` of
+/// [`SyncProbe::read_dir`], which makes `walkdir` give up on the directory
+/// entirely (`file_utils.c:304`); `readdir` failing part-way through is
+/// [`DirListing::read_error`], which C reports *after* acting on everything it
+/// did manage to read and then still fsyncs the directory (`:337`, `:347`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirListing {
+    /// The entry names the loop read, in directory order, without `.` and
+    /// `..` (`file_utils.c:312`).
+    pub names: Vec<OsString>,
+    /// `errno` after the loop, as `%m` would print it: `Some` only when
+    /// `readdir` itself failed before the directory ran out.
+    pub read_error: Option<String>,
+}
+
 /// The three things the walk asks of the filesystem.
 ///
 /// A trait so [`plan`] is a calculation: every case below is exercised from a
@@ -113,12 +131,13 @@ pub trait SyncProbe {
     /// What `%m` would print for the failing `stat`.
     fn stat(&self, path: &Path) -> Result<FileKind, String>;
 
-    /// `opendir` + `readdir`: the entry names, in directory order, without
-    /// `.` and `..`.
+    /// `opendir` + the `readdir` loop, as [`DirListing`].
     ///
     /// # Errors
-    /// What `%m` would print for the failing `opendir` or `readdir`.
-    fn read_dir(&self, path: &Path) -> Result<Vec<OsString>, String>;
+    /// What `%m` would print for a failing `opendir`. A `readdir` that fails
+    /// part-way through is not an error here: it comes back as
+    /// [`DirListing::read_error`] alongside the names already read.
+    fn read_dir(&self, path: &Path) -> Result<DirListing, String>;
 }
 
 /// One step of `sync_pgdata`, in the order C performs it.
@@ -160,10 +179,13 @@ pub fn plan(
         }
     };
 
-    // file_utils.c:188 is a switch on the method. `SyncMethod::Syncfs` plans
-    // this same `DATA_DIR_SYNC_METHOD_FSYNC` branch, because `syncfs(2)` is
-    // not reachable from the standard library; see the `--sync-method=syncfs`
-    // row in docs/divergences.md and `syncfs_plans_the_same_walk_as_fsync`.
+    // file_utils.c:188 is a switch on the method, and both arms plan the same
+    // `DATA_DIR_SYNC_METHOD_FSYNC` walk here, because `syncfs(2)` is not
+    // reachable from the standard library; see the `--sync-method=syncfs` row
+    // in docs/divergences.md and `syncfs_plans_the_same_walk_as_fsync`. This
+    // match is the exhaustiveness guard that keeps that a decision: a third
+    // `DataDirSyncMethod` stops compiling here instead of quietly inheriting
+    // the fsync walk.
     match method {
         SyncMethod::Fsync | SyncMethod::Syncfs => {}
     }
@@ -201,8 +223,8 @@ fn walkdir(
         return;
     }
 
-    let names = match fs.read_dir(path) {
-        Ok(names) => names,
+    let listing = match fs.read_dir(path) {
+        Ok(listing) => listing,
         Err(reason) => {
             // file_utils.c:304 — reported, and the caller carries on. Note
             // that `path` itself is *not* fsync'd in this case: C returns
@@ -215,7 +237,7 @@ fn walkdir(
         }
     };
 
-    for name in names {
+    for name in listing.names {
         let subpath = path.join(name);
         match dirent_type(&subpath, process_symlinks, fs, ops) {
             Some(FileKind::Regular) => ops.push(SyncOp::Fsync {
@@ -229,6 +251,16 @@ fn walkdir(
             // entries `get_dirent_type` already complained about are ignored.
             _ => {}
         }
+    }
+
+    // file_utils.c:337 — `if (errno)` after the loop. A readdir that gave up
+    // part-way is reported here, after everything it did read has been acted
+    // on, and the directory is still fsync'd below.
+    if let Some(reason) = listing.read_error {
+        ops.push(SyncOp::Warn(InitdbError::CouldNotReadDirectory {
+            path: display(path),
+            reason,
+        }));
     }
 
     // file_utils.c:347 — "It's important to fsync the destination directory
@@ -384,17 +416,26 @@ impl SyncProbe for RealFs {
             .map_err(|err| crate::validate::strerror(&err))
     }
 
-    fn read_dir(&self, path: &Path) -> Result<Vec<OsString>, String> {
-        // `read_dir` already skips "." and ".." (file_utils.c:312).
+    fn read_dir(&self, path: &Path) -> Result<DirListing, String> {
+        // Only the `opendir` failure is an Err: file_utils.c:302.
         let entries = std::fs::read_dir(path).map_err(|err| crate::validate::strerror(&err))?;
-        let mut names = Vec::new();
+        let mut listing = DirListing::default();
         for entry in entries {
-            // file_utils.c:338: a readdir that fails mid-way is its own
-            // message, but the walk has already acted on what it read.
-            let entry = entry.map_err(|err| crate::validate::strerror(&err))?;
-            names.push(entry.file_name());
+            // file_utils.c:308 — `while (errno = 0, (de = readdir(dir)) !=
+            // NULL)`. A failure here ends the loop with the names already
+            // read intact; `:337` then reports it. Std folds `readdir`'s
+            // errno into the item, so the loop stops at the first bad item,
+            // exactly where C's would.
+            match entry {
+                // `read_dir` already skips "." and ".." (file_utils.c:312).
+                Ok(entry) => listing.names.push(entry.file_name()),
+                Err(err) => {
+                    listing.read_error = Some(crate::validate::strerror(&err));
+                    break;
+                }
+            }
         }
-        Ok(names)
+        Ok(listing)
     }
 }
 
@@ -425,6 +466,9 @@ mod tests {
         entries: BTreeMap<PathBuf, Vec<OsString>>,
         /// Where a symlink points, for `stat`.
         targets: BTreeMap<PathBuf, FileKind>,
+        /// Directories whose `readdir` gives up after handing over the names
+        /// in `entries`, with the `%m` text it gives up with.
+        read_errors: BTreeMap<PathBuf, String>,
     }
 
     impl FakeFs {
@@ -439,6 +483,14 @@ mod tests {
 
         fn file(mut self, path: &str) -> Self {
             self.kinds.insert(PathBuf::from(path), FileKind::Regular);
+            self
+        }
+
+        /// A directory whose `readdir` fails after `names` (`file_utils.c:308`).
+        fn unreadable_after(mut self, path: &str, names: &[&str], reason: &str) -> Self {
+            self = self.dir(path, names);
+            self.read_errors
+                .insert(PathBuf::from(path), reason.to_owned());
             self
         }
 
@@ -472,9 +524,12 @@ mod tests {
             }
         }
 
-        fn read_dir(&self, path: &Path) -> Result<Vec<OsString>, String> {
+        fn read_dir(&self, path: &Path) -> Result<DirListing, String> {
             match self.entries.get(path) {
-                Some(names) => Ok(names.clone()),
+                Some(names) => Ok(DirListing {
+                    names: names.clone(),
+                    read_error: self.read_errors.get(path).cloned(),
+                }),
                 None if self.kinds.contains_key(path) => Err("Not a directory".to_owned()),
                 None => Err(ENOENT.to_owned()),
             }
@@ -683,6 +738,44 @@ mod tests {
         assert!(!fsyncs(&ops).contains(&"/d/global".to_owned()));
         // The walk still finishes the rest of the tree.
         assert!(fsyncs(&ops).contains(&"/d".to_owned()));
+    }
+
+    #[test]
+    fn a_readdir_that_gives_up_part_way_is_not_an_unopenable_directory() {
+        // file_utils.c:302 and :337 are two different messages at two
+        // different places. opendir failing means the directory is skipped
+        // whole (tested above); readdir failing part-way means C acts on the
+        // names it did read, reports `could not read directory`, and *still*
+        // fsyncs the directory at :347.
+        let fs = cluster().unreadable_after("/d/global", &["pg_control"], "Stale file handle");
+        let ops = plan(Path::new("/d"), SyncMethod::Fsync, true, &fs);
+
+        assert_eq!(
+            warnings(&ops),
+            vec!["initdb: error: could not read directory \"/d/global\": Stale file handle"]
+        );
+        // The entry it read is synced, the warning lands after it, and the
+        // directory itself is still synced.
+        let synced = fsyncs(&ops);
+        assert!(
+            synced.contains(&"/d/global/pg_control".to_owned()),
+            "{synced:?}"
+        );
+        assert!(synced.contains(&"/d/global".to_owned()), "{synced:?}");
+
+        let global = ops
+            .iter()
+            .position(|op| matches!(op, SyncOp::Warn(InitdbError::CouldNotReadDirectory { .. })))
+            .expect("the readdir warning");
+        let entry = ops
+            .iter()
+            .position(|op| matches!(op, SyncOp::Fsync { path, .. } if path == Path::new("/d/global/pg_control")))
+            .expect("the entry it read");
+        let dir = ops
+            .iter()
+            .position(|op| matches!(op, SyncOp::Fsync { path, isdir: true } if path == Path::new("/d/global")))
+            .expect("the directory itself");
+        assert!(entry < global && global < dir, "{ops:#?}");
     }
 
     /// The pin for the `--sync-method=syncfs` row in `docs/divergences.md`.

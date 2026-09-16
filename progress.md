@@ -3,6 +3,55 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-416 review fixes
+
+**What** (two findings were real, the third is a history the branch cannot undo)
+- `install-links` promised "an error naming the path" and then named a path the
+  operator could not copy back. Every `InstallError` path field was a `String`
+  built from `Path::display()`, so `install-links $'/tmp/b\xffad'` with a file
+  in the way reported `"/tmp/b\u{FFFD}ad/psql"` — the `0xFF` came out as the
+  three bytes `EF BF BD`. The paths are `PathBuf`s now, the message is built as
+  an `OsString` by `InstallError::message`, and `write_os_line` puts it on the
+  stream as bytes, so the name survives end to end. `LinkOp::note` had the same
+  defect and got the same treatment: a `created "…"` line is a path the caller
+  may well feed back to a shell.
+
+  `Display` cannot be that message — `std::fmt` has no byte-preserving path —
+  so `thiserror`'s derive could no longer be the single home for the wording.
+  `message()` is that home; `Display` is it with the substitution `fmt` forces,
+  and a unit assertion pins the two together. With the derive gone, `thiserror`
+  is no longer a pgdrop dependency, and its manifest and lockfile lines are
+  removed in this one commit.
+- `APPLETS` was defined as `Applet::ALL`, which made
+  `assert_eq!(APPLETS, Applet::ALL)` a tautology dressed as a guard. The alias
+  is gone; `run` and the tests plan over `Applet::ALL` directly, and the test
+  now earns its name by checking that the planned links are named after every
+  applet the dispatcher answers to.
+- **Not fixable here**: 577a03e added `thiserror` to pgdrop's manifest while
+  its `Cargo.lock` line landed in cffab72, so `cargo build --locked` fails at
+  577a03e alone. Amending and force-pushing are forbidden (AGENTS.md), so the
+  hazard stays at exactly that one commit and is recorded here for a bisect
+  that lands on it. `cargo build --locked --all-targets` is exit 0 at this
+  commit and at every commit after it; this one removes the dependency, so
+  manifest and lockfile move together.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 363 tests (was 361), 19 gates still
+`SKIP (flagged, not silent)`. `cargo build --locked --all-targets` exit 0.
+Non-vacuity checked by putting `Path::display()` back inside `quoted`: the two
+new byte-fidelity tests fail (the unit one over `render`, the integration one
+over the binary's real stderr and stdout) and nothing else does.
+
+**Risks**. Off Unix `write_os_line` still goes through `to_string_lossy`,
+because no stable byte view of an `OsStr` exists there; Windows paths are
+UTF-16 and lose nothing unless they hold an unpaired surrogate.
+
+**Follow-ups**. `rinitdb`'s `InitdbError` holds its paths as `String`s filled
+from `Path::display()` too, so a non-UTF-8 `--pgdata` is reported with the same
+substitution while C's `%s` writes the bytes. That is a port with stolen tests
+and a byte-diff gate, so it is a finding for its own issue, not a change to
+make from here; noted for NAT-378's reviewer.
+
 ## 2026-09-16 — NAT-416 pgdrop install-links
 
 **What**. `pgdrop install-links DIR` creates one symlink per applet —

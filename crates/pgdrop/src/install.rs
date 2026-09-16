@@ -27,6 +27,8 @@
 //! after the operator has looked at that file — starts from the state they
 //! inspected rather than from a half-installed one.
 
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,9 +42,6 @@ const PROGNAME: &str = "pgdrop";
 
 /// Exit status for a failed `install-links`.
 const EXIT_FAILURE: u8 = 1;
-
-/// The names `install-links` creates, in the order it creates them.
-pub const APPLETS: [Applet; 3] = Applet::ALL;
 
 /// Options for `pgdrop install-links` (Linear NAT-416).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -162,86 +161,153 @@ impl LinkOp {
     }
 
     /// Pure: the line [`apply`] prints once the op has been carried out.
+    ///
+    /// An [`OsString`], not a `String`: it names a path the operator gave us
+    /// and may want to copy back, and `Path::display()` would replace the
+    /// bytes of a name that is not UTF-8 with `U+FFFD`. [`write_os_line`]
+    /// puts the bytes back on the stream unchanged.
     #[must_use]
-    pub fn note(&self) -> String {
+    pub fn note(&self) -> OsString {
+        let mut note = OsString::from(format!("{PROGNAME}: "));
         match self {
-            LinkOp::Create { link, target } => format!(
-                "{PROGNAME}: created \"{}\" -> \"{}\"",
-                link.display(),
-                target.display()
-            ),
-            LinkOp::Replace { link, target } => format!(
-                "{PROGNAME}: replaced \"{}\" -> \"{}\"",
-                link.display(),
-                target.display()
-            ),
-            LinkOp::Keep { link } => format!(
-                "{PROGNAME}: \"{}\" is already a symbolic link; left alone (use --force to replace it)",
-                link.display()
-            ),
+            LinkOp::Create { link, target } => {
+                note.push("created ");
+                quoted(&mut note, link);
+                note.push(" -> ");
+                quoted(&mut note, target);
+            }
+            LinkOp::Replace { link, target } => {
+                note.push("replaced ");
+                quoted(&mut note, link);
+                note.push(" -> ");
+                quoted(&mut note, target);
+            }
+            LinkOp::Keep { link } => {
+                quoted(&mut note, link);
+                note.push(" is already a symbolic link; left alone (use --force to replace it)");
+            }
         }
+        note
     }
 }
 
 /// Everything `install-links` can fail with.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// The paths are [`PathBuf`]s and the message is built as an [`OsString`] by
+/// [`InstallError::message`], because "an error naming the path" has to name
+/// the path the operator typed: a `String` field filled from
+/// `Path::display()` would hand back `U+FFFD` where a name is not UTF-8, and
+/// they could not copy it back. `Display` is that same message with the
+/// substitutions `std::fmt` cannot avoid, so there is still one home for the
+/// wording; `message` is the authoritative one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
     /// `std::env::current_exe()` failed, so there is no target to point at.
-    #[error("could not determine the path of this executable: {reason}")]
     NoCurrentExe {
         /// What `%m` would print.
         reason: String,
     },
     /// The target is relative, and a relative link target would be resolved
     /// against the link's own directory rather than the current one.
-    #[error("refusing to point the links at the relative path \"{path}\"")]
     RelativeTarget {
         /// The offending target.
-        path: String,
+        path: PathBuf,
     },
     /// Something that is not a symlink is using the name.
-    #[error("refusing to replace \"{path}\": it is {noun}, not a symbolic link")]
     Occupied {
         /// The name that is taken.
-        path: String,
+        path: PathBuf,
         /// [`EntryKind::noun`] for what is there.
         noun: &'static str,
     },
     /// `lstat` on the name failed with something other than `ENOENT`.
-    #[error("could not access \"{path}\": {reason}")]
     Unreadable {
         /// The name that could not be examined.
-        path: String,
+        path: PathBuf,
         /// What `%m` would print.
         reason: String,
     },
     /// `--force` could not get the old link out of the way.
-    #[error("could not remove \"{path}\": {reason}")]
     Remove {
         /// The link that is still there.
-        path: String,
+        path: PathBuf,
         /// What `%m` would print.
         reason: String,
     },
     /// `symlink(2)` failed — most often because `DIR` does not exist.
-    #[error("could not create symbolic link \"{path}\": {reason}")]
     Symlink {
         /// The link that was not created.
-        path: String,
+        path: PathBuf,
         /// What `%m` would print.
         reason: String,
     },
     /// A platform with neither `symlink(2)` nor Windows' file symlinks.
-    #[error("symbolic links are not supported on this platform")]
     Unsupported,
 }
 
 impl InstallError {
-    /// The stderr line, `pg_log_error`-shaped, without its newline.
+    /// Pure: the message itself, with every path's bytes intact.
     #[must_use]
-    pub fn render(&self) -> String {
-        format!("{PROGNAME}: error: {self}")
+    pub fn message(&self) -> OsString {
+        match self {
+            InstallError::NoCurrentExe { reason } => OsString::from(format!(
+                "could not determine the path of this executable: {reason}"
+            )),
+            InstallError::RelativeTarget { path } => {
+                let mut line = OsString::from("refusing to point the links at the relative path ");
+                quoted(&mut line, path);
+                line
+            }
+            InstallError::Occupied { path, noun } => {
+                let mut line = OsString::from("refusing to replace ");
+                quoted(&mut line, path);
+                line.push(format!(": it is {noun}, not a symbolic link"));
+                line
+            }
+            InstallError::Unreadable { path, reason } => about(path, "could not access ", reason),
+            InstallError::Remove { path, reason } => about(path, "could not remove ", reason),
+            InstallError::Symlink { path, reason } => {
+                about(path, "could not create symbolic link ", reason)
+            }
+            InstallError::Unsupported => {
+                OsString::from("symbolic links are not supported on this platform")
+            }
+        }
     }
+
+    /// Pure: the stderr line, `pg_log_error`-shaped, without its newline.
+    #[must_use]
+    pub fn render(&self) -> OsString {
+        let mut line = OsString::from(format!("{PROGNAME}: error: "));
+        line.push(self.message());
+        line
+    }
+}
+
+impl fmt::Display for InstallError {
+    /// The message, with a path that is not UTF-8 rendered lossily — which is
+    /// exactly why [`InstallError::render`] and not this is what reaches
+    /// stderr. `std::fmt` has no byte-preserving path.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message().to_string_lossy())
+    }
+}
+
+impl std::error::Error for InstallError {}
+
+/// `<verb> "<path>": <what %m said>`, the shape three variants share.
+fn about(path: &Path, verb: &str, reason: &str) -> OsString {
+    let mut line = OsString::from(verb);
+    quoted(&mut line, path);
+    line.push(format!(": {reason}"));
+    line
+}
+
+/// Append `"path"`, quotes included and bytes intact.
+fn quoted(line: &mut OsString, path: &Path) {
+    line.push("\"");
+    line.push(path);
+    line.push("\"");
 }
 
 /// Pure: what has to happen to each of `applets`' names in `dir`.
@@ -264,7 +330,7 @@ pub fn link_plan(
 ) -> Result<Vec<LinkOp>, InstallError> {
     if !exe.is_absolute() {
         return Err(InstallError::RelativeTarget {
-            path: exe.display().to_string(),
+            path: exe.to_path_buf(),
         });
     }
     let mut ops = Vec::with_capacity(applets.len());
@@ -281,14 +347,11 @@ pub fn link_plan(
             },
             EntryKind::Symlink => LinkOp::Keep { link },
             EntryKind::Unreadable { reason } => {
-                return Err(InstallError::Unreadable {
-                    path: link.display().to_string(),
-                    reason,
-                });
+                return Err(InstallError::Unreadable { path: link, reason });
             }
             taken => {
                 return Err(InstallError::Occupied {
-                    path: link.display().to_string(),
+                    path: link,
                     noun: taken.noun(),
                 });
             }
@@ -317,7 +380,7 @@ pub fn apply(ops: &[LinkOp], out: &mut impl Write) -> Result<(), InstallError> {
                 // races with, and a rename dance would trade that window for a
                 // stray temporary name in a directory on PATH.
                 std::fs::remove_file(link).map_err(|err| InstallError::Remove {
-                    path: link.display().to_string(),
+                    path: link.clone(),
                     reason: strerror(&err),
                 })?;
                 symlink(target, link)?;
@@ -325,7 +388,7 @@ pub fn apply(ops: &[LinkOp], out: &mut impl Write) -> Result<(), InstallError> {
             LinkOp::Keep { .. } => {}
         }
         // A closed stream is not worth a second error message.
-        let _ = writeln!(out, "{}", op.note());
+        let _ = write_os_line(out, &op.note());
     }
     Ok(())
 }
@@ -334,7 +397,7 @@ pub fn apply(ops: &[LinkOp], out: &mut impl Write) -> Result<(), InstallError> {
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> Result<(), InstallError> {
     std::os::unix::fs::symlink(target, link).map_err(|err| InstallError::Symlink {
-        path: link.display().to_string(),
+        path: link.to_path_buf(),
         reason: strerror(&err),
     })
 }
@@ -344,7 +407,7 @@ fn symlink(target: &Path, link: &Path) -> Result<(), InstallError> {
 #[cfg(windows)]
 fn symlink(target: &Path, link: &Path) -> Result<(), InstallError> {
     std::os::windows::fs::symlink_file(target, link).map_err(|err| InstallError::Symlink {
-        path: link.display().to_string(),
+        path: link.to_path_buf(),
         reason: strerror(&err),
     })
 }
@@ -352,6 +415,27 @@ fn symlink(target: &Path, link: &Path) -> Result<(), InstallError> {
 #[cfg(not(any(unix, windows)))]
 fn symlink(_target: &Path, _link: &Path) -> Result<(), InstallError> {
     Err(InstallError::Unsupported)
+}
+
+/// Action: write one message and its newline, keeping its bytes.
+///
+/// # Errors
+/// Whatever the stream reports; both callers ignore it, because a closed
+/// stream is not worth a second error message.
+fn write_os_line(out: &mut impl Write, line: &OsStr) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        out.write_all(line.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        // No stable byte view of an `OsStr` off Unix. Windows paths are UTF-16
+        // and lose nothing through a lossy conversion that is only reached for
+        // an unpaired surrogate.
+        out.write_all(line.to_string_lossy().as_bytes())?;
+    }
+    out.write_all(b"\n")
 }
 
 /// What `%m` would print: `strerror(errno)` and nothing else.
@@ -362,12 +446,12 @@ fn strerror(err: &std::io::Error) -> String {
 /// The whole command: read the process, plan, apply, report.
 pub fn run(args: &InstallLinks, stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
     let plan = current_exe()
-        .and_then(|exe| link_plan(&exe, &args.dir, &APPLETS, args.force, &RealFs))
+        .and_then(|exe| link_plan(&exe, &args.dir, &Applet::ALL, args.force, &RealFs))
         .and_then(|ops| apply(&ops, stdout));
     match plan {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let _ = writeln!(stderr, "{}", err.render());
+            let _ = write_os_line(stderr, &err.render());
             ExitCode::from(EXIT_FAILURE)
         }
     }
@@ -413,7 +497,13 @@ mod tests {
     const EXE: &str = "/opt/pgdrop/bin/pgdrop";
 
     fn plan(fs: &FakeFs, force: bool) -> Result<Vec<LinkOp>, InstallError> {
-        link_plan(Path::new(EXE), Path::new("/tmp/bin"), &APPLETS, force, fs)
+        link_plan(
+            Path::new(EXE),
+            Path::new("/tmp/bin"),
+            &Applet::ALL,
+            force,
+            fs,
+        )
     }
 
     fn create(name: &str) -> LinkOp {
@@ -447,7 +537,7 @@ mod tests {
         let err = link_plan(
             Path::new("target/debug/pgdrop"),
             Path::new("/tmp/bin"),
-            &APPLETS,
+            &Applet::ALL,
             false,
             &FakeFs::empty(),
         )
@@ -455,7 +545,7 @@ mod tests {
         assert_eq!(
             err,
             InstallError::RelativeTarget {
-                path: "target/debug/pgdrop".to_owned(),
+                path: PathBuf::from("target/debug/pgdrop"),
             }
         );
     }
@@ -505,7 +595,7 @@ mod tests {
                 assert_eq!(
                     plan(&fs, force).expect_err("occupied"),
                     InstallError::Occupied {
-                        path: "/tmp/bin/psql".to_owned(),
+                        path: PathBuf::from("/tmp/bin/psql"),
                         noun,
                     },
                     "{kind:?} force={force}"
@@ -525,7 +615,7 @@ mod tests {
         assert_eq!(
             plan(&fs, true).expect_err("unreadable"),
             InstallError::Unreadable {
-                path: "/tmp/bin/initdb".to_owned(),
+                path: PathBuf::from("/tmp/bin/initdb"),
                 reason: "Permission denied".to_owned(),
             }
         );
@@ -538,65 +628,104 @@ mod tests {
                 reason: "No such file or directory".to_owned(),
             },
             InstallError::RelativeTarget {
-                path: "./pgdrop".to_owned(),
+                path: PathBuf::from("./pgdrop"),
             },
             InstallError::Occupied {
-                path: "/tmp/bin/psql".to_owned(),
+                path: PathBuf::from("/tmp/bin/psql"),
                 noun: "a regular file",
             },
             InstallError::Unreadable {
-                path: "/tmp/bin/psql".to_owned(),
+                path: PathBuf::from("/tmp/bin/psql"),
                 reason: "Permission denied".to_owned(),
             },
             InstallError::Remove {
-                path: "/tmp/bin/psql".to_owned(),
+                path: PathBuf::from("/tmp/bin/psql"),
                 reason: "Permission denied".to_owned(),
             },
             InstallError::Symlink {
-                path: "/tmp/bin/psql".to_owned(),
+                path: PathBuf::from("/tmp/bin/psql"),
                 reason: "No such file or directory".to_owned(),
             },
             InstallError::Unsupported,
         ];
         for err in errors {
-            let line = err.render();
+            let line = err.render().to_string_lossy().into_owned();
             assert!(
                 line.starts_with("pgdrop: error: "),
                 "{line}: not a pg_log_error line"
             );
             assert!(!line.ends_with('\n'), "{line}: the caller adds the newline");
+            // One home for the wording: Display is `message` too.
+            assert_eq!(line, format!("pgdrop: error: {err}"));
         }
         assert_eq!(
             InstallError::Occupied {
-                path: "/tmp/bin/psql".to_owned(),
+                path: PathBuf::from("/tmp/bin/psql"),
                 noun: "a regular file",
             }
             .render(),
-            "pgdrop: error: refusing to replace \"/tmp/bin/psql\": it is a regular file, \
-             not a symbolic link"
+            OsString::from(
+                "pgdrop: error: refusing to replace \"/tmp/bin/psql\": it is a regular file, \
+                 not a symbolic link"
+            )
         );
+    }
+
+    /// The Acceptance line is "an error naming the path", and a path is bytes.
+    /// `Path::display()` would put `U+FFFD` where the `0xFF` is, naming a path
+    /// the operator cannot copy back.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_keeps_its_bytes_through_the_message() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let dir = PathBuf::from(OsString::from_vec(b"/tmp/b\xffad".to_vec()));
+        let psql = dir.join("psql");
+        let fs = FakeFs(
+            [(psql.clone(), EntryKind::File)]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+        );
+        let err = link_plan(Path::new(EXE), &dir, &Applet::ALL, false, &fs).expect_err("occupied");
+
+        let rendered = err.render();
+        let bytes = rendered.as_bytes();
+        let wanted = psql.as_os_str().as_bytes();
+        assert!(
+            bytes.windows(wanted.len()).any(|window| window == wanted),
+            "the path is not in the message byte for byte: {rendered:?}"
+        );
+        // U+FFFD, the substitution this test exists to keep out.
+        assert!(
+            !bytes.windows(3).any(|window| window == [0xEF, 0xBF, 0xBD]),
+            "the message still substitutes: {rendered:?}"
+        );
+
+        let mut stream = Vec::new();
+        write_os_line(&mut stream, &rendered).expect("write");
+        assert_eq!(stream, [bytes, b"\n"].concat());
     }
 
     #[test]
     fn each_note_names_the_link_and_says_what_happened() {
-        let created = create("initdb").note();
         assert_eq!(
-            created,
-            format!("pgdrop: created \"/tmp/bin/initdb\" -> \"{EXE}\"")
+            create("initdb").note(),
+            OsString::from(format!("pgdrop: created \"/tmp/bin/initdb\" -> \"{EXE}\""))
         );
-        let replaced = LinkOp::Replace {
-            link: PathBuf::from("/tmp/bin/psql"),
-            target: PathBuf::from(EXE),
-        }
-        .note();
         assert_eq!(
-            replaced,
-            format!("pgdrop: replaced \"/tmp/bin/psql\" -> \"{EXE}\"")
+            LinkOp::Replace {
+                link: PathBuf::from("/tmp/bin/psql"),
+                target: PathBuf::from(EXE),
+            }
+            .note(),
+            OsString::from(format!("pgdrop: replaced \"/tmp/bin/psql\" -> \"{EXE}\""))
         );
         let kept = LinkOp::Keep {
             link: PathBuf::from("/tmp/bin/postgres"),
         }
-        .note();
+        .note()
+        .to_string_lossy()
+        .into_owned();
         assert!(kept.contains("/tmp/bin/postgres"), "{kept}");
         assert!(kept.contains("--force"), "{kept}");
     }
@@ -615,7 +744,6 @@ mod tests {
 
     #[test]
     fn every_applet_the_dispatcher_answers_to_gets_a_link_with_its_name() {
-        assert_eq!(APPLETS, Applet::ALL);
         let ops = plan(&FakeFs::empty(), false).expect("plan");
         let names: Vec<String> = ops
             .iter()

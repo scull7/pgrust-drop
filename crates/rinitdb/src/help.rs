@@ -88,11 +88,24 @@ pub fn version_line(progname: &str) -> String {
     format!("{progname} (PostgreSQL) {PG_VERSION}")
 }
 
-/// `pg_log_error_hint("Try \"%s --help\" for more information.", progname)`
-/// as `src/common/logging.c` renders it: `progname: hint: …`.
+/// The message of `pg_log_error_hint("Try \"%s --help\" for more information.",
+/// progname)`, without the `progname: hint: ` that `src/common/logging.c`
+/// prefixes.
+///
+/// `initdb.c` emits this from four sites (`:3274`, `:3400`, `:3420` and the
+/// `getopt_long` `default:` arm), two of which are reached through
+/// [`crate::error::InitdbError`] and two directly, so the string itself lives
+/// here — in the module that holds the text C prints — and nowhere else.
+#[must_use]
+pub fn try_help(progname: &str) -> String {
+    format!("Try \"{progname} --help\" for more information.")
+}
+
+/// [`try_help`] as a whole stderr line, the way `pg_log_generic_v` renders a
+/// hint with no `pg_log_error` above it.
 #[must_use]
 pub fn try_help_hint(progname: &str) -> String {
-    format!("{progname}: hint: Try \"{progname} --help\" for more information.")
+    format!("{progname}: hint: {}", try_help(progname))
 }
 
 #[cfg(test)]

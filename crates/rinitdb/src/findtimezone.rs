@@ -186,17 +186,17 @@ impl TzSource for RealTzSource {
 /// Upstream calls `localtime()` inside the scoring loop; caching it here is the
 /// same values in the same order, computed once instead of once per candidate.
 #[derive(Debug, Clone)]
-pub struct Probe {
+pub struct Probe<'a> {
     test_times: Vec<i64>,
-    system: Vec<Option<PgTm>>,
+    system: Vec<Option<PgTm<'a>>>,
 }
 
-impl Probe {
+impl<'a> Probe<'a> {
     /// `identify_system_timezone`'s probe-date set (`findtimezone.c:349`):
     /// January and July 15 of the current year, then every week for 100 years
     /// back from that July, each rounded back to GMT midnight Thursday.
     #[must_use]
-    pub fn build(system: &State, now: i64) -> Option<Self> {
+    pub fn build(system: &'a State, now: i64) -> Option<Self> {
         let thisyear = tz::localtime(system, now)?.calendar_year();
 
         let mut test_times = Vec::with_capacity(MAX_TEST_TIMES);
@@ -396,11 +396,11 @@ pub fn local_zone_abbrevs(system: &State, now: i64) -> (String, String, i64) {
     while t <= tnow + T_MONTH * 14 {
         if let Some(tm) = tz::localtime(system, t) {
             if tm.isdst == 0 && std_zone_name.is_empty() {
-                std_zone_name.clone_from(&tm.zone);
+                std_zone_name = tm.zone_name().into_owned();
                 std_ofs = tm.gmtoff;
             }
             if tm.isdst > 0 && dst_zone_name.is_empty() {
-                dst_zone_name.clone_from(&tm.zone);
+                dst_zone_name = tm.zone_name().into_owned();
             }
             if !std_zone_name.is_empty() && !dst_zone_name.is_empty() {
                 break;
@@ -632,9 +632,8 @@ mod tests {
 
     #[test]
     fn a_relative_symlink_and_doubled_slashes_are_walked_the_same_way() {
-        let system = eastern();
-        let probe = Probe::build(&tz::load(&system, true).expect("load"), 1_789_128_000)
-            .expect("build the probe");
+        let system = tz::load(&eastern(), true).expect("load");
+        let probe = Probe::build(&system, 1_789_128_000).expect("build the probe");
         let load = |name: &str| tz::load(&eastern(), true).filter(|_| name == "America/New_York");
         for target in [
             "/usr/share/zoneinfo/America/New_York",

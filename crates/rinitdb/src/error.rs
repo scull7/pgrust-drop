@@ -201,6 +201,12 @@ pub enum InitdbError {
     #[error("could not open directory \"{path}\": {reason}")]
     CouldNotOpenDirectory { path: String, reason: String },
 
+    /// `src/common/file_utils.c:337` (`walkdir`) — `readdir` itself failed
+    /// part-way through. Reported after the entries it did read have been
+    /// acted on, and the directory is still fsync'd.
+    #[error("could not read directory \"{path}\": {reason}")]
+    CouldNotReadDirectory { path: String, reason: String },
+
     /// `src/common/file_utils.c:428` (`fsync_fname`). Reported; the file is
     /// not synced and the walk carries on.
     #[error("could not open file \"{path}\": {reason}")]

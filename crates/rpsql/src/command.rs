@@ -12,7 +12,7 @@ use std::io::Write;
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::PsqlSettings;
 use crate::slash::SlashOption;
-use crate::variables::VariableSpace;
+use crate::variables::{VarView, VariableSpace};
 
 /// `backslashResult` (`command.h:18`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,49 @@ pub struct CommandContext<'a> {
     pub pset: &'a PsqlSettings,
     /// `pset.vars`.
     pub vars: &'a mut VariableSpace,
+}
+
+/// One whole backslash command, from the variable snapshot the lexer reads to
+/// the settings a `\set` may have changed.
+///
+/// Every caller that reaches [`crate::scan::ScanResult::Backslash`] owes the
+/// same sequence, and upstream gets it for free because `pset` is a global.
+/// Here it is one function so the sequence — and the message that refuses
+/// `\connect` — has a single spelling.
+///
+/// Reconnection is an action no caller performs yet, so [`CommandResult`]
+/// never comes back as [`CommandResult::Connect`]: it is reported and turned
+/// into [`CommandResult::Error`] here. NAT-405 replaces that with the real
+/// thing.
+pub fn dispatch_slash(
+    scanner: &mut Scanner,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    // The lexer reads the variable space while the command writes to it;
+    // upstream aliases one global for both, so the read side works from a
+    // snapshot taken before dispatch — the state the C lexer would have seen.
+    let snapshot = vars.clone();
+    let before = pset.clone();
+    let status = {
+        let mut ctx = CommandContext {
+            pset: &before,
+            vars,
+        };
+        handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
+    };
+    *pset = vars.settings(pset);
+
+    if matches!(status, CommandResult::Connect(_)) {
+        let _ = writeln!(
+            stderr,
+            "psql: error: \\connect is not implemented yet (Linear NAT-405)"
+        );
+        return CommandResult::Error;
+    }
+    status
 }
 
 /// `HandleSlashCmds()` (`command.c:214`).
@@ -351,6 +394,52 @@ mod tests {
             run.stderr,
             "psql: warning: \\q: extra argument \"one\" ignored\n"
         );
+    }
+
+    /// Run one backslash command through the whole dispatch sequence, the way
+    /// both `MainLoop` and the `-c \…` action do.
+    fn dispatch(line: &str) -> (CommandResult, PsqlSettings, String) {
+        let mut vars = VariableSpace::new();
+        let mut pset = PsqlSettings::default();
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+
+        (status, pset, String::from_utf8(stderr).unwrap())
+    }
+
+    #[test]
+    fn a_connect_is_refused_with_one_message_for_every_caller() {
+        // The two dispatch sites used to each spell this string themselves,
+        // which in a port judged by byte-identical output is a drift waiting
+        // to happen.
+        let (status, _, stderr) = dispatch("\\c other");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            stderr,
+            "psql: error: \\connect is not implemented yet (Linear NAT-405)\n"
+        );
+    }
+
+    #[test]
+    fn a_set_through_the_dispatcher_refreshes_the_settings_it_owns() {
+        let (status, pset, stderr) = dispatch("\\set ECHO all");
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(pset.echo, crate::settings::Echo::All);
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn a_quit_still_reaches_the_caller_as_terminate() {
+        assert_eq!(dispatch("\\q").0, CommandResult::Terminate);
     }
 
     #[test]

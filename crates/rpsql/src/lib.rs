@@ -46,12 +46,13 @@ use std::process::ExitCode;
 
 use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
-use crate::command::{CommandContext, CommandResult, handle_slash_cmds};
+use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
-use crate::scan::{QuoteType, ScanResult, Scanner, VariableSource};
+use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
 use crate::startup::{Action, Invocation, Session};
+use crate::variables::VarView;
 
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
 pub const PG_VERSION: &str = "18.6";
@@ -81,20 +82,6 @@ impl Executor for LiveExecutor {
 
     fn connected(&self) -> bool {
         self.alive
-    }
-}
-
-/// Read-only view of the variable space for the lexer callback.
-struct VarView(variables::VariableSpace);
-
-impl VariableSource for VarView {
-    fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String> {
-        let value = self.0.get(name)?.to_string();
-        Some(match quote {
-            QuoteType::Plain | QuoteType::ShellArg => value,
-            QuoteType::SqlLiteral => variables::escape_literal(&value),
-            QuoteType::SqlIdent => variables::escape_identifier(&value),
-        })
     }
 }
 
@@ -311,35 +298,23 @@ fn run_action(
             let mut scanner = Scanner::new();
             scanner.setup(format!("\\{text}").as_bytes(), true);
             let mut buf = Vec::new();
-            // The lexer reads the variable space while the command writes to
-            // it, which upstream gets away with because both are the same
-            // global. The read side works from a snapshot taken before
-            // dispatch, which is the state the C lexer would have seen.
-            let view = VarView(session.vars.clone());
-            let status = if scanner.scan(&mut buf, &view).0 == ScanResult::Backslash {
-                let pset = session.pset.clone();
-                let mut ctx = CommandContext {
-                    pset: &pset,
-                    vars: &mut session.vars,
-                };
-                handle_slash_cmds(&mut scanner, &mut ctx, &view, stdout, stderr)
+            let opens_a_command =
+                scanner.scan(&mut buf, &VarView(&session.vars)).0 == ScanResult::Backslash;
+            let status = if opens_a_command {
+                dispatch_slash(
+                    &mut scanner,
+                    &mut session.pset,
+                    &mut session.vars,
+                    stdout,
+                    stderr,
+                )
             } else {
                 CommandResult::Error
             };
-            session.pset = session.vars.settings(&session.pset);
-            match status {
-                // Reconnection is an action this issue does not perform, and
-                // reporting success without it would be a lie: `MainLoop`
-                // refuses the same result (NAT-405).
-                CommandResult::Connect(_) => {
-                    let _ = writeln!(
-                        stderr,
-                        "psql: error: \\connect is not implemented yet (Linear NAT-405)"
-                    );
-                    EXIT_FAILURE
-                }
-                CommandResult::Error => EXIT_FAILURE,
-                _ => EXIT_SUCCESS,
+            if status == CommandResult::Error {
+                EXIT_FAILURE
+            } else {
+                EXIT_SUCCESS
             }
         }
         // `ACT_FILE` (`startup.c:403`): `None` is stdin.
@@ -363,23 +338,15 @@ fn run_action(
                 pset: &mut session.pset,
                 vars: &mut session.vars,
             };
-            let mut stdout_ref: &mut dyn Write = stdout;
-            let mut stderr_ref: &mut dyn Write = stderr;
             main_loop(
                 &mut Lines::new(&input),
                 &mut loop_session,
                 executor,
-                &mut stdout_ref,
-                &mut stderr_ref,
+                stdout,
+                stderr,
             )
         }
     }
-}
-
-/// The exit statuses `main()` can return (`settings.h:192`), re-exported so
-/// the integration tests name them rather than numbering them.
-pub mod exit {
-    pub use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
 }
 
 #[cfg(test)]
@@ -453,18 +420,5 @@ mod tests {
             panic!("expected a session");
         };
         assert!(session.single_txn);
-    }
-
-    #[test]
-    fn exit_statuses_are_reexported() {
-        assert_eq!(
-            (
-                exit::EXIT_SUCCESS,
-                exit::EXIT_FAILURE,
-                exit::EXIT_BADCONN,
-                exit::EXIT_USER
-            ),
-            (0, 1, 2, 3)
-        );
     }
 }

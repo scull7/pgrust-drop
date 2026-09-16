@@ -1,9 +1,10 @@
 //! rpsql: psql in Rust.
 //!
-//! Tracks PostgreSQL 18.6 `src/bin/psql/`. Seeded from pgrust's
-//! `crates/bin/psql` (NAT-398), then moved onto `rlibpq`. Gates: pgrust's psql
-//! corpus, regress `psql.sql` / `psql_crosstab.sql` / `psql_pipeline.sql`,
-//! `t/001_basic.pl`, `t/020_cancel.pl`.
+//! Tracks PostgreSQL 18.6 `src/bin/psql/`, ported fresh from the C sources
+//! (ADR-0003: nothing is copied from pgrust's Rust psql) on top of `rlibpq`.
+//! Gates: regress `psql.sql` / `psql_crosstab.sql` / `psql_pipeline.sql`,
+//! `t/001_basic.pl`, `t/020_cancel.pl`, and a byte-diff of the same input
+//! through PGDG psql 18 (the method pgrust uses for its own psql).
 //!
 //! Today only the `--version` fast path exists so the multicall binary has a
 //! real applet to dispatch to.

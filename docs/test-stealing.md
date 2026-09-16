@@ -7,7 +7,7 @@ same SQL corpus through PGDG psql 18 and the Rust psql, against both a stock
 PostgreSQL 18 server and a pgrust server, stdout/stderr/exit code diffed after
 three justified normalizations.
 
-pgrust-drop copies that method for every crate.
+pgrust-drop copies that *method* for every crate (the method, not pgrust's corpus files: ADR-0003).
 
 ## Sources (PostgreSQL 18.6, vendored in pgrust)
 
@@ -15,7 +15,7 @@ pgrust-drop copies that method for every crate.
 | --------- | ------------------------------------------------------------------------------------------------------ |
 | `rinitdb` | `src/bin/initdb/t/001_initdb.pl` (334 lines); datadir tree diff vs C initdb                            |
 | `rlibpq`  | `src/interfaces/libpq/t/001_uri.pl` … `006_service.pl`, `test/libpq_uri_regress.c`, `libpq_testclient.c`, `src/test/modules/libpq_pipeline` (9 traces) |
-| `rpsql`   | `src/bin/psql/t/001_basic.pl`, `020_cancel.pl`, regress `psql.sql` (+`psql.out` 6982 lines), `psql_crosstab.sql`, `psql_pipeline.sql`; pgrust `crates/bin/psql/gate/corpus.sql` |
+| `rpsql`   | `src/bin/psql/t/001_basic.pl`, `020_cancel.pl`, regress `psql.sql` (+`psql.out` 6982 lines), `psql_crosstab.sql`, `psql_pipeline.sql`; gate corpus written here or cut from regress (never copied from pgrust, ADR-0003) |
 | helpers   | `src/test/perl/PostgreSQL/Test/Utils.pm` (`program_help_ok`, `command_ok`, `check_mode_recursive`, …) |
 
 ## Rules

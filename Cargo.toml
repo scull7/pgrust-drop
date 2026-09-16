@@ -14,6 +14,7 @@ edition = "2024"
 rust-version = "1.96"
 repository = "https://github.com/scull7/pgrust-drop"
 publish = false
+# Per-crate `license` is set in each manifest (ADR-0003): MIT for the ports, AGPL-3.0-only for pgdrop.
 
 [workspace.dependencies]
 # All CLIs use usage-rs (owner decision, 2026-09-16). Aliased to `usage` in each crate.

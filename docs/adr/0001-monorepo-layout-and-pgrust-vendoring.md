@@ -1,6 +1,6 @@
 # ADR-0001: Monorepo layout and how pgrust is vendored
 
-Status: proposed (2026-09-16). Owner decision pending on the vendoring option.
+Status: accepted (owner decision 2026-09-16): pgrust is a rev-pinned Cargo git dependency.
 
 ## Context
 

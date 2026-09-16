@@ -707,14 +707,20 @@ mod tests {
     /// in `progress.md` — and is a bug in every other case, including a stray
     /// editor reformat or a line-ending conversion. The lengths are asserted
     /// too so the failure says *which* file and by how much.
+    ///
+    /// A digest proves only "unchanged since someone pinned it", never
+    /// "upstream's". It is computed *from* the file, so whatever bytes were
+    /// vendored are the bytes it blesses — which is how a pgrust-modified
+    /// `postgresql.conf.sample` shipped here and passed. The two tests below
+    /// assert against expectations written down from upstream instead.
     #[test]
     fn the_embedded_templates_are_the_postgresql_18_6_bytes_we_vendored() {
         for (name, sample, length, digest) in [
             (
                 "postgresql.conf.sample",
                 POSTGRESQL_CONF_SAMPLE,
-                34_323,
-                0xa9b9_6fcb_1ac3_6b48_u64,
+                32_652,
+                0x364a_ac11_a839_c67f_u64,
             ),
             (
                 "pg_hba.conf.sample",
@@ -732,6 +738,91 @@ mod tests {
             assert_eq!(sample.len(), length, "{name} changed length");
             assert_eq!(fnv1a64(sample.as_bytes()), digest, "{name} changed content");
         }
+    }
+
+    /// The banner titles of PostgreSQL 18.6's `postgresql.conf.sample`, in
+    /// upstream order (`src/backend/utils/misc/postgresql.conf.sample`,
+    /// tag `REL_18_6`). Written out here from upstream rather than read back
+    /// out of the vendored file, so it is a statement about what the file may
+    /// contain and not a restatement of what it does contain.
+    const UPSTREAM_CONF_SECTIONS: [&str; 15] = [
+        "FILE LOCATIONS",
+        "CONNECTIONS AND AUTHENTICATION",
+        "RESOURCE USAGE (except WAL)",
+        "WRITE-AHEAD LOG",
+        "REPLICATION",
+        "QUERY TUNING",
+        "REPORTING AND LOGGING",
+        "STATISTICS",
+        "VACUUMING",
+        "CLIENT CONNECTION DEFAULTS",
+        "LOCK MANAGEMENT",
+        "VERSION AND PLATFORM COMPATIBILITY",
+        "ERROR HANDLING",
+        "CONFIG FILE INCLUDES",
+        "CUSTOMIZED OPTIONS",
+    ];
+
+    /// A `#-----…` rule: a `#` followed only by dashes.
+    fn is_banner_rule(line: &str) -> bool {
+        line.len() > 2 && line.starts_with('#') && line[1..].bytes().all(|byte| byte == b'-')
+    }
+
+    /// The title of every rule-title-rule banner in a `postgresql.conf`
+    /// template, in file order.
+    fn section_titles(sample: &str) -> Vec<&str> {
+        let lines: Vec<&str> = sample.lines().collect();
+        lines
+            .windows(3)
+            .filter(|window| is_banner_rule(window[0]) && is_banner_rule(window[2]))
+            .filter_map(|window| window[1].strip_prefix("# "))
+            .collect()
+    }
+
+    /// The name assigned on a line, whether or not the line is commented out:
+    /// `#work_mem = 4MB` and `work_mem = 4MB` both yield `work_mem`.
+    fn assigned_name(line: &str) -> Option<&str> {
+        let (name, _) = line.trim_start().trim_start_matches('#').split_once('=')?;
+        let name = name.trim();
+        let is_identifier = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.');
+        is_identifier.then_some(name)
+    }
+
+    /// Catches a vendor-specific block appended to the sample — exactly the
+    /// 41-line `# PGRUST` section that pgrust's `postgres-18.6-reference`
+    /// tree carries and that was vendored here by mistake. A settings block
+    /// has to announce itself with a banner to be readable, so pinning the
+    /// banner list against upstream's catches the block as a whole, including
+    /// one renamed to something less obvious than `PGRUST`.
+    #[test]
+    fn the_conf_sample_carries_only_upstreams_sections() {
+        assert_eq!(
+            section_titles(POSTGRESQL_CONF_SAMPLE),
+            UPSTREAM_CONF_SECTIONS,
+            "a section upstream does not ship: the sample is not pristine \
+             PostgreSQL 18.6 (see crates/rinitdb/share/README.md)"
+        );
+    }
+
+    /// Catches a vendor GUC smuggled *inside* an upstream section, where no
+    /// new banner would give it away — `pgrust.admission_bypass` and friends.
+    /// Upstream's sample documents only core GUCs, and a core GUC never has a
+    /// prefix: a dot means an extension's namespace, which upstream leaves to
+    /// the empty `CUSTOMIZED OPTIONS` section for the operator to fill in.
+    #[test]
+    fn no_setting_in_the_conf_sample_is_namespaced_like_an_extension() {
+        let namespaced: Vec<&str> = POSTGRESQL_CONF_SAMPLE
+            .lines()
+            .filter_map(assigned_name)
+            .filter(|name| name.contains('.'))
+            .collect();
+        assert!(
+            namespaced.is_empty(),
+            "non-upstream namespaced settings in the sample: {namespaced:?}"
+        );
     }
 
     /// The tokens `setup_config` substitutes have to still be in the template

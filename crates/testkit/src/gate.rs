@@ -15,9 +15,11 @@
 //!   unit-tested without spawning anything.
 //! - [`Gate::run`] is the only action: it spawns the two processes.
 //!
-//! When the reference binary is absent, [`Gate::for_tool`] yields `None` and
-//! the caller prints [`crate::reference::skip_message`]: a skip is flagged,
-//! never silent.
+//! When the reference binary is absent, [`Gate::for_tool_or_skip`] yields
+//! `None` having *already* announced `SKIP (flagged, not silent)`, so the
+//! caller cannot reach that arm with the skip unannounced. The older
+//! [`Gate::for_tool`] leaves the announcement to the caller and is superseded
+//! by it: a skip is flagged, never silent.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -155,14 +157,62 @@ impl Gate {
     }
 
     /// Locate the reference `tool` (see [`crate::reference::find`]) and gate
+    /// `candidate` against it, announcing the skip when it is not there.
+    ///
+    /// This is the constructor a gate should use. `None` means the reference
+    /// is not installed here **and** [`crate::reference::skip`] has already
+    /// put `SKIP (flagged, not silent)` on the process's own stderr, so the
+    /// caller has nothing left to do but return. There is no way to reach the
+    /// `None` arm with the skip unannounced, which is the difference between a
+    /// guarantee and the call-site convention [`Gate::for_tool`] relies on.
+    ///
+    /// ```no_run
+    /// # use testkit::Gate;
+    /// let Some(gate) = Gate::for_tool_or_skip("initdb", "target/debug/rinitdb") else {
+    ///     return; // The flagged skip is already on stderr.
+    /// };
+    /// gate.arg("--version").assert_clean();
+    /// ```
+    #[must_use]
+    pub fn for_tool_or_skip(tool: &str, candidate: impl Into<PathBuf>) -> Option<Self> {
+        Self::for_located_tool(tool, candidate, reference::find, reference::skip)
+    }
+
+    /// Locate the reference `tool` (see [`crate::reference::find`]) and gate
     /// `candidate` against it.
     ///
     /// `None` means the reference is not installed here; the caller must print
     /// [`crate::reference::skip_message`] and pass, so the skip is visible in
     /// the test output rather than a silently narrowed assertion.
+    ///
+    /// Superseded by [`Gate::for_tool_or_skip`], which makes that announcement
+    /// itself instead of trusting each call site to remember it. It is kept
+    /// only so the call sites not yet migrated keep compiling; they move over
+    /// as their owning review chunks land, and this goes away with the last of
+    /// them.
     #[must_use]
     pub fn for_tool(tool: &str, candidate: impl Into<PathBuf>) -> Option<Self> {
-        reference::find(tool).map(|reference| Self::new(reference, candidate))
+        Self::for_located_tool(tool, candidate, reference::find, |_| {})
+    }
+
+    /// The lookup and the announcement it owes, with both actions injected.
+    ///
+    /// Taking `find` and `announce_skip` as arguments is the same seam
+    /// [`crate::reference::locate`] opens with `exists`: it lets the pairing
+    /// this function exists to guarantee — absent reference implies announced
+    /// skip — be asserted in a unit test, with no filesystem and no captured
+    /// stderr to read back.
+    fn for_located_tool(
+        tool: &str,
+        candidate: impl Into<PathBuf>,
+        find: impl FnOnce(&str) -> Option<PathBuf>,
+        announce_skip: impl FnOnce(&str),
+    ) -> Option<Self> {
+        let Some(reference) = find(tool) else {
+            announce_skip(tool);
+            return None;
+        };
+        Some(Self::new(reference, candidate))
     }
 
     /// Add one argument.
@@ -495,6 +545,8 @@ fn binary_mismatch(reference: &[u8], candidate: &[u8]) -> StreamDiff {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::normalize::{DEFAULT, TIMING};
 
@@ -651,6 +703,45 @@ mod tests {
     #[test]
     fn for_tool_is_none_when_the_reference_is_absent() {
         assert!(Gate::for_tool("no-such-postgres-tool", "target/debug/rinitdb").is_none());
+    }
+
+    #[test]
+    fn an_absent_reference_announces_its_skip_before_yielding_none() {
+        let announced = RefCell::new(Vec::new());
+
+        let gate = Gate::for_located_tool(
+            "initdb",
+            "target/debug/rinitdb",
+            |_| None,
+            |tool| announced.borrow_mut().push(tool.to_owned()),
+        );
+
+        assert!(gate.is_none());
+        assert_eq!(announced.into_inner(), ["initdb"]);
+    }
+
+    #[test]
+    fn a_located_reference_is_gated_without_any_skip() {
+        let announced = RefCell::new(Vec::new());
+
+        let gate = Gate::for_located_tool(
+            "initdb",
+            "target/debug/rinitdb",
+            |tool| Some(Path::new("/ref/bin").join(tool)),
+            |tool| announced.borrow_mut().push(tool.to_owned()),
+        );
+
+        let gate = gate.expect("a located reference yields a gate");
+        assert_eq!(gate.reference, PathBuf::from("/ref/bin/initdb"));
+        assert_eq!(gate.candidate, PathBuf::from("target/debug/rinitdb"));
+        assert!(announced.into_inner().is_empty());
+    }
+
+    #[test]
+    fn for_tool_or_skip_is_none_when_the_reference_is_absent() {
+        // The real wiring, announcement included: the `SKIP (flagged, not
+        // silent)` line this prints on stderr is the mechanism working.
+        assert!(Gate::for_tool_or_skip("no-such-postgres-tool", "target/debug/rinitdb").is_none());
     }
 
     #[test]

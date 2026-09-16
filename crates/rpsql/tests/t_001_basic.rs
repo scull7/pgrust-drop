@@ -143,7 +143,10 @@ fn a_connection_failure_exits_badconn() {
         ],
     )
     .expect("spawn rpsql");
-    assert_eq!(outcome.status, Some(i32::from(rpsql::exit::EXIT_BADCONN)));
+    assert_eq!(
+        outcome.status,
+        Some(i32::from(rpsql::settings::EXIT_BADCONN))
+    );
     assert!(!outcome.stderr.is_empty(), "a failure must say why");
     assert!(outcome.stdout.is_empty(), "nothing is printed on stdout");
 }

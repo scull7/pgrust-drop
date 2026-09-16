@@ -16,6 +16,11 @@ name = "rpsql"
 path = "src/main.rs"
 
 [dependencies]
+rlibpq = { workspace = true }
+usage = { workspace = true }
+
+[dev-dependencies]
+testkit = { workspace = true }
 
 [lints]
 workspace = true

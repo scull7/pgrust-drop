@@ -16,6 +16,9 @@ fn b64lookup(c: u8) -> i8 {
     let mut i = 0usize;
     while i < 64 {
         if BASE64[i] == c {
+            // The `i < 64` guard above bounds this index to 0..=63, which is
+            // both inside `i8` and non-negative, so -1 stays the one value
+            // that means "not a base64 symbol".
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             return i as i8;
         }
@@ -107,12 +110,16 @@ pub fn decode(src: &[u8]) -> Option<Vec<u8>> {
             i32::from(b)
         };
 
+        // `b` is 0 on the `=` arm and otherwise a table hit that already
+        // returned on `b < 0`, so it is in 0..=63 and the cast keeps its value.
         #[allow(clippy::cast_sign_loss)]
         {
             buf = (buf << 6) + b as u32;
         }
         pos += 1;
         if pos == 4 {
+            // Each group is masked with 255 first, so every value cast here
+            // is already one byte wide.
             #[allow(clippy::cast_possible_truncation)]
             {
                 out.push(((buf >> 16) & 255) as u8);
@@ -204,6 +211,8 @@ mod tests {
     #[test]
     fn the_scram_sizes_round_trip() {
         for len in [18usize, 32] {
+            // `len` is at most 32, so `i * 7 + 3` peaks at 31 * 7 + 3 = 220
+            // and every element is the byte the expression spells.
             #[allow(clippy::cast_possible_truncation)]
             let raw: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             assert_eq!(decode(&encode(&raw)), Some(raw));

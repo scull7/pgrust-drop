@@ -1,8 +1,9 @@
 //! Actions: spawn a binary and hand its outcome to the pure checks.
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::CommandOutcome;
 use crate::checks::{self, Violation};
@@ -22,6 +23,47 @@ where
         .stdin(std::process::Stdio::null())
         .output()
         .map(CommandOutcome::from)
+}
+
+/// Run `bin` with `args`, feeding `stdin` to it and capturing both streams.
+///
+/// Empty `stdin` closes the child's stdin, exactly as [`run`] does. Otherwise
+/// the bytes are written from a helper thread while the parent drains stdout
+/// and stderr, so a tool that writes more than a pipe buffer before reading
+/// all of its input cannot deadlock the gate. A child that exits before
+/// consuming everything (psql with `-c`, initdb rejecting an option) breaks
+/// the pipe; that is the child's business, not a test failure, so `EPIPE` is
+/// not reported.
+///
+/// # Errors
+/// The `io::Error` from spawning, or from writing to the child's stdin.
+///
+/// # Panics
+/// If the stdin-writing thread panics.
+pub fn run_with_stdin<I, S>(bin: &Path, args: I, stdin: &[u8]) -> std::io::Result<CommandOutcome>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if stdin.is_empty() {
+        return run(bin, args);
+    }
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut pipe = child.stdin.take().expect("stdin was piped");
+    let bytes = stdin.to_vec();
+    let writer = std::thread::spawn(move || pipe.write_all(&bytes));
+    let output = child.wait_with_output()?;
+    match writer.join().expect("stdin writer panicked") {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => return Err(err),
+    }
+    Ok(CommandOutcome::from(output))
 }
 
 /// `program_help_ok('initdb')`: runs `bin --help` and asserts the upstream

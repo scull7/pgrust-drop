@@ -5,8 +5,9 @@
 //! C-ABI `libpq.so`, with GSSAPI feature-gated and no libc/OpenSSL build-time
 //! coupling.
 //!
-//! Nothing is implemented yet. Work is tracked in Linear NAT-388 … NAT-396,
-//! starting with conninfo/URI parsing against `t/001_uri.pl`.
+//! What is here so far is the connection-string front end: `PQconninfoOptions[]`
+//! and the two parsers that fill a working copy of it, proved against
+//! `t/001_uri.pl`. The rest is tracked in Linear NAT-389 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -18,3 +19,21 @@
 // and upstream-fidelity names repeat the module name on purpose
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
+
+pub mod conninfo;
+mod cstr;
+pub mod error;
+pub mod pg_config;
+pub mod regress;
+mod text;
+pub mod uri;
+
+pub use conninfo::{
+    CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,
+    conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,
+    uri_prefix_length,
+};
+pub use error::ConnError;
+pub use regress::regress_report;
+pub use text::RawText;
+pub use uri::{parse_uri, uri_decode};

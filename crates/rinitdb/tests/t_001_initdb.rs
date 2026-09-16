@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use testkit::reference;
+use testkit::{Gate, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
 
@@ -29,21 +29,20 @@ fn program_options_handling_ok() {
     testkit::program_options_handling_ok(Path::new(RINITDB));
 }
 
-/// Byte-diff gate: `--help` and `--version` against the C initdb when present.
+/// Byte-diff gate (NAT-374): the same invocation through C `initdb` and
+/// through `rinitdb`, with stdout, stderr and exit status diffed byte for
+/// byte. No normalizer is justified here — `--help` and `--version` are fixed
+/// text — so the comparison is as strict as it gets.
+///
+/// Missing reference binary → `SKIP (flagged, not silent)`; the gate is real
+/// wherever PostgreSQL 18 is installed or `PGDROP_REF_BIN` points at it.
 #[test]
 fn help_and_version_match_reference_initdb() {
-    let Some(reference_bin) = reference::find_or_skip("initdb") else {
+    let Some(gate) = Gate::for_tool("initdb", RINITDB) else {
         println!("{}", reference::skip_message("initdb"));
         return;
     };
     for arg in ["--help", "--version"] {
-        let theirs = testkit::run(&reference_bin, [arg]).expect("run reference initdb");
-        let ours = testkit::run(Path::new(RINITDB), [arg]).expect("run rinitdb");
-        assert_eq!(
-            theirs,
-            ours,
-            "initdb {arg} differs from {}",
-            reference_bin.display()
-        );
+        gate.clone().arg(arg).assert_clean();
     }
 }

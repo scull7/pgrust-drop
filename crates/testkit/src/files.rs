@@ -165,9 +165,17 @@ mod unix {
     /// loop ends the walk instead of hanging it — that memo is what
     /// `follow_fast` buys upstream.
     ///
-    /// `ENOENT` is allowed and skipped: "a running server can delete files,
-    /// such as those in `pg_stat`" (`Utils.pm:601`). Every other `stat`
-    /// failure is returned, where upstream dies.
+    /// An ignored entry is left out of the result but still descended into:
+    /// upstream's `wanted` merely `return`s for it and never sets
+    /// `$File::Find::prune`, so `File::Find` walks on into an ignored
+    /// directory and every file below it is still checked. Pruning here would
+    /// silently stop checking a whole subtree.
+    ///
+    /// `ENOENT` is allowed and skipped, for the `stat` and for the directory
+    /// read alike: "a running server can delete files, such as those in
+    /// `pg_stat`" (`Utils.pm:601`), and a directory can vanish between the two
+    /// calls just as a file can. Every other failure is returned, where
+    /// upstream dies.
     ///
     /// # Errors
     /// Any `io::Error` other than `NotFound` from reading a directory or
@@ -177,9 +185,6 @@ mod unix {
         let mut seen = HashSet::new();
         let mut queue = vec![dir.to_path_buf()];
         while let Some(path) = queue.pop() {
-            if is_ignored(dir, &path, ignore_list) {
-                continue;
-            }
             // `stat`, not `lstat`: upstream stats through the symlink.
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
@@ -199,12 +204,23 @@ mod unix {
             } else {
                 EntryKind::Other
             };
+            // Descend first, so an ignored directory still yields its children.
             if kind == EntryKind::Dir {
-                for child in std::fs::read_dir(&path)? {
-                    queue.push(child?.path());
+                match std::fs::read_dir(&path) {
+                    Ok(children) => {
+                        for child in children {
+                            queue.push(child?.path());
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        warn(&format!("unable to read {}: {err}", path.display()));
+                    }
+                    Err(err) => return Err(err),
                 }
             }
-            entries.push(Entry::new(path, kind, metadata.mode() & 0o7777));
+            if !is_ignored(dir, &path, ignore_list) {
+                entries.push(Entry::new(path, kind, metadata.mode() & 0o7777));
+            }
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
@@ -427,6 +443,55 @@ mod unix_tests {
         )
         .expect("walk the tree");
         assert!(ignored.is_empty(), "{ignored:?}");
+    }
+
+    #[test]
+    fn an_ignored_directory_is_still_descended_into() {
+        // File::Find's wanted returns for an ignored name but does not prune,
+        // so upstream still reports "$dir/pg_wal/badfile mode must be 0600".
+        // Pruning here would quietly stop checking a whole subtree.
+        let scratch = Scratch::new("ignore-dir");
+        let data = scratch.0.join("data");
+        let wal = data.join("pg_wal");
+        fs::create_dir_all(&wal).expect("mkdir pg_wal");
+        let bad = wal.join("badfile");
+        fs::write(&bad, "").expect("write badfile");
+        chmod(&bad, 0o644);
+        chmod(&wal, PGDATA_DIR_MODE);
+        chmod(&data, PGDATA_DIR_MODE);
+
+        let violations =
+            check_mode_recursive(&data, PGDATA_DIR_MODE, PGDATA_FILE_MODE, &["pg_wal"])
+                .expect("walk the tree");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0]
+                .to_string()
+                .ends_with("badfile mode must be 0600, is 0644"),
+            "{}",
+            violations[0]
+        );
+        // The ignored directory itself is still left out of the result.
+        let walked = walk(&data, &["pg_wal"]).expect("walk the tree");
+        assert!(
+            walked.iter().all(|entry| entry.path != wal),
+            "the ignored directory must not be checked itself: {walked:?}"
+        );
+        assert!(walked.iter().any(|entry| entry.path == bad));
+    }
+
+    #[test]
+    fn a_vanished_entry_is_warned_about_not_fatal() {
+        // The ENOENT the doc comment cites: a dangling symlink stats as
+        // NotFound, and upstream warns and carries on rather than dying.
+        let scratch = Scratch::new("enoent");
+        let data = scratch.0.join("data");
+        fs::create_dir(&data).expect("mkdir data");
+        chmod(&data, PGDATA_DIR_MODE);
+        std::os::unix::fs::symlink(data.join("gone"), data.join("dangling")).expect("symlink");
+        let entries = walk(&data, &[]).expect("a dangling symlink is not an error");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, data);
     }
 
     #[test]

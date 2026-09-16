@@ -3,6 +3,45 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-373 review fixes
+
+**What** (all five reviewer findings were real)
+- `pattern::at_start`: under `(?m)`, `^` matched at the position past a
+  trailing newline, where Perl refuses — `MBOL` requires `!NEXTCHR_IS_EOS`
+  (`regexec.c`). `"a\n" =~ /^$/m` is nomatch in Perl but matched here, so a
+  stolen `command_like` carrying a `/m`-anchored empty-line pattern would have
+  passed on output Perl rejects: precisely the fidelity `docs/divergences.md`
+  promises. Now guarded with `pos < chars.len()`, pinned by
+  `multiline_start_refuses_the_position_after_a_trailing_newline`.
+- `files::walk`: an ignore-list hit skipped the entry *and* its whole subtree.
+  Upstream's `wanted` only `return`s and never sets `$File::Find::prune`, so
+  `File::Find` still descends and every file under an ignored directory is
+  still checked. Ignoring `pg_wal` therefore stopped checking everything below
+  it — a silently narrowed gate. The walk now descends first and filters the
+  entry afterwards; `an_ignored_directory_is_still_descended_into` builds
+  `data/pg_wal/badfile` at 0644 and demands the violation upstream reports.
+- `files::walk`: `read_dir` propagated `NotFound` while the `stat` above it
+  tolerated the same error, so a directory the running server deletes mid-walk
+  (the `pg_stat` case the doc comment cites) was a hard error instead of a
+  warn-and-skip. Both calls now warn and continue; a dangling symlink pins it.
+- `pattern`: `\s` used `is_ascii_whitespace`, which leaves out the vertical
+  tab; Perl's `\s` has matched `\x0b` since 5.18. Added, with the whole ASCII
+  set asserted in `perl_whitespace_includes_the_vertical_tab`.
+- `run`: the joined command line was built on every call, passing ones
+  included, and the `program_*` wrappers had started allocating an `OsString`
+  per literal flag. Both are failure-path-only data: `assert_clean` now formats
+  inside the `if`, and the flag helpers never build an `OsString` at all.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 125 tests (was 121; +4 regression tests).
+The rinitdb gate still prints `SKIP (flagged, not silent)`.
+
+**Risks**: none new. The two `must` fixes both make the checks stricter, so a
+test that passed on the old code and fails now was passing wrongly.
+
+**Follow-ups**: unchanged from the entry below (the `pgdrop` manifest sets both
+`license` and `license-file`).
+
 ## 2026-09-16 — testkit TAP helpers completed (NAT-373)
 
 **What** (the rest of the `Utils.pm` port list NAT-373 names)

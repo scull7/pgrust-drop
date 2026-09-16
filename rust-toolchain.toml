@@ -1,0 +1,5 @@
+# Matches pgrust's pin (rust-toolchain.toml in malisper/pgrust): 1.96.0 / LLVM 22,
+# required for aarch64 (LLVM 21 SIGTRAPs on thin-LTO). rustup fetches it on demand.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

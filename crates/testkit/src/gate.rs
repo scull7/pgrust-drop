@@ -68,6 +68,53 @@ pub enum GateError {
     },
 }
 
+/// Which streams a gate's verdict is allowed to rest on.
+///
+/// [`Scope::Everything`] is the default and the only scope a finished tool
+/// should ever use. [`Scope::StderrAndStatus`] exists for a tool that is being
+/// ported in chunks: the diagnostics of a failure can be made byte-exact long
+/// before the progress output of the success path exists at all, and gating
+/// the diagnostics now is strictly better than gating nothing.
+///
+/// It narrows the *verdict*, never the *report*: an out-of-scope stream is
+/// still compared, still rendered, and [`GateReport::out_of_scope_difference`]
+/// says so, which is what `assert_clean` announces on the process's own
+/// stderr. A narrowing that cannot be seen in the log is the one AGENTS.md
+/// forbids; this one is on screen every time it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// stdout, stderr and the exit status must all match.
+    Everything,
+    /// Only stderr and the exit status decide the verdict.
+    StderrAndStatus {
+        /// Why stdout is out of scope, printed with every flagged difference.
+        because: &'static str,
+    },
+}
+
+impl Scope {
+    /// Does a stdout difference fail the gate?
+    #[must_use]
+    pub fn judges_stdout(self) -> bool {
+        matches!(self, Scope::Everything)
+    }
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scope::Everything => f.write_str("stdout, stderr and exit status"),
+            Scope::StderrAndStatus { because } => {
+                write!(f, "stderr and exit status only ({because})")
+            }
+        }
+    }
+}
+
+/// The flag an out-of-scope difference carries, so it is greppable in a log
+/// exactly like [`crate::reference::SKIP_FLAG`].
+pub const OUT_OF_SCOPE_FLAG: &str = "OUT OF SCOPE (flagged, not silent)";
+
 /// One invocation to run through both binaries.
 #[derive(Debug, Clone)]
 pub struct Gate {
@@ -81,6 +128,8 @@ pub struct Gate {
     pub stdin: Vec<u8>,
     /// Justified normalizations applied to both sides before diffing.
     pub normalizers: Vec<Normalizer>,
+    /// Which streams the verdict rests on; [`Scope::Everything`] by default.
+    pub scope: Scope,
 }
 
 impl Gate {
@@ -94,6 +143,7 @@ impl Gate {
             args: Vec::new(),
             stdin: Vec::new(),
             normalizers: Vec::new(),
+            scope: Scope::Everything,
         }
     }
 
@@ -127,6 +177,17 @@ impl Gate {
         self
     }
 
+    /// Judge this gate on stderr and the exit status alone, saying why.
+    ///
+    /// For an invocation whose *diagnostics* are ported but whose success-path
+    /// stdout is not yet. The stdout difference is still computed and still
+    /// shown; see [`Scope`].
+    #[must_use]
+    pub fn stderr_and_status_only(mut self, because: &'static str) -> Self {
+        self.scope = Scope::StderrAndStatus { because };
+        self
+    }
+
     /// Feed these bytes to both binaries on stdin.
     #[must_use]
     pub fn with_stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
@@ -155,7 +216,12 @@ impl Gate {
     pub fn run(&self) -> Result<GateReport, GateError> {
         let reference = self.spawn(Side::Reference, &self.reference)?;
         let candidate = self.spawn(Side::Candidate, &self.candidate)?;
-        Ok(compare(&reference, &candidate, &self.normalizers))
+        Ok(compare(
+            &reference,
+            &candidate,
+            &self.normalizers,
+            self.scope,
+        ))
     }
 
     fn spawn(&self, side: Side, bin: &Path) -> Result<CommandOutcome, GateError> {
@@ -174,6 +240,9 @@ impl Gate {
         let report = self
             .run()
             .unwrap_or_else(|err| panic!("{self}: could not run: {err}"));
+        if let Some(difference) = report.out_of_scope_difference() {
+            reference::announce_skip(&format!("{OUT_OF_SCOPE_FLAG}: {self}\n{difference}"));
+        }
         assert!(report.is_clean(), "{self}\n{report}");
     }
 }
@@ -198,6 +267,9 @@ impl fmt::Display for Gate {
                 write!(f, " {}", normalizer.name)?;
             }
             write!(f, "]")?;
+        }
+        if !self.scope.judges_stdout() {
+            write!(f, " [judged on: {}]", self.scope)?;
         }
         Ok(())
     }
@@ -297,20 +369,36 @@ pub struct GateReport {
     pub stdout_diff: StreamDiff,
     pub stderr_diff: StreamDiff,
     pub rc: RcCheck,
+    /// Which streams this verdict rests on.
+    pub scope: Scope,
 }
 
 impl GateReport {
-    /// Both streams identical (after normalization) and the same exit status.
+    /// Every stream the [`Scope`] judges is identical (after normalization)
+    /// and the exit statuses agree.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.stdout_diff.matches() && self.stderr_diff.matches() && self.rc.matches()
+        let stdout_ok = self.stdout_diff.matches() || !self.scope.judges_stdout();
+        stdout_ok && self.stderr_diff.matches() && self.rc.matches()
+    }
+
+    /// A rendered difference the [`Scope`] chose not to judge, if there is one.
+    ///
+    /// The caller prints it; a narrowed gate that hides what it narrowed is
+    /// the failure mode AGENTS.md rules out.
+    #[must_use]
+    pub fn out_of_scope_difference(&self) -> Option<String> {
+        if self.scope.judges_stdout() || self.stdout_diff.matches() {
+            return None;
+        }
+        Some(format!("{}\nstdout {}", self.scope, self.stdout_diff))
     }
 }
 
 impl fmt::Display for GateReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_clean() {
-            return f.write_str("gate clean: stdout, stderr and exit status all match");
+            return write!(f, "gate clean, judged on {}", self.scope);
         }
         if !self.rc.matches() {
             writeln!(f, "{}", self.rc)?;
@@ -338,8 +426,10 @@ pub fn compare(
     reference: &CommandOutcome,
     candidate: &CommandOutcome,
     normalizers: &[Normalizer],
+    scope: Scope,
 ) -> GateReport {
     GateReport {
+        scope,
         stdout_diff: compare_stream("stdout", &reference.stdout, &candidate.stdout, normalizers),
         stderr_diff: compare_stream("stderr", &reference.stderr, &candidate.stderr, normalizers),
         rc: RcCheck {
@@ -398,7 +488,7 @@ mod tests {
     #[test]
     fn identical_outcomes_are_clean() {
         let theirs = outcome(0, "initdb (PostgreSQL) 18.6\n", "");
-        let report = compare(&theirs, &theirs.clone(), &[]);
+        let report = compare(&theirs, &theirs.clone(), &[], Scope::Everything);
         assert!(report.is_clean(), "{report}");
         assert_eq!(report.stdout_diff, StreamDiff::Match);
         assert_eq!(report.stderr_diff, StreamDiff::Match);
@@ -409,7 +499,7 @@ mod tests {
     fn a_stdout_difference_is_reported_as_a_unified_diff() {
         let theirs = outcome(0, "initdb (PostgreSQL) 18.6\n", "");
         let ours = outcome(0, "rinitdb (PostgreSQL) 18.6\n", "");
-        let report = compare(&theirs, &ours, &[]);
+        let report = compare(&theirs, &ours, &[], Scope::Everything);
         assert!(!report.is_clean());
         let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(
@@ -424,7 +514,7 @@ mod tests {
     fn a_stderr_difference_is_reported_separately() {
         let theirs = outcome(1, "", "initdb: error: invalid option\n");
         let ours = outcome(1, "", "error: unexpected argument\n");
-        let report = compare(&theirs, &ours, &[]);
+        let report = compare(&theirs, &ours, &[], Scope::Everything);
         assert_eq!(report.stdout_diff, StreamDiff::Match);
         assert!(!report.stderr_diff.matches());
         assert!(report.rc.matches());
@@ -435,7 +525,7 @@ mod tests {
     fn a_differing_exit_status_alone_fails_the_gate() {
         let theirs = outcome(1, "", "");
         let ours = outcome(2, "", "");
-        let report = compare(&theirs, &ours, &[]);
+        let report = compare(&theirs, &ours, &[], Scope::Everything);
         assert_eq!(report.stdout_diff, StreamDiff::Match);
         assert_eq!(report.stderr_diff, StreamDiff::Match);
         assert!(!report.rc.matches());
@@ -450,7 +540,7 @@ mod tests {
     fn a_signal_death_never_matches_an_exit_code() {
         let theirs = CommandOutcome::new(None, "", "");
         let ours = CommandOutcome::new(Some(0), "", "");
-        let report = compare(&theirs, &ours, &[]);
+        let report = compare(&theirs, &ours, &[], Scope::Everything);
         assert!(!report.rc.matches());
         assert!(
             report.to_string().contains("killed by a signal"),
@@ -463,18 +553,18 @@ mod tests {
         let theirs = outcome(0, "SELECT 1\nTime: 1.234 ms\n", "");
         let ours = outcome(0, "SELECT 1\nTime: 9.876 ms\n", "");
         assert!(
-            !compare(&theirs, &ours, &[]).is_clean(),
+            !compare(&theirs, &ours, &[], Scope::Everything).is_clean(),
             "unnormalized gates must fail"
         );
-        assert!(compare(&theirs, &ours, &[TIMING]).is_clean());
-        assert!(compare(&theirs, &ours, &DEFAULT).is_clean());
+        assert!(compare(&theirs, &ours, &[TIMING], Scope::Everything).is_clean());
+        assert!(compare(&theirs, &ours, &DEFAULT, Scope::Everything).is_clean());
     }
 
     #[test]
     fn a_normalizer_does_not_hide_a_real_difference_on_the_same_line() {
         let theirs = outcome(0, "Timing is on.\nTime: 1.0 ms\n", "");
         let ours = outcome(0, "Timing is off.\nTime: 2.0 ms\n", "");
-        let report = compare(&theirs, &ours, &DEFAULT);
+        let report = compare(&theirs, &ours, &DEFAULT, Scope::Everything);
         assert!(!report.is_clean());
         let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(diff.contains("-Timing is on."), "{diff}");
@@ -488,7 +578,7 @@ mod tests {
     fn a_trailing_newline_difference_fails_the_gate() {
         let theirs = outcome(0, "initdb (PostgreSQL) 18.6\n", "");
         let ours = outcome(0, "initdb (PostgreSQL) 18.6", "");
-        let report = compare(&theirs, &ours, &DEFAULT);
+        let report = compare(&theirs, &ours, &DEFAULT, Scope::Everything);
         assert!(!report.is_clean());
         let diff = report.stdout_diff.text().expect("stdout differs as text");
         assert!(diff.contains("\\ No newline at end of file"), "{diff}");
@@ -500,7 +590,7 @@ mod tests {
         // two different byte strings equal.
         let theirs = CommandOutcome::new(Some(0), vec![0xff], Vec::new());
         let ours = CommandOutcome::new(Some(0), vec![0xfe], Vec::new());
-        let report = compare(&theirs, &ours, &DEFAULT);
+        let report = compare(&theirs, &ours, &DEFAULT, Scope::Everything);
         assert!(!report.is_clean());
         assert_eq!(
             report.stdout_diff,
@@ -520,7 +610,7 @@ mod tests {
     #[test]
     fn identical_non_utf8_output_is_still_clean() {
         let theirs = CommandOutcome::new(Some(0), vec![0xff, 0xfe], Vec::new());
-        let report = compare(&theirs, &theirs.clone(), &DEFAULT);
+        let report = compare(&theirs, &theirs.clone(), &DEFAULT, Scope::Everything);
         assert!(report.is_clean(), "{report}");
     }
 
@@ -544,5 +634,71 @@ mod tests {
     #[test]
     fn for_tool_is_none_when_the_reference_is_absent() {
         assert!(Gate::for_tool("no-such-postgres-tool", "target/debug/rinitdb").is_none());
+    }
+
+    #[test]
+    fn a_narrowed_scope_still_fails_on_stderr_and_on_the_exit_status() {
+        let scope = Scope::StderrAndStatus {
+            because: "cluster creation lands later",
+        };
+        let theirs = outcome(1, "creating directory ... ok\n", "initdb: error: boom\n");
+
+        let wrong_stderr = outcome(1, "creating directory ... ok\n", "initdb: error: bang\n");
+        assert!(!compare(&theirs, &wrong_stderr, &[], scope).is_clean());
+
+        let wrong_status = outcome(2, "creating directory ... ok\n", "initdb: error: boom\n");
+        assert!(!compare(&theirs, &wrong_status, &[], scope).is_clean());
+    }
+
+    #[test]
+    fn a_narrowed_scope_forgives_stdout_but_reports_it() {
+        let scope = Scope::StderrAndStatus {
+            because: "cluster creation lands later",
+        };
+        let theirs = outcome(1, "creating directory ... ok\n", "initdb: error: boom\n");
+        let ours = outcome(1, "", "initdb: error: boom\n");
+        let report = compare(&theirs, &ours, &[], scope);
+
+        assert!(report.is_clean(), "{report}");
+        let flagged = report
+            .out_of_scope_difference()
+            .expect("the stdout difference is still reported");
+        assert!(
+            flagged.contains("cluster creation lands later"),
+            "{flagged}"
+        );
+        assert!(flagged.contains("creating directory ... ok"), "{flagged}");
+        // The same invocation under the default scope is a failure.
+        assert!(!compare(&theirs, &ours, &[], Scope::Everything).is_clean());
+    }
+
+    #[test]
+    fn nothing_is_flagged_when_the_out_of_scope_stream_matches_anyway() {
+        let scope = Scope::StderrAndStatus { because: "any" };
+        let theirs = outcome(1, "same\n", "initdb: error: boom\n");
+        let report = compare(&theirs, &theirs.clone(), &[], scope);
+        assert_eq!(report.out_of_scope_difference(), None);
+        assert_eq!(
+            compare(&theirs, &theirs.clone(), &[], Scope::Everything).out_of_scope_difference(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_gate_line_says_when_the_verdict_is_narrowed() {
+        let gate = Gate::new("/ref/initdb", "/our/rinitdb")
+            .arg("--sync-only")
+            .stderr_and_status_only("cluster creation lands later");
+        let line = gate.to_string();
+        assert!(
+            line.contains("judged on: stderr and exit status only"),
+            "{line}"
+        );
+        assert!(line.contains("cluster creation lands later"), "{line}");
+        assert!(
+            !Gate::new("/ref/initdb", "/our/rinitdb")
+                .to_string()
+                .contains("judged on")
+        );
     }
 }

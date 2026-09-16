@@ -3,6 +3,7 @@
 //! Search order matches pgrust's own sim sweep: an explicit environment
 //! variable first, then the PGDG Debian layout, then Homebrew.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Environment variable naming the directory that holds the reference
@@ -44,12 +45,30 @@ pub fn find(tool: &str) -> Option<PathBuf> {
     locate(tool, env_dir.as_deref(), DEFAULT_REF_DIRS, Path::is_file)
 }
 
+/// The flag every skipped gate carries, so skips are greppable in a log.
+pub const SKIP_FLAG: &str = "SKIP (flagged, not silent)";
+
 /// The message a gate prints when the reference tool is absent.
 #[must_use]
 pub fn skip_message(tool: &str) -> String {
-    format!(
-        "SKIP (flagged, not silent): reference `{tool}` not found; set {REF_BIN_ENV} or install PostgreSQL 18"
-    )
+    format!("{SKIP_FLAG}: reference `{tool}` not found; set {REF_BIN_ENV} or install PostgreSQL 18")
+}
+
+/// Action: put a flagged skip on screen.
+///
+/// Not `println!`/`eprintln!`: libtest captures both and replays them only for
+/// a *failing* test or under `--nocapture`, so a skip announced that way is
+/// invisible in the CI log of a passing run — a silently narrowed gate, which
+/// is exactly what AGENTS.md forbids. Writing to the process's own stderr
+/// handle goes around the capture, so the flag always shows.
+pub fn announce_skip(reason: &str) {
+    // Nothing useful to do if stderr is closed; the test still passes.
+    let _ = writeln!(std::io::stderr().lock(), "{reason}");
+}
+
+/// Action: announce that a gate is skipped because reference `tool` is absent.
+pub fn skip(tool: &str) {
+    announce_skip(&skip_message(tool));
 }
 
 #[cfg(test)]
@@ -80,5 +99,10 @@ mod tests {
     #[test]
     fn skip_message_names_the_override() {
         assert!(skip_message("initdb").contains(REF_BIN_ENV));
+    }
+
+    #[test]
+    fn skip_message_carries_the_flag() {
+        assert!(skip_message("initdb").starts_with(SKIP_FLAG));
     }
 }

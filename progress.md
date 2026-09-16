@@ -3,6 +3,68 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-384 rinitdb sync options
+
+**What**. `--sync-only` stops being a validation-only path: `rinitdb::sync`
+is `sync_pgdata` (`src/common/file_utils.c:99`) over `walkdir` (`:290`) and
+`fsync_fname` (`:400`), `parse_sync_method`
+(`src/fe_utils/option_utils.c:90`) in the `case 19:` arm it belongs to
+(`initdb.c:3389`), and the three messages `initdb.c:3447`, `:2127` and
+`:3516` as constants. `SyncPlan` gained `sync_method`; `CreatePlan` gained
+`do_sync`, `sync_method` and `sync_data_files`, which is all NAT-387 needs to
+call the same code at the end of a real cluster creation. Six new
+`InitdbError` variants, one per `pg_log_error` site the walk can reach.
+Stolen: `sync only` (`001_initdb.pl:78`), `--no-sync-data-files` (`:79`) and
+`sync method syncfs` (`:83`, both branches), each byte-diff gated.
+
+**Why this shape**. `plan()` is a calculation over a `SyncProbe`, so all of
+`walkdir` — the recursion, the rule that symlinks are followed under
+`pg_tblspc` and nowhere else, the `exclude_dir` of `--no-sync-data-files`,
+and `pg_wal` being walked a second time when it is a symlink — is unit-tested
+against a map of fake directories with no temporary files at all. The
+`pg_log_error` lines the walk emits are `SyncOp::Warn` ops rather than side
+effects of the walk: C interleaves them with the syncing, and where a line
+lands in stderr is exactly what the byte-diff gate compares, so it has to be
+part of the calculation's output and not of its plumbing. The four `errno`
+values `fsync_fname` tests by name are spelled as POSIX numbers with a
+comment saying so; no `ErrorKind` covers `EBADF`, and `%m` is errno-shaped
+anyway.
+
+Upstream syncs the cluster its `successful creation` case left behind. That
+cluster does not exist yet, so the three stolen cases run over the directory
+tree `build_layout` makes (NAT-380's real parse → validate → lay out → apply
+path, not a fixture). `sync_pgdata` walks whatever is in front of it and the
+gate walks the very same tree through C initdb, so the comparison is exact
+either way; it widens to a finished cluster with NAT-387.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 343 tests (was 328). 19 gates print
+`SKIP (flagged, not silent)`; three of them are new and all three are
+`Scope::Everything`, since C prints nothing on stdout here but the progress
+line this port now prints too. Each new case was checked non-vacuous:
+breaking `CHECK_OK` fails the unit test, and an extra byte on stdout fails
+all three stolen cases.
+
+**Risks**: the two new `docs/divergences.md` rows. `--sync-method=syncfs` is
+accepted wherever a Linux C initdb accepts it but performs the fsync walk —
+`syncfs(2)` is unreachable from the standard library, the crate is
+`#![deny(unsafe_code)]` and `libc` is not approved. The fsync walk is the
+stronger of the two for `$PGDATA` (it syncs the directory entries as well),
+and on a readable cluster both print nothing, so the gated bytes are
+identical; the residual is the error text on an unreadable subtree. The
+`pre_sync_fname` hint pass is absent, which is the `PG_FLUSH_DATA_WORKS`-undef
+build upstream itself supports. Separately, `--sync-only` on a directory that
+is not a cluster prints C's `could not stat file ".../pg_wal"` and
+`could not open directory ".../pg_tblspc"` and still exits 0 — verified by
+hand against the C source, not against a C binary, because there is none here.
+
+**Follow-ups**: `Sync to disk skipped.` (`initdb.c:3516`) is pinned as bytes
+by a unit test but has no command line to reach it until NAT-387 implements
+cluster creation; the `do_sync` flag it hangs off is already on `CreatePlan`.
+`initdb.c:3389` exits 1 on a bad `--sync-method` *before* `atexit` registers
+the cleanup — matching today, but worth re-checking when NAT-385 adds
+`cleanup_directories_atexit`.
+
 ## 2026-09-16 — NAT-388 rlibpq conninfo and URI parsing
 
 **What**. The connection-string front end of libpq, ported from

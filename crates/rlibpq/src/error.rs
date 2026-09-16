@@ -1,7 +1,9 @@
-//! The messages `PQconninfoParse` leaves in its error buffer.
+//! The messages `PQconninfoParse` leaves in its error buffer, and the ones
+//! `PQconnectPoll` appends before it opens anything.
 //!
-//! Each variant is one `libpq_append_error` call site in `fe-connect.c`, and
-//! the rendering is that call's format string with its arguments substituted.
+//! Each variant is one `libpq_append_error` / `libpq_append_conn_error` call
+//! site in `fe-connect.c`, and the rendering is that call's format string with
+//! its arguments substituted.
 //! The message is built as *bytes* in one place ([`ConnError::message`]) and
 //! [`fmt::Display`] is derived from it, so there is a single spelling of each
 //! string to drift and a token that is not UTF-8 still reaches stderr as the
@@ -47,6 +49,16 @@ pub enum ConnError {
     ForbiddenNulInPercentEncoding(RawText),
     /// `fe-connect.c:7265` — a space that is not leading or trailing.
     UnexpectedSpaces(RawText),
+    /// `fe-connect.c:3046` — `PQconnectPoll` read the `port` as an `int`, but
+    /// it is outside 1..=65535.
+    InvalidPortNumber(RawText),
+    /// `fe-connect.c:8231` — `pqParseIntParam` could not read the whole value
+    /// of an integer-valued option. `option` is its `context` argument, a
+    /// literal at the call site rather than anything that came off the wire.
+    InvalidIntegerValue {
+        value: RawText,
+        option: &'static str,
+    },
 }
 
 impl ConnError {
@@ -54,109 +66,90 @@ impl ConnError {
     /// `libpq_append_error` adds (`fe-misc.c:1539`).
     #[must_use]
     pub fn message(&self) -> Vec<u8> {
-        let mut out = Vec::new();
         match self {
-            ConnError::MissingEquals(name) => {
-                wrap(
-                    &mut out,
-                    "missing \"=\" after \"",
-                    name,
-                    "\" in connection info string",
-                );
-            }
+            ConnError::MissingEquals(name) => wrap(
+                "missing \"=\" after \"",
+                name,
+                "\" in connection info string",
+            ),
             ConnError::UnterminatedQuotedString => {
-                out.extend_from_slice(b"unterminated quoted string in connection info string");
+                b"unterminated quoted string in connection info string".to_vec()
             }
             ConnError::InvalidConnectionOption(keyword) => {
-                wrap(&mut out, "invalid connection option \"", keyword, "\"");
+                wrap("invalid connection option \"", keyword, "\"")
             }
-            ConnError::InvalidUriPropagated(uri) => {
-                wrap(
-                    &mut out,
-                    "invalid URI propagated to internal parser routine: \"",
-                    uri,
-                    "\"",
-                );
-            }
-            ConnError::Ipv6Unterminated(uri) => {
-                wrap(
-                    &mut out,
-                    "end of string reached when looking for matching \"]\" in IPv6 host address in URI: \"",
-                    uri,
-                    "\"",
-                );
-            }
+            ConnError::InvalidUriPropagated(uri) => wrap(
+                "invalid URI propagated to internal parser routine: \"",
+                uri,
+                "\"",
+            ),
+            ConnError::Ipv6Unterminated(uri) => wrap(
+                "end of string reached when looking for matching \"]\" in IPv6 host address in URI: \"",
+                uri,
+                "\"",
+            ),
             ConnError::Ipv6Empty(uri) => {
-                wrap(
-                    &mut out,
-                    "IPv6 host address may not be empty in URI: \"",
-                    uri,
-                    "\"",
-                );
+                wrap("IPv6 host address may not be empty in URI: \"", uri, "\"")
             }
             ConnError::UnexpectedCharacter {
                 character,
                 position,
                 uri,
             } => {
-                out.extend_from_slice(b"unexpected character \"");
+                let mut out = b"unexpected character \"".to_vec();
                 out.push(*character);
                 out.extend_from_slice(
                     format!("\" at position {position} in URI (expected \":\" or \"/\"): \"")
                         .as_bytes(),
                 );
                 out.extend_from_slice(uri.as_bytes());
-                out.extend_from_slice(b"\"");
+                out.push(b'"');
+                out
             }
-            ConnError::ExtraSeparator(keyword) => {
-                wrap(
-                    &mut out,
-                    "extra key/value separator \"=\" in URI query parameter: \"",
-                    keyword,
-                    "\"",
-                );
-            }
-            ConnError::MissingSeparator(keyword) => {
-                wrap(
-                    &mut out,
-                    "missing key/value separator \"=\" in URI query parameter: \"",
-                    keyword,
-                    "\"",
-                );
-            }
+            ConnError::ExtraSeparator(keyword) => wrap(
+                "extra key/value separator \"=\" in URI query parameter: \"",
+                keyword,
+                "\"",
+            ),
+            ConnError::MissingSeparator(keyword) => wrap(
+                "missing key/value separator \"=\" in URI query parameter: \"",
+                keyword,
+                "\"",
+            ),
             ConnError::InvalidUriQueryParameter(keyword) => {
-                wrap(&mut out, "invalid URI query parameter: \"", keyword, "\"");
+                wrap("invalid URI query parameter: \"", keyword, "\"")
             }
             ConnError::InvalidPercentEncoding(token) => {
-                wrap(&mut out, "invalid percent-encoded token: \"", token, "\"");
+                wrap("invalid percent-encoded token: \"", token, "\"")
             }
-            ConnError::ForbiddenNulInPercentEncoding(token) => {
-                wrap(
-                    &mut out,
-                    "forbidden value %00 in percent-encoded value: \"",
-                    token,
-                    "\"",
-                );
-            }
-            ConnError::UnexpectedSpaces(token) => {
-                wrap(
-                    &mut out,
-                    "unexpected spaces found in \"",
-                    token,
-                    "\", use percent-encoded spaces (%20) instead",
-                );
-            }
+            ConnError::ForbiddenNulInPercentEncoding(token) => wrap(
+                "forbidden value %00 in percent-encoded value: \"",
+                token,
+                "\"",
+            ),
+            ConnError::UnexpectedSpaces(token) => wrap(
+                "unexpected spaces found in \"",
+                token,
+                "\", use percent-encoded spaces (%20) instead",
+            ),
+            ConnError::InvalidPortNumber(port) => wrap("invalid port number: \"", port, "\""),
+            ConnError::InvalidIntegerValue { value, option } => wrap(
+                "invalid integer value \"",
+                value,
+                &format!("\" for connection option \"{option}\""),
+            ),
         }
-        out
     }
 }
 
 /// `prefix`, the token's raw bytes, then `suffix` — the shape of all but one
 /// of the format strings above.
-fn wrap(out: &mut Vec<u8>, prefix: &str, token: &RawText, suffix: &str) {
+fn wrap(prefix: &str, token: &RawText, suffix: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
     out.extend_from_slice(prefix.as_bytes());
     out.extend_from_slice(token.as_bytes());
     out.extend_from_slice(suffix.as_bytes());
+    out
 }
 
 impl fmt::Display for ConnError {
@@ -239,6 +232,25 @@ mod tests {
         assert_eq!(
             error.message(),
             b"invalid URI query parameter: \"\xff\xfe\"".to_vec()
+        );
+    }
+
+    /// The two messages a bad `port` produces: the range one at
+    /// `fe-connect.c:3046`, and `pqParseIntParam`'s at `:8231` for a value
+    /// `strtol` cannot read in full.
+    #[test]
+    fn the_port_messages_are_the_ones_pq_connect_poll_appends() {
+        assert_eq!(
+            ConnError::InvalidPortNumber("99999".into()).to_string(),
+            "invalid port number: \"99999\""
+        );
+        assert_eq!(
+            ConnError::InvalidIntegerValue {
+                value: "abc".into(),
+                option: "port",
+            }
+            .to_string(),
+            "invalid integer value \"abc\" for connection option \"port\""
         );
     }
 

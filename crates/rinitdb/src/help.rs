@@ -4,6 +4,12 @@
 /// `PG_VERSION` from `pg_config.h` for the tree this port tracks.
 pub const PG_VERSION: &str = "18.6";
 
+/// `PG_MAJORVERSION` from the same header: everything in [`PG_VERSION`] before
+/// the first dot. It is the whole content of a `PG_VERSION` *file*
+/// (`write_version_file`, `initdb.c:1036`), so the two must not drift apart —
+/// `the_major_version_is_the_leading_component_of_pg_version` pins them.
+pub const PG_MAJORVERSION: &str = "18";
+
 /// The name C initdb reports for itself (`get_progname(argv[0])`).
 pub const PROGNAME: &str = "initdb";
 
@@ -145,6 +151,11 @@ mod tests {
         let text = usage("initdb");
         let too_long: Vec<&str> = text.lines().filter(|l| l.chars().count() > 95).collect();
         assert!(too_long.is_empty(), "{too_long:?}");
+    }
+
+    #[test]
+    fn the_major_version_is_the_leading_component_of_pg_version() {
+        assert_eq!(PG_VERSION.split('.').next(), Some(PG_MAJORVERSION));
     }
 
     #[test]

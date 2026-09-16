@@ -22,7 +22,9 @@
 pub mod cli;
 pub mod encoding;
 pub mod error;
+pub mod file_perm;
 pub mod help;
+pub mod layout;
 pub mod validate;
 
 use std::ffi::OsString;
@@ -31,6 +33,8 @@ use std::process::ExitCode;
 
 pub use cli::{Invocation, Options};
 pub use error::{InitdbError, LocaleProvider};
+pub use file_perm::DataDirPerm;
+pub use layout::{FsOp, layout};
 pub use validate::{Environment, FsProbe, Plan, RealFs, validate};
 
 /// Exit status C initdb uses for its own errors (`pg_fatal`, `exit(1)`).

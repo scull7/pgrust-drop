@@ -629,9 +629,13 @@ pub fn render_pg_hba_conf(sample: &str, settings: &Settings) -> String {
 
 /// `setup_config`'s `pg_ident.conf` half (`initdb.c:1527`): the template,
 /// copied through unchanged.
+///
+/// Upstream still goes `readfile` → `writefile`, but it replaces no token on
+/// the way, and that round trip is the identity (`split_lines` keeps every
+/// terminator) — so this is the same bytes without the intermediate `Vec`.
 #[must_use]
 pub fn render_pg_ident_conf(sample: &str) -> String {
-    join_lines(&split_lines(sample))
+    sample.to_owned()
 }
 
 /// The four files, in `setup_config` order, as `(name, contents)`.
@@ -656,7 +660,6 @@ pub fn render_all(settings: &Settings) -> Vec<(&'static str, String)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
 
@@ -681,6 +684,71 @@ mod tests {
     }
 
     // --- readfile / writefile ------------------------------------------
+
+    /// FNV-1a (64-bit), so the digests below need no dependency and no
+    /// `unsafe`. It is not a cryptographic hash and is not being used as one:
+    /// it guards against an accidental edit, not against a forged one.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Pins the divergence in `docs/divergences.md`: these three files are
+    /// compiled in, so a cluster gets *these* bytes and never the ones in a
+    /// host's `share/`. What upstream ships is therefore part of this crate's
+    /// observable behaviour, and drifting from it has to be a deliberate act.
+    ///
+    /// A failure here means a template changed. That is legitimate when
+    /// PostgreSQL 18.x changes one — re-vendor, update the digest, and say so
+    /// in `progress.md` — and is a bug in every other case, including a stray
+    /// editor reformat or a line-ending conversion. The lengths are asserted
+    /// too so the failure says *which* file and by how much.
+    #[test]
+    fn the_embedded_templates_are_the_postgresql_18_6_bytes_we_vendored() {
+        for (name, sample, length, digest) in [
+            (
+                "postgresql.conf.sample",
+                POSTGRESQL_CONF_SAMPLE,
+                34_323,
+                0xa9b9_6fcb_1ac3_6b48_u64,
+            ),
+            (
+                "pg_hba.conf.sample",
+                PG_HBA_CONF_SAMPLE,
+                5_635,
+                0x0a0d_1bd3_d9f1_4f98,
+            ),
+            (
+                "pg_ident.conf.sample",
+                PG_IDENT_CONF_SAMPLE,
+                2_681,
+                0xda9b_59c0_b8dd_0769,
+            ),
+        ] {
+            assert_eq!(sample.len(), length, "{name} changed length");
+            assert_eq!(fnv1a64(sample.as_bytes()), digest, "{name} changed content");
+        }
+    }
+
+    /// The tokens `setup_config` substitutes have to still be in the template
+    /// it is handed, or a replacement would quietly become a no-op and the
+    /// digest above would be the only thing standing between a cluster and a
+    /// `pg_hba.conf` full of `@authmethodlocal@`.
+    #[test]
+    fn every_token_setup_config_replaces_is_present_in_the_template() {
+        for token in [
+            "@remove-line-for-nolocal@",
+            "@authmethodlocal@",
+            "@authmethodhost@",
+            "@authcomment@",
+        ] {
+            assert!(PG_HBA_CONF_SAMPLE.contains(token), "{token} is gone");
+        }
+    }
 
     #[test]
     fn splitting_and_joining_is_the_identity_on_every_template() {

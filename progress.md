@@ -3,6 +3,52 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-379 review fixes
+
+**What** (one finding was a real build break, three were real cleanups)
+- `multiple_set_options_with_different_case` carried a bare `#[test]` while the
+  `create_plan` helper it calls is `#[cfg(unix)]`, so off Unix the whole test
+  target failed to compile with E0425 — invisible here because CI is
+  ubuntu-latest and because nothing in the case is itself platform-specific.
+  Guarded like its four siblings, with a comment saying the guard belongs to
+  the helper and not to the stolen case. Audited the rest of the file rather
+  than fixing the one report: every caller of `create_plan` / `build_layout`
+  is now inside a `cfg(unix)` item, checked mechanically, not by eye. A
+  non-Unix toolchain is not installed on this box, so the fix is reasoned from
+  the cfg structure and not compiled; unguarding `create_plan` instead would
+  keep the case running on Windows and is the better answer if anyone ever has
+  a target to prove it on.
+- The "templates compiled in rather than read from `share_path`" divergence
+  cited `splitting_and_joining_is_the_identity_on_every_template`, which only
+  proves `readfile`/`writefile` round-trips, and the gate, which always skips
+  here — so it had no pin at all, which is what AGENTS.md asks for. It now has
+  one that bites: the byte length and an FNV-1a digest of each of the three
+  templates. Compiling the templates in is what makes their bytes part of this
+  crate's observable behaviour, so drift has to be deliberate; a stray reformat
+  or a line-ending conversion now fails the suite instead of shipping. Checked
+  non-vacuous by appending one byte to `pg_ident.conf.sample` — the test fails
+  and names the file. A second test asserts the four `@…@` tokens are still in
+  the hba template, since a replacement against a template that lost its token
+  is a silent no-op.
+- `#[allow(clippy::too_many_lines)]` sat on the whole `mod tests`, exempting
+  every test function and standing as the repo's only lint suppression. It
+  turned out to be unnecessary outright, not merely too broad: with it deleted,
+  pedantic clippy exits 0 with nothing to scope it down to.
+- `render_pg_ident_conf` built and joined a 72-element `Vec<String>` to return
+  its argument unchanged. `sample.to_owned()`, with the comment explaining that
+  upstream's `readfile` → `writefile` really is the identity when no token is
+  replaced.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 270 tests (was 268). All 15 gates still
+print `SKIP (flagged, not silent)`.
+
+**Risks**: none new. The digest test is the only one that can fail for a
+non-bug reason (a genuine PostgreSQL 18.x template change); its doc comment
+says what to do then.
+
+**Follow-ups**: unchanged from the entry below.
+
 ## 2026-09-16 — NAT-379 rinitdb config generation
 
 **What**. `setup_config()` (`initdb.c:1283`) as pure functions over the three

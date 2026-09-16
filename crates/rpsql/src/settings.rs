@@ -158,7 +158,7 @@ impl Separator {
         if self.separator_zero {
             vec![0]
         } else {
-            self.separator.clone().unwrap_or_default().into_bytes()
+            self.separator.as_deref().unwrap_or("").as_bytes().to_vec()
         }
     }
 }

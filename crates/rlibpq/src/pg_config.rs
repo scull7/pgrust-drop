@@ -52,6 +52,13 @@ pub const DEFAULT_SSL_NEGOTIATION: &str = "postgres";
 /// `fe-connect.c:139` with `ENABLE_GSS`, `:141` without.
 pub const DEFAULT_GSS_MODE: &str = if ENABLE_GSS { "prefer" } else { "disable" };
 
+/// `pg_config_manual.h` — `DEFAULT_PGSOCKET_DIR`, the compiled-in directory
+/// `DefaultHost` (`fe-connect.c:110`) falls back to when `host` is unset. A
+/// stock build uses `/tmp`; a distribution build often does not, which is the
+/// same stock-build-constant divergence `crates/rinitdb/src/pg_config.rs`
+/// records for `initdb`.
+pub const DEFAULT_PGSOCKET_DIR: &str = "/tmp";
+
 #[cfg(test)]
 mod tests {
     use super::*;

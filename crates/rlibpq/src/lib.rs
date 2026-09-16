@@ -5,9 +5,12 @@
 //! C-ABI `libpq.so`, with GSSAPI feature-gated and no libc/OpenSSL build-time
 //! coupling.
 //!
-//! What is here so far is the connection-string front end: `PQconninfoOptions[]`
-//! and the two parsers that fill a working copy of it, proved against
-//! `t/001_uri.pl`. The rest is tracked in Linear NAT-389 … NAT-396.
+//! What is here so far is the connection-string front end
+//! (`PQconninfoOptions[]` and the two parsers that fill a working copy of it,
+//! proved against `t/001_uri.pl`) and the protocol version 3 core: the wire
+//! messages, the authentication methods a build without TLS or GSSAPI can do
+//! (trust, password, md5, SCRAM-SHA-256), and a blocking `Connection` that
+//! runs simple queries. The rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -20,20 +23,36 @@
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
+pub mod auth;
+pub mod base64;
+pub mod connection;
 pub mod conninfo;
 mod cstr;
 pub mod error;
+pub mod hmac;
+pub mod md5;
+pub mod message;
 pub mod pg_config;
 pub mod regress;
+pub mod result;
+pub mod scram;
+pub mod sha256;
 mod text;
 pub mod uri;
 
+pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
+pub use connection::{Address, Connection, ConnectionError, QueryRunner, Stream, socket_address};
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,
     conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,
     uri_prefix_length,
 };
 pub use error::ConnError;
+pub use message::{Backend, Frame, Frontend, ProtocolError, TransactionStatus, next_frame};
 pub use regress::regress_report;
+pub use result::{
+    ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,
+};
+pub use scram::{Mechanism, ScramClient, ScramError};
 pub use text::RawText;
 pub use uri::{parse_uri, uri_decode};

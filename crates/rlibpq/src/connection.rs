@@ -18,10 +18,11 @@ use std::path::PathBuf;
 
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::conninfo::ConnInfo;
+use crate::error::ConnError;
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, TransactionStatus, next_frame,
 };
-use crate::pg_config::{DEF_PGPORT_STR, DEFAULT_PGSOCKET_DIR};
+use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
 
@@ -42,6 +43,9 @@ pub enum ConnectionError {
     /// A message that is well-formed but cannot appear here
     /// (`fe-protocol3.c:447`).
     UnexpectedMessage(u8),
+    /// A conninfo value `PQconnectPoll` refuses before it opens anything —
+    /// today the `port` alone (`fe-connect.c:3036`-`:3049`).
+    Conninfo(ConnError),
 }
 
 impl ConnectionError {
@@ -64,6 +68,7 @@ impl ConnectionError {
             ConnectionError::UnexpectedMessage(id) => {
                 ProtocolError::UnexpectedResponse(*id).message()
             }
+            ConnectionError::Conninfo(err) => err.message(),
         }
     }
 }
@@ -94,6 +99,12 @@ impl From<AuthError> for ConnectionError {
     }
 }
 
+impl From<ConnError> for ConnectionError {
+    fn from(err: ConnError) -> Self {
+        ConnectionError::Conninfo(err)
+    }
+}
+
 /// Where to connect: `pg_conn_host_type`, `fe-connect.c`'s `CHT_HOST_NAME` and
 /// `CHT_UNIX_SOCKET`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,40 +122,116 @@ pub fn is_unixsock_path(host: &[u8]) -> bool {
     host.first() == Some(&b'/') || host.first() == Some(&b'@')
 }
 
-/// Which socket a `ConnInfo` names — `parse_connection_string`'s host
-/// classification at `fe-connect.c:1310`-`:1350`, as a pure function.
+/// `DEF_PGPORT`, the integer `PQconnectPoll` substitutes for an absent or
+/// empty `port` (`fe-connect.c:3038`).
 ///
-/// # Panics
-/// Never: the only `expect` is over `DEF_PGPORT_STR`, a compiled-in literal
-/// this crate's `pg_config` test already parses.
-#[must_use]
-pub fn socket_address(conninfo: &ConnInfo) -> Address {
-    let port = conninfo
-        .get("port")
-        .and_then(|p| std::str::from_utf8(p).ok())
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or_else(|| DEF_PGPORT_STR.parse().expect("DEF_PGPORT_STR is a port"));
+/// `pg_config::DEF_PGPORT_STR` is the same number in the spelling
+/// `PQconninfoOptions[]` stores; `the_two_spellings_of_def_pgport_agree` pins
+/// the pair, so only one of them can drift.
+const DEF_PGPORT: u16 = 5432;
+
+/// `isspace` in the "C" locale — the bytes `strtol` skips before a number
+/// (`fe-connect.c:8206`) and the ones `pqParseIntParam` skips after one
+/// (`:8221`).
+fn is_c_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// The same bytes without their leading whitespace.
+fn without_leading_space(bytes: &[u8]) -> &[u8] {
+    let spaces = bytes.iter().take_while(|byte| is_c_space(**byte)).count();
+    &bytes[spaces..]
+}
+
+/// `strtol(value, &end, 10)` and the two checks around it
+/// (`fe-connect.c:8208`-`:8225`), as far as `pqParseIntParam` uses them:
+/// `None` is every arm that reaches its `error:` label.
+fn strtol_int(value: &[u8]) -> Option<i32> {
+    let body = without_leading_space(value);
+    let (negative, after_sign) = match body.split_first() {
+        Some((&b'-', rest)) => (true, rest),
+        Some((&b'+', rest)) => (false, rest),
+        _ => (false, body),
+    };
+    let digit_count = after_sign
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let (digits, tail) = after_sign.split_at(digit_count);
+    // `value == end` (`:8214`) and `*end != '\0'` (`:8224`): strtol must
+    // convert something, and only whitespace may follow what it converted.
+    if digits.is_empty() || !without_leading_space(tail).is_empty() {
+        return None;
+    }
+    let magnitude = digits.iter().try_fold(0i64, |acc, &digit| {
+        acc.checked_mul(10)?.checked_add(i64::from(digit - b'0'))
+    })?;
+    // `errno != 0 || numval != (int) numval` (`:8214`): a value too wide for
+    // an `int` is an error, not a saturated one.
+    i32::try_from(if negative { -magnitude } else { magnitude }).ok()
+}
+
+/// `pqParseIntParam`, `fe-connect.c:8196`, for one named option.
+fn parse_int_param(value: &[u8], option: &'static str) -> Result<i32, ConnError> {
+    strtol_int(value).ok_or_else(|| ConnError::InvalidIntegerValue {
+        value: value.into(),
+        option,
+    })
+}
+
+/// The port to connect to, from the raw `port` conninfo value.
+///
+/// `fe-connect.c:3036`-`:3049`, the block that settles `thisport` before
+/// `PQconnectPoll` resolves any address — for a Unix socket (`:3079`) exactly
+/// as for TCP. An absent or empty value is [`DEF_PGPORT`] (`:3037`); anything
+/// else must be an integer `pqParseIntParam` reads in full (`:3041`) that
+/// lands in 1..=65535 (`:3044`).
+///
+/// # Errors
+/// [`ConnError::InvalidIntegerValue`] when the value is not an integer at all,
+/// [`ConnError::InvalidPortNumber`] when it is one but out of range.
+pub fn parse_port(raw: Option<&[u8]>) -> Result<u16, ConnError> {
+    let Some(value) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(DEF_PGPORT);
+    };
+    match u16::try_from(parse_int_param(value, "port")?) {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(ConnError::InvalidPortNumber(value.into())),
+    }
+}
+
+/// Which socket a `ConnInfo` names — `parse_connection_string`'s host
+/// classification at `fe-connect.c:1310`-`:1350` over the port
+/// [`parse_port`] settles, as a pure function.
+///
+/// # Errors
+/// The `port` is not one `PQconnectPoll` would use; see [`parse_port`].
+pub fn socket_address(conninfo: &ConnInfo) -> Result<Address, ConnError> {
+    let port = parse_port(conninfo.get("port"))?;
 
     let host = conninfo.get("host").unwrap_or_default();
     if host.is_empty() {
         // fe-connect.c:1339 — the compiled-in socket directory wins when it
         // is not empty; only a build without one falls back to DefaultHost.
         if DEFAULT_PGSOCKET_DIR.is_empty() {
-            return Address::Tcp {
+            return Ok(Address::Tcp {
                 host: "localhost".to_string(),
                 port,
-            };
+            });
         }
-        return Address::Unix(unix_socket_path(DEFAULT_PGSOCKET_DIR, port));
+        return Ok(Address::Unix(unix_socket_path(DEFAULT_PGSOCKET_DIR, port)));
     }
 
     if is_unixsock_path(host) {
-        return Address::Unix(unix_socket_path(&String::from_utf8_lossy(host), port));
+        return Ok(Address::Unix(unix_socket_path(
+            &String::from_utf8_lossy(host),
+            port,
+        )));
     }
-    Address::Tcp {
+    Ok(Address::Tcp {
         host: String::from_utf8_lossy(host).into_owned(),
         port,
-    }
+    })
 }
 
 /// `UNIXSOCK_PATH`, `pqcomm.h:44`.
@@ -416,10 +503,15 @@ impl Connection<Stream> {
     /// the environment.
     ///
     /// # Errors
-    /// The socket could not be opened, the nonce could not be drawn, the
-    /// server refused the connection, or authentication failed.
+    /// The `port` is not one `PQconnectPoll` would use, the socket could not
+    /// be opened, the nonce could not be drawn, the server refused the
+    /// connection, or authentication failed.
     pub fn connect(conninfo: &ConnInfo) -> Result<Self, ConnectionError> {
-        let address = socket_address(conninfo);
+        // fe-connect.c:3036 — `PQconnectPoll` settles the port, and refuses a
+        // value that is not one, before it resolves an address or opens a
+        // socket. Doing it here keeps that order: nothing is opened for a
+        // conninfo C would have rejected.
+        let address = socket_address(conninfo)?;
         let stream = Stream::connect(&address)?;
         let nonce = strong_random(RAW_NONCE_LEN)?;
         Connection::start_up(stream, conninfo, &nonce)
@@ -642,6 +734,7 @@ pub fn text_field(name: &[u8]) -> FieldDescription {
 mod tests {
     use super::*;
     use crate::conninfo::{Env, parse_conninfo};
+    use crate::pg_config::DEF_PGPORT_STR;
     use crate::result::diag;
 
     /// A stream that plays back recorded server bytes and records what the
@@ -768,19 +861,19 @@ mod tests {
     #[test]
     fn the_address_is_the_socket_upstream_would_pick() {
         assert_eq!(
-            socket_address(&conninfo("host=example.com port=5433")),
+            socket_address(&conninfo("host=example.com port=5433")).unwrap(),
             Address::Tcp {
                 host: "example.com".to_string(),
                 port: 5433
             }
         );
         assert_eq!(
-            socket_address(&conninfo("host=/var/run/postgresql")),
+            socket_address(&conninfo("host=/var/run/postgresql")).unwrap(),
             Address::Unix(PathBuf::from("/var/run/postgresql/.s.PGSQL.5432"))
         );
         // No host at all: the compiled-in socket directory.
         assert_eq!(
-            socket_address(&conninfo("")),
+            socket_address(&conninfo("")).unwrap(),
             Address::Unix(PathBuf::from("/tmp/.s.PGSQL.5432"))
         );
         assert!(is_unixsock_path(b"/tmp"));
@@ -790,6 +883,99 @@ mod tests {
             unix_socket_path("/tmp", 5432),
             PathBuf::from("/tmp/.s.PGSQL.5432")
         );
+    }
+
+    /// `fe-connect.c:3037` — a `port` that is absent or empty is the only way
+    /// to reach `DEF_PGPORT`, and it must keep reaching it.
+    #[test]
+    fn a_port_that_was_never_given_is_the_compiled_in_default() {
+        assert_eq!(parse_port(None).unwrap(), 5432);
+        assert_eq!(parse_port(Some(b"")).unwrap(), 5432);
+        assert_eq!(
+            socket_address(&conninfo("host=example.com")).unwrap(),
+            Address::Tcp {
+                host: "example.com".to_string(),
+                port: 5432
+            }
+        );
+    }
+
+    /// The integer form this module uses against the string form
+    /// `PQconninfoOptions[]` stores (`fe-connect.c:237`), so the two cannot
+    /// drift apart.
+    #[test]
+    fn the_two_spellings_of_def_pgport_agree() {
+        assert_eq!(DEF_PGPORT.to_string(), DEF_PGPORT_STR);
+    }
+
+    /// `fe-connect.c:3041` — a `port` `pqParseIntParam` cannot read in full
+    /// is that function's message (`:8231`), not a silent fallback.
+    #[test]
+    fn a_port_that_is_not_an_integer_is_refused_the_way_pq_parse_int_param_refuses_it() {
+        for value in [&b"abc"[..], b"54ab", b"5432 5433", b"5432,5433", b"-"] {
+            let error = parse_port(Some(value)).unwrap_err();
+            let mut expected = b"invalid integer value \"".to_vec();
+            expected.extend_from_slice(value);
+            expected.extend_from_slice(b"\" for connection option \"port\"");
+            assert_eq!(error.message(), expected, "for {value:?}");
+        }
+    }
+
+    /// `:8214`'s `numval != (int) numval`: too wide for an `int` is
+    /// `pqParseIntParam`'s error, not the range one.
+    #[test]
+    fn a_port_too_wide_for_an_int_is_an_invalid_integer_value_not_a_bad_port() {
+        assert_eq!(
+            parse_port(Some(b"99999999999")).unwrap_err().message(),
+            b"invalid integer value \"99999999999\" for connection option \"port\"".to_vec()
+        );
+    }
+
+    /// `fe-connect.c:3044` — an integer outside 1..=65535 is `invalid port
+    /// number`. `0` is included on purpose: upstream's lower bound is 1, so
+    /// `port=0` is refused rather than handed to the resolver.
+    #[test]
+    fn a_port_outside_upstreams_range_is_an_invalid_port_number() {
+        for value in [&b"99999"[..], b"0", b"-1", b"65536", b"2147483647"] {
+            let error = parse_port(Some(value)).unwrap_err();
+            let mut expected = b"invalid port number: \"".to_vec();
+            expected.extend_from_slice(value);
+            expected.extend_from_slice(b"\"");
+            assert_eq!(error.message(), expected, "for {value:?}");
+        }
+        // The two ends of the range upstream does accept.
+        assert_eq!(parse_port(Some(b"1")).unwrap(), 1);
+        assert_eq!(parse_port(Some(b"65535")).unwrap(), 65535);
+    }
+
+    /// `strtol` skips leading whitespace (`:8206`) and `:8221` skips trailing
+    /// whitespace, so both are a port and neither is an error.
+    #[test]
+    fn a_port_is_the_number_strtol_reads_out_of_it() {
+        assert_eq!(parse_port(Some(b" \t5433\r\n ")).unwrap(), 5433);
+        assert_eq!(parse_port(Some(b"+5433")).unwrap(), 5433);
+    }
+
+    /// A `port` that is not UTF-8 is quoted back as the bytes C would have
+    /// written, the same property `error.rs` pins for the URI tokens.
+    #[test]
+    fn a_port_that_is_not_utf8_reaches_the_message_unchanged() {
+        assert_eq!(
+            parse_port(Some(b"\xff\xfe")).unwrap_err().message(),
+            b"invalid integer value \"\xff\xfe\" for connection option \"port\"".to_vec()
+        );
+    }
+
+    /// The pre-flight is where C puts it: `PQconnectPoll` fails on the port
+    /// before it resolves an address (`fe-connect.c:3036`), so no socket is
+    /// ever opened for a conninfo upstream would have rejected. The host here
+    /// does not exist, which is what makes "no socket was opened" visible:
+    /// the error is the port's, not the socket's.
+    #[test]
+    fn an_invalid_port_stops_a_connection_before_any_socket_is_opened() {
+        let info = conninfo("host=/nonexistent-socket-dir port=99999");
+        let error = Connection::connect(&info).unwrap_err();
+        assert_eq!(error.message(), b"invalid port number: \"99999\"".to_vec());
     }
 
     /// A trust connection and one `select version()`, replayed end to end:

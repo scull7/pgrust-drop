@@ -3,6 +3,66 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-389 rlibpq protocol v3 core
+
+**What**. `rlibpq` can now connect, authenticate and run simple queries.
+Ported from the C: `message` is the version 3 wire format (`fe-protocol3.c`
+framing, every backend message the simple-query path sees, the six frontend
+messages it sends), `auth` is `pg_fe_sendauth`'s switch as a state machine over
+`AuthRequest`s, `scram` is `fe-auth-scram.c`'s client plus `scram-common.c`,
+`result` is `PGresult` — `ExecStatus`, the `PG_DIAG_*` fields and
+`pqBuildErrorMessage3`'s rendering — and `connection` is the only part that
+touches a socket. The hash primitives SCRAM and md5 need are ported from
+PostgreSQL's own C as well (`base64.c`, `md5.c` + `md5_common.c`, `sha2.c`,
+`hmac.c`): ADR-0003 forbids lifting pgrust's `scram_common`/`pg_hmac`/`pg_md5`
+crates, which are AGPL.
+
+**Why this shape**. The issue's Design splits data / calculations / actions and
+the split is load-bearing here: decoding, the authentication decision and the
+whole SCRAM exchange are pure functions of their inputs, with the one value
+that cannot be — `pg_strong_random`'s nonce (`fe-auth-scram.c:363`) — passed in
+rather than drawn. That is what lets a captured trace be replayed: the tests
+drive complete trust / md5 / SCRAM sessions over a scripted stream and then
+check the bytes the client wrote, not just the values it computed.
+
+**How it is proved**. RFC 1321 (MD5), FIPS 180-4 (SHA-256), RFC 4231 (HMAC,
+including the two long-key cases), RFC 4648 (base64) and RFC 7677 §3 for SCRAM.
+The RFC 7677 case is deliberately two tests: `the_rfc_7677_vector` computes the
+transcript's own `p=` and `v=` from its inputs through the primitives, and
+`the_libpq_exchange` runs the same key material through `ScramClient` in the
+form libpq actually sends — `n=` rather than the RFC's `n=user`, because
+`fe-auth-scram.c:387` leaves the user name to the startup packet. Keeping them
+apart is what caught that difference: the first draft asserted the RFC's proof
+against the libpq message and was wrong, and the transcript is what said so.
+
+**Gates**. `crates/rlibpq/tests/t_protocol3.rs` starts a PostgreSQL 18 cluster
+and compares `select version()`, a syntax error's rendering and all four local
+authentication methods against C `psql`. There is no PostgreSQL 18 on this box
+(`docs/nightshift/2026-09-16.md`), so each prints `SKIP (flagged, not silent)`
+and passes: 23 gate lines → 27. No upstream TAP file was stolen because there
+is none to steal for this — `src/interfaces/libpq/t/` has no simple-query test
+and `src/test/authentication/` is outside the sparse checkout — so the cases
+are named for what they pin, and that is called out in the file.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 469 tests (392 before), 27 SKIP-flagged
+gate lines.
+
+**Risks**. The four gates have never executed: no PostgreSQL 18 exists here, so
+their live path is unproven code. Everything they would check is covered
+offline by the replay tests, but the first machine with PGDG 18 should expect
+to fix the harness rather than the port. COPY, pipelining, cancel requests and
+TLS are all out of scope and the runner refuses their messages rather than
+guessing (`ProtocolError::UnexpectedResponse`).
+
+**Follow-ups**. Four new divergence rows: protocol 3.0 instead of 3.2, no
+environment-driven GUCs in the startup packet, SASLprep only as far as its
+ASCII fast path, and no syntax-cursor display in a rendered error. SASLprep in
+full needs `unicode_norm.c` and its tables and is worth its own issue. The
+acceptance sentence — rpsql switching off its private `proto.rs` — cannot be
+exercised yet: rpsql is still the `--version` stub, M3 has not started, and
+nothing has a private `proto.rs` to switch off.
+
 ## 2026-09-16 — NAT-382 review fixes
 
 **What** (three of the four findings were real; the fourth was real but its

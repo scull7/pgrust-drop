@@ -47,7 +47,7 @@ use std::process::ExitCode;
 use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
 use crate::command::{CommandContext, CommandResult, handle_slash_cmds};
-use crate::common::{Executor, send_query};
+use crate::common::{ErrorMessage, Executor, send_query};
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{QuoteType, ScanResult, Scanner, VariableSource};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
@@ -69,15 +69,12 @@ struct LiveExecutor {
 }
 
 impl Executor for LiveExecutor {
-    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, String> {
+    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
         match self.connection.exec(query) {
             Ok(results) => Ok(results),
             Err(err) => {
                 self.alive = false;
-                Err(format!(
-                    "psql: error: {}\n",
-                    String::from_utf8_lossy(&err.message())
-                ))
+                Err(err.into())
             }
         }
     }
@@ -123,7 +120,7 @@ pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
 }
 
 /// Action: open the connection this session asks for.
-fn connect(session: &Session) -> Result<LiveExecutor, String> {
+fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
     let mut conninfo = conndefaults(&Env::from_process());
     for (key, value) in connection_keywords(session) {
         // Every keyword here is a row of `PQconninfoOptions[]`, so an unknown
@@ -135,10 +132,7 @@ fn connect(session: &Session) -> Result<LiveExecutor, String> {
             connection,
             alive: true,
         }),
-        Err(err) => Err(format!(
-            "psql: error: {}\n",
-            String::from_utf8_lossy(&err.message())
-        )),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -203,8 +197,8 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
 
     let mut executor = match connect(&session) {
         Ok(executor) => executor,
-        Err(message) => {
-            let _ = stderr.write_all(message.as_bytes());
+        Err(err) => {
+            let _ = stderr.write_all(&err.rendered());
             return ExitCode::from(EXIT_BADCONN);
         }
     };
@@ -283,8 +277,8 @@ fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write)
             }
             ok
         }
-        Err(message) => {
-            let _ = stderr.write_all(message.as_bytes());
+        Err(err) => {
+            let _ = stderr.write_all(&err.rendered());
             false
         }
     }

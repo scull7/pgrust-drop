@@ -30,9 +30,17 @@ twice and the second alignment depends on the first's output length. The render
 therefore replays upstream's exact sequence.
 
 **Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
-`cargo test --all-features` exit 0 — 257 tests (was 219). All 15 gates print
+`cargo test --all-features` exit 0 — 268 tests (was 219). All 15 gates print
 `SKIP (flagged, not silent)`; the new one is
 `the_configuration_files_match_reference_initdb`.
+
+ec00620's own message says 257, which is wrong and cannot be amended: it came
+from `grep -cE '^test [a-z_:]+ \.\.\. ok'`, a pattern that silently drops every
+test whose name contains a digit (`..._c_utf_8_...`, `t_001_...`). The count
+here and below is the sum of the `test result:` lines, which is what the 219
+baseline was measured with too. A greppable count is exactly the kind of check
+AGENTS.md says to take from an exit status instead; the exit status was 0 both
+times, and only the number in the prose was ever wrong.
 
 **How the renderer was verified without a PostgreSQL 18 reference**. The box has
 Ubuntu's PostgreSQL *16* initdb, which is not a reference binary and is not

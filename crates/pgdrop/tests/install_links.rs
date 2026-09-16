@@ -190,3 +190,53 @@ fn a_directory_that_does_not_exist_is_reported_not_created() {
     );
     assert!(!missing.exists());
 }
+
+/// The Acceptance line is "an error naming the path", and a path is bytes, not
+/// characters. A `String` field filled from `Path::display()` would hand the
+/// operator `U+FFFD` where the `0xFF` is — a path they cannot copy back.
+#[test]
+fn the_messages_name_a_path_that_is_not_utf8_byte_for_byte() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let parent = TempDir::new("not-utf8");
+    let dir = PathBuf::from(OsString::from_vec(
+        [parent.path().as_os_str().as_bytes(), b"/b\xffad"].concat(),
+    ));
+    std::fs::create_dir(&dir).expect("create a directory whose name is not UTF-8");
+    let psql = dir.join("psql");
+    std::fs::write(&psql, b"not a link\n").expect("write psql");
+
+    // The error path: `refusing to replace "<dir>/psql"`.
+    let refused = install(&dir, false);
+    assert_eq!(refused.status, Some(1));
+    contains_bytes(&refused.stderr, psql.as_os_str().as_bytes());
+    substitutes_nothing(&refused.stderr);
+
+    // And the note path: `created "<dir>/initdb"`.
+    std::fs::remove_file(&psql).expect("clear the way");
+    let installed = install(&dir, false);
+    assert_eq!(installed.status, Some(0), "{}", installed.stderr_text());
+    contains_bytes(&installed.stdout, dir.join("initdb").as_os_str().as_bytes());
+    substitutes_nothing(&installed.stdout);
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) {
+    assert!(
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle),
+        "{:?} does not name {:?} byte for byte",
+        String::from_utf8_lossy(haystack),
+        String::from_utf8_lossy(needle)
+    );
+}
+
+/// U+FFFD, the substitution these two streams must not be making.
+fn substitutes_nothing(stream: &[u8]) {
+    assert!(
+        !stream.windows(3).any(|window| window == [0xEF, 0xBF, 0xBD]),
+        "{:?} substitutes",
+        String::from_utf8_lossy(stream)
+    );
+}

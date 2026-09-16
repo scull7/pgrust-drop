@@ -9,7 +9,6 @@ dependencies = [
  "rinitdb",
  "rpsql",
  "testkit",
- "thiserror",
  "usage-rs",
 ]
 

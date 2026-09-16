@@ -7,14 +7,15 @@
 //! (Linear NAT-378 … NAT-387) following ADR-0002.
 //!
 //! Layout: [`cli`] is data + pure parsing, [`validate`] is the pure pre-flight
-//! calculation over an [`validate::FsProbe`], [`encoding`] and [`error`] are
-//! the tables and messages they need, [`conf`] renders the configuration files
-//! from the vendored templates over [`pg_config`]'s build-time constants,
-//! [`sync`] plans and performs `sync_pgdata`, [`control`] parses and rewrites
-//! `pg_control` over [`crc32c`], [`tz`] reads the timezone database and
-//! [`findtimezone`] picks the default zone over it, [`help`] is the upstream
-//! text,
-//! and [`run`] is the only function that writes to a stream.
+//! calculation over a [`validate::FsProbe`], [`encoding`] and [`error`] are the
+//! tables and messages they need, [`file_perm`] holds the mode constants the
+//! plan carries, [`layout`] turns that plan into the data directory tree as
+//! pure [`layout::FsOp`]s, [`conf`] renders the configuration files from the
+//! vendored templates over [`pg_config`]'s build-time constants, [`sync`] plans
+//! and performs `sync_pgdata`, [`control`] parses and rewrites `pg_control`
+//! over [`crc32c`], [`tz`] reads the timezone database and [`findtimezone`]
+//! picks the default zone over it, [`help`] is the upstream text, and [`run`]
+//! is the only function that writes to a stream.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are

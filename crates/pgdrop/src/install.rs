@@ -33,6 +33,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use rinitdb::validate::strerror;
 use usage::Args;
 
 use crate::dispatch::Applet;
@@ -53,12 +54,16 @@ pub struct InstallLinks {
     pub force: bool,
 }
 
-/// What is already sitting at a link's path.
+/// What is already sitting at a link's path, as far as link planning cares.
 ///
 /// `lstat`, not `stat`: a symlink is judged as a symlink, whether or not it
 /// still resolves to anything.
+///
+/// Named for the job rather than `EntryKind`, which `testkit::files` already
+/// uses for a different question (`S_ISDIR` / `S_ISREG` / neither, for mode
+/// checks).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntryKind {
+pub enum LinkTarget {
     /// Nothing is there (`ENOENT`).
     Absent,
     /// A symbolic link — the only kind this command will replace.
@@ -76,15 +81,15 @@ pub enum EntryKind {
     },
 }
 
-impl EntryKind {
+impl LinkTarget {
     /// How the entry is named in the "refusing to replace" message.
     fn noun(&self) -> &'static str {
         match self {
-            EntryKind::Absent => "nothing",
-            EntryKind::Symlink => "a symbolic link",
-            EntryKind::File => "a regular file",
-            EntryKind::Directory => "a directory",
-            EntryKind::Other | EntryKind::Unreadable { .. } => "an entry of another type",
+            LinkTarget::Absent => "nothing",
+            LinkTarget::Symlink => "a symbolic link",
+            LinkTarget::File => "a regular file",
+            LinkTarget::Directory => "a directory",
+            LinkTarget::Other | LinkTarget::Unreadable { .. } => "an entry of another type",
         }
     }
 }
@@ -94,8 +99,8 @@ impl EntryKind {
 /// A trait so [`link_plan`] is a calculation; [`RealFs`] is the only
 /// implementor that touches a disk.
 pub trait LinkProbe {
-    /// `lstat(path)`, as the [`EntryKind`] it reveals.
-    fn entry_kind(&self, path: &Path) -> EntryKind;
+    /// `lstat(path)`, as the [`LinkTarget`] it reveals.
+    fn link_target(&self, path: &Path) -> LinkTarget;
 }
 
 /// The real filesystem.
@@ -103,22 +108,22 @@ pub trait LinkProbe {
 pub struct RealFs;
 
 impl LinkProbe for RealFs {
-    fn entry_kind(&self, path: &Path) -> EntryKind {
+    fn link_target(&self, path: &Path) -> LinkTarget {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 let kind = meta.file_type();
                 if kind.is_symlink() {
-                    EntryKind::Symlink
+                    LinkTarget::Symlink
                 } else if kind.is_dir() {
-                    EntryKind::Directory
+                    LinkTarget::Directory
                 } else if kind.is_file() {
-                    EntryKind::File
+                    LinkTarget::File
                 } else {
-                    EntryKind::Other
+                    LinkTarget::Other
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EntryKind::Absent,
-            Err(err) => EntryKind::Unreadable {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => LinkTarget::Absent,
+            Err(err) => LinkTarget::Unreadable {
                 reason: strerror(&err),
             },
         }
@@ -217,7 +222,7 @@ pub enum InstallError {
     Occupied {
         /// The name that is taken.
         path: PathBuf,
-        /// [`EntryKind::noun`] for what is there.
+        /// [`LinkTarget::noun`] for what is there.
         noun: &'static str,
     },
     /// `lstat` on the name failed with something other than `ENOENT`.
@@ -336,17 +341,17 @@ pub fn link_plan(
     let mut ops = Vec::with_capacity(applets.len());
     for applet in applets {
         let link = dir.join(applet.name());
-        let op = match probe.entry_kind(&link) {
-            EntryKind::Absent => LinkOp::Create {
+        let op = match probe.link_target(&link) {
+            LinkTarget::Absent => LinkOp::Create {
                 link,
                 target: exe.to_path_buf(),
             },
-            EntryKind::Symlink if force => LinkOp::Replace {
+            LinkTarget::Symlink if force => LinkOp::Replace {
                 link,
                 target: exe.to_path_buf(),
             },
-            EntryKind::Symlink => LinkOp::Keep { link },
-            EntryKind::Unreadable { reason } => {
+            LinkTarget::Symlink => LinkOp::Keep { link },
+            LinkTarget::Unreadable { reason } => {
                 return Err(InstallError::Unreadable { path: link, reason });
             }
             taken => {
@@ -438,11 +443,6 @@ fn write_os_line(out: &mut impl Write, line: &OsStr) -> std::io::Result<()> {
     out.write_all(b"\n")
 }
 
-/// What `%m` would print: `strerror(errno)` and nothing else.
-fn strerror(err: &std::io::Error) -> String {
-    rinitdb::validate::strerror(err)
-}
-
 /// The whole command: read the process, plan, apply, report.
 pub fn run(args: &InstallLinks, stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
     let plan = current_exe()
@@ -470,11 +470,11 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    /// A map of paths to what is there; anything absent is [`EntryKind::Absent`].
-    struct FakeFs(BTreeMap<PathBuf, EntryKind>);
+    /// A map of paths to what is there; anything absent is [`LinkTarget::Absent`].
+    struct FakeFs(BTreeMap<PathBuf, LinkTarget>);
 
     impl FakeFs {
-        fn new(entries: &[(&str, EntryKind)]) -> Self {
+        fn new(entries: &[(&str, LinkTarget)]) -> Self {
             FakeFs(
                 entries
                     .iter()
@@ -489,8 +489,8 @@ mod tests {
     }
 
     impl LinkProbe for FakeFs {
-        fn entry_kind(&self, path: &Path) -> EntryKind {
-            self.0.get(path).cloned().unwrap_or(EntryKind::Absent)
+        fn link_target(&self, path: &Path) -> LinkTarget {
+            self.0.get(path).cloned().unwrap_or(LinkTarget::Absent)
         }
     }
 
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn an_existing_link_is_kept_unless_force_is_given() {
-        let fs = FakeFs::new(&[("/tmp/bin/psql", EntryKind::Symlink)]);
+        let fs = FakeFs::new(&[("/tmp/bin/psql", LinkTarget::Symlink)]);
         let ops = plan(&fs, false).expect("plan");
         assert_eq!(
             ops,
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn force_replaces_an_existing_link_and_only_a_link() {
-        let fs = FakeFs::new(&[("/tmp/bin/psql", EntryKind::Symlink)]);
+        let fs = FakeFs::new(&[("/tmp/bin/psql", LinkTarget::Symlink)]);
         let ops = plan(&fs, true).expect("plan");
         assert_eq!(
             ops,
@@ -586,9 +586,9 @@ mod tests {
     #[test]
     fn a_file_in_the_way_refuses_the_whole_plan_with_or_without_force() {
         for (kind, noun) in [
-            (EntryKind::File, "a regular file"),
-            (EntryKind::Directory, "a directory"),
-            (EntryKind::Other, "an entry of another type"),
+            (LinkTarget::File, "a regular file"),
+            (LinkTarget::Directory, "a directory"),
+            (LinkTarget::Other, "an entry of another type"),
         ] {
             let fs = FakeFs::new(&[("/tmp/bin/psql", kind.clone())]);
             for force in [false, true] {
@@ -608,7 +608,7 @@ mod tests {
     fn a_name_that_cannot_be_examined_is_its_own_error() {
         let fs = FakeFs::new(&[(
             "/tmp/bin/initdb",
-            EntryKind::Unreadable {
+            LinkTarget::Unreadable {
                 reason: "Permission denied".to_owned(),
             },
         )]);
@@ -682,7 +682,7 @@ mod tests {
         let dir = PathBuf::from(OsString::from_vec(b"/tmp/b\xffad".to_vec()));
         let psql = dir.join("psql");
         let fs = FakeFs(
-            [(psql.clone(), EntryKind::File)]
+            [(psql.clone(), LinkTarget::File)]
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
         );

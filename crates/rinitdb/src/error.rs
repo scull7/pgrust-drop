@@ -156,6 +156,29 @@ pub enum InitdbError {
     /// `initdb.c:2962`.
     #[error("WAL directory location must be an absolute path")]
     WalDirectoryNotAbsolute,
+
+    /// `initdb.c:2903` (`pg_mkdir_p` on PGDATA), `:2974` (on the WAL
+    /// directory), `:3022` (`pg_wal` itself) and `:3079` (the `subdirs[]`
+    /// loop) — one message, four `mkdir` sites.
+    #[error("could not create directory \"{path}\": {reason}")]
+    CouldNotCreateDirectory { path: String, reason: String },
+
+    /// `initdb.c:2917` and `:2989`: the `chmod` on a directory that was
+    /// already there and empty.
+    #[error("could not change permissions of directory \"{path}\": {reason}")]
+    CouldNotChangePermissionsOfDirectory { path: String, reason: String },
+
+    /// `initdb.c:3015`. `path` is `subdirloc`, the link, not its target.
+    #[error("could not create symbolic link \"{path}\": {reason}")]
+    CouldNotCreateSymbolicLink { path: String, reason: String },
+
+    /// `initdb.c:1035` (`write_version_file`).
+    #[error("could not open file \"{path}\" for writing: {reason}")]
+    CouldNotOpenFileForWriting { path: String, reason: String },
+
+    /// `initdb.c:1038` (`write_version_file`).
+    #[error("could not write file \"{path}\": {reason}")]
+    CouldNotWriteFile { path: String, reason: String },
 }
 
 impl InitdbError {

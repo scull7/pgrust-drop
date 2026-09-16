@@ -13,9 +13,10 @@
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use testkit::{Environment, Gate, reference, run_in};
+use testkit::{Environment, Gate, run_in};
 
 const LIBPQ_URI_REGRESS: &str = env!("CARGO_BIN_EXE_libpq_uri_regress");
 
@@ -480,11 +481,36 @@ fn test_uri() {
     );
 }
 
+/// Calculation: every URI the table holds more than once, with how many times,
+/// in a stable order.
+fn repeated_uris(tests: &[UriTest]) -> Vec<(&'static str, usize)> {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for test in tests {
+        *counts.entry(test.uri).or_default() += 1;
+    }
+    counts.into_iter().filter(|(_, times)| *times > 1).collect()
+}
+
 /// The table above was copied from `001_uri.pl:14`; this is the pin that says
-/// nothing was dropped on the way. Upstream has 63 rows.
+/// nothing was dropped on the way.
+///
+/// The row *count* needs no test: `TESTS` is declared `[UriTest; 63]`, so
+/// `TESTS.len() == 63` is a compile-time property and an assertion on it
+/// cannot fail. What the array type cannot give is which rows those 63 are,
+/// and the transcription slip that survives a correct count is pasting one row
+/// twice instead of advancing to the next — the count stays 63 while a row of
+/// upstream's table is gone and its coverage with it.
+///
+/// Upstream repeats exactly one URI, `postgresql://host/db`, at `001_uri.pl:32`
+/// and again at `:46`, so exactly one repeat is expected here and any other is
+/// a row of upstream's table overwritten by its neighbour.
 #[test]
-fn the_stolen_table_is_the_whole_upstream_table() {
-    assert_eq!(TESTS.len(), 63);
+fn the_stolen_table_repeats_only_the_row_upstream_repeats() {
+    assert_eq!(
+        repeated_uris(&TESTS),
+        [("postgresql://host/db", 2)],
+        "a URI repeated here that upstream does not repeat means a row was pasted over"
+    );
 }
 
 /// Gate: every row of the stolen table through the C `libpq_uri_regress` and
@@ -497,12 +523,11 @@ fn the_stolen_table_is_the_whole_upstream_table() {
 /// silent)` and passes — it is never narrowed to something weaker.
 #[test]
 fn libpq_uri_regress_matches_the_c_helper() {
-    let Some(c_helper) = reference::find("libpq_uri_regress") else {
-        reference::skip("libpq_uri_regress");
-        return;
+    let Some(gate) = Gate::for_tool_or_skip("libpq_uri_regress", LIBPQ_URI_REGRESS) else {
+        return; // The flagged skip is already on stderr.
     };
     for test in &TESTS {
-        Gate::new(&c_helper, LIBPQ_URI_REGRESS)
+        gate.clone()
             .arg(test.uri)
             .with_env(environment(test))
             .assert_clean();

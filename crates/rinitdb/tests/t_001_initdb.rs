@@ -11,7 +11,7 @@
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
@@ -364,6 +364,89 @@ fn waldir_becomes_a_pg_wal_symlink() {
     );
 }
 
+/// The four `pg_fatal` sites `apply` can reach, each driven by a real failing
+/// syscall rather than a hand-made error value, so the `%m` text is the one
+/// the kernel produced.
+///
+/// `initdb.c:3079` (mkdir), `:2917` (chmod), `:3015` (symlink) and `:1035`
+/// (the `fopen` in `write_version_file`). The fifth, `:1038`, is the `fprintf`
+/// failing mid-write — ENOSPC and friends, which a test cannot provoke without
+/// a full filesystem; its rendering is pinned in
+/// `error::tests::the_filesystem_failures_render_their_pg_fatal_line_and_no_hint`.
+#[cfg(unix)]
+#[test]
+fn a_failed_filesystem_op_reports_its_upstream_pg_fatal() {
+    use rinitdb::layout::FsOp;
+
+    let tempdir = TempDir::new("apply-failures");
+    let file = tempdir.join("a-file");
+    std::fs::write(&file, b"not a directory").expect("make a regular file");
+    let absent = tempdir.join("absent");
+
+    // mkdir under something that is not a directory.
+    let under_file = file.join("global");
+    expect_apply_error(
+        &[FsOp::CreateDir {
+            path: under_file.clone(),
+            mode: 0o700,
+            parents: false,
+        }],
+        &format!(
+            "initdb: error: could not create directory \"{}\": Not a directory",
+            under_file.display()
+        ),
+    );
+
+    // chmod on a directory that is not there.
+    expect_apply_error(
+        &[FsOp::SetMode {
+            path: absent.clone(),
+            mode: 0o700,
+        }],
+        &format!(
+            "initdb: error: could not change permissions of directory \"{}\": \
+             No such file or directory",
+            absent.display()
+        ),
+    );
+
+    // symlink onto a path that is already taken.
+    expect_apply_error(
+        &[FsOp::Symlink {
+            target: tempdir.join("anywhere"),
+            link: file.clone(),
+        }],
+        &format!(
+            "initdb: error: could not create symbolic link \"{}\": File exists",
+            file.display()
+        ),
+    );
+
+    // open for writing inside a directory that is not there.
+    let orphan = absent.join("PG_VERSION");
+    expect_apply_error(
+        &[FsOp::WriteFile {
+            path: orphan.clone(),
+            mode: 0o600,
+            contents: "18\n".to_owned(),
+        }],
+        &format!(
+            "initdb: error: could not open file \"{}\" for writing: \
+             No such file or directory",
+            orphan.display()
+        ),
+    );
+}
+
+/// `apply(ops)` must fail, with exactly the stderr C's `pg_fatal` writes.
+#[cfg(unix)]
+fn expect_apply_error(ops: &[rinitdb::layout::FsOp], expected: &str) {
+    match rinitdb::layout::apply(ops) {
+        Ok(()) => panic!("{ops:?} should not have succeeded"),
+        Err(err) => assert_eq!(err.render(), expected),
+    }
+}
+
 /// The acceptance gate for this port (Linear NAT-380): the tree listing —
 /// names and modes — that `layout()` produces is exactly what C initdb leaves
 /// behind, for a default run and for an `--allow-group-access` run.
@@ -428,8 +511,9 @@ fn the_data_directory_tree_matches_reference_initdb() {
             "PGDATA mode differs from C initdb's ({tag})"
         );
 
-        for (relative, mode) in rinitdb::layout::tree_listing(&plan) {
-            let Some((kind, found)) = reference_tree.get(&relative) else {
+        let listing = rinitdb::layout::tree_listing(&plan);
+        for (relative, mode) in &listing {
+            let Some((kind, found)) = reference_tree.get(relative) else {
                 panic!("C initdb did not create {} ({tag})", relative.display());
             };
             let expected_kind = if relative == Path::new("PG_VERSION") {
@@ -440,11 +524,38 @@ fn the_data_directory_tree_matches_reference_initdb() {
             assert_eq!(*kind, expected_kind, "{} ({tag})", relative.display());
             assert_eq!(
                 *found,
-                mode,
+                *mode,
                 "{} mode differs from C initdb's ({tag})",
                 relative.display()
             );
         }
+
+        // ...and the other direction. The loop above only proves the listing
+        // is a *subset* of C's cluster, so a subdirectory `layout` forgot to
+        // create would pass it unseen. C's finished cluster is a strict
+        // superset of this stage — the backend adds `base/4`, `base/5`, every
+        // relation file and the config files — so the comparison is narrowed
+        // to the paths this stage owns, and over those it is an equality.
+        // The narrowing set comes from `SUBDIRS`, so it cannot by itself catch
+        // a row missing from that table; `layout::tests::
+        // the_subdirs_table_is_upstreams_in_upstream_order` transcribes
+        // initdb.c:231-255 a second time and is what pins the table.
+        let owned: BTreeSet<PathBuf> = rinitdb::layout::SUBDIRS
+            .iter()
+            .map(PathBuf::from)
+            .chain([PathBuf::from("pg_wal"), PathBuf::from("PG_VERSION")])
+            .collect();
+        let c_owned: BTreeSet<PathBuf> = reference_tree
+            .keys()
+            .filter(|path| owned.contains(*path))
+            .cloned()
+            .collect();
+        let ours: BTreeSet<PathBuf> = listing.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            ours, c_owned,
+            "the tree this port creates is not C initdb's, restricted to the \
+             entries this stage owns ({tag})"
+        );
 
         // PG_VERSION is the one file this stage writes; the bytes are C's too.
         assert_eq!(

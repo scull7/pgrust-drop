@@ -316,6 +316,59 @@ mod tests {
     }
 
     #[test]
+    fn the_filesystem_failures_render_their_pg_fatal_line_and_no_hint() {
+        // The five sites apply() can reach. Each is a pg_fatal, so each is one
+        // line with no detail and no hint, and `%m` is already expanded.
+        let cases = [
+            (
+                InitdbError::CouldNotCreateDirectory {
+                    path: "/tmp/data/global".to_owned(),
+                    reason: "Permission denied".to_owned(),
+                },
+                "initdb: error: could not create directory \"/tmp/data/global\": \
+                 Permission denied",
+            ),
+            (
+                InitdbError::CouldNotChangePermissionsOfDirectory {
+                    path: "/tmp/data".to_owned(),
+                    reason: "Operation not permitted".to_owned(),
+                },
+                "initdb: error: could not change permissions of directory \"/tmp/data\": \
+                 Operation not permitted",
+            ),
+            (
+                InitdbError::CouldNotCreateSymbolicLink {
+                    path: "/tmp/data/pg_wal".to_owned(),
+                    reason: "File exists".to_owned(),
+                },
+                "initdb: error: could not create symbolic link \"/tmp/data/pg_wal\": \
+                 File exists",
+            ),
+            (
+                InitdbError::CouldNotOpenFileForWriting {
+                    path: "/tmp/data/PG_VERSION".to_owned(),
+                    reason: "No such file or directory".to_owned(),
+                },
+                "initdb: error: could not open file \"/tmp/data/PG_VERSION\" for writing: \
+                 No such file or directory",
+            ),
+            (
+                InitdbError::CouldNotWriteFile {
+                    path: "/tmp/data/PG_VERSION".to_owned(),
+                    reason: "No space left on device".to_owned(),
+                },
+                "initdb: error: could not write file \"/tmp/data/PG_VERSION\": \
+                 No space left on device",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.render(), expected);
+            assert!(err.details().is_empty(), "{err:?}");
+            assert!(err.hints().is_empty(), "{err:?}");
+        }
+    }
+
+    #[test]
     fn a_nonempty_data_directory_names_itself_twice_in_the_hint() {
         let err = InitdbError::DirectoryNotEmpty {
             path: "/tmp/data".to_owned(),

@@ -842,7 +842,7 @@ impl ControlFile {
     /// the file match the one over its contents?
     #[must_use]
     pub fn crc_is_valid(&self) -> bool {
-        self.crc == u32_at(&self.to_bytes(), offset::CRC)
+        self.crc == crc32c::crc32c(&self.to_bytes()[..offset::CRC])
     }
 
     /// `DataChecksumsEnabled()` (`xlog.c:4614`).

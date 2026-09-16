@@ -9,11 +9,11 @@
 
 use std::io::Write;
 
-use crate::command::{CommandContext, CommandResult, handle_slash_cmds};
+use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{Executor, send_query};
-use crate::scan::{PromptStatus, QuoteType, ScanResult, Scanner, VariableSource};
+use crate::scan::{PromptStatus, ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
-use crate::variables::VariableSpace;
+use crate::variables::{VarView, VariableSpace};
 
 /// Where `MainLoop` gets its lines. `None` is end of input.
 pub trait LineSource {
@@ -46,20 +46,6 @@ impl Lines {
 impl LineSource for Lines {
     fn next_line(&mut self) -> Option<Vec<u8>> {
         self.lines.next()
-    }
-}
-
-/// A read-only view of the variable space for the lexer's `:name` callback.
-struct VarView(VariableSpace);
-
-impl VariableSource for VarView {
-    fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String> {
-        let value = self.0.get(name)?.to_string();
-        Some(match quote {
-            QuoteType::Plain | QuoteType::ShellArg => value,
-            QuoteType::SqlLiteral => crate::variables::escape_literal(&value),
-            QuoteType::SqlIdent => crate::variables::escape_identifier(&value),
-        })
     }
 }
 
@@ -136,10 +122,7 @@ pub fn main_loop(
         success = true;
 
         while success || !die_on_error {
-            let scan_result = {
-                let view = VarView(session.vars.clone());
-                scanner.scan(&mut query_buf, &view).0
-            };
+            let scan_result = scanner.scan(&mut query_buf, &VarView(session.vars)).0;
             if scan_result == ScanResult::Eol {
                 session.pset.stmt_lineno += 1;
             }
@@ -165,20 +148,8 @@ pub fn main_loop(
                 }
                 added_nl_pos = None;
 
-                slash_status = {
-                    // The lexer reads the variable space while the command
-                    // writes to it; upstream aliases one global for both, so
-                    // the read side works from the state the C lexer would
-                    // have seen.
-                    let view = VarView(session.vars.clone());
-                    let pset = session.pset.clone();
-                    let mut ctx = CommandContext {
-                        pset: &pset,
-                        vars: session.vars,
-                    };
-                    handle_slash_cmds(&mut scanner, &mut ctx, &view, stdout, stderr)
-                };
-                *session.pset = session.vars.settings(session.pset);
+                slash_status =
+                    dispatch_slash(&mut scanner, session.pset, session.vars, stdout, stderr);
                 success = slash_status != CommandResult::Error;
                 session.pset.stmt_lineno = 1;
 
@@ -189,16 +160,6 @@ pub fn main_loop(
                         query_buf.clear();
                     }
                     CommandResult::Terminate => break,
-                    CommandResult::Connect(_) => {
-                        // Reconnection is an action the caller owns; this loop
-                        // reports it rather than pretending it happened.
-                        let _ = writeln!(
-                            stderr,
-                            "psql: error: \\connect is not implemented yet (Linear NAT-405)"
-                        );
-                        success = false;
-                        slash_status = CommandResult::Error;
-                    }
                     _ => {}
                 }
             }

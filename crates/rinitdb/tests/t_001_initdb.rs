@@ -18,6 +18,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use rinitdb::control::{ControlFile, DataChecksums, SystemIdentifier};
 use testkit::{Gate, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
@@ -30,6 +31,10 @@ const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
 /// The diagnostics are finished now, so they are gated now — and the stdout
 /// difference is still rendered and flagged, never dropped (`testkit::Scope`).
 const STDOUT_PENDING: &str = "cluster-creation progress output lands with Linear NAT-379 … NAT-387";
+
+/// Names an existing PostgreSQL 18 data directory, for the round-trip gate on a
+/// machine that has a cluster but not the binaries that made it.
+const REF_PGDATA_ENV: &str = "PGDROP_REF_PGDATA";
 
 /// `PostgreSQL::Test::Utils::tempdir`: a directory of this test's own, removed
 /// when the test ends.
@@ -577,7 +582,7 @@ fn the_data_directory_tree_matches_reference_initdb() {
         assert_eq!(
             ours, c_owned,
             "the tree this port creates is not C initdb's, restricted to the \
-             entries this stage owns ({tag})"
+         entries this stage owns ({tag})"
         );
 
         // PG_VERSION is the one file this stage writes; the bytes are C's too.
@@ -587,6 +592,84 @@ fn the_data_directory_tree_matches_reference_initdb() {
             "PG_VERSION content ({tag})"
         );
     }
+}
+
+// --- pg_control (Linear NAT-382) --------------------------------------------
+
+/// The `pg_control` a template cluster brings with it (ADR-0002).
+///
+/// The template itself lands with Linear NAT-381, so this is the stand-in: the
+/// fields a PostgreSQL 18.6 cluster carries that `pg_controldata` reads on its
+/// way to the data-checksum line, and zero everywhere else. That is faithful to
+/// what this issue does — `rewrite` treats everything but the system identifier
+/// and the checksum version as the template's opaque bytes — and it is what the
+/// gate below will be handed for real once the unpack exists.
+fn a_template_control_file() -> [u8; rinitdb::control::PG_CONTROL_FILE_SIZE] {
+    let zeroed = [0u8; rinitdb::control::PG_CONTROL_FILE_SIZE];
+    let mut template = ControlFile::parse(&zeroed).expect("a zeroed image is long enough");
+    template.pg_control_version = rinitdb::control::PG_CONTROL_VERSION;
+    template.catalog_version_no = rinitdb::control::CATALOG_VERSION_NO;
+    // `InitControlFile`, xlog.c:4219.
+    template.state = rinitdb::control::DbState::Shutdowned;
+    // `IsValidWalSegSize` (`src/include/access/xlog_internal.h:104`): any other
+    // value makes `pg_controldata` warn that the file is corrupt, so the
+    // stand-in carries `initdb.c:169`'s default like a real template would.
+    template.xlog_seg_size = rinitdb::pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB * 1024 * 1024;
+    template.to_bytes()
+}
+
+/// Expand one cluster's `$PGDATA/global/pg_control` from the template, which is
+/// `rewrite` plus the one write to disk, and answer with the identifier it got.
+fn expand_control_file(datadir: &Path, checksums: DataChecksums) -> SystemIdentifier {
+    let system_identifier = SystemIdentifier::generate();
+    let image = rinitdb::control::rewrite(&a_template_control_file(), system_identifier, checksums)
+        .expect("rewrite the template's pg_control");
+    let path = testkit::control_file_path(datadir);
+    std::fs::create_dir_all(path.parent().expect("pg_control is inside global/"))
+        .expect("create the cluster's global/ directory");
+    std::fs::write(&path, image).expect("write the cluster's pg_control");
+    system_identifier
+}
+
+/// The stolen `command_like([ 'pg_controldata', $datadir ], qr/…/)`, made twice:
+/// against the C tool when this machine has one, and against the control file
+/// itself either way.
+///
+/// `pg_controldata` is a PostgreSQL binary, so without PostgreSQL 18 on the box
+/// the first half prints `SKIP (flagged, not silent)`. The second half is not a
+/// weakened version of it — the pattern is the stolen one, run unchanged over
+/// the line `pg_controldata.c:337` prints — so the assertion is still made.
+fn assert_data_page_checksum_version(datadir: &Path, expected: u32) {
+    let pattern = testkit::Pattern::new(&format!("Data page checksum version:.*{expected}"))
+        .expect("compile the stolen pattern");
+
+    let data = testkit::read_control_file(datadir);
+    assert_eq!(data.data_checksum_version, expected);
+    assert!(
+        pattern.is_match(&data.data_page_checksum_version_line()),
+        "{:?} does not match the stolen pattern",
+        data.data_page_checksum_version_line()
+    );
+
+    match reference::find("pg_controldata") {
+        Some(pg_controldata) => testkit::command_like(&pg_controldata, [datadir], &pattern),
+        None => reference::skip("pg_controldata"),
+    }
+}
+
+/// `command_like([ 'pg_controldata', $datadir ],
+/// qr/Data page checksum version:.*1/,
+/// 'checksums are enabled in control file');` — 001_initdb.pl:72-76.
+///
+/// `initdb.c:167` starts `data_checksums` at `true`, so a PostgreSQL 18 cluster
+/// is checksummed unless the command line says otherwise; the version written
+/// is `PG_DATA_CHECKSUM_VERSION` (`src/include/storage/bufpage.h:208`).
+#[test]
+fn checksums_are_enabled_in_control_file() {
+    let tempdir = TempDir::new("checksums-on");
+    let datadir = tempdir.join("data");
+    expand_control_file(&datadir, DataChecksums::Enabled);
+    assert_data_page_checksum_version(&datadir, 1);
 }
 
 /// `command_ok([ 'initdb', '--sync-only', $datadir ], 'sync only');`
@@ -646,8 +729,8 @@ fn existing_data_directory() {
         &argv,
         &format!(
             "initdb: error: directory \"{path}\" exists but is not empty\n\
-             initdb: hint: If you want to create a new database system, either remove or empty \
-             the directory \"{path}\" or run initdb with an argument other than \"{path}\".",
+         initdb: hint: If you want to create a new database system, either remove or empty \
+         the directory \"{path}\" or run initdb with an argument other than \"{path}\".",
             path = datadir.display()
         ),
     );
@@ -793,7 +876,7 @@ fn fails_for_locale_provider_builtin_with_icu_locale() {
     fails_with(
         &argv,
         "initdb: error: --icu-locale cannot be specified unless locale provider \
-         \"icu\" is chosen",
+     \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }
@@ -818,7 +901,7 @@ fn fails_for_locale_provider_builtin_with_icu_rules() {
     fails_with(
         &argv,
         "initdb: error: --icu-rules cannot be specified unless locale provider \
-         \"icu\" is chosen",
+     \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }
@@ -858,7 +941,7 @@ fn fails_for_invalid_option_combination() {
     fails_with(
         &argv,
         "initdb: error: --icu-locale cannot be specified unless locale provider \
-         \"icu\" is chosen",
+     \"icu\" is chosen",
     );
     gate_strictly(&argv);
 }
@@ -921,6 +1004,174 @@ fn multiple_set_options_with_different_case() {
         let pattern = testkit::Pattern::new(source).expect("compile the stolen pattern");
         assert_eq!(pattern.is_match(&conf), expected, "{what}");
     }
+}
+
+/// `command_ok([ 'initdb', '--no-data-checksums', $datadir_nochecksums ],
+/// 'successful creation without data checksums');` — 001_initdb.pl:315-319,
+/// followed by `command_like([ 'pg_controldata', $datadir_nochecksums ],
+/// qr/Data page checksum version:.*0/,
+/// 'checksums are disabled in control file');` — 001_initdb.pl:321-325.
+///
+/// The `command_ok` half needs a finished cluster and lands with it
+/// (NAT-381 … NAT-387); what the case is *about* — that `--no-data-checksums`
+/// puts a zero in `pg_control` where the default puts a one — is here in full.
+/// The command line goes through the real parser, so the switch is the one
+/// `initdb.c:3393` recognizes and not a constant this test chose.
+#[test]
+fn checksums_are_disabled_in_control_file() {
+    let tempdir = TempDir::new("checksums-off");
+    let datadir = tempdir.join("data_no_checksums");
+
+    let argv = sync_argv(&["--no-data-checksums"], &datadir, &[]);
+    let rinitdb::Invocation::Init(options) = rinitdb::cli::plan(&argv) else {
+        panic!("{argv:?} should be a cluster-creation command line");
+    };
+    assert!(options.no_data_checksums && !options.data_checksums);
+
+    let switches = [rinitdb::control::ChecksumSwitch::NoDataChecksums];
+    expand_control_file(&datadir, DataChecksums::resolve(switches));
+    assert_data_page_checksum_version(&datadir, 0);
+}
+
+/// `command_fails([ 'pg_checksums', '--pgdata' => $datadir_nochecksums ],
+/// "pg_checksums fails with data checksum disabled");` — 001_initdb.pl:327-332.
+///
+/// `pg_checksums` has no port here and is not in this project's scope, so this
+/// case is the C tool or nothing: with PostgreSQL 18 on the box it is run
+/// against the control file this port wrote and must fail; without it, the
+/// gate prints `SKIP (flagged, not silent)`. There is no reader-side stand-in,
+/// because what upstream is pinning is `pg_checksums`' refusal and not a field
+/// value — `assert_data_page_checksum_version` above already pins the field.
+#[test]
+fn pg_checksums_fails_with_data_checksum_disabled() {
+    let tempdir = TempDir::new("pg-checksums");
+    let datadir = tempdir.join("data_no_checksums");
+    expand_control_file(&datadir, DataChecksums::Disabled);
+
+    let Some(pg_checksums) = reference::find("pg_checksums") else {
+        reference::skip("pg_checksums");
+        return;
+    };
+    let argv = [OsString::from("--pgdata"), OsString::from(&datadir)];
+    testkit::command_fails(&pg_checksums, &argv);
+}
+
+/// The issue's second acceptance criterion: two expansions never share a
+/// system identifier.
+///
+/// `BootStrapXLOG` derives one per `initdb` *process* (`xlog.c:5099`-`:5101`);
+/// ADR-0002 makes an expansion an unpack, so a single process can make several
+/// in the same microsecond, and `SystemIdentifier::generate` is what keeps them
+/// apart (see its divergence note, and `docs/divergences.md`).
+#[test]
+fn two_expansions_never_share_a_system_identifier() {
+    let tempdir = TempDir::new("sysid");
+
+    let mut seen = BTreeSet::new();
+    for which in 0..64 {
+        let datadir = tempdir.join(&format!("data{which}"));
+        let generated = expand_control_file(&datadir, DataChecksums::Enabled);
+        // What is in the file, not just what the generator returned.
+        let on_disk = testkit::read_control_file(&datadir).system_identifier;
+        assert_eq!(on_disk, generated.get());
+        assert!(seen.insert(on_disk), "system identifier {on_disk} repeated");
+    }
+}
+
+/// `testkit`'s small reader and `rinitdb`'s whole-struct one must see the same
+/// `pg_control`.
+///
+/// They are separate on purpose — `testkit` must not depend on the crate it
+/// tests — and separate offsets are offsets that can drift apart. This is the
+/// test that stops them: whatever the reader half of
+/// `assert_data_page_checksum_version` reports is what the port itself wrote.
+#[test]
+fn the_two_control_file_readers_agree() {
+    let tempdir = TempDir::new("readers");
+    let datadir = tempdir.join("data");
+    // Checksums *on*, so `data_checksum_version` is the one field of the four
+    // that is nonzero in a template stand-in: a reader looking at the wrong
+    // offset reads a zero and the comparison below catches it.
+    expand_control_file(&datadir, DataChecksums::Enabled);
+
+    let image = std::fs::read(testkit::control_file_path(&datadir)).expect("read pg_control");
+    let full = ControlFile::parse(&image).expect("parse with rinitdb's reader");
+    let small = testkit::read_control_file(&datadir);
+
+    assert_eq!(small.system_identifier, full.system_identifier.get());
+    assert_eq!(small.pg_control_version, full.pg_control_version);
+    assert_eq!(small.catalog_version_no, full.catalog_version_no);
+    assert_eq!(small.data_checksum_version, full.data_checksum_version);
+    assert!(full.crc_is_valid());
+}
+
+/// Gate: the issue's first acceptance criterion, over a *real* `pg_control`.
+///
+/// Parsing and serializing a file C initdb wrote must give the bytes back
+/// unchanged — which proves the field offsets, the native byte order, the
+/// zeroed interior padding and the CRC all at once, and is the one check a
+/// hand-built image cannot make (`control.rs`'s own round-trip test uses an
+/// image this port synthesized, so it cannot catch a layout this port and
+/// PostgreSQL disagree about).
+///
+/// The real file comes from `PGDROP_REF_PGDATA` if that names a PostgreSQL 18
+/// data directory, otherwise from running the reference `initdb` into a
+/// temporary one. With neither, `SKIP (flagged, not silent)`.
+#[test]
+fn a_real_control_file_round_trips_byte_for_byte() {
+    let tempdir = TempDir::new("real-control");
+    let datadir = if let Some(existing) = std::env::var_os(REF_PGDATA_ENV) {
+        PathBuf::from(existing)
+    } else {
+        let Some(initdb) = reference::find("initdb") else {
+            reference::announce_skip(&format!(
+                "{}: no reference `initdb` and {REF_PGDATA_ENV} is unset; \
+                 no real pg_control to round-trip",
+                reference::SKIP_FLAG
+            ));
+            return;
+        };
+        let datadir = tempdir.join("data");
+        let argv = args(&[
+            "--no-sync",
+            "--no-locale",
+            "-A",
+            "trust",
+            "-U",
+            "postgres",
+            "-D",
+        ])
+        .into_iter()
+        .chain([OsString::from(&datadir)])
+        .collect::<Vec<_>>();
+        let outcome = testkit::run(&initdb, &argv).expect("run the reference initdb");
+        assert_eq!(
+            outcome.status,
+            Some(0),
+            "reference initdb failed: {}",
+            outcome.stderr_text()
+        );
+        datadir
+    };
+
+    let path = testkit::control_file_path(&datadir);
+    let image = std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    assert_eq!(
+        image.len(),
+        rinitdb::control::PG_CONTROL_FILE_SIZE,
+        "a pg_control is PG_CONTROL_FILE_SIZE bytes"
+    );
+
+    let parsed = ControlFile::parse(&image).expect("parse a real pg_control");
+    assert!(
+        parsed.crc_is_valid(),
+        "the reference cluster's own CRC does not check out"
+    );
+    assert_eq!(
+        parsed.pg_control_version,
+        rinitdb::control::PG_CONTROL_VERSION
+    );
+    assert_eq!(parsed.to_bytes().as_slice(), image.as_slice());
 }
 
 /// Gate: the four files `setup_config` writes, diffed byte for byte against

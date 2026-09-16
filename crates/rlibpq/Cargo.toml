@@ -11,7 +11,15 @@ license = "MIT"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+# src/interfaces/libpq/test/libpq_uri_regress.c, the helper t/001_uri.pl drives.
+name = "libpq_uri_regress"
+path = "src/bin/libpq_uri_regress.rs"
+
 [dependencies]
+
+[dev-dependencies]
+testkit = { workspace = true }
 
 [lints]
 workspace = true

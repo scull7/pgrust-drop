@@ -11,6 +11,8 @@ use std::ffi::{OsStr, OsString};
 
 use usage::Cli;
 
+use crate::error::InitdbError;
+
 /// Every option C initdb accepts, in `long_options[]` order.
 ///
 /// Field names follow the C variables where one exists. All values are kept
@@ -156,12 +158,12 @@ impl Options {
     /// `None` means "fall back to `PGDATA`" (a later step).
     ///
     /// # Errors
-    /// The exact `pg_log_error` message C prints when both are given.
-    pub fn resolve_datadir(&self) -> Result<Option<&str>, String> {
+    /// [`InitdbError::TooManyArguments`], as C prints it at `initdb.c:3418`.
+    pub fn resolve_datadir(&self) -> Result<Option<&str>, InitdbError> {
         match (&self.pgdata, &self.datadir) {
-            (Some(_), Some(positional)) => Err(format!(
-                "too many command-line arguments (first is \"{positional}\")"
-            )),
+            (Some(_), Some(positional)) => Err(InitdbError::TooManyArguments {
+                first: positional.clone(),
+            }),
             (Some(flag), None) => Ok(Some(flag)),
             (None, Some(positional)) => Ok(Some(positional)),
             (None, None) => Ok(None),
@@ -179,8 +181,6 @@ pub enum Invocation {
     /// `--help`/`--version` anywhere else: C's getopt hands `'?'` to the
     /// `default:` arm, which prints only the hint and exits 1.
     Hint,
-    /// A `pg_log_error` + hint + exit 1 that needs no filesystem.
-    Fatal(String),
     /// usage-rs could not parse the line; the rendered diagnostic, exit 2.
     Unparsable(String),
     /// Go initialize a cluster (boxed: `Options` is ~600 bytes, the other arms are small).
@@ -209,14 +209,14 @@ fn fast_path(first: Option<&OsStr>) -> Option<Invocation> {
     }
 }
 
+/// `initdb.c`'s `default:` getopt arm is the only thing decided here that is
+/// not a plain parse; every other rule needs the environment and the
+/// filesystem and lives in [`crate::validate`], in upstream order.
 fn classify(options: Options) -> Invocation {
     if options.help || options.version {
         return Invocation::Hint;
     }
-    match options.resolve_datadir() {
-        Err(message) => Invocation::Fatal(message),
-        Ok(_) => Invocation::Init(Box::new(options)),
-    }
+    Invocation::Init(Box::new(options))
 }
 
 #[cfg(test)]
@@ -384,8 +384,10 @@ mod tests {
         assert_eq!(init(&["-D", "dd"]).resolve_datadir(), Ok(Some("dd")));
         assert_eq!(init(&[]).resolve_datadir(), Ok(None));
         assert_eq!(
-            plan(&args(&["-D", "dd", "extra"])),
-            Invocation::Fatal("too many command-line arguments (first is \"extra\")".to_owned())
+            init(&["-D", "dd", "extra"]).resolve_datadir(),
+            Err(InitdbError::TooManyArguments {
+                first: "extra".to_owned()
+            })
         );
         // A second positional is caught by the parser instead (divergence: exit 2, usage-rs text).
         assert!(matches!(

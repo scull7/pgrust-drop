@@ -16,6 +16,7 @@ name = "rinitdb"
 path = "src/main.rs"
 
 [dependencies]
+thiserror = { workspace = true }
 usage = { workspace = true }
 
 [dev-dependencies]

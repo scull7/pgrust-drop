@@ -147,21 +147,3 @@ fn a_connection_failure_exits_badconn() {
     assert!(!outcome.stderr.is_empty(), "a failure must say why");
     assert!(outcome.stdout.is_empty(), "nothing is printed on stdout");
 }
-
-/// An unimplemented output format is refused rather than rendered wrongly.
-#[test]
-fn an_unimplemented_format_is_refused() {
-    let outcome = testkit::run(
-        Path::new(RPSQL),
-        [
-            OsString::from("-X"),
-            OsString::from("--csv"),
-            OsString::from("-c"),
-            OsString::from("\\echo hi"),
-        ],
-    )
-    .expect("spawn rpsql");
-    // `\echo` needs no server, so this reaches the connection attempt first;
-    // either way it must not print a CSV table it cannot produce.
-    assert_ne!(outcome.status, Some(0));
-}

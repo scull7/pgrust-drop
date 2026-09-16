@@ -11,8 +11,12 @@ fn main() -> ExitCode {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     match dispatch::dispatch(&argv) {
-        Dispatch::Applet(Applet::Initdb, args) => rinitdb::run(&args, &mut stdout, &mut stderr),
-        Dispatch::Applet(Applet::Psql, args) => rpsql::run(&args, &mut stdout, &mut stderr),
+        Dispatch::Applet(Applet::Initdb, applet_args) => {
+            rinitdb::run(&applet_args, &mut stdout, &mut stderr)
+        }
+        Dispatch::Applet(Applet::Psql, applet_args) => {
+            rpsql::run(&applet_args, &mut stdout, &mut stderr)
+        }
         Dispatch::Applet(Applet::Postgres, _) => {
             let _ = writeln!(
                 stderr,

@@ -3,6 +3,56 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — testkit TAP helpers completed (NAT-373)
+
+**What** (the rest of the `Utils.pm` port list NAT-373 names)
+- `testkit::pattern`: the Perl-regex subset `command_like` and
+  `command_fails_like` need, on the standard library alone. The issue left the
+  choice open between the `regex` crate and substring/glob matching; `regex` is
+  not on the approved list and substring matching would quietly weaken every
+  stolen `qr//` that uses `\d+`, `.*`, a class or an anchor, so the patterns
+  are matched verbatim by a parser plus a Thompson NFA simulation. Supported:
+  literals and escapes, `.`, classes with ranges and negation, `\d \D \w \W
+  \s \S`, groups, alternation, `* + ? {n} {n,} {n,m}`, and `^`/`$` with Perl's
+  semantics (including `$` matching before a trailing newline, which every
+  stolen `…8$` pattern depends on). Anything outside the subset —
+  backreferences, lookaround, `\b`, `/x` — is a `PatternError` at construction,
+  never a silent mismatch. The NFA simulation, rather than a backtracker, is
+  why `(a*)*b` against 2000 `a`s is linear instead of exponential; that case is
+  a test.
+- `checks::command_ok` / `command_fails` / `command_like` /
+  `command_fails_like` (Utils.pm:866, :883, :1006, :1059) as pure functions over
+  a `CommandOutcome`, with the spawning wrappers in `run`. Each keeps upstream's
+  exact assertion set: `command_ok` looks only at the exit status because
+  `run_log` reports nothing else, `command_like` also demands an empty stderr,
+  `command_fails_like` does not look at stdout.
+- `testkit::files`: `slurp_file` (Utils.pm:512, with the optional offset, bytes
+  not `String`) and `check_mode_recursive` (Utils.pm:601) — pure
+  `mode_violations` / `is_ignored` over a `Vec<Entry>`, with a `walk` action
+  that follows symlinks like `File::Find`'s `follow_fast`, remembers
+  `(device, inode)` so a symlink loop ends the walk, and tolerates `ENOENT` for
+  the files a running server deletes under it.
+
+**Why**: NAT-373's acceptance is a unit test for every check plus rinitdb's
+first integration test on the `program_*` helpers; the latter already landed
+with NAT-374, the former needed these six helpers, and they are what the
+upstream `t/*.pl` files call on nearly every line after the `program_*` block.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 121 tests (was 84). The rinitdb gate still
+prints `SKIP (flagged, not silent)`: no PostgreSQL 18 on this box.
+
+**Risks**: the pattern subset is the one real risk. A stolen `qr//` outside it
+fails to compile rather than mismatching, so the failure is loud, but a future
+test may need a construct that has to be added (`\b` and lookaround are the
+likely ones). Character classes fold only ASCII case under `(?i)`; no upstream
+pattern uses `(?i)` on non-ASCII.
+
+**Follow-ups**: `crates/pgdrop/Cargo.toml` sets both `license` and
+`license-file`, which cargo warns about on every build — one of the two should
+go (not touched here, it is outside this issue). Otherwise unchanged from the
+entries below.
+
 ## 2026-09-16 — NAT-374 review fixes
 
 **What** (all five reviewer findings were real)

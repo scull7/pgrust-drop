@@ -2,6 +2,9 @@
 //! `program_*_ok` assertions pass through `pgdrop initdb` and through a
 //! symlink named `initdb`.
 
+// Integration tests are their own crate; see the library root for why this lint is off.
+#![allow(clippy::doc_markdown)]
+
 use std::path::{Path, PathBuf};
 
 const PGDROP: &str = env!("CARGO_BIN_EXE_pgdrop");

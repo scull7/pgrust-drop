@@ -139,13 +139,11 @@ fn root(words: &[OsString]) -> Dispatch {
         Ok(Pgdrop {
             command: Command::Start(start),
         }) => Dispatch::Start(start),
-        Err(usage::Error::Help { cmd, long }) => Dispatch::PrintHelp(
-            Pgdrop::render_help(cmd, long)
-                .map(|page| page.to_string())
-                .unwrap_or_default(),
-        ),
+        Err(usage::Error::Help { cmd, long }) => {
+            Dispatch::PrintHelp(Pgdrop::render_help(cmd, long).unwrap_or_default())
+        }
         Err(usage::Error::Version { .. }) => Dispatch::PrintVersion,
-        Err(err) => Dispatch::Unparsable(Pgdrop::render_failure(&refs, &err).to_string()),
+        Err(err) => Dispatch::Unparsable(Pgdrop::render_failure(&refs, &err).clone()),
     }
 }
 

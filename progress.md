@@ -55,6 +55,12 @@ client tools first and test suites reach for Docker. The plan removes that.
   against C `initdb --help/--version` printed `SKIP (flagged, not silent)`
   here; it runs for real once CI installs the PGDG 18 packages (NAT-374).
 - Not run: anything needing a pgrust build (nothing links pgrust yet).
+- Correction: the first scaffold commit was pushed while clippy still had four
+  findings (a grep in the check script hid the exit code). The follow-up commit
+  fixes them; the numbers above are for the branch head. Lesson recorded in
+  AGENTS.md: gate on the command's exit status, never on filtered output.
+- CI note: `ci.yml` runs on pushes to `main` and on pull requests, so this
+  branch gets its first CI run when a PR is opened.
 
 **Risks / open questions**
 - Licensing (ADR-0003): repo is MIT, pgrust is AGPL-3.0; `pgdrop` and `rpsql`

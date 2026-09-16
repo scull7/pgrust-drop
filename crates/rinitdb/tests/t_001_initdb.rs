@@ -91,8 +91,12 @@ fn fails_with(argv: &[OsString], expected_stderr: &str) {
 /// `command_ok(...)` plus the exact stdout C writes for the same line, and an
 /// empty stderr.
 fn succeeds_with(argv: &[OsString], expected_stdout: &str) {
-    testkit::command_ok(Path::new(RINITDB), argv);
+    // One spawn, not two: these cases sync a directory tree, so running the
+    // binary twice would do the work twice. The stolen `command_ok` assertion
+    // is the pure check over the outcome that `testkit::command_ok` wraps.
     let outcome = testkit::run(Path::new(RINITDB), argv).expect("run rinitdb");
+    let violations = testkit::checks::command_ok(&outcome);
+    assert!(violations.is_empty(), "{argv:?}: {violations:?}");
     assert_eq!(outcome.status, Some(0), "{argv:?}");
     assert_eq!(outcome.stdout_text(), expected_stdout, "{argv:?}");
     assert_eq!(outcome.stderr_text(), String::new(), "{argv:?}");

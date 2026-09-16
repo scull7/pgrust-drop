@@ -3,6 +3,61 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-380 review fixes
+
+**What** (all four reviewer findings were real)
+- `pg_mkdir_p` could be handed the empty path. `Path::ancestors` ends a
+  *relative* path with `""`, and `Path::new("").exists()` is false, so the
+  take-while collected it and the first `mkdir` was `mkdir("")` — ENOENT.
+  `initdb -D mydata` is a legal command line (`initdb.c:2634` canonicalizes a
+  relative `--pgdata`, it does not reject one), so this was reachable the
+  moment `run()` was wired up; every test used an absolute temp path, which is
+  why the suite was green. The ancestor walk is now the pure
+  `layout::missing_ancestors(path, exists)`, unit-tested from a fake `exists`
+  over `mydata`, `a/b`, `./data`, `/tmp/x/y` and `""` with no disk and no
+  current-directory games. Verified end to end as well: all three relative
+  forms now build the full tree, `a/b` creating the intermediate `a` too.
+- `write_file` called `sync_all()`. C's `write_version_file` (`initdb.c:1024`)
+  only `fprintf`s and `fclose`s; initdb's one durability pass is the end-of-run
+  `sync_pgdata` that `--no-sync` suppresses (`:3508`). Dropped, rather than
+  recorded as a divergence, because the fsync pass is its own issue and an
+  extra fsync here would have to come back out when it lands.
+- The acceptance gate only proved `tree_listing ⊆ C's cluster`, so a
+  subdirectory `layout` failed to create was invisible to it while the
+  Acceptance says "identical". It now also intersects C's tree with the paths
+  this stage owns and asserts set equality both ways. Confirmed non-vacuous by
+  dropping `pg_stat` from the layout loop: the old assertion passed, the new
+  one fails and prints both sets.
+- The five new `InitdbError` variants had no test. The existing
+  `every_remaining_variant_renders_its_upstream_sentence` is a hand-listed set,
+  not an exhaustive one, so it had quietly stopped being every variant. They
+  now have their byte-exact renderings, and
+  `a_failed_filesystem_op_reports_its_upstream_pg_fatal` drives four of the
+  five through real failing syscalls (mkdir under a regular file, chmod on a
+  missing directory, symlink onto a taken path, open inside a missing
+  directory) so the `%m` text is the kernel's. The fifth is `fprintf` failing
+  mid-write, which needs a full filesystem; only its rendering is pinned.
+
+**Why the empty path got through.** The unit tests covered the op *list*,
+which is pure and was correct; `apply` was covered only through integration
+tests, and those all used `TempDir`, which is absolute. Making the ancestor
+walk a calculation rather than a detail of the action is what makes the
+relative case testable at all.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 219 tests (was 215). All 14 gates still
+print `SKIP (flagged, not silent)`. The permission cases were re-run under
+umask 022, 077, 070 and 000, and the tree gate re-run live against the
+stand-in reference.
+
+**Risks**: none new. `missing_ancestors` is pure and covered; the gate got
+strictly stricter; dropping the fsync cannot change any mode or name.
+
+**Follow-ups**: unchanged from the entry below, plus one small one —
+`every_remaining_variant_renders_its_upstream_sentence` claims a completeness
+it does not enforce. An exhaustive `match` mapping each variant to the test
+that covers it would make a new variant fail to compile until it has one.
+
 ## 2026-09-16 — NAT-380 rinitdb datadir layout, permissions, --waldir symlink
 
 **What**

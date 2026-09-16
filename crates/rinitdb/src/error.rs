@@ -17,7 +17,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use crate::help::PROGNAME;
+use crate::help::{PROGNAME, try_help};
 
 /// Which directory a "exists but is not empty" complaint is about.
 ///
@@ -237,12 +237,6 @@ impl InitdbError {
     }
 }
 
-/// `pg_log_error_hint("Try \"%s --help\" for more information.", progname)`.
-#[must_use]
-pub fn try_help(progname: &str) -> String {
-    format!("Try \"{progname} --help\" for more information.")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +263,21 @@ mod tests {
             err.render(),
             "initdb: error: too many command-line arguments (first is \"extra\")\n\
              initdb: hint: Try \"initdb --help\" for more information."
+        );
+    }
+
+    #[test]
+    fn the_try_help_hint_is_the_same_text_the_bare_hint_path_prints() {
+        // lib.rs prints help::try_help_hint for Invocation::Hint (the getopt
+        // `default:` arm); InitdbError renders the same upstream string
+        // through its own prefix. They must not drift apart.
+        let rendered = InitdbError::TooManyArguments {
+            first: "extra".to_owned(),
+        }
+        .render();
+        assert!(
+            rendered.ends_with(&crate::help::try_help_hint(PROGNAME)),
+            "{rendered}"
         );
     }
 

@@ -7,6 +7,7 @@
 //! [`Libc`] of *this* test binary, decided at compile time, and each lane has
 //! its own environment variable so a stray export cannot cross the streams.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The C library a binary links against.
@@ -148,18 +149,33 @@ pub fn find_or_skip(tool: &str) -> Option<PathBuf> {
     found
 }
 
+/// The flag every skipped gate carries, so skips are greppable in a log.
+pub const SKIP_FLAG: &str = "SKIP (flagged, not silent)";
+
 /// The message a gate prints when the reference tool is absent.
 ///
 /// It names the lane so a skipped gate cannot be mistaken for the wrong libc
 /// being installed.
 #[must_use]
 pub fn skip_message(tool: &str) -> String {
-    let lane = Libc::HOST;
-    format!(
-        "SKIP (flagged, not silent): no {} reference `{tool}`; set {} (see scripts/fetch-ref-binaries.sh)",
-        lane.as_str(),
-        lane.env_var()
-    )
+    format!("{SKIP_FLAG}: reference `{tool}` not found; set {REF_BIN_ENV} or install PostgreSQL 18")
+}
+
+/// Action: put a flagged skip on screen.
+///
+/// Not `println!`/`eprintln!`: libtest captures both and replays them only for
+/// a *failing* test or under `--nocapture`, so a skip announced that way is
+/// invisible in the CI log of a passing run — a silently narrowed gate, which
+/// is exactly what AGENTS.md forbids. Writing to the process's own stderr
+/// handle goes around the capture, so the flag always shows.
+pub fn announce_skip(reason: &str) {
+    // Nothing useful to do if stderr is closed; the test still passes.
+    let _ = writeln!(std::io::stderr().lock(), "{reason}");
+}
+
+/// Action: announce that a gate is skipped because reference `tool` is absent.
+pub fn skip(tool: &str) {
+    announce_skip(&skip_message(tool));
 }
 
 #[cfg(test)]
@@ -232,5 +248,10 @@ mod tests {
         let message = skip_message("initdb");
         assert!(message.contains(Libc::HOST.env_var()));
         assert!(message.contains(Libc::HOST.as_str()));
+    }
+
+    #[test]
+    fn skip_message_carries_the_flag() {
+        assert!(skip_message("initdb").starts_with(SKIP_FLAG));
     }
 }

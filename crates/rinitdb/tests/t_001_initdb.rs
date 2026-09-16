@@ -39,7 +39,7 @@ fn program_options_handling_ok() {
 #[test]
 fn help_and_version_match_reference_initdb() {
     let Some(gate) = Gate::for_tool("initdb", RINITDB) else {
-        println!("{}", reference::skip_message("initdb"));
+        reference::skip("initdb");
         return;
     };
     for arg in ["--help", "--version"] {

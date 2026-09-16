@@ -1394,22 +1394,50 @@ fn the_default_time_zone_is_the_one_etc_localtime_names() {
         src.tzdir().display()
     );
 
-    match std::fs::read_link(rinitdb::findtimezone::TZDEFAULT) {
-        Ok(target) => {
-            let target = target.to_string_lossy().into_owned();
-            assert!(
-                target.ends_with(&chosen),
-                "{} points at {target}, but the default zone is {chosen:?}",
-                rinitdb::findtimezone::TZDEFAULT
-            );
-        }
-        Err(_) => reference::announce_skip(&format!(
-            "{}: {} is not a symlink, so the brute-force scan chose {chosen:?} \
-             and there is no second opinion on this machine",
+    let (Ok(target), Ok(system)) = (
+        std::fs::read_link(rinitdb::findtimezone::TZDEFAULT),
+        std::fs::read(rinitdb::findtimezone::TZDEFAULT),
+    ) else {
+        reference::announce_skip(&format!(
+            "{}: {} is not a readable symlink, so the brute-force scan chose \
+             {chosen:?} and there is no second opinion on this machine",
             reference::SKIP_FLAG,
             rinitdb::findtimezone::TZDEFAULT
-        )),
-    }
+        ));
+        return;
+    };
+
+    // `check_system_link_file` walks the target left to right, skipping the
+    // first component, and takes the *first* tail that names the zone
+    // (`findtimezone.c:566`). Anything shorter is a different spelling of the
+    // same instant — on this machine the brute-force scan answers "UTC" where
+    // the symlink answers "Etc/UTC", because `zone_name_pref` prefers the
+    // bare name — so a suffix test would pass for the wrong reason. Compare
+    // against the exact tail instead.
+    let target = target.to_string_lossy().into_owned();
+    let components: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
+    let expected = (1..components.len())
+        .map(|i| components[i..].join("/"))
+        .find(|tail| {
+            rinitdb::findtimezone::TzSource::read_tzfile(&src, tail).as_deref() == Some(&system[..])
+        });
+    let Some(expected) = expected else {
+        reference::announce_skip(&format!(
+            "{}: no tail of {target} names a file in {} with {}'s bytes, so the \
+             database and the symlink disagree and {chosen:?} cannot be checked \
+             against it",
+            reference::SKIP_FLAG,
+            src.tzdir().display(),
+            rinitdb::findtimezone::TZDEFAULT
+        ));
+        return;
+    };
+    assert_eq!(
+        chosen,
+        expected,
+        "{} points at {target}, whose zone is {expected:?}",
+        rinitdb::findtimezone::TZDEFAULT
+    );
 }
 
 /// Gate: the issue's acceptance criterion. `grep -E '^(log_)?timezone'` over

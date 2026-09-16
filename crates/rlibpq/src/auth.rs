@@ -15,6 +15,38 @@ use crate::scram::{
     Mechanism, SCRAM_SHA_256_NAME, SCRAM_SHA_256_PLUS_NAME, ScramClient, ScramError,
 };
 
+/// The `AUTH_REQ_*` codes of `protocol.h:74`-`:87`, under upstream's names so
+/// the port stays grep-able against that header. [`AuthRequest::decode`] and
+/// [`AuthRequest::code`] both read the wire encoding from here rather than
+/// spelling it twice; 6 is missing because upstream retired it with the SCM
+/// credentials method and left the number unused.
+pub const AUTH_REQ_OK: u32 = 0;
+/// `AUTH_REQ_KRB4` — Kerberos V4, not supported any more.
+pub const AUTH_REQ_KRB4: u32 = 1;
+/// `AUTH_REQ_KRB5` — Kerberos V5, not supported any more.
+pub const AUTH_REQ_KRB5: u32 = 2;
+/// `AUTH_REQ_PASSWORD` — cleartext password.
+pub const AUTH_REQ_PASSWORD: u32 = 3;
+/// `AUTH_REQ_CRYPT` — crypt password, not supported any more.
+pub const AUTH_REQ_CRYPT: u32 = 4;
+/// `AUTH_REQ_MD5` — md5 password.
+pub const AUTH_REQ_MD5: u32 = 5;
+/// `AUTH_REQ_GSS` — GSSAPI without `wrap()`.
+pub const AUTH_REQ_GSS: u32 = 7;
+/// `AUTH_REQ_GSS_CONT` — continue a GSS exchange.
+pub const AUTH_REQ_GSS_CONT: u32 = 8;
+/// `AUTH_REQ_SSPI` — SSPI negotiate without `wrap()`.
+pub const AUTH_REQ_SSPI: u32 = 9;
+/// `AUTH_REQ_SASL` — begin SASL authentication.
+pub const AUTH_REQ_SASL: u32 = 10;
+/// `AUTH_REQ_SASL_CONT` — continue SASL authentication.
+pub const AUTH_REQ_SASL_CONT: u32 = 11;
+/// `AUTH_REQ_SASL_FIN` — the final SASL message.
+pub const AUTH_REQ_SASL_FIN: u32 = 12;
+/// `AUTH_REQ_MAX` — the largest code upstream assigns. Anything above it is
+/// `pg_fe_sendauth`'s default arm, i.e. [`AuthRequest::Unknown`].
+pub const AUTH_REQ_MAX: u32 = AUTH_REQ_SASL_FIN;
+
 /// The `AUTH_REQ_*` codes of `protocol.h:74`-`:87`, with their payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRequest {
@@ -57,19 +89,19 @@ impl AuthRequest {
         let mut r = Reader::new(body, b'R');
         let areq = r.u32()?;
         Ok(match areq {
-            0 => AuthRequest::Ok,
-            1 => AuthRequest::KerberosV4,
-            2 => AuthRequest::KerberosV5,
-            3 => AuthRequest::CleartextPassword,
-            4 => AuthRequest::Crypt,
-            5 => {
+            AUTH_REQ_OK => AuthRequest::Ok,
+            AUTH_REQ_KRB4 => AuthRequest::KerberosV4,
+            AUTH_REQ_KRB5 => AuthRequest::KerberosV5,
+            AUTH_REQ_PASSWORD => AuthRequest::CleartextPassword,
+            AUTH_REQ_CRYPT => AuthRequest::Crypt,
+            AUTH_REQ_MD5 => {
                 let salt = r.take(4)?;
                 AuthRequest::Md5Password([salt[0], salt[1], salt[2], salt[3]])
             }
-            7 => AuthRequest::Gss,
-            8 => AuthRequest::GssContinue(r.rest().to_vec()),
-            9 => AuthRequest::Sspi,
-            10 => {
+            AUTH_REQ_GSS => AuthRequest::Gss,
+            AUTH_REQ_GSS_CONT => AuthRequest::GssContinue(r.rest().to_vec()),
+            AUTH_REQ_SSPI => AuthRequest::Sspi,
+            AUTH_REQ_SASL => {
                 // fe-auth.c:465 — read strings until the empty one.
                 let mut mechanisms = Vec::new();
                 loop {
@@ -81,8 +113,8 @@ impl AuthRequest {
                 }
                 AuthRequest::Sasl(mechanisms)
             }
-            11 => AuthRequest::SaslContinue(r.rest().to_vec()),
-            12 => AuthRequest::SaslFinal(r.rest().to_vec()),
+            AUTH_REQ_SASL_CONT => AuthRequest::SaslContinue(r.rest().to_vec()),
+            AUTH_REQ_SASL_FIN => AuthRequest::SaslFinal(r.rest().to_vec()),
             other => AuthRequest::Unknown(other),
         })
     }
@@ -91,18 +123,18 @@ impl AuthRequest {
     #[must_use]
     pub fn code(&self) -> u32 {
         match self {
-            AuthRequest::Ok => 0,
-            AuthRequest::KerberosV4 => 1,
-            AuthRequest::KerberosV5 => 2,
-            AuthRequest::CleartextPassword => 3,
-            AuthRequest::Crypt => 4,
-            AuthRequest::Md5Password(_) => 5,
-            AuthRequest::Gss => 7,
-            AuthRequest::GssContinue(_) => 8,
-            AuthRequest::Sspi => 9,
-            AuthRequest::Sasl(_) => 10,
-            AuthRequest::SaslContinue(_) => 11,
-            AuthRequest::SaslFinal(_) => 12,
+            AuthRequest::Ok => AUTH_REQ_OK,
+            AuthRequest::KerberosV4 => AUTH_REQ_KRB4,
+            AuthRequest::KerberosV5 => AUTH_REQ_KRB5,
+            AuthRequest::CleartextPassword => AUTH_REQ_PASSWORD,
+            AuthRequest::Crypt => AUTH_REQ_CRYPT,
+            AuthRequest::Md5Password(_) => AUTH_REQ_MD5,
+            AuthRequest::Gss => AUTH_REQ_GSS,
+            AuthRequest::GssContinue(_) => AUTH_REQ_GSS_CONT,
+            AuthRequest::Sspi => AUTH_REQ_SSPI,
+            AuthRequest::Sasl(_) => AUTH_REQ_SASL,
+            AuthRequest::SaslContinue(_) => AUTH_REQ_SASL_CONT,
+            AuthRequest::SaslFinal(_) => AUTH_REQ_SASL_FIN,
             AuthRequest::Unknown(code) => *code,
         }
     }
@@ -392,49 +424,90 @@ impl Authenticator {
 mod tests {
     use super::*;
 
-    /// The twelve `AUTH_REQ_*` codes of `protocol.h:74`, decoded from the
-    /// bodies a server sends.
+    /// Every code of `protocol.h:74`-`:87` with the payload a server sends
+    /// after it, so the table below is the whole wire vocabulary.
+    fn every_code_with_its_payload() -> Vec<(u32, &'static [u8], AuthRequest)> {
+        vec![
+            (AUTH_REQ_OK, b"", AuthRequest::Ok),
+            (AUTH_REQ_KRB4, b"", AuthRequest::KerberosV4),
+            (AUTH_REQ_KRB5, b"", AuthRequest::KerberosV5),
+            (AUTH_REQ_PASSWORD, b"", AuthRequest::CleartextPassword),
+            (AUTH_REQ_CRYPT, b"", AuthRequest::Crypt),
+            (
+                AUTH_REQ_MD5,
+                b"\x01\x02\x03\x04",
+                AuthRequest::Md5Password([1, 2, 3, 4]),
+            ),
+            (AUTH_REQ_GSS, b"", AuthRequest::Gss),
+            (
+                AUTH_REQ_GSS_CONT,
+                b"gss-token",
+                AuthRequest::GssContinue(b"gss-token".to_vec()),
+            ),
+            (AUTH_REQ_SSPI, b"", AuthRequest::Sspi),
+            (
+                AUTH_REQ_SASL,
+                b"SCRAM-SHA-256\0\0",
+                AuthRequest::Sasl(vec![SCRAM_SHA_256_NAME.to_vec()]),
+            ),
+            (
+                AUTH_REQ_SASL_CONT,
+                b"r=abc,s=c2FsdA==,i=4096",
+                AuthRequest::SaslContinue(b"r=abc,s=c2FsdA==,i=4096".to_vec()),
+            ),
+            (
+                AUTH_REQ_SASL_FIN,
+                b"v=c2ln",
+                AuthRequest::SaslFinal(b"v=c2ln".to_vec()),
+            ),
+            // protocol.h:80 — 6 was SCM credentials and is now a hole, so it
+            // decodes like anything above AUTH_REQ_MAX.
+            (6, b"", AuthRequest::Unknown(6)),
+            (
+                AUTH_REQ_MAX + 1,
+                b"",
+                AuthRequest::Unknown(AUTH_REQ_MAX + 1),
+            ),
+        ]
+    }
+
+    /// `decode` and `code` are two directions over one table; this walks every
+    /// code through both so neither can drift from the other.
     #[test]
-    fn every_auth_request_code_decodes() {
-        assert_eq!(AuthRequest::decode(&[0, 0, 0, 0]).unwrap(), AuthRequest::Ok);
-        assert_eq!(
-            AuthRequest::decode(&[0, 0, 0, 3]).unwrap(),
-            AuthRequest::CleartextPassword
-        );
-        assert_eq!(
-            AuthRequest::decode(&[0, 0, 0, 5, 1, 2, 3, 4]).unwrap(),
-            AuthRequest::Md5Password([1, 2, 3, 4])
-        );
-        let mut sasl = vec![0, 0, 0, 10];
-        sasl.extend_from_slice(b"SCRAM-SHA-256\0\0");
-        assert_eq!(
-            AuthRequest::decode(&sasl).unwrap(),
-            AuthRequest::Sasl(vec![b"SCRAM-SHA-256".to_vec()])
-        );
-        let mut cont = vec![0, 0, 0, 11];
-        cont.extend_from_slice(b"r=abc,s=c2FsdA==,i=4096");
-        assert_eq!(
-            AuthRequest::decode(&cont).unwrap(),
-            AuthRequest::SaslContinue(b"r=abc,s=c2FsdA==,i=4096".to_vec())
-        );
-        assert_eq!(
-            AuthRequest::decode(&[0, 0, 0, 13]).unwrap(),
-            AuthRequest::Unknown(13)
-        );
-        for (code, request) in [
-            (1u32, AuthRequest::KerberosV4),
-            (2, AuthRequest::KerberosV5),
-            (4, AuthRequest::Crypt),
-            (7, AuthRequest::Gss),
-            (9, AuthRequest::Sspi),
-        ] {
-            assert_eq!(
-                AuthRequest::decode(&code.to_be_bytes()).unwrap(),
-                request,
-                "code {code}"
-            );
-            assert_eq!(request.code(), code);
+    fn every_auth_request_code_round_trips_through_decode_and_code() {
+        for (code, payload, expected) in every_code_with_its_payload() {
+            let mut body = code.to_be_bytes().to_vec();
+            body.extend_from_slice(payload);
+
+            let decoded = AuthRequest::decode(&body).expect("well-formed body");
+
+            assert_eq!(decoded, expected, "decoding code {code}");
+            assert_eq!(decoded.code(), code, "re-encoding code {code}");
         }
+    }
+
+    /// The constants are the port's copy of `protocol.h:74`-`:87`; pin the
+    /// integers so a rename can never quietly renumber the wire.
+    #[test]
+    fn the_auth_request_constants_are_the_numbers_protocol_h_assigns() {
+        assert_eq!(
+            [
+                AUTH_REQ_OK,
+                AUTH_REQ_KRB4,
+                AUTH_REQ_KRB5,
+                AUTH_REQ_PASSWORD,
+                AUTH_REQ_CRYPT,
+                AUTH_REQ_MD5,
+                AUTH_REQ_GSS,
+                AUTH_REQ_GSS_CONT,
+                AUTH_REQ_SSPI,
+                AUTH_REQ_SASL,
+                AUTH_REQ_SASL_CONT,
+                AUTH_REQ_SASL_FIN,
+            ],
+            [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12],
+        );
+        assert_eq!(AUTH_REQ_MAX, AUTH_REQ_SASL_FIN);
     }
 
     /// An AuthenticationMD5Password with no salt is a truncated message, not

@@ -3,6 +3,66 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — testkit byte-diff gate runner (NAT-374)
+
+**What**
+- `testkit::gate`: `Gate { reference, candidate, args, stdin, normalizers }` →
+  `GateReport { stdout_diff, stderr_diff, rc }`. `gate::compare` is the whole
+  verdict as a pure function over two `CommandOutcome`s; `Gate::run` is the one
+  action that spawns. `Gate::for_tool` reuses the existing `PGDROP_REF_BIN` →
+  PGDG → Homebrew discovery and yields `None` so the caller prints
+  `SKIP (flagged, not silent)`.
+- `testkit::normalize`: three justified normalizers as pure
+  `fn(&str) -> String`, each citing the upstream printf it rewrites —
+  `Time: …` (`src/bin/psql/common.c:608`, covering all four duration forms),
+  `PID n` (`common.c:755`), system identifier
+  (`src/include/catalog/pg_control.h:107`). `DEFAULT` is the three in order.
+- `testkit::diff`: in-process Myers diff rendered as `diff -U3`, matching
+  pg_regress's `pretty_diff_opts` (`src/test/regress/pg_regress.c:65`), with
+  diff(1)'s `\ No newline at end of file` marker.
+- `testkit::run_with_stdin`: feeds stdin from a helper thread while the parent
+  drains both pipes, so a tool that writes more than a pipe buffer before
+  reading its input cannot deadlock a gate; `EPIPE` from a child that exits
+  early is the child's business, not a failure.
+- `rinitdb`'s `help_and_version_match_reference_initdb` now runs through the
+  gate instead of `assert_eq!` on two byte vectors.
+
+**Why**
+The gate is how every later issue proves itself (`docs/test-stealing.md`), so
+it had to exist before the ports that lean on it. The pure/action split is what
+makes the comparison testable here, where no C reference binary exists.
+
+**Checks run** (Rust 1.96.0, this container, no PostgreSQL installed)
+- `cargo fmt --all --check` exit 0.
+- `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic`
+  exit 0. `tests/gate.rs` needs its own crate-level `doc_markdown` allow, like
+  the other integration tests: the CLI's `-W clippy::pedantic` outranks the
+  workspace `[lints]` table.
+- `cargo test --all-features` exit 0, 80 tests (was 46): +30 testkit unit
+  (8 diff, 10 normalize, 12 gate), +4 testkit integration.
+- The gate itself was proved non-vacuous by hand, since the byte-diff gate here
+  can only SKIP: with `PGDROP_REF_BIN` pointing at a directory whose `initdb`
+  is a symlink to `rinitdb`, the gate runs live and passes with no SKIP line;
+  pointing it at `/bin/echo` fails the test with the unified diff.
+
+**Risks**
+- A mismatching stream that is not valid UTF-8 is reported as "differs and is
+  not valid UTF-8" with the first differing byte offset rather than diffed.
+  That is deliberate: `from_utf8_lossy` maps every invalid byte to U+FFFD and
+  could call two different outputs equal.
+- The diff renderer stops looking for a minimal edit script past
+  `MAX_EDIT_DISTANCE` (4096) and prints one whole-file replacement hunk. It
+  only affects how a failure reads; the verdict is always the byte comparison.
+- The gate hands both binaries the same environment but does not pin one
+  (`LC_ALL`, `TZ`, `PGCLIENTENCODING`). Both sides see the same values, so a
+  comparison stays honest, but two machines can gate on different text.
+
+**Follow-ups**
+- Pinning a gate environment is worth its own issue once a gate runs something
+  locale-sensitive (M3, rpsql).
+- `crates/pgdrop/Cargo.toml` sets both `license` and `license-file`, so every
+  cargo invocation warns. Pre-existing, one line, not touched here.
+
 ## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
 
 **What**

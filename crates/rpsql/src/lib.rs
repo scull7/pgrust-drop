@@ -44,13 +44,13 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
-use rlibpq::{Connection, Env, QueryResult, Stream, conndefaults};
+use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
 use crate::command::{CommandContext, CommandResult, handle_slash_cmds};
 use crate::common::{Executor, send_query};
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{QuoteType, ScanResult, Scanner, VariableSource};
-use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS};
+use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
 use crate::startup::{Action, Invocation, Session};
 
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
@@ -209,15 +209,85 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         }
     };
 
+    // The list is consumed here and never read again, so it moves out rather
+    // than being cloned past the `&mut session` the loop needs.
+    let actions = std::mem::take(&mut session.actions);
+    let single_txn = session.single_txn;
     let mut code = EXIT_SUCCESS;
-    for action in session.actions.clone() {
-        code = run_action(&action, &mut session, &mut executor, stdout, stderr);
-        if code != EXIT_SUCCESS && session.pset.on_error_stop {
-            break;
+
+    // `-1`: wrap every action in one transaction (`startup.c:366`). A failed
+    // BEGIN only stops the run under ON_ERROR_STOP, and then it skips the
+    // actions *and* the COMMIT, which is what upstream's `goto error` does.
+    let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", stderr);
+    if begun || !session.pset.on_error_stop {
+        for action in &actions {
+            code = run_action(action, &mut session, &mut executor, stdout, stderr);
+            if code != EXIT_SUCCESS && session.pset.on_error_stop {
+                break;
+            }
         }
+        if single_txn {
+            // Roll back only when ON_ERROR_STOP made a failure fatal; other-
+            // wise COMMIT, which the server itself turns into a rollback if
+            // the transaction is already aborted (`startup.c:432`).
+            let finish = single_txn_finish(code, session.pset.on_error_stop);
+            if !psql_exec(&mut executor, finish, stderr) && session.pset.on_error_stop {
+                code = EXIT_USER;
+            }
+        }
+    } else {
+        code = EXIT_USER;
     }
+
     let _ = executor.connection.terminate();
     ExitCode::from(code)
+}
+
+/// Which statement closes a `-1` transaction (`startup.c:432`).
+///
+/// Upstream rolls back only when `ON_ERROR_STOP` made a failure fatal — the
+/// check "needs to match the one done a couple of lines above", which is the
+/// one that breaks out of the action loop. Otherwise it commits, and a
+/// transaction the server has already aborted turns that commit into a
+/// rollback by itself.
+#[must_use]
+pub fn single_txn_finish(code: u8, on_error_stop: bool) -> &'static [u8] {
+    if code != EXIT_SUCCESS && on_error_stop {
+        b"ROLLBACK"
+    } else {
+        b"COMMIT"
+    }
+}
+
+/// `PSQLexec()` (`common.c:501`): run a query psql issues for itself, printing
+/// nothing on success and the server's error on failure.
+fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write) -> bool {
+    match executor.exec(query) {
+        Ok(results) => {
+            let mut ok = true;
+            for result in &results {
+                // `AcceptResult`'s list of statuses that are not a failure
+                // (`common.c:439`).
+                let accepted = matches!(
+                    result.status(),
+                    ExecStatus::CommandOk
+                        | ExecStatus::TuplesOk
+                        | ExecStatus::EmptyQuery
+                        | ExecStatus::CopyIn
+                        | ExecStatus::CopyOut
+                );
+                if !accepted {
+                    let _ = stderr.write_all(&result.error_message());
+                    ok = false;
+                }
+            }
+            ok
+        }
+        Err(message) => {
+            let _ = stderr.write_all(message.as_bytes());
+            false
+        }
+    }
 }
 
 fn run_action(
@@ -263,10 +333,19 @@ fn run_action(
                 CommandResult::Error
             };
             session.pset = session.vars.settings(&session.pset);
-            if status == CommandResult::Error {
-                EXIT_FAILURE
-            } else {
-                EXIT_SUCCESS
+            match status {
+                // Reconnection is an action this issue does not perform, and
+                // reporting success without it would be a lie: `MainLoop`
+                // refuses the same result (NAT-405).
+                CommandResult::Connect(_) => {
+                    let _ = writeln!(
+                        stderr,
+                        "psql: error: \\connect is not implemented yet (Linear NAT-405)"
+                    );
+                    EXIT_FAILURE
+                }
+                CommandResult::Error => EXIT_FAILURE,
+                _ => EXIT_SUCCESS,
             }
         }
         // `ACT_FILE` (`startup.c:403`): `None` is stdin.
@@ -348,6 +427,38 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "fallback_application_name" && v == "psql")
         );
+    }
+
+    #[test]
+    fn a_single_transaction_commits_unless_on_error_stop_made_it_fatal() {
+        // `startup.c:432`. Without ON_ERROR_STOP upstream still COMMITs after
+        // a failed statement; the server has aborted the transaction, so the
+        // commit discards the work anyway. With ON_ERROR_STOP it ROLLBACKs.
+        assert_eq!(single_txn_finish(EXIT_SUCCESS, false), b"COMMIT");
+        assert_eq!(single_txn_finish(EXIT_SUCCESS, true), b"COMMIT");
+        assert_eq!(single_txn_finish(EXIT_FAILURE, false), b"COMMIT");
+        assert_eq!(single_txn_finish(EXIT_FAILURE, true), b"ROLLBACK");
+    }
+
+    #[test]
+    fn single_transaction_is_carried_from_the_option_table() {
+        let Invocation::Run(session) = startup::plan(&[
+            OsString::from("-1"),
+            OsString::from("-c"),
+            OsString::from("select 1"),
+        ]) else {
+            panic!("expected a session");
+        };
+        assert!(session.single_txn);
+
+        let Invocation::Run(session) = startup::plan(&[
+            OsString::from("--single-transaction"),
+            OsString::from("-c"),
+            OsString::from("select 1"),
+        ]) else {
+            panic!("expected a session");
+        };
+        assert!(session.single_txn);
     }
 
     #[test]

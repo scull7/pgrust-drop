@@ -3,6 +3,67 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-398 review fixes
+
+**What** (four of the seven findings were real bugs, two were tests or docs
+claiming more than they checked, one was a needless clone)
+- `-1`/`--single-transaction` parsed and then did nothing: it was read only by
+  the "no actions" fatal check and appeared in neither the refusal list nor any
+  BEGIN/COMMIT. `rpsql -X -1 -c 'create table t(n int)' -c 'selec 1'` left `t`
+  committed where C psql discards it. The wrapper is now ported
+  (`startup.c:366`, `:432`): BEGIN before the action list, then ROLLBACK when
+  `ON_ERROR_STOP` made a failure fatal and COMMIT otherwise — upstream's own
+  asymmetry, and the reason it is safe is that the server has already aborted
+  the transaction, so that COMMIT discards the work by itself. A failed BEGIN
+  skips the actions *and* the COMMIT under `ON_ERROR_STOP`, which is what
+  upstream's `goto error` does. The choice is the pure `single_txn_finish`,
+  tested over all four combinations.
+- `echo_line` echoed for `ECHO=all` as well as `ECHO=queries`, but `SendQuery`
+  echoes only for the latter (`common.c:1158`); `ECHO=all` is echoed per input
+  line in `MainLoop` (`mainloop.c:360`) and per action in `main`
+  (`startup.c:386`), both of which this port already did. Every query was
+  printed twice under `-a`. The `MainLoop` test that should have caught it
+  asserted `stdout.starts_with("select 1;\n")`, which the duplicate satisfies;
+  it now counts occurrences and runs two statements.
+- `print_aligned_text` had no `pg_wcsformat` (`mbprint.c:398`): a cell holding
+  a newline went into the table raw and mis-measured its column, so
+  `select E'a\nb'` broke the frame instead of rendering `a       +` / `b`.
+  Cells and headers are now split per newline, the width is the widest line
+  rather than the whole string, continued lines carry `pg_asciiformat`'s
+  `nl_right` `+`, and a column that has run out of lines is blank-padded. This
+  was silent corruption, which is exactly what the module's stated policy —
+  refuse what it cannot render — exists to avoid.
+- `\c` through `-c` fell past `CommandResult::Connect` to `EXIT_SUCCESS`, so
+  `rpsql -X -c '\c otherdb'` did nothing and claimed to have done it. It now
+  refuses with the same message `MainLoop` already used.
+
+**Two tests and a doc corrected**. `an_unimplemented_format_is_refused` spawned
+the binary and asserted only a nonzero exit, which the connection failure
+supplied — its own comment admitted as much — so it never reached the `--csv`
+refusal it was named for. It moved into `print.rs`, where the refusal is
+decided, and now covers six formats and asserts the message names NAT-400. The
+unported `psqlrc` handling (`startup.c:702`) was described only in progress.md
+and Linear; it is a deliberate divergence and now has a row in
+`docs/divergences.md` with a test that pins the flag and fails loudly if a
+reader lands. progress.md's claim that "-l, -o, -L and -1 parse but are refused
+at the point of use" was false for `-1` — it is now implemented, and the
+sentence names only the three that are refused.
+
+**One cleanup**. `run_session` cloned the whole action list, every `-c` string
+included, on each run to dodge a borrow; it takes the list with
+`std::mem::take` instead.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 611 tests (605 before; one weak
+integration test removed, seven unit tests added), 30 SKIP-flagged gate lines,
+unchanged.
+
+**Risks**. The single-transaction wrapper has never run against a server: the
+BEGIN/COMMIT statements and the `AcceptResult` check around them are reasoned
+from the C, and the first live run is where they are proved. The newline
+rendering is pinned against hand-computed expectations from `print.c`, not
+against C psql's bytes, for the same reason every gate here skips.
+
 ## 2026-09-16 — NAT-398 rpsql startup/mainloop/command skeleton
 
 **What**. `rpsql` stops being a `--version` stub and becomes psql's skeleton,
@@ -60,11 +121,11 @@ scan.l has rules psql's copy inherits that no test here exercises.
 
 **Follow-ups**. (1) `print.c`'s width measurement counts characters, not
 display columns — recorded in `docs/divergences.md`, and NAT-400 must close it
-with `pg_wcssize`'s tables. (2) `-l`, `-o`, `-L` and `-1` parse but are refused
-at the point of use; `-1`'s single-transaction wrapper is a few lines once
-`\c` has a home. (3) `psqlrc` processing (`process_psqlrc`, `startup.c:702`)
-is not ported at all — `-X` is honoured by never looking for the file, which is
-right for the Acceptance line but wrong for a psql without `-X`.
+with `pg_wcssize`'s tables. (2) `-l`, `-o` and `-L` parse but are refused at the
+point of use. (3) `psqlrc` processing (`process_psqlrc`, `startup.c:702`) is not
+ported at all — `-X` is honoured by never looking for the file, which is right
+for the Acceptance line but wrong for a psql without `-X`; now recorded in
+`docs/divergences.md` rather than only here.
 
 ## 2026-09-16 — NAT-389 review fixes
 

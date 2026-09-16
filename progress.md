@@ -3,6 +3,51 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-374 review fixes
+
+**What** (all five reviewer findings were real)
+- `diff`: the Myers trace kept a full-width diagonal array per distance, so
+  memory was `D * (rows + cols)`, not the `D^2` the doc claimed — 543 MB to
+  render two all-different 4k-line outputs, ~13 GB for two 100k-line psql
+  outputs, which OOM-kills the test process and destroys the gate failure the
+  renderer exists to explain. Each distance now records only the `2d + 1`
+  diagonals reachable at it, and `MAX_EDIT_DISTANCE` is 1024, so the trace is
+  `(D + 1)^2` words ≈ 8 MB whatever the inputs. The common head and tail are
+  also trimmed before the search and only `CONTEXT_LINES` of each are
+  reattached, so a one-line change in a 50k-line output costs a handful of
+  edits. Measured: the diff tests now pass under `ulimit -v` of 48 MB, and the
+  testkit unit suite went from 0.82 s to 0.04 s.
+- `reference::skip` / `announce_skip`: the `SKIP (flagged, not silent)` line was
+  a `println!` in a *passing* test, which libtest captures and replays only on
+  failure or under `--nocapture` — so CI's plain `cargo test --all-features`
+  showed no trace of the repo's only real gate being skipped. Verified both
+  ways: `println!` and `eprintln!` are captured, a write to the `io::stderr()`
+  handle is not. `cargo test --all-features` now prints the SKIP line.
+- `gate`: `run` returns `GateError::Spawn { side, path, source }` (thiserror,
+  approved) instead of a bare `io::Result`, so "the reference is not installed"
+  and "the candidate is not built" are told apart.
+- `gate`: per-stream verdict is a `StreamDiff` enum (`Match` / `Text` /
+  `Binary { at, reference_len, candidate_len }`) instead of an
+  `Option<String>` folding three outcomes into one string.
+- `normalize::pid`: anchored on a word boundary. It matched "PID " anywhere, so
+  `"RAPID 42 rows"` became `"RAPID <pid> rows"` and a DEFAULT-normalized gate
+  could have masked a real numeric difference.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 84 tests (was 80; +4 regression tests:
+`one_change_in_a_long_output_stays_small`,
+`past_the_edit_budget_the_whole_file_is_replaced`,
+`pid_does_not_fire_inside_a_word`, `skip_message_carries_the_flag`). Both live
+gate controls re-run and still correct (reference symlinked to `rinitdb`
+passes; `/bin/echo` fails with the diff).
+
+**Risks**: the edit budget is now 1024 rather than 4096, so a mismatch needing
+more than 1024 edits renders as one whole-file replacement hunk instead of a
+minimal script. That is a readability trade for a hard memory bound; the
+verdict is still the byte comparison, never the rendering.
+
+**Follow-ups**: unchanged from the entry below.
+
 ## 2026-09-16 — testkit byte-diff gate runner (NAT-374)
 
 **What**

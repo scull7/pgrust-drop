@@ -35,6 +35,7 @@ name = "rinitdb"
 version = "0.1.0"
 dependencies = [
  "testkit",
+ "thiserror",
  "usage-rs",
 ]
 

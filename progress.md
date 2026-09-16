@@ -3,6 +3,82 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-378 rinitdb pre-flight validation
+
+**What**
+- `rinitdb::validate`: `validate(&Options, &Environment, &dyn FsProbe) -> Result<Plan, InitdbError>`,
+  the whole of `initdb.c`'s `main()` from the getopt switch arms down to
+  `create_xlog_or_symlink`, as one pure calculation. The only thing it asks of
+  the outside world is `FsProbe::check_dir`, a port of `pg_check_dir`
+  (`src/port/pgcheckdir.c:32`) with its six outcomes as an enum, so all 33 unit
+  tests run against a table of fake directories and touch no disk.
+- `rinitdb::error`: fifteen `InitdbError` variants, one per `pg_fatal` /
+  `pg_log_error` site, each citing its `initdb.c` line. `render()` reproduces
+  `pg_log_generic_v` (`src/common/logging.c:99`) exactly — the `error:`,
+  `detail:` and `hint:` lines, and the fact that a hint carrying an embedded
+  newline prints its second line *without* the `initdb: hint: ` prefix, which
+  is what the `lost+found` case needs.
+- `rinitdb::encoding`: `pg_encname_tbl[]`, `clean_encoding_name`,
+  `pg_char_to_encoding` and `PG_VALID_BE_ENCODING` from
+  `src/common/encnames.c` and `src/include/mb/pg_wchar.h`. `--encoding` had to
+  be validated for real rather than pattern-matched for "utf8": the
+  `--builtin-locale=C.UTF-8` rule turns on the encoding's *identity*, so
+  `UTF8`, `UTF-8` and `Unicode` must all pass and `SJIS` (a client-only
+  encoding, not an unknown name) must fail.
+- `crates/rinitdb/tests/t_001_initdb.rs`: eleven more cases from
+  `001_initdb.pl`, upstream names and upstream order, each asserting both the
+  stolen `command_fails` and the exact stderr C writes, then running the gate.
+
+**Why the order is the deliverable, not just the messages.** Several of these
+conditions hold at once on the test's own command lines and C reports exactly
+one of them: `--sync-only` returns before the superuser and locale checks;
+`--pwprompt` + `--pwfile` is caught before the data directory is even resolved;
+`create_data_directory` runs before `create_xlog_or_symlink`, so a non-empty
+PGDATA outranks a bad `--waldir`. Five unit tests pin orderings rather than
+messages.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 191 tests (was 125). Every gate prints
+`SKIP (flagged, not silent)`: there is no PostgreSQL 18 on this box
+(`docs/nightshift/2026-09-16.md`).
+
+**Gate scope.** Five of the new gates are judged on stderr and the exit status
+only, through a new `testkit::Scope`. By the time C reaches those five errors
+it has already printed "The files belonging to this database system will be
+owned by …" and its `creating directory … ok` progress, which rinitdb produces
+only when cluster creation exists (NAT-379 … NAT-387); the issue's Acceptance
+scopes them to "stderr + rc" for exactly that reason. This is not a quiet
+narrowing: the stdout difference is still compared, still rendered, and
+`assert_clean` prints it behind `OUT OF SCOPE (flagged, not silent)`. The other
+six gates stay strict, because C prints nothing on stdout before those errors
+either. Row in `docs/divergences.md`.
+
+**Risks**
+- The transcribed stderr is only as good as the transcription until a
+  PostgreSQL 18 binary exists to diff against. Mitigated by asserting the exact
+  bytes in the integration test as well as in the unit test, so the two have to
+  be wrong the same way.
+- `--set foo=bar` is listed in the issue's Cases but is **not** a pre-flight
+  error in C: `initdb` never validates a GUC name. It writes the setting into
+  `postgresql.conf` (`initdb.c:1430`) and passes it to the child
+  `postgres --boot`, which is what rejects it, after the data directory has
+  been created. The issue's Goal sentence — "every case … that needs no server"
+  — excludes it. Faking it with a name allowlist would also be wrong: custom
+  GUCs such as `plpgsql.check_asserts` are legal `-c` arguments. Left for the
+  cluster-creation issues; `-c NAME` with no `=` (`initdb.c:3273`), which *is*
+  pre-flight, is implemented.
+
+**Follow-ups**
+- `canonicalize_path` (`src/port/path.c`) is not ported, so paths appear in
+  messages as typed (`docs/divergences.md`).
+- Still unvalidated, and none of them in this issue's Acceptance:
+  `--wal-segsize` (`option_parse_int` plus the power-of-two rule,
+  `initdb.c:3466`), `--sync-method` (`parse_sync_method`), the authentication
+  methods (`check_authmethod_valid`), and `-E` left unset, which C derives from
+  `LC_CTYPE` via `nl_langinfo` and `Plan::encoding` therefore leaves `None`.
+- Unchanged from the entries below (the `pgdrop` manifest sets both `license`
+  and `license-file`).
+
 ## 2026-09-16 — NAT-373 review fixes
 
 **What** (all five reviewer findings were real)

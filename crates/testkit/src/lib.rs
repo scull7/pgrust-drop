@@ -37,7 +37,7 @@ pub mod run;
 
 pub use checks::Violation;
 pub use files::{Entry, EntryKind, ModeViolation, slurp_file};
-pub use gate::{Gate, GateError, GateReport, RcCheck, Side, StreamDiff};
+pub use gate::{Gate, GateError, GateReport, RcCheck, Scope, Side, StreamDiff};
 pub use normalize::Normalizer;
 pub use outcome::CommandOutcome;
 pub use pattern::{Pattern, PatternError};

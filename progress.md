@@ -3,6 +3,69 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-16 — NAT-398 rpsql startup/mainloop/command skeleton
+
+**What**. `rpsql` stops being a `--version` stub and becomes psql's skeleton,
+ported from the C (ADR-0003: nothing from pgrust's Rust psql). Ten modules,
+each tracking one upstream file: `scan` is `fe_utils/psqlscan.l` as a
+hand-written state machine over the same ten start conditions; `slash` is the
+add-on lexer `psqlscanslash.l` bolted onto the same buffer stack; `variables`
+is `variables.c`; `settings` is `settings.h`; `startup` is `startup.c`'s
+`long_options[]` and `parse_psql_options`; `mainloop` is `MainLoop`; `common`
+is `SendQuery`; `command` is `HandleSlashCmds` with the four commands the issue
+names (`\q`, `\c`, `\echo`, `\set`, plus the `\unset`/`\qecho`/`\warn`
+that share their code); `prompt` is `prompt.c`; `print` is as much of
+`fe_utils/print.c` as the Acceptance line needs.
+
+**Why this shape**. Upstream is one `pset` global that the lexer, the assign
+hooks and the printer all reach into. Two substitutions keep the split the
+issue's Design asks for. First, the assign hooks become *data*: `Assign` names
+which `pset` field each variable controls, and `VariableSpace::settings` is one
+pure function that derives every hook-owned field, so the twenty C hooks that
+write a global become one calculation with one test. Second, the two actions
+are behind traits — `Executor` for the connection, `LineSource` for input — so
+`MainLoop`, `SendQuery` and every backslash command are tested without a
+server, against results built by feeding wire frames through rlibpq's
+`QueryRunner`.
+
+The lexer is the one place fidelity is expensive and the tests say why: flex
+picks the longest match and breaks ties by rule order, and the rules whose
+*consumed length* differs from the naive reading are the ones that matter.
+`=--` is a `=` operator and then a comment, not a three-character operator
+(`psqlscan.l:824`); `+/*` is `+` and a comment start (`:263`); `1..10` throws
+the `..` back (`:322`); a string continuation needs a newline (`:167`). Each is
+a named test.
+
+**Scope held**. `--help` is NAT-399's, so the stolen `program_help_ok` is
+declared `#[ignore]` with that reason rather than deleted — the file keeps
+upstream's order and the gap is visible. The rest of `print.c` is NAT-400's, so
+`-H`, `--csv`, expanded and wrapped are refused with an error instead of
+approximated. `\d` is NAT-401's, `\if`/`\gset` NAT-402's, `\copy`/`\g`
+NAT-403's, interactive input and `\c`'s reconnect NAT-405's; each is named at
+the point where it is missing.
+
+**Checks run**: `cargo fmt --all --check` exit 0, pedantic clippy exit 0,
+`cargo test --all-features` exit 0 — 605 tests (471 before), 1 ignored, 30
+SKIP-flagged gate lines (27 before; the three new ones are the Acceptance
+`-X -c 'select 1'` gate, the SQL-corpus gate and `--version`).
+
+**Risks**. The Acceptance gate has never executed: it needs a PostgreSQL 18
+psql *and* a cluster, and this box has neither, so it skips on both counts
+rather than on one. It is written to demand both — a gate over two connection
+failures would prove nothing about `select 1` — and the aligned output it would
+compare is instead pinned by unit tests that spell the bytes out. The lexer is
+reasoned from the flex rules, not diffed against flex; the cases above are the
+ones where that reasoning could be wrong, and each is tested, but the backend's
+scan.l has rules psql's copy inherits that no test here exercises.
+
+**Follow-ups**. (1) `print.c`'s width measurement counts characters, not
+display columns — recorded in `docs/divergences.md`, and NAT-400 must close it
+with `pg_wcssize`'s tables. (2) `-l`, `-o`, `-L` and `-1` parse but are refused
+at the point of use; `-1`'s single-transaction wrapper is a few lines once
+`\c` has a home. (3) `psqlrc` processing (`process_psqlrc`, `startup.c:702`)
+is not ported at all — `-X` is honoured by never looking for the file, which is
+right for the Acceptance line but wrong for a psql without `-X`.
+
 ## 2026-09-16 — NAT-389 review fixes
 
 **What** (all six findings were real; two were holes, four were tests or

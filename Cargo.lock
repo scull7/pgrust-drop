@@ -49,6 +49,11 @@ dependencies = [
 [[package]]
 name = "rpsql"
 version = "0.1.0"
+dependencies = [
+ "rlibpq",
+ "testkit",
+ "usage-rs",
+]
 
 [[package]]
 name = "syn"

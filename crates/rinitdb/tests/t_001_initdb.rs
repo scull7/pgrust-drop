@@ -1281,12 +1281,41 @@ fn configured_socket_directory() -> Option<String> {
     if outcome.status != Some(0) {
         return None;
     }
-    // No switch at all is the compiled-in default of pg_config_manual.h:193,
-    // which is this port's constant too.
-    Some(
-        socketdir_switch(&outcome.stdout_text())
-            .unwrap_or_else(|| rinitdb::pg_config::DEFAULT_PGSOCKET_DIR.to_owned()),
-    )
+    // No switch means pg_config cannot answer, NOT that the build used the
+    // compiled-in default. Upstream has no `--with-socketdir` at all: in
+    // 18.6, `grep -rn socketdir configure configure.ac meson_options.txt
+    // meson.build` is empty, and DEFAULT_PGSOCKET_DIR exists only at
+    // pg_config_manual.h:193. Debian moves it by patching that header, so the
+    // switch this parses is one no upstream build ever emits. Returning None
+    // hands the question to the fallback, which reads the value out of the
+    // postgresql.conf C actually wrote — the only source that can carry it.
+    socketdir_switch(&outcome.stdout_text())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pg_config_that_names_no_socket_switch_defers_to_the_file_c_wrote() {
+    // The bug this pins: treating "pg_config named no switch" as a positive
+    // answer of DEFAULT_PGSOCKET_DIR made `socket_directory_for` short-circuit
+    // before its fallback, so the gate rendered `/tmp` against a PGDG build
+    // that writes `/var/run/postgresql`, and the whole retarget was a no-op.
+    let c_wrote = "#unix_socket_directories = '/var/run/postgresql'\t# comma-separated\n";
+
+    assert_eq!(socketdir_switch("--prefix=/usr --with-openssl"), None);
+    assert_eq!(
+        socket_directory_for(None, c_wrote),
+        "/var/run/postgresql",
+        "with no switch to go on, the value C wrote must win"
+    );
+    assert_eq!(
+        socket_directory_for(Some("/var/run/postgresql".to_owned()), c_wrote),
+        "/var/run/postgresql"
+    );
+    assert_eq!(
+        socket_directory_for(None, "#port = 5432\n"),
+        rinitdb::pg_config::DEFAULT_PGSOCKET_DIR,
+        "only when neither source can answer is this port's constant assumed"
+    );
 }
 
 /// `setup_config`'s `unix_socket_directories` fix-up (`initdb.c:1370`) redone

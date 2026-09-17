@@ -17,6 +17,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+use testkit::normalize::EXTRA_VERSION;
 use testkit::{Gate, reference};
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
@@ -117,13 +118,24 @@ fn a_small_sql_corpus_matches_c_psql() {
 }
 
 /// `psql --version` through both binaries, which needs no server at all.
+///
+/// Normalized by `normalize::EXTRA_VERSION`, for the same reason the `initdb`
+/// half is: C `psql` prints the compile-time `PG_VERSION` verbatim, and a
+/// distribution that builds with `configure --with-extra-version` appends its
+/// own vendor string to it, so PGDG's binary answers
+/// `psql (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)` where a stock build
+/// answers `psql (PostgreSQL) 18.6`. The normalizer strips only a trailing
+/// parenthetical from that one line shape; the version number itself is still
+/// compared, so 18.6 and 19.1 still differ.
 #[test]
 fn version_matches_c_psql() {
     let Some(gate) = Gate::for_tool("psql", RPSQL) else {
         reference::skip("psql");
         return;
     };
-    gate.arg("--version").assert_clean();
+    gate.arg("--version")
+        .normalizer(EXTRA_VERSION)
+        .assert_clean();
 }
 
 /// Without a server, `-c` still reports a connection failure and exits 2

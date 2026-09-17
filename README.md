@@ -5,8 +5,10 @@ includes `initdb` and `psql`, all in Rust. Point a test suite at `pgdrop start`
 and it has a Postgres in milliseconds, with no Docker and no PostgreSQL client
 tools installed.
 
-Status: **scaffolding**. See [`progress.md`](progress.md) for what works today
-and the Linear project *pgrust-drop* for the plan.
+Status: **scaffolding**. The Linear project
+[*pgrust-drop*](https://linear.app/scull7/project/pgrust-drop) (team NAT) is the
+single source of truth for what works today and for the plan. (`progress.md` is
+a historical archive up to 2026-09-16, not current state.)
 
 ## Layout
 

@@ -1,6 +1,7 @@
 # ADR-0006: rlibpq's TLS backend is rustls
 
-Status: accepted (owner decision 2026-09-16).
+Status: accepted (owner decision 2026-09-16); crypto provider settled
+2026-09-17.
 
 ## Context
 
@@ -13,14 +14,30 @@ only the handshake and certificate verification are.
 
 `rustls` behind a `tls` Cargo feature (on by default), with a `NoTls` backend
 always compiled so the negotiation state machine and its stolen tests run
-without it. The crypto provider (rustls default `aws-lc-rs` vs `ring`) is
-chosen at implementation time in NAT-392 and recorded here; both build without
-a system OpenSSL, neither is pure Rust.
+without it. Use rustls wherever a choice exists rather than reaching past it.
+
+The crypto provider is **`ring`**, not rustls' default `aws-lc-rs` (owner
+decision, 2026-09-17). ADR-0007 makes `*-unknown-linux-musl` and
+`aarch64-apple-darwin` the primary targets, and `ring` is the provider that
+cross-builds to both without cmake or bindgen. `rustls` is therefore declared
+with `default-features = false` and the `ring` feature, so the default provider
+is never pulled in alongside it.
 
 ## Consequences
 
+- `ring` compiles C and assembly, so the musl target gains a build prerequisite
+  that the workspace does not have today. Measured: with no musl C toolchain,
+  `cargo build --target x86_64-unknown-linux-musl` fails in `cc-rs` with
+  `failed to find tool "x86_64-linux-musl-gcc"`; with Ubuntu's `musl-tools`
+  installed and `CC_x86_64_unknown_linux_musl=musl-gcc` it builds. Until `ring`
+  lands, the workspace cross-builds to a static-pie musl binary with no C
+  compiler at all, so this is a real cost, accepted for the cross-platform
+  build story. CI's musl lane and `AGENTS.md` must state the prerequisite.
 - `sslmode=verify-ca|verify-full` need root stores: `webpki-roots` or the
-  system store via `rustls-native-certs`; decided with the provider.
+  system store via `rustls-native-certs`. Not yet decided —
+  `webpki-roots` suits a static musl binary with no assumption about
+  `/etc/ssl`, but it is a second new dependency and needs owner approval under
+  the AGENTS.md rule.
 - `sslrootcert`, `sslcert`, `sslkey` map onto rustls' PEM loading; client
   certificates and `sslcrl` are covered by rustls, `sslpassword` for encrypted
   keys needs a small PKCS#8 decrypt (evaluate when reached).

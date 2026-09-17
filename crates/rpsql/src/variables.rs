@@ -489,13 +489,38 @@ impl VariableSource for VarView<'_> {
     fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String> {
         let value = self.0.get(name)?.to_string();
         Some(match quote {
-            // `PQUOTE_SHELL_ARG` is upstream's fourth case. Nothing asks for
-            // it here: the only lexer state that requests it is
-            // `<xslashbackquote>`, and this port refuses a backquote rather
-            // than running a shell (`slash.rs:8`).
-            QuoteType::Plain | QuoteType::ShellArg => value,
+            QuoteType::Plain => value,
             QuoteType::SqlLiteral => escape_literal(&value),
             QuoteType::SqlIdent => escape_identifier(&value),
+            // `PQUOTE_SHELL_ARG` is upstream's fourth case, and exactly one
+            // lexer rule asks for it: `:'{variable_char}+'` at
+            // `psqlscanslash.l:397`, which sits inside the
+            // `<xslashbackquote>` start condition opened at `:355`. So
+            // `:'var'` means SQL-literal quoting in ordinary context and
+            // shell-arg quoting inside backticks.
+            //
+            // Nothing in this port produces it: a backquote stops at
+            // `SlashOption::backquote` rather than running a shell
+            // (`slash.rs:8`), so the case is unreachable today. It refuses
+            // instead of falling in with `Plain`, because a plain
+            // fallthrough would hand a future backquote implementation an
+            // *unquoted* substitution where C shell-quotes: after
+            // `\set f "foo'; rm -rf ~; '"`, ``\echo `cat :'f'` `` would run
+            // whatever the value says. A loud stop beats that silence.
+            //
+            // NAT-405 owns the implementation. Upstream is
+            // `common.c:248`-`:268`, and it does two things, both required:
+            //
+            // 1. Shell-quote via `appendShellStringNoError`: wrap the value
+            //    in single quotes and escape every embedded `'`.
+            // 2. Refuse a value containing a newline or carriage return,
+            //    logging `shell command argument contains a newline or
+            //    carriage return: "%s"` and returning NULL. This is the half
+            //    most easily forgotten, and the one that keeps a multi-line
+            //    value from becoming a second shell command.
+            QuoteType::ShellArg => {
+                unimplemented!("shell-arg quoting is not implemented yet (Linear NAT-405)")
+            }
         })
     }
 }
@@ -991,5 +1016,18 @@ mod tests {
             Some("\"a'b\"")
         );
         assert_eq!(view.get_variable("nosuch", QuoteType::Plain), None);
+    }
+
+    /// A shell-arg request must never come back as the bare value: upstream
+    /// shell-quotes it (`common.c:248`), so an unquoted substitution would be
+    /// a shell injection the moment NAT-405 runs backquotes.
+    #[test]
+    #[should_panic(expected = "NAT-405")]
+    fn a_shell_arg_request_refuses_instead_of_substituting_unquoted() {
+        let mut vars = VariableSpace::new();
+        vars.set("f", Some("foo'; rm -rf ~; '")).unwrap();
+        let view = VarView(&vars);
+
+        let _ = view.get_variable("f", QuoteType::ShellArg);
     }
 }

@@ -72,6 +72,11 @@ pub enum QuoteType {
     /// `PQUOTE_SQL_IDENT`: quote if needed to make a SQL identifier.
     SqlIdent,
     /// `PQUOTE_SHELL_ARG`: quote if needed to be safe in a shell command.
+    ///
+    /// Only `<xslashbackquote>` asks for this (`psqlscanslash.l:397`), and
+    /// this port does not run backquotes, so nothing produces it yet. The
+    /// variable source refuses it rather than quoting it wrongly; the
+    /// specification NAT-405 needs is at that arm in `variables.rs`.
     ShellArg,
 }
 
@@ -1391,9 +1396,14 @@ mod tests {
                 return None;
             }
             Some(match quote {
-                QuoteType::Plain | QuoteType::ShellArg => self.1.to_string(),
+                QuoteType::Plain => self.1.to_string(),
                 QuoteType::SqlLiteral => escape_literal(self.1),
                 QuoteType::SqlIdent => escape_identifier(self.1),
+                // Refuse exactly as `VarView` does, so the double cannot
+                // make an unquoted shell substitution look supported.
+                QuoteType::ShellArg => {
+                    unimplemented!("shell-arg quoting is not implemented yet (Linear NAT-405)")
+                }
             })
         }
     }

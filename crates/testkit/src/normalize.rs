@@ -4,7 +4,7 @@
 //! to earn its place. Each one here is a pure `fn(&str) -> String` that carries
 //! the single line of justification the method asks for
 //! (`docs/test-stealing.md`, rule 3) and names the upstream `printf` whose
-//! output it rewrites. Nothing else is normalized: a gate that needs a fourth
+//! output it rewrites. Nothing else is normalized: a gate that needs another
 //! normalizer adds it here, with its justification, rather than loosening a
 //! comparison at the call site.
 
@@ -75,7 +75,35 @@ pub const SYSTEM_IDENTIFIER: Normalizer = Normalizer {
     apply: system_identifier,
 };
 
-/// The three normalizers above, in the order a psql gate wants them.
+/// A distribution appends its own vendor and package revision to the version
+/// string the C tool prints, so PGDG's Ubuntu build of `initdb` answers
+/// `initdb (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)` where a stock 18.6
+/// build — and this port — answers `initdb (PostgreSQL) 18.6`. Neither side
+/// is wrong: both print the `PG_VERSION` they were compiled with.
+///
+/// Upstream: `src/bin/initdb/initdb.c` prints
+/// `puts("initdb (PostgreSQL) " PG_VERSION)`, and `configure.ac`'s
+/// `--with-extra-version` is the only thing that appends a parenthesized
+/// suffix to that `PG_VERSION`.
+///
+/// Unlike the three above this one *removes* rather than substitutes: the
+/// candidate has no suffix at all, so writing a placeholder would move the
+/// difference instead of settling it. It is deliberately narrow — it fires
+/// only on a whole line of the shape `<progname> (PostgreSQL) <version>
+/// (<extra>)` and never touches the version itself, so `18.6` and `19.1`
+/// still differ after it. A normalizer that made those two compare equal
+/// would destroy exactly what the gate exists to prove.
+pub const EXTRA_VERSION: Normalizer = Normalizer {
+    name: "extra-version",
+    justification: "a distribution's --with-extra-version is appended to the PG_VERSION initdb prints (src/bin/initdb/initdb.c)",
+    apply: extra_version,
+};
+
+/// The three nondeterminism normalizers, in the order a psql gate wants them.
+///
+/// [`EXTRA_VERSION`] is deliberately not one of them: only a gate that runs
+/// `--version` has a line for it to rewrite, and a gate should carry no
+/// normalizer it does not need.
 pub const DEFAULT: [Normalizer; 3] = [TIMING, PID, SYSTEM_IDENTIFIER];
 
 /// Placeholder written in place of an elapsed time.
@@ -86,6 +114,10 @@ pub const PID_PLACEHOLDER: &str = "<pid>";
 pub const SYSTEM_IDENTIFIER_PLACEHOLDER: &str = "<system identifier>";
 
 const SYSTEM_IDENTIFIER_LABEL: &str = "Database system identifier:";
+
+/// The fixed middle of upstream's version line, the only anchor this file has
+/// for one: `progname`, the version and any suffix are all build-dependent.
+const VERSION_MARKER: &str = " (PostgreSQL) ";
 
 fn timing(text: &str) -> String {
     map_lines(text, |line| {
@@ -132,6 +164,51 @@ fn system_identifier(text: &str) -> String {
         }
         None => line.to_owned(),
     })
+}
+
+fn extra_version(text: &str) -> String {
+    map_lines(text, |line| {
+        strip_extra_version(line).unwrap_or_else(|| line.to_owned())
+    })
+}
+
+/// The line without its trailing parenthetical, and `None` for every line that
+/// is not exactly `<progname> (PostgreSQL) <version> (<extra>)`.
+///
+/// Each of the three guards is the reason this cannot erase a real difference:
+/// without them the marker would fire in the middle of prose, over a token
+/// that is not a version, or over a trailing word that is not a suffix at all.
+fn strip_extra_version(line: &str) -> Option<String> {
+    let (progname, rest) = line.split_once(VERSION_MARKER)?;
+    let (version, suffix) = rest.split_once(' ')?;
+    if !is_progname(progname) || !is_version(version) || !is_parenthesized(suffix) {
+        return None;
+    }
+    Some(format!("{progname}{VERSION_MARKER}{version}"))
+}
+
+/// One bare word: `get_progname` never yields whitespace or a parenthesis, and
+/// demanding that keeps the marker from matching in the middle of a sentence.
+fn is_progname(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| !c.is_whitespace() && c != '(' && c != ')')
+}
+
+/// A version number, not an arbitrary token: `18.6`, `18beta1`, `19devel`.
+fn is_version(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_digit())
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+}
+
+/// The whole remainder of the line is one parenthetical, which is the shape
+/// `--with-extra-version` leaves; anything else is a difference to keep.
+fn is_parenthesized(suffix: &str) -> bool {
+    suffix.len() >= 2
+        && suffix.starts_with('(')
+        && suffix.ends_with(')')
+        && !suffix[1..suffix.len() - 1].contains(['(', ')'])
 }
 
 /// Rewrite each line, keeping the exact line terminators: a normalizer must
@@ -223,6 +300,90 @@ mod tests {
         let before =
             "pg_control version number:            1800\nCatalog version number: 202504071\n";
         assert_eq!(system_identifier(before), before);
+    }
+
+    /// The exact two lines the CI gate diffed: PGDG's Ubuntu 18.6 build of C
+    /// `initdb` against this port's stock-build `PG_VERSION`.
+    #[test]
+    fn a_distribution_extra_version_suffix_is_stripped_so_the_two_sides_match() {
+        let reference = "initdb (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)\n";
+        let candidate = "initdb (PostgreSQL) 18.6\n";
+
+        let reference = apply_all(reference, &[EXTRA_VERSION]);
+        let candidate = apply_all(candidate, &[EXTRA_VERSION]);
+
+        assert_eq!(reference, "initdb (PostgreSQL) 18.6\n");
+        assert_eq!(reference, candidate);
+    }
+
+    /// The failure mode this normalizer is designed against: it must not make
+    /// a real version difference disappear.
+    #[test]
+    fn two_genuinely_different_versions_still_differ_after_normalization() {
+        let theirs = "initdb (PostgreSQL) 19.1 (Ubuntu 19.1-1.pgdg24.04+2)\n";
+        let ours = "initdb (PostgreSQL) 18.6\n";
+
+        let theirs = apply_all(theirs, &[EXTRA_VERSION]);
+        let ours = apply_all(ours, &[EXTRA_VERSION]);
+
+        assert_eq!(theirs, "initdb (PostgreSQL) 19.1\n");
+        assert_ne!(theirs, ours);
+    }
+
+    #[test]
+    fn a_version_line_with_no_suffix_is_left_exactly_as_it_is() {
+        let before = "initdb (PostgreSQL) 18.6\npsql (PostgreSQL) 18beta1\n";
+        assert_eq!(extra_version(before), before);
+    }
+
+    #[test]
+    fn only_a_trailing_parenthetical_counts_as_a_suffix() {
+        assert_eq!(
+            extra_version("initdb (PostgreSQL) 18.6 (Ubuntu) trailing words"),
+            "initdb (PostgreSQL) 18.6 (Ubuntu) trailing words"
+        );
+        assert_eq!(
+            extra_version("initdb (PostgreSQL) 18.6 and then some"),
+            "initdb (PostgreSQL) 18.6 and then some"
+        );
+        assert_eq!(
+            extra_version("initdb (PostgreSQL) 18.6 (a (nested) one)"),
+            "initdb (PostgreSQL) 18.6 (a (nested) one)"
+        );
+    }
+
+    #[test]
+    fn the_marker_does_not_fire_outside_a_version_line() {
+        // A progname is one word, so prose around the marker is not a match.
+        assert_eq!(
+            extra_version("built against (PostgreSQL) 18.6 (Ubuntu 18.6-1)"),
+            "built against (PostgreSQL) 18.6 (Ubuntu 18.6-1)"
+        );
+        // ... and what follows the marker has to look like a version.
+        assert_eq!(
+            extra_version("initdb (PostgreSQL) server (Ubuntu 18.6-1)"),
+            "initdb (PostgreSQL) server (Ubuntu 18.6-1)"
+        );
+        assert_eq!(
+            extra_version("initdb initializes a PostgreSQL database cluster.\n"),
+            "initdb initializes a PostgreSQL database cluster.\n"
+        );
+    }
+
+    #[test]
+    fn extra_version_keeps_a_missing_final_newline() {
+        assert_eq!(
+            extra_version("initdb (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)"),
+            "initdb (PostgreSQL) 18.6"
+        );
+    }
+
+    /// It rewrites a `--version` line and nothing else, so no gate that lacks
+    /// one — every other gate here — needs to carry it.
+    #[test]
+    fn extra_version_is_not_one_of_the_default_normalizers() {
+        assert!(!DEFAULT.iter().any(|it| it.name == EXTRA_VERSION.name));
+        assert!(EXTRA_VERSION.justification.contains("src/"));
     }
 
     #[test]

@@ -32,6 +32,18 @@ pub enum DirRole {
     Wal,
 }
 
+impl DirRole {
+    /// How `cleanup_directories_atexit` names the directory (`initdb.c:771`
+    /// and `:785`) — the one place the two roles are spelled out in prose.
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            DirRole::Data => "data directory",
+            DirRole::Wal => "WAL directory",
+        }
+    }
+}
+
 /// Why `pg_check_dir` judged a directory non-empty.
 ///
 /// `initdb.c:2931` branches on the code: 4 gets the "remove or empty it" hint,

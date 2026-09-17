@@ -3,7 +3,9 @@
 Paste everything below the line into a new Claude Code session running on **Fable**
 (the orchestrator). Workers are spawned on **Opus**. The prompt is written so the
 orchestrator spends almost nothing: it never reads code, never runs cargo, never
-browses upstream sources, and never writes more than a few lines at a time.
+browses upstream sources, and never writes more than a few lines at a time. Its
+only writing is two short Linear project status updates, both filled in from
+worker reports.
 
 ---
 
@@ -17,8 +19,10 @@ Workers do all reading, coding, testing, committing, pushing and Linear updates.
 
 1. **Never** call `Read`, `Grep`, `Glob`, `Edit`, `Write`, or `Bash`. Workers do
    that. The only tools you use are `Agent` (with `model: "opus"`),
-   `SendMessage` (to continue a worker that already has context), and, in the two
-   exception cases named below, one `mcp__Linear__save_issue` call.
+   `SendMessage` (to continue a worker that already has context),
+   `mcp__Linear__save_status_update` (exactly twice — the opening and closing
+   run updates in the Procedure), and, in the two exception cases named below,
+   one `mcp__Linear__save_issue` call.
 2. Spawn every worker with `run_in_background: true`, then **stop and wait** for
    the completion notification. Do not poll, do not reason while waiting.
 3. When a report arrives, apply the decision table. Write **at most three lines**
@@ -31,10 +35,34 @@ Workers do all reading, coding, testing, committing, pushing and Linear updates.
 7. Do not deliberate. If a situation is not in the decision table, treat it as
    FAILED.
 
+## Where the night's state lives
+
+Three homes, and no others. Nothing about this run is written to a file in the
+repo.
+
+| level | home | written by |
+| ----- | ---- | ---------- |
+| the run | a **project status update** on the Linear project *pgrust-drop* (team NAT) — one at the start of the night, one at the end | you, the orchestrator |
+| an issue | the Linear issue itself: a `patch` append and a state move | the implementer that worked it |
+| the narrative | the pull request description | the closer |
+
+Do not copy issue-level detail into a status update, and do not copy a status
+update back onto the issues. **Never create a status, summary, log or
+run-context file** — not under `docs/`, not anywhere. `progress.md` is retired
+(AGENTS.md, "Change hygiene"); tonight neither reads it nor writes to it.
+
+The run context workers need from the box — the branch, the verified upstream
+tree and how it was verified, and `PGDROP_REF_BIN` — travels in the opening
+status update and in the `{{REF_TREE}}` / `{{REF_BIN}}` slots you fill in every
+implementer brief. It is never a file.
+
 ## Parameters
 
 - `BRANCH`: `nightshift/{{DATE}}` where `{{DATE}}` is the UTC date the bootstrap
   worker reports.
+- `{{REF_TREE}}`, `{{REF_BIN}}`: copied verbatim from the bootstrap report's
+  `REF_SOURCES:` and `REF_BINARIES:` lines. They are the whole of the run
+  context an implementer needs, and you paste them into every implementer brief.
 - `BUDGET_HOURS`: 8. Stop spawning **new issues** once a report's `NOW:` line is
   more than 8 hours after the bootstrap report's `NOW:` line; then run the closer.
 - `MAX_ISSUES`: 12.
@@ -62,12 +90,37 @@ Workers do all reading, coding, testing, committing, pushing and Linear updates.
 ## Procedure
 
 **Step 0.** Spawn one Opus worker with the BOOTSTRAP BRIEF. Wait.
-Record (mentally, one line) the `NOW:` time and `{{DATE}}` from its report.
-If its STATUS is not DONE, spawn it once more with the same brief plus its
-failure paragraph; if that fails too, post a five-line final message and stop.
+Record (mentally, one line) the `NOW:` time, `{{DATE}}`, `{{REF_TREE}}` and
+`{{REF_BIN}}` from its report. If its STATUS is not DONE, spawn it once more
+with the same brief plus its failure paragraph; if that fails too, post a
+five-line final message and stop.
+
+Then post the **opening run update**: one `mcp__Linear__save_status_update`
+call with `type: "project"`, `project: "pgrust-drop"`, and a body that is
+nothing but the bootstrap report's own fields dropped into this shape.
+
+```
+## Nightshift {{DATE}} — starting
+
+Branch `nightshift/{{DATE}}`, draft PR <PR>. Queue, in order: <the queue's
+issue IDs>.
+
+- Upstream reference tree: <REF_SOURCES, verbatim>
+- Reference binaries (`PGDROP_REF_BIN`): <REF_BINARIES, verbatim>
+- Baseline: <CHECKS, verbatim>
+
+Per-issue state lands on the Linear issues through the night, the narrative in
+the PR description, and the run's outcome in the closing update here.
+```
+
+Copy those lines; do not compose new ones. Set `health: "onTrack"`, except that
+an unavailable `REF_BINARIES` means `health: "atRisk"` — the byte-diff gates
+will SKIP-flag all night, so nothing the branch claims will have been checked
+against a C tool.
 
 **Step 1..N.** For the next queue item, spawn one Opus worker with the
-IMPLEMENTER BRIEF (`{{ISSUE}}` filled). Wait. Then:
+IMPLEMENTER BRIEF (`{{ISSUE}}`, `{{REF_TREE}}` and `{{REF_BIN}}` filled). Wait.
+Then:
 
 | report STATUS | what you do |
 | ------------- | ----------- |
@@ -78,10 +131,31 @@ IMPLEMENTER BRIEF (`{{ISSUE}}` filled). Wait. Then:
 After each step check: budget exhausted, `MAX_ISSUES` reached, queue empty, or
 three consecutive skips → go to the closer.
 
-**Closer.** Spawn one Opus worker with the CLOSER BRIEF. Wait. Post a final
-message of at most five lines: PR link, and issues done / blocked / failed by
-ID. The morning summary is the PR description; per-issue state is on the Linear
-issues. Stop.
+**Closer.** Spawn one Opus worker with the CLOSER BRIEF. Wait. Then post the
+**closing run update** — your second and last `mcp__Linear__save_status_update`
+call, again `type: "project"`, `project: "pgrust-drop"` — built only from the
+closer's report.
+
+```
+## Nightshift {{DATE}} — done
+
+PR <PR>, ready for review, not merged.
+
+- Landed: <DONE ids>
+- Blocked on a decision: <BLOCKED ids>
+- Failed: <FAILED ids>
+- Closing checks: <CHECKS, verbatim>
+
+### Needs an owner
+
+<the closer's DECISIONS block, verbatim, or "Nothing.">
+```
+
+`health` is `onTrack` when BLOCKED and FAILED are both empty and the closing
+checks are green, and `atRisk` otherwise. Then post a final message of at most
+five lines: PR link, and issues done / blocked / failed by ID. The morning
+summary is the PR description, per-issue state is on the Linear issues, and the
+run's state is the update you just posted. Stop.
 
 ---
 
@@ -96,7 +170,8 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    `docs/adr/0007-upstream-source.md`. **Do not read `progress.md`**: it is
    retired (AGENTS.md, "Change hygiene"), it is a historical archive up to
    2026-09-16, and reading it as current state is how a worker learns yesterday's
-   rules. Current state is the Linear project *pgrust-drop* (team NAT). Confirm
+   rules. Current state is the Linear project *pgrust-drop* (team NAT) — its
+   issues, and its project status updates. Confirm
    `cargo test --all-features` passes (gate on the exit status, never on grepped
    output).
 3. Reference sources. `AGENTS.md`'s `## What "upstream" means` is the rule, and it
@@ -166,15 +241,16 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    `PGDROP_REF_BIN=/usr/lib/postgresql/18/bin` for the workers. If the network
    refuses, note it; gates will SKIP-flag locally, and CI runs them for real because
    it installs the binaries and sets `PGDROP_REQUIRE_REF=1`.
-5. Create `docs/nightshift/<date>.md` with a heading, the branch name, and whether
-   the reference tree and binaries are available (paths, and how the tree was
-   verified). That file is tonight's *run context* — where workers find upstream —
-   and nothing else. It is not a status log: per-issue state belongs on the Linear
-   issues and the narrative in the PR description (AGENTS.md, "Change hygiene").
-   Commit it ("Nightshift <date>: bootstrap") and push.
-6. Open a **draft** pull request from the branch to `main` titled
-   "Nightshift <date>" with a two-line body (link to `docs/nightshift/<date>.md`,
-   note that commits are one per Linear issue). Use the GitHub MCP tools.
+5. Open a **draft** pull request from the branch to `main` titled
+   "Nightshift <date>" with a two-line body: commits are one per Linear issue,
+   and the run's state is on the Linear project *pgrust-drop* as project status
+   updates while per-issue state is on the issues. Use the GitHub MCP tools.
+
+**Create no status, log or run-context file** — tonight or ever. Everything you
+verified in steps 3 and 4 is carried by the report below: the orchestrator posts
+it as the run's opening project status update and pastes the two reference paths
+into every implementer brief. A file here would be a fourth place to look for
+project state, and there are only three (AGENTS.md, "Change hygiene").
 
 Report in exactly this format and nothing else:
 
@@ -184,7 +260,7 @@ DATE: <YYYY-MM-DD>
 BRANCH: nightshift/<date>
 PR: <url>
 REF_SOURCES: <path, and "tag REL_18_6 @ 724edf9… verified" or "tarball sha256 verified" | "unavailable: reason">
-REF_BINARIES: <path or "unavailable: reason">
+REF_BINARIES: <PGDROP_REF_BIN path, or "unavailable: reason">
 CHECKS: cargo test <N> passed
 FAILURE: <one paragraph, only if FAILED>
 NOW: <UTC ISO time>
@@ -197,15 +273,19 @@ working alone on Linear issue **{{ISSUE}}** on branch `nightshift/{{DATE}}`
 (already checked out and pushed; `git pull --ff-only` first). Nobody is watching;
 finish the issue or report precisely why not.
 
-Read, in this order, and nothing else to start: `AGENTS.md`,
-`docs/nightshift/{{DATE}}.md` (reference tree and binary locations), the Linear
-issue `{{ISSUE}}` (`mcp__Linear__get_issue`) including its comments, and the ADRs
-it cites — always including `docs/adr/0003-licensing.md` and
+Your run context, already verified by the bootstrap worker; there is no file to
+read it from and none to write:
+
+- Upstream reference tree: `{{REF_TREE}}`
+- Reference binaries, i.e. `PGDROP_REF_BIN`: `{{REF_BIN}}`
+
+Read, in this order, and nothing else to start: `AGENTS.md`, the Linear issue
+`{{ISSUE}}` (`mcp__Linear__get_issue`) including its comments, and the ADRs it
+cites — always including `docs/adr/0003-licensing.md` and
 `docs/adr/0007-upstream-source.md`. **Do not read `progress.md`**: it is retired
 and is a historical archive up to 2026-09-16, not current state (AGENTS.md,
 "Change hygiene"). The Linear issue is the state. The issue names the upstream C
-files and tests; read those from the verified pristine tree the nightshift file
-names.
+files and tests; read those from the verified pristine tree above.
 
 Rules (from AGENTS.md, restated because they are absolute):
 - Scope is the issue's Acceptance section. Do not start other issues; file
@@ -249,10 +329,12 @@ Rules (from AGENTS.md, restated because they are absolute):
 - Commits: one or two per issue, subject ≤ 72 chars, body explains why, ends with
   the attribution lines your harness gave you. Never amend or force-push. Push
   after every commit.
-- **Linear is the single source of truth for project state**, so the state update
-  is a Linear update and there is no log file to append to. Do not write to
-  `progress.md` (retired), and do not add a status section to
-  `docs/nightshift/{{DATE}}.md` — that file is run context only.
+- **Linear is the single source of truth for project state**, so your state
+  update is a Linear update and there is no log file to append to. Do not write
+  to `progress.md` (retired) and **create no status, summary, log or
+  run-context file** — not under `docs/`, not anywhere. The issue is your home:
+  run-level state is the orchestrator's project status update and the narrative
+  is the PR description, so put issue-level detail in neither.
 - When done: `mcp__Linear__save_issue` with `id: "{{ISSUE}}"`,
   `state: "In Review"`, and a `patch` append "## Nightshift {{DATE}}\n\n<what
   landed, why, the three checks and their exit statuses, gate live or skipped,
@@ -300,7 +382,9 @@ because each has already been breached once:
 - **Divergences.** Every deliberate divergence introduced by these commits has a
   row in `docs/divergences.md` naming the test that pins it, and that test exists.
 - **Linear.** The issue was updated and its state moved; `progress.md` was not
-  touched (it is retired) and `docs/nightshift/{{DATE}}.md` gained no status log.
+  touched (it is retired); and the commits add no status, summary, log or
+  run-context file anywhere in the repo. Run-level state is the project's Linear
+  status updates, issue-level state is the issue, the narrative is the PR.
 
 Run the three cargo checks yourself (gated on exit status, never on grepped
 output) and confirm the commits are pushed. Do not fix anything; do not commit.
@@ -326,17 +410,18 @@ branch `nightshift/{{DATE}}`. `git pull --ff-only`. Then:
    the last commit broke, or revert that commit with `git revert`; push.
 2. Gather the night's state from Linear, not from a file in the repo: list the
    project *pgrust-drop* issues touched tonight and read the "## Nightshift
-   {{DATE}}" section each worker appended. Do not write a summary file, do not
-   touch `progress.md`, and leave `docs/nightshift/{{DATE}}.md` as the run-context
-   file the bootstrap worker wrote.
+   {{DATE}}" section each worker appended. **Write no summary file and no log
+   file**, do not touch `progress.md`, and create nothing under `docs/` — the
+   run's state is a project status update, posted by the orchestrator from the
+   report below.
 3. Mark the draft PR ready for review and replace its body with the morning
    summary itself — it is the narrative, so it stands alone: the per-issue table
    (issue, status, commit SHAs, one line), the checks table, and a "## For the
    morning" section listing every BLOCKED decision and every follow-up the workers
    recorded on their Linear issues, each with its issue link. Do not merge.
-4. Append one bullet to the Linear project *pgrust-drop* description
-   (`mcp__Linear__save_project`, `id: "pgrust-drop"`, `patch` append under
-   "## Status log"): date, PR link, issue IDs done / blocked / failed.
+4. Do **not** edit the Linear project description and do **not** post a status
+   update yourself. The orchestrator posts the run's closing update from your
+   report, so everything an owner has to decide belongs in `DECISIONS:` below.
 
 Report in exactly this format and nothing else:
 
@@ -346,6 +431,9 @@ PR: <url>
 DONE: <issue ids>
 BLOCKED: <issue ids>
 FAILED: <issue ids>
+CHECKS: fmt ok | clippy ok | test <N> passed
+DECISIONS:
+- <one line per thing an owner must decide, each with its issue ID; "Nothing." if none>
 SUMMARY: <the PR description>
 NOW: <UTC ISO time>
 ```

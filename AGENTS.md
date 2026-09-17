@@ -128,9 +128,11 @@ container does not change that.
 
 ## Unattended runs
 
-`docs/nightshift/ORCHESTRATOR.md` is the prompt for an overnight session: a
+`docs/nightshift-orchestrator.md` is the prompt for an overnight session: a
 Fable orchestrator that only dispatches Opus workers issue by issue on a
-`nightshift/<date>` branch and opens one PR. Workers follow this file.
+`nightshift/<date>` branch and opens one PR. Workers follow this file. A run
+leaves no file behind: its running log is a **project status update** on the
+Linear project *pgrust-drop*, posted at the start of the night and at the end.
 
 ## Change hygiene
 
@@ -143,6 +145,9 @@ NAT, issues NAT-372 … — not in a file in this repo.
   not happen.
 - The PR description carries the human-readable narrative; the Linear issue
   carries the state. Do not duplicate either into a log file.
+- Run-level state — an unattended run, a release, anything about the project
+  rather than one issue — is a **project status update** on the Linear project
+  *pgrust-drop*. Not a file in this repo, and not the project description.
 - `progress.md` is retired. It stays in the repo as a historical archive of
   work up to 2026-09-16. Do not extend it, do not read it as current state, do
   not delete it.

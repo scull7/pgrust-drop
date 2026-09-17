@@ -1,5 +1,9 @@
 name: ci
 
+# Lane order is deliberate (ADR-0007): musl is the product's primary target and
+# runs on every push; gnu and apple only run on pull requests, and only once
+# musl is green. Branch protection requires `gnu`, making it the final gate.
+
 on:
   push:
     branches: [main]
@@ -10,8 +14,55 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: fmt + clippy + test
+  musl:
+    name: musl (alpine) — primary
+    runs-on: ubuntu-latest
+    # GitHub offers no Alpine runner image; a container is the supported way to
+    # get a musl userland. This is CI configuration only: nothing in the
+    # product or the developer workflow may require a container runtime.
+    container: alpine:3.21
+    steps:
+      - name: Install the Alpine toolchain
+        run: apk add --no-cache bash build-base curl git libstdc++ musl-dev tar unzip xz
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 \
+            --component rustfmt,clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Fetch the musl reference binaries
+        run: ./scripts/fetch-ref-binaries.sh --lane musl >> "$GITHUB_ENV"
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - name: test
+        run: cargo test --all-features
+
+  apple:
+    name: apple (aarch64-darwin)
+    needs: musl
+    if: github.event_name == 'pull_request'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the Darwin reference binaries
+        run: ./scripts/fetch-ref-binaries.sh --lane apple >> "$GITHUB_ENV"
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - name: test
+        run: cargo test --all-features
+
+  gnu:
+    name: gnu — final gate
+    needs: musl
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +71,8 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch the glibc reference binaries
+        run: ./scripts/fetch-ref-binaries.sh --lane gnu >> "$GITHUB_ENV"
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

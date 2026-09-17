@@ -4,9 +4,16 @@
 //! [`validate`] walks the checks of `initdb.c`'s `main()` in upstream order —
 //! the `getopt_long` switch arms that can fail, the post-loop cross-option
 //! rules, `setup_pgdata`, the superuser-name rule, `setlocales` /
-//! `setup_locale_encoding`, then `create_data_directory` and
-//! `create_xlog_or_symlink` — and turns the first failure into the
-//! [`InitdbError`] whose rendering is byte-identical to C's stderr.
+//! `setup_locale_encoding`, then `create_data_directory`'s `pg_check_dir` —
+//! and turns the first failure into the [`InitdbError`] whose rendering is
+//! byte-identical to C's stderr.
+//!
+//! `create_xlog_or_symlink`'s own checks are *not* here. C runs them at
+//! `initdb.c:2955`, after `create_data_directory` has already made PGDATA, and
+//! its exit handler reports the directory it made; a `--waldir` rejected
+//! before the `mkdir` would print one stderr line fewer than C's. They are
+//! [`classify_waldir`], the same calculation over the same [`FsProbe`], called
+//! by the creation sequence at the point C calls it.
 //!
 //! Data / Calculations / Actions:
 //!
@@ -189,8 +196,10 @@ pub struct SyncPlan {
 pub struct CreatePlan {
     pub pgdata: PathBuf,
     pub pgdata_action: DirAction,
-    /// `--waldir`, with what will be done to it.
-    pub waldir: Option<(PathBuf, DirAction)>,
+    /// `--waldir` exactly as it was given, still unjudged: absoluteness and
+    /// emptiness are `create_xlog_or_symlink`'s business (`initdb.c:2955`),
+    /// which C reaches only after PGDATA exists. See [`classify_waldir`].
+    pub waldir: Option<PathBuf>,
     /// What `-g` left `pg_dir_create_mode` and friends at (`initdb.c:3360`).
     pub perm: DataDirPerm,
     pub locale_provider: LocaleProvider,
@@ -284,27 +293,14 @@ pub fn validate(
     let encoding = resolve_encoding(options.encoding.as_deref())?;
     check_builtin_locale_encoding(locale_provider, datlocale.as_deref(), encoding)?;
 
-    // initdb.c:2890 — the data directory is judged before the WAL directory,
-    // so a non-empty PGDATA outranks a bad --waldir.
+    // initdb.c:2894 — create_data_directory's own pg_check_dir, which is the
+    // last thing C decides before it starts making directories.
     let pgdata_action = classify_dir(fs.check_dir(&pgdata), &pgdata, DirRole::Data)?;
-
-    // initdb.c:2948.
-    let waldir = match &options.waldir {
-        None => None,
-        Some(raw) => {
-            let path = PathBuf::from(raw);
-            if !path.is_absolute() {
-                return Err(InitdbError::WalDirectoryNotAbsolute);
-            }
-            let action = classify_dir(fs.check_dir(&path), &path, DirRole::Wal)?;
-            Some((path, action))
-        }
-    };
 
     Ok(Plan::Create(CreatePlan {
         pgdata,
         pgdata_action,
-        waldir,
+        waldir: options.waldir.as_deref().map(PathBuf::from),
         perm: DataDirPerm::for_allow_group_access(options.allow_group_access),
         locale_provider,
         datlocale,
@@ -315,6 +311,33 @@ pub fn validate(
         sync_method,
         sync_data_files: !options.no_sync_data_files,
     }))
+}
+
+/// The head of `create_xlog_or_symlink` (`initdb.c:2955`-`:3010`): `--waldir`
+/// must be absolute and usable, and what will be done to it.
+///
+/// Pure, like [`validate`], and over the same [`FsProbe`] — but deliberately
+/// not part of it. C runs these two checks *after* `create_data_directory`,
+/// so both of their failures are reported with PGDATA already on disk and the
+/// exit handler's `removing data directory` line after them
+/// (`crate::cleanup`). Calling this before the data directory is made would
+/// drop that line.
+///
+/// # Errors
+/// [`InitdbError::WalDirectoryNotAbsolute`] (`initdb.c:2962`), or whatever
+/// `pg_check_dir` makes of the directory (`:2966`).
+pub fn classify_waldir(
+    waldir: Option<&Path>,
+    fs: &dyn FsProbe,
+) -> Result<Option<(PathBuf, DirAction)>, InitdbError> {
+    let Some(path) = waldir else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        return Err(InitdbError::WalDirectoryNotAbsolute);
+    }
+    let action = classify_dir(fs.check_dir(path), path, DirRole::Wal)?;
+    Ok(Some((path.to_path_buf(), action)))
 }
 
 /// `initdb.c:3268`: every `-c` argument must contain an `=`.
@@ -1055,7 +1078,7 @@ mod tests {
     fn a_relative_wal_directory_is_rejected() {
         // initdb.c:2962. Upstream: 'relative xlog directory not allowed'.
         assert_eq!(
-            failure(&["--waldir", "pgxlog", "/tmp/data"], &FakeFs::empty()),
+            classify_waldir(Some(Path::new("pgxlog")), &FakeFs::empty()).unwrap_err(),
             InitdbError::WalDirectoryNotAbsolute
         );
     }
@@ -1064,7 +1087,7 @@ mod tests {
     fn an_existing_nonempty_wal_directory_is_rejected_with_the_wal_hint() {
         // initdb.c:3001. Upstream: 'existing nonempty xlog directory'.
         let fs = FakeFs::with("/tmp/pgxlog", DirState::MountPoint);
-        let err = failure(&["--waldir", "/tmp/pgxlog", "/tmp/data"], &fs);
+        let err = classify_waldir(Some(Path::new("/tmp/pgxlog")), &fs).unwrap_err();
         assert_eq!(
             err,
             InitdbError::DirectoryNotEmpty {
@@ -1078,7 +1101,9 @@ mod tests {
     #[test]
     fn the_data_directory_is_judged_before_the_wal_directory() {
         // create_data_directory() runs first (initdb.c:3060), so a non-empty
-        // PGDATA is reported even when --waldir is also wrong.
+        // PGDATA is reported even when --waldir is also wrong — and it is
+        // reported by the pre-flight, before `classify_waldir` is ever
+        // reached, which is what keeps the two in C's order.
         let fs = FakeFs::with("/tmp/data", DirState::NotEmpty);
         assert_eq!(
             failure(&["--waldir", "pgxlog", "/tmp/data"], &fs),
@@ -1091,12 +1116,44 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_flight_carries_the_wal_directory_over_unjudged() {
+        // A --waldir that create_xlog_or_symlink will refuse must still leave
+        // `validate` with a plan: C does not look at it until PGDATA is made.
+        let plan = created(&["--waldir", "pgxlog", "/tmp/data"], &FakeFs::empty());
+        assert_eq!(plan.waldir, Some(PathBuf::from("pgxlog")));
+    }
+
+    #[test]
     fn a_usable_wal_directory_is_part_of_the_plan() {
         let fs = FakeFs::with("/tmp/pgxlog", DirState::Empty).and("/tmp/data", DirState::Empty);
         let plan = created(&["--waldir", "/tmp/pgxlog", "/tmp/data"], &fs);
+        assert_eq!(plan.waldir, Some(PathBuf::from("/tmp/pgxlog")));
         assert_eq!(
-            plan.waldir,
+            classify_waldir(plan.waldir.as_deref(), &fs).unwrap(),
             Some((PathBuf::from("/tmp/pgxlog"), DirAction::ReuseEmpty))
+        );
+    }
+
+    #[test]
+    fn no_wal_directory_is_no_decision_at_all() {
+        assert_eq!(classify_waldir(None, &FakeFs::empty()).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_wal_directory_is_reported_as_inaccessible() {
+        // initdb.c:3009, the `default:` arm of create_xlog_or_symlink.
+        let fs = FakeFs::with(
+            "/tmp/pgxlog",
+            DirState::Inaccessible {
+                reason: "Permission denied".to_owned(),
+            },
+        );
+        assert_eq!(
+            classify_waldir(Some(Path::new("/tmp/pgxlog")), &fs).unwrap_err(),
+            InitdbError::CouldNotAccessDirectory {
+                path: "/tmp/pgxlog".to_owned(),
+                reason: "Permission denied".to_owned(),
+            }
         );
     }
 

@@ -212,7 +212,11 @@ fn sync_missing_data_directory() {
 /// 'existing nonempty xlog directory');` — 001_initdb.pl:30, with
 /// `$xlogdir/lost+found` in place.
 ///
-/// `initdb.c:3001` plus `warn_on_mount_point(3)` at `:3036`.
+/// `initdb.c:3001` plus `warn_on_mount_point(3)` at `:3036`, and then the
+/// `removing data directory` of `cleanup_directories_atexit` (`:771`):
+/// `create_data_directory` has already made PGDATA by the time
+/// `create_xlog_or_symlink` looks at `--waldir`, so the handler takes it back
+/// again. That last line is what PGDATA no longer being there proves.
 #[test]
 fn existing_nonempty_xlog_directory() {
     let tempdir = TempDir::new("nonempty-xlog");
@@ -231,17 +235,22 @@ fn existing_nonempty_xlog_directory() {
              initdb: detail: It contains a lost+found directory, perhaps due to it being a \
              mount point.\n\
              initdb: hint: Using a mount point directly as the data directory is not recommended.\n\
-             Create a subdirectory under the mount point.",
-            xlogdir.display()
+             Create a subdirectory under the mount point.\n\
+             initdb: removing data directory \"{}\"",
+            xlogdir.display(),
+            datadir.display()
         ),
     );
+    assert!(!datadir.exists(), "the data directory was not taken back");
     gate_diagnostics(&argv);
 }
 
 /// `command_fails([ 'initdb', '--waldir' => 'pgxlog', $datadir ],
 /// 'relative xlog directory not allowed');` — 001_initdb.pl:33.
 ///
-/// `initdb.c:2962`.
+/// `initdb.c:2962`, then `cleanup_directories_atexit` (`:771`) for the same
+/// reason as [`existing_nonempty_xlog_directory`]: the absolute-path rule
+/// lives in `create_xlog_or_symlink`, which C runs after PGDATA is made.
 #[test]
 fn relative_xlog_directory_not_allowed() {
     let tempdir = TempDir::new("relative-xlog");
@@ -254,8 +263,13 @@ fn relative_xlog_directory_not_allowed() {
 
     fails_with(
         &argv,
-        "initdb: error: WAL directory location must be an absolute path",
+        &format!(
+            "initdb: error: WAL directory location must be an absolute path\n\
+             initdb: removing data directory \"{}\"",
+            datadir.display()
+        ),
     );
+    assert!(!datadir.exists(), "the data directory was not taken back");
     gate_diagnostics(&argv);
 }
 
@@ -307,7 +321,12 @@ fn create_plan(argv: &[OsString]) -> rinitdb::validate::CreatePlan {
 #[cfg(unix)]
 fn build_layout(argv: &[OsString]) -> PathBuf {
     let plan = create_plan(argv);
-    rinitdb::layout::apply(&rinitdb::layout::layout(&plan))
+    // `create_xlog_or_symlink`'s verdict on --waldir (`initdb.c:2955`), which
+    // C reaches only after PGDATA exists. Here the whole tree is applied in
+    // one go, so the two are asked for together.
+    let waldir = rinitdb::classify_waldir(plan.waldir.as_deref(), &rinitdb::RealFs)
+        .unwrap_or_else(|err| panic!("{argv:?}: {}", err.render()));
+    rinitdb::layout::apply(&rinitdb::layout::layout(&plan, waldir.as_ref()))
         .unwrap_or_else(|err| panic!("{argv:?}: {}", err.render()));
     plan.pgdata
 }
@@ -548,7 +567,7 @@ fn the_data_directory_tree_matches_reference_initdb() {
             "PGDATA mode differs from C initdb's ({tag})"
         );
 
-        let listing = rinitdb::layout::tree_listing(&plan);
+        let listing = rinitdb::layout::tree_listing(&plan, None);
         for (relative, mode) in &listing {
             let Some((kind, found)) = reference_tree.get(relative) else {
                 panic!("C initdb did not create {} ({tag})", relative.display());
@@ -1200,6 +1219,186 @@ fn a_real_control_file_round_trips_byte_for_byte() {
     assert_eq!(parsed.to_bytes().as_slice(), image.as_slice());
 }
 
+/// The whole `unix_socket_directories` line of a rendered `postgresql.conf`.
+///
+/// `setup_config` leaves it commented (`initdb.c:1370`, `mark_as_comment`), so
+/// this is the `#`-prefixed assignment and its trailing comment, tabs and all.
+#[cfg(unix)]
+fn socket_directory_line(conf: &str) -> Option<&str> {
+    conf.lines()
+        .find(|line| line.starts_with("#unix_socket_directories"))
+}
+
+/// The value inside the quotes of that line.
+#[cfg(unix)]
+fn socket_directory_value(conf: &str) -> Option<String> {
+    let line = socket_directory_line(conf)?;
+    let (_, rest) = line.split_once('\'')?;
+    rest.split_once('\'').map(|(value, _)| value.to_owned())
+}
+
+/// The `--with-socketdir=` argument of a `pg_config --configure` line, whose
+/// switches come back each wrapped in single quotes.
+#[cfg(unix)]
+fn socketdir_switch(configure: &str) -> Option<String> {
+    configure
+        .split(['\'', ' ', '\n'])
+        .find_map(|token| token.strip_prefix("--with-socketdir="))
+        .map(str::to_owned)
+}
+
+/// Pure: the reference build's `DEFAULT_PGSOCKET_DIR` (`pg_config_manual.h:193`),
+/// given what `pg_config` said (if it was there to ask) and the
+/// `postgresql.conf` the reference `initdb` wrote.
+///
+/// It is a compile-time constant of the server the reference `initdb` belongs
+/// to and not of this port: `configure --with-socketdir` moves it, and Debian
+/// and Ubuntu build PostgreSQL with `/var/run/postgresql` where upstream's
+/// default is `/tmp`. `docs/divergences.md` pre-declared the difference and
+/// said "the byte-diff gate against it is what would surface it"; this is the
+/// gate reading the constant instead of assuming its own.
+///
+/// `pg_config --configure` echoes the switch verbatim and is the one place a
+/// built tree states it without also stating the rendering under test, so it
+/// is asked first. PGDG ships `pg_config` in `postgresql-server-dev-18`, which
+/// CI does not install, so the fallback is the `postgresql.conf` C initdb just
+/// wrote — and only the string between its quotes is taken. The `#` prefix,
+/// the ` = `, the quoting rule and the comment column are all still rendered
+/// here and still diffed, exactly as `max_connections` is still rendered here
+/// after its value is read off C's progress output.
+#[cfg(unix)]
+fn socket_directory_for(configured: Option<String>, reference_conf: &str) -> String {
+    configured
+        .or_else(|| socket_directory_value(reference_conf))
+        .unwrap_or_else(|| rinitdb::pg_config::DEFAULT_PGSOCKET_DIR.to_owned())
+}
+
+/// `pg_config --configure`, when the reference installation ships `pg_config`.
+#[cfg(unix)]
+fn configured_socket_directory() -> Option<String> {
+    let pg_config = reference::find("pg_config")?;
+    let outcome = testkit::run(&pg_config, [OsString::from("--configure")]).ok()?;
+    if outcome.status != Some(0) {
+        return None;
+    }
+    // No switch at all is the compiled-in default of pg_config_manual.h:193,
+    // which is this port's constant too.
+    Some(
+        socketdir_switch(&outcome.stdout_text())
+            .unwrap_or_else(|| rinitdb::pg_config::DEFAULT_PGSOCKET_DIR.to_owned()),
+    )
+}
+
+/// `setup_config`'s `unix_socket_directories` fix-up (`initdb.c:1370`) redone
+/// over `rendered`, for a build whose `DEFAULT_PGSOCKET_DIR` is `socketdir`.
+///
+/// It is the crate's own `replace_guc_value`, the same call `setup_config`
+/// makes, so the quoting and the comment re-alignment are still this port's
+/// and are still what the gate judges.
+#[cfg(unix)]
+fn retarget_socket_directory(rendered: &str, socketdir: &str) -> String {
+    rinitdb::conf::join_lines(&rinitdb::conf::replace_guc_value(
+        rinitdb::conf::split_lines(rendered),
+        "unix_socket_directories",
+        socketdir,
+        true,
+    ))
+}
+
+/// Action: run the reference `initdb` for one gate case and return its
+/// progress output, which is where C announces every value it probed for.
+#[cfg(unix)]
+fn reference_progress(reference: &Path, argv: &[OsString]) -> String {
+    let output = std::process::Command::new(reference)
+        .args(argv)
+        .env("TZ", "UTC")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run the reference initdb");
+    assert!(
+        output.status.success(),
+        "reference initdb {argv:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("initdb progress is UTF-8")
+}
+
+/// The [`rinitdb::conf::Settings`] for one gate case: the four values
+/// `test_config_settings` (`initdb.c:1140`) probed the machine for, read off
+/// the lines where C announces each one, over the command line's own answers.
+#[cfg(unix)]
+fn probed_settings(
+    progress: &str,
+    options: &rinitdb::Options,
+    plan: &rinitdb::CreatePlan,
+    tag: &str,
+) -> rinitdb::conf::Settings {
+    let announced = |prefix: &str| -> String {
+        progress
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("C initdb did not announce {prefix:?} ({tag})"))
+            .trim()
+            .to_owned()
+    };
+    let max_connections: u32 = announced("selecting default \"max_connections\" ... ")
+        .parse()
+        .expect("max_connections is a number");
+    let shared_buffers = announced("selecting default \"shared_buffers\" ... ");
+
+    rinitdb::conf::Settings {
+        max_connections,
+        // AV_SLOTS_FOR_CONNS(nconns), initdb.c:1135 — not announced.
+        autovacuum_worker_slots: max_connections / 6,
+        shared_buffers_blocks: shared_buffers_blocks(&shared_buffers),
+        default_timezone: Some(announced("selecting default time zone ... ")),
+        dynamic_shared_memory_type: announced(
+            "selecting dynamic shared memory implementation ... ",
+        ),
+        auth: rinitdb::conf::AuthMethods::resolve(options),
+        gucs: plan.gucs.clone(),
+        perm: plan.perm,
+        ..rinitdb::conf::Settings::default()
+    }
+}
+
+/// `shared_buffers` is announced in the units it is written in, so it converts
+/// straight back to the block count [`rinitdb::conf::Settings`] carries.
+#[cfg(unix)]
+fn shared_buffers_blocks(announced: &str) -> u32 {
+    let kb_per_block = rinitdb::pg_config::BLCKSZ / 1024;
+    match announced.strip_suffix("MB") {
+        Some(mb) => mb.parse::<u32>().expect("shared_buffers MB") * 1024 / kb_per_block,
+        None => {
+            announced
+                .strip_suffix("kB")
+                .expect("shared_buffers is MB or kB")
+                .parse::<u32>()
+                .expect("shared_buffers kB")
+                / kb_per_block
+        }
+    }
+}
+
+/// This port's `postgresql.conf` for the gate: its own rendering, with
+/// `setup_config`'s `unix_socket_directories` fix-up (`initdb.c:1370`) redone
+/// for the reference build's constant.
+#[cfg(unix)]
+fn our_postgresql_conf(rendered: &str, socketdir: &str, tag: &str) -> String {
+    let retargeted = retarget_socket_directory(rendered, socketdir);
+    // Redoing the replacement over a line this port has already rewritten must
+    // land exactly where C's single pass over the pristine sample lands — same
+    // quoting, same comment column. Without this the retarget could be
+    // papering over the rendering instead of supplying the one constant.
+    let single_pass = retarget_socket_directory(rinitdb::conf::POSTGRESQL_CONF_SAMPLE, socketdir);
+    assert_eq!(
+        socket_directory_line(&retargeted),
+        socket_directory_line(&single_pass),
+        "retargeting {socketdir} moved the line off where one pass puts it ({tag})"
+    );
+    retargeted
+}
+
 /// Gate: the four files `setup_config` writes, diffed byte for byte against
 /// the ones C initdb writes, for `-A trust`, `-A md5` and
 /// `--auth-host scram-sha-256` (the issue's three cases).
@@ -1233,6 +1432,13 @@ fn the_configuration_files_match_reference_initdb() {
         reference::skip("initdb");
         return;
     };
+    // Every file of every case is compared before anything is reported: a
+    // first difference that stopped the run would hide the other three files
+    // and the other two auth cases, which is how the socket-directory hunk
+    // below kept `postgresql.auto.conf`, `pg_hba.conf`, `pg_ident.conf`,
+    // `-A md5` and `--auth-host scram-sha-256` from ever being compared at all.
+    let mut differences: Vec<String> = Vec::new();
+
     for (tag, auth, needs_password) in [
         ("conf-trust", ["-A", "trust"], false),
         // `-A md5` puts md5 on both sides, and `check_need_password`
@@ -1263,48 +1469,7 @@ fn the_configuration_files_match_reference_initdb() {
 
         let mut argv = common.clone();
         argv.push(OsString::from(&datadir));
-        let output = std::process::Command::new(&reference)
-            .args(&argv)
-            .env("TZ", "UTC")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("run the reference initdb");
-        assert!(
-            output.status.success(),
-            "reference initdb {argv:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let progress = String::from_utf8(output.stdout).expect("initdb progress is UTF-8");
-
-        // Each probe result, from the line where C announces it.
-        let announced = |prefix: &str| -> String {
-            progress
-                .lines()
-                .find_map(|line| line.strip_prefix(prefix))
-                .unwrap_or_else(|| panic!("C initdb did not announce {prefix:?} ({tag})"))
-                .trim()
-                .to_owned()
-        };
-        let max_connections: u32 = announced("selecting default \"max_connections\" ... ")
-            .parse()
-            .expect("max_connections is a number");
-        let shared_buffers = announced("selecting default \"shared_buffers\" ... ");
-        let timezone = announced("selecting default time zone ... ");
-        let dsm = announced("selecting dynamic shared memory implementation ... ");
-
-        // `shared_buffers` is announced in the units it is written in, so it
-        // converts straight back to the block count `Settings` carries.
-        let kb_per_block = rinitdb::pg_config::BLCKSZ / 1024;
-        let shared_buffers_blocks = if let Some(mb) = shared_buffers.strip_suffix("MB") {
-            mb.parse::<u32>().expect("shared_buffers MB") * 1024 / kb_per_block
-        } else {
-            shared_buffers
-                .strip_suffix("kB")
-                .expect("shared_buffers is MB or kB")
-                .parse::<u32>()
-                .expect("shared_buffers kB")
-                / kb_per_block
-        };
+        let progress = reference_progress(&reference, &argv);
 
         // The same command line, pointed at a directory that does not exist,
         // so `validate` sees what it saw before C initdb built the cluster.
@@ -1314,28 +1479,118 @@ fn the_configuration_files_match_reference_initdb() {
             panic!("{plan_argv:?} should be a cluster-creation command line");
         };
         let plan = create_plan(&plan_argv);
+        let settings = probed_settings(&progress, &options, &plan, tag);
 
-        let settings = rinitdb::conf::Settings {
-            max_connections,
-            // AV_SLOTS_FOR_CONNS(nconns), initdb.c:1135 — not announced.
-            autovacuum_worker_slots: max_connections / 6,
-            shared_buffers_blocks,
-            default_timezone: Some(timezone),
-            dynamic_shared_memory_type: dsm,
-            auth: rinitdb::conf::AuthMethods::resolve(&options),
-            gucs: plan.gucs.clone(),
-            perm: plan.perm,
-            ..rinitdb::conf::Settings::default()
+        let slurp = |name: &str| -> String {
+            let bytes = testkit::slurp_file(&datadir.join(name), None)
+                .unwrap_or_else(|err| panic!("slurp C initdb's {name} ({tag}): {err}"));
+            String::from_utf8(bytes).expect("a config file is UTF-8")
         };
 
+        // The last value `setup_config` writes that this port cannot know:
+        // the reference server's own DEFAULT_PGSOCKET_DIR.
+        let socketdir = socket_directory_for(
+            configured_socket_directory(),
+            &slurp(rinitdb::conf::CONF_FILES[0]),
+        );
+
         for (name, ours) in rinitdb::conf::render_all(&settings) {
-            let theirs = testkit::slurp_file(&datadir.join(name), None)
-                .unwrap_or_else(|err| panic!("slurp C initdb's {name} ({tag}): {err}"));
-            let theirs = String::from_utf8(theirs).expect("a config file is UTF-8");
+            let ours = if name == rinitdb::conf::CONF_FILES[0] {
+                our_postgresql_conf(&ours, &socketdir, tag)
+            } else {
+                ours
+            };
+            let theirs = slurp(name);
             if let Some(diff) = testkit::diff::unified(&theirs, &ours, "C initdb", "rinitdb") {
-                panic!("{name} differs from C initdb's ({tag})\n{diff}");
+                differences.push(format!("{name} differs from C initdb's ({tag})\n{diff}"));
             }
         }
+    }
+
+    assert!(
+        differences.is_empty(),
+        "{}\n{}",
+        differences.len(),
+        differences.join("\n")
+    );
+}
+
+/// The one hunk of [`the_configuration_files_match_reference_initdb`] that
+/// needs no reference binary: how the `unix_socket_directories` line comes out
+/// for the two builds that exist in the wild.
+///
+/// `replace_guc_value`'s indentation loop (`initdb.c:604`) tabs to the comment
+/// column the sample used, which is 40, but never closer than one space. A tab
+/// fits after the 33-column `'/tmp'`; a single space is all that fits after
+/// the 48-column `'/var/run/postgresql'`. So the whitespace difference between
+/// a stock build's line and Debian's is upstream's own arithmetic, and any fix
+/// that special-cased it would be the wrong fix.
+#[cfg(unix)]
+#[test]
+fn the_socket_directory_line_is_rendered_for_whatever_build_wrote_it() {
+    let sample = rinitdb::conf::POSTGRESQL_CONF_SAMPLE;
+    assert_eq!(
+        socket_directory_line(&retarget_socket_directory(sample, "/tmp")),
+        Some("#unix_socket_directories = '/tmp'\t# comma-separated list of directories")
+    );
+    assert_eq!(
+        socket_directory_line(&retarget_socket_directory(sample, "/var/run/postgresql")),
+        Some(
+            "#unix_socket_directories = '/var/run/postgresql' \
+             # comma-separated list of directories"
+        )
+    );
+}
+
+/// Retargeting a line this port has already rendered must land where one pass
+/// over the pristine sample lands — the invariant the gate asserts per run,
+/// checked here for both builds without a reference binary.
+#[cfg(unix)]
+#[test]
+fn retargeting_a_rendered_line_lands_where_one_pass_lands() {
+    let ours = rinitdb::conf::render_postgresql_conf(
+        rinitdb::conf::POSTGRESQL_CONF_SAMPLE,
+        &rinitdb::conf::Settings::default(),
+    );
+    for socketdir in ["/tmp", "/var/run/postgresql", "/run/postgresql"] {
+        assert_eq!(
+            socket_directory_line(&retarget_socket_directory(&ours, socketdir)),
+            socket_directory_line(&retarget_socket_directory(
+                rinitdb::conf::POSTGRESQL_CONF_SAMPLE,
+                socketdir
+            )),
+            "{socketdir}"
+        );
+    }
+}
+
+/// The two ways the reference build's constant is discovered, over the exact
+/// shapes each source produces.
+#[cfg(unix)]
+#[test]
+fn the_reference_socket_directory_is_read_not_assumed() {
+    // `pg_config --configure` quotes every switch it echoes.
+    assert_eq!(
+        socketdir_switch(
+            "'--build=x86_64-linux-gnu' '--with-socketdir=/var/run/postgresql' '--with-gssapi'\n"
+        )
+        .as_deref(),
+        Some("/var/run/postgresql")
+    );
+    // A stock build passes no such switch.
+    assert_eq!(socketdir_switch("'--prefix=/usr/local/pgsql'\n"), None);
+
+    // The fallback reads only what is between the quotes, from either build's
+    // line — including Debian's, whose comment is one space away.
+    for socketdir in ["/tmp", "/var/run/postgresql"] {
+        let conf = retarget_socket_directory(rinitdb::conf::POSTGRESQL_CONF_SAMPLE, socketdir);
+        assert_eq!(socket_directory_value(&conf).as_deref(), Some(socketdir));
+        assert_eq!(socket_directory_for(None, &conf), socketdir);
+        // A `pg_config` answer outranks the file.
+        assert_eq!(
+            socket_directory_for(Some("/run/postgresql".to_owned()), &conf),
+            "/run/postgresql"
+        );
     }
 }
 

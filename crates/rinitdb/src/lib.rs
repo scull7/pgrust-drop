@@ -10,12 +10,13 @@
 //! calculation over a [`validate::FsProbe`], [`encoding`] and [`error`] are the
 //! tables and messages they need, [`file_perm`] holds the mode constants the
 //! plan carries, [`layout`] turns that plan into the data directory tree as
-//! pure [`layout::FsOp`]s, [`conf`] renders the configuration files from the
-//! vendored templates over [`pg_config`]'s build-time constants, [`sync`] plans
-//! and performs `sync_pgdata`, [`control`] parses and rewrites `pg_control`
-//! over [`crc32c`], [`tz`] reads the timezone database and [`findtimezone`]
-//! picks the default zone over it, [`help`] is the upstream text, and [`run`]
-//! is the only function that writes to a stream.
+//! pure [`layout::FsOp`]s, [`cleanup`] says what a failed run has to take back
+//! again, [`conf`] renders the configuration files from the vendored templates
+//! over [`pg_config`]'s build-time constants, [`sync`] plans and performs
+//! `sync_pgdata`, [`control`] parses and rewrites `pg_control` over
+//! [`crc32c`], [`tz`] reads the timezone database and [`findtimezone`] picks
+//! the default zone over it, [`help`] is the upstream text, and [`run`] is the
+//! only function that writes to a stream.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -25,6 +26,7 @@
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
+pub mod cleanup;
 pub mod cli;
 pub mod conf;
 pub mod control;
@@ -44,6 +46,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
+pub use cleanup::Progress;
 pub use cli::{Invocation, Options};
 pub use conf::{AuthMethods, DateOrder, Settings};
 pub use control::{
@@ -55,7 +58,9 @@ pub use file_perm::DataDirPerm;
 pub use findtimezone::{RealTzSource, TzSource, select_default_timezone};
 pub use layout::{FsOp, layout};
 pub use sync::{SyncMethod, SyncOp};
-pub use validate::{CreatePlan, Environment, FsProbe, Plan, RealFs, SyncPlan, validate};
+pub use validate::{
+    CreatePlan, DirAction, Environment, FsProbe, Plan, RealFs, SyncPlan, classify_waldir, validate,
+};
 
 /// Exit status C initdb uses for its own errors (`pg_fatal`, `exit(1)`).
 const EXIT_FAILURE: u8 = 1;
@@ -93,17 +98,53 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
                 // initdb.c:3439 — `--sync-only` does its one job and returns 0
                 // before any of the cluster-creation steps.
                 Ok(Plan::Sync(plan)) => sync_only(&plan, stdout, stderr),
-                Ok(Plan::Create(_)) => {
-                    let _ = writeln!(
-                        stderr,
-                        "{}: error: cluster initialization is not implemented yet (Linear NAT-381 … NAT-387)",
-                        help::PROGNAME
-                    );
-                    ExitCode::from(EXIT_FAILURE)
-                }
+                Ok(Plan::Create(plan)) => create_cluster(&plan, options.no_clean, stderr),
             }
         }
     }
+}
+
+/// `initialize_data_directory` (`initdb.c:3049`) as far as this port has it,
+/// with `cleanup_directories_atexit` (`:761`) behind it.
+///
+/// Action, and the reason the two are one function: C's exit handler reports
+/// the directories the creation sequence had already made, so every failure
+/// from the first `mkdir` onwards leaves by the same door — render the
+/// diagnostic, then hand [`cleanup::plan`]'s verdict to [`cleanup::apply`].
+fn create_cluster(plan: &CreatePlan, no_clean: bool, stderr: &mut impl Write) -> ExitCode {
+    let mut progress = Progress::default();
+    let diagnostic = match create_directories(plan, &mut progress) {
+        Err(err) => err.render(),
+        // The rest of initialize_data_directory (the subdirs loop at
+        // initdb.c:3068 onwards) lands with Linear NAT-381 … NAT-387. Until it
+        // does this is where a run stops, and it stops the way C stops:
+        // `success` stays false, so the handler takes the directory back.
+        Ok(()) => format!(
+            "{}: error: cluster initialization is not implemented yet (Linear NAT-381 … NAT-387)",
+            help::PROGNAME
+        ),
+    };
+    let _ = writeln!(stderr, "{diagnostic}");
+    cleanup::apply(&cleanup::plan(&progress, no_clean), stderr);
+    ExitCode::from(EXIT_FAILURE)
+}
+
+/// Action: `create_data_directory` (`initdb.c:3060`) and then the head of
+/// `create_xlog_or_symlink` (`:3062`), in C's order.
+///
+/// The order is the whole point. C judges `--waldir` only once PGDATA exists,
+/// which is why both of its `--waldir` refusals are followed by `removing data
+/// directory`; `progress` records the data directory the moment the `mkdir`
+/// succeeds, exactly where `initdb.c:2907` sets `made_new_pgdata`.
+fn create_directories(plan: &CreatePlan, progress: &mut Progress) -> Result<(), InitdbError> {
+    layout::apply(std::slice::from_ref(&layout::data_directory_op(plan)))?;
+    progress.pgdata = Some((plan.pgdata.clone(), plan.pgdata_action));
+
+    // initdb.c:2955-:3010. Its mkdir half, and the subdirs loop after it, are
+    // NAT-381 … NAT-387; nothing beyond this point touches the filesystem yet,
+    // so `progress.waldir` stays None.
+    classify_waldir(plan.waldir.as_deref(), &RealFs)?;
+    Ok(())
 }
 
 /// `initdb.c:3439`: the whole of the `--sync-only` path.

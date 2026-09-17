@@ -3,6 +3,78 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-17 — Target matrix: musl + Darwin primary (ADR-0002, 0006, 0007)
+
+**What**
+- ADR-0007 (new): `*-unknown-linux-musl` (Omen devices) and `aarch64-apple-darwin`
+  (developer laptops) are the primary targets; glibc is a pull-request gate only.
+  A byte-diff gate is only valid when both sides link the same C library, so
+  `testkit::reference` derives `Libc` from `cfg!` at compile time and each lane
+  has its own variable (`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`).
+- ADR-0002 revised: the embedded template carries **bootstrap catalogs only**.
+  Locale is stamped at run time in the `postgres --single` phase from the host's
+  libc, so one image serves every libc and the locale matrix is not frozen at
+  mint time. Fallback if pgrust's `--single` cannot import collations: a single
+  image minted with `builtin` + `C.UTF-8`.
+- ADR-0006 completed: crypto provider is `ring` (owner decision), rustls with
+  `default-features = false`. Root store still undecided.
+- `scripts/fetch-ref-binaries.sh`: PostgreSQL 18.6.0 reference binaries per lane
+  and architecture from Maven Central, the only source covering musl and Darwin.
+- CI restructured into lanes: musl (`container: alpine:3.21`) on every push, gnu
+  and apple gated behind `needs: musl` and pull-request-only.
+
+**Why**
+The product runs on Alpine and on Apple silicon; neither has glibc. Measured on
+one host, PostgreSQL 18.6 both sides:
+
+| mint recipe (glibc initdb) | `datcollversion` | musl server on it |
+| --- | --- | --- |
+| `--no-locale` | `NULL` | clean |
+| `--locale-provider=builtin --builtin-locale=C.UTF-8` | `1` | clean |
+| `--locale=en_US.UTF-8` | `2.39` | warns on every connection |
+
+`2.39` is the *mint host's glibc version*, so per-libc images would not have
+fixed it — it would take one image per libc version. Hence: bake no locale.
+
+Also measured: `initdb --help`/`--version` are byte-identical across libcs, but
+`initdb -D data` differs in the locale block, and `--locale=xx_ZZ.UTF-8` exits 1
+on glibc and **0 on musl** (musl's `setlocale` accepts any name). Both are now
+entries in `docs/divergences.md`.
+
+**Checks run** (this container, Rust 1.96.0)
+- gnu lane: `cargo fmt --all --check`, pedantic clippy, `cargo test --all-features`
+  — all clean, 49 tests.
+- musl lane: `rustup target add x86_64-unknown-linux-musl`, pedantic clippy and
+  `cargo test --all-features --target x86_64-unknown-linux-musl` — clean.
+- **The initdb byte-diff gate ran for real for the first time**, in both lanes,
+  against Maven's 18.6.0 builds: `rinitdb --help`/`--version` are byte-identical
+  to C initdb. Previously it always printed SKIP.
+- `ring` on musl: verified it fails without a musl C toolchain
+  (`failed to find tool "x86_64-linux-musl-gcc"`) and builds with `musl-tools`
+  plus `CC_x86_64_unknown_linux_musl=musl-gcc`. Recorded in ADR-0006.
+- Not run: the CI workflow itself. The Alpine container job (rustup on a musl
+  host, `actions/checkout` in a container) has never executed; first PR run is
+  its real test.
+
+**Risks / open questions**
+- ADR-0002's run-time stamping depends on pgrust's `--single` supporting
+  `pg_import_system_collations()` and reporting a collation version. Unverified
+  until NAT-376 vendors pgrust; the `builtin` fallback is the hedge.
+- Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
+  guess; the Alpine lane fetches from Maven, so nothing depends on it yet.
+- Template image portability across architectures is untested → v2, via a
+  `pg_controldata` comparison on an arm runner.
+- `PGDROP_REF_BIN` (lane-agnostic) is still accepted and is an unchecked
+  assertion that the directory matches the compiled lane. A follow-up could read
+  the reference's ELF interpreter and refuse a cross-libc pairing outright.
+- No `psql` in the Maven bundles; the M3 rpsql gate needs its own reference.
+
+**Follow-ups**
+- NAT-374 gate runner: now partly done (the fetch script and both lanes run).
+- Root store decision for ADR-0006 (`webpki-roots` needs approval as a new dep).
+- New Linear issues wanted: run-time locale stamping in `--single`, arm
+  portability (v2), Docker-based fixtures (v2), psql reference for M3.
+
 ## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
 
 **What**

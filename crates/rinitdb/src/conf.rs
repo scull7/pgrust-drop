@@ -20,6 +20,12 @@ use crate::cli::Options;
 use crate::file_perm::{DataDirPerm, PG_DIR_MODE_GROUP};
 use crate::pg_config;
 
+/// SHA-256, used only by the provenance gate in `tests` and therefore not
+/// compiled into the binary. See that module's header for why this crate
+/// carries its own instead of borrowing `rlibpq`'s.
+#[cfg(test)]
+mod sha256;
+
 /// `src/backend/utils/misc/postgresql.conf.sample`, vendored byte for byte.
 pub const POSTGRESQL_CONF_SAMPLE: &str = include_str!("../share/postgresql.conf.sample");
 
@@ -711,8 +717,10 @@ mod tests {
     /// A digest proves only "unchanged since someone pinned it", never
     /// "upstream's". It is computed *from* the file, so whatever bytes were
     /// vendored are the bytes it blesses — which is how a pgrust-modified
-    /// `postgresql.conf.sample` shipped here and passed. The two tests below
-    /// assert against expectations written down from upstream instead.
+    /// `postgresql.conf.sample` shipped here and passed. The tests below
+    /// assert against expectations written down from upstream instead —
+    /// upstream's own SHA-256 of each file, its section banners, and the
+    /// absence of any namespaced setting.
     #[test]
     fn the_embedded_templates_are_the_postgresql_18_6_bytes_we_vendored() {
         for (name, sample, length, digest) in [
@@ -737,6 +745,131 @@ mod tests {
         ] {
             assert_eq!(sample.len(), length, "{name} changed length");
             assert_eq!(fnv1a64(sample.as_bytes()), digest, "{name} changed content");
+        }
+    }
+
+    // --- provenance: is this pristine PostgreSQL 18.6? ------------------
+
+    /// The release the templates are copies of, in the two forms PostgreSQL
+    /// publishes it. These are facts about *upstream*, recorded here (and in
+    /// `crates/rinitdb/share/README.md`) from PostgreSQL's own artifacts, so
+    /// nothing below is derived from the vendored bytes it judges.
+    const UPSTREAM_TAG: &str = "REL_18_6";
+    const UPSTREAM_COMMIT: &str = "724edf9bde9d356724ad384a2e196edc3c9f80f7";
+    const UPSTREAM_TARBALL: &str =
+        "https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2";
+    /// The tarball's own digest, as published at `…/postgresql-18.6.tar.bz2.sha256`.
+    const UPSTREAM_TARBALL_SHA256: &str =
+        "555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f";
+
+    /// Each template as `(vendored name, embedded bytes, upstream path,
+    /// upstream SHA-256)`. The digests are the ones `sha256sum` prints for
+    /// these files in the tarball above and at tag [`UPSTREAM_TAG`]; the two
+    /// sources were checked against each other and agree.
+    const UPSTREAM_SAMPLES: [(&str, &str, &str, &str); 3] = [
+        (
+            "postgresql.conf.sample",
+            POSTGRESQL_CONF_SAMPLE,
+            "src/backend/utils/misc/postgresql.conf.sample",
+            "93e3da1fc8d667ba086ee239e5f053581739648a90566f191666cc63de16357f",
+        ),
+        (
+            "pg_hba.conf.sample",
+            PG_HBA_CONF_SAMPLE,
+            "src/backend/libpq/pg_hba.conf.sample",
+            "e3abfe29646ac6ece67e92d0b5255eb3b35d2878d23c7ea6bbd94f100054c168",
+        ),
+        (
+            "pg_ident.conf.sample",
+            PG_IDENT_CONF_SAMPLE,
+            "src/backend/libpq/pg_ident.conf.sample",
+            "bf8f1664dc42eeb78a71a3746afb6b6c93805bda55ff4504f796dbe339d1fa50",
+        ),
+    ];
+
+    /// What a reader of the failure has to be told: which file drifted, by how
+    /// much, what the file is supposed to be, where to get that, and which
+    /// tree is never the answer.
+    fn drift_report(name: &str, upstream_path: &str, upstream: &str, vendored: &str) -> String {
+        [
+            format!("{name} is not the file PostgreSQL 18.6 ships."),
+            String::new(),
+            format!("    upstream sha256: {upstream}"),
+            format!("    vendored sha256: {vendored}"),
+            String::new(),
+            String::from(
+                "The upstream digest was recorded from PostgreSQL's own release, not \
+                 computed from this file, so a mismatch says the vendored copy is not \
+                 pristine upstream. It does not say a pin has gone stale.",
+            ),
+            String::new(),
+            format!(
+                "Re-fetch {upstream_path} from {UPSTREAM_TARBALL} (published sha256 \
+                 {UPSTREAM_TARBALL_SHA256}), or from postgres/postgres at tag \
+                 {UPSTREAM_TAG}, commit {UPSTREAM_COMMIT}."
+            ),
+            String::new(),
+            String::from(
+                "Never re-vendor from pgrust's crates/postgres-18.6-reference/ tree. It \
+                 is a modified checkout: its postgresql.conf.sample carries a 41-line \
+                 `# PGRUST` section of pgrust-only GUCs, and copying pgrust's own work \
+                 into this MIT crate breaks ADR-0003. That tree is where the earlier \
+                 contamination came from, and is why this test exists.",
+            ),
+            String::new(),
+            String::from(
+                "Moving to a newer PostgreSQL is a deliberate act: update UPSTREAM_SAMPLES \
+                 here and crates/rinitdb/share/README.md in the same commit, and say so in \
+                 progress.md.",
+            ),
+        ]
+        .join("\n")
+    }
+
+    /// Pins the templates to upstream's *identity*, not to their own past.
+    ///
+    /// The digest test above can only ever prove "unchanged since someone
+    /// vendored this"; it faithfully blessed the pgrust-contaminated sample
+    /// and passed. A SHA-256 recorded from PostgreSQL's release artifacts is a
+    /// claim about what the file must be, checkable by anyone with
+    /// `sha256sum` and the tarball, and it fails the moment a vendored file is
+    /// anything other than what 18.6 shipped.
+    #[test]
+    fn each_embedded_template_is_the_file_postgresql_18_6_ships() {
+        for (name, sample, upstream_path, upstream) in UPSTREAM_SAMPLES {
+            let vendored = sha256::digest_hex(sample.as_bytes());
+            assert_eq!(
+                vendored,
+                upstream,
+                "{}",
+                drift_report(name, upstream_path, upstream, &vendored)
+            );
+        }
+    }
+
+    #[test]
+    fn the_drift_report_says_what_broke_and_where_to_get_the_real_file() {
+        let report = drift_report(
+            "postgresql.conf.sample",
+            "src/backend/utils/misc/postgresql.conf.sample",
+            "expected-digest",
+            "actual-digest",
+        );
+
+        for expected in [
+            "postgresql.conf.sample",
+            "expected-digest",
+            "actual-digest",
+            UPSTREAM_TARBALL,
+            UPSTREAM_TAG,
+            UPSTREAM_COMMIT,
+            "crates/postgres-18.6-reference/",
+            "crates/rinitdb/share/README.md",
+        ] {
+            assert!(
+                report.contains(expected),
+                "the report never mentions {expected}"
+            );
         }
     }
 

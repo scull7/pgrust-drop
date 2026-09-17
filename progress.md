@@ -1,7 +1,21 @@
-# progress.md — running log
+# progress.md — RETIRED historical archive
 
-Newest first. Each entry: what, why, checks run, risks, follow-ups.
-Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
+> **This file is closed. Do not add entries.**
+>
+> **Linear is the project's source of truth** — project *pgrust-drop*, team NAT:
+> https://linear.app/scull7/project/pgrust-drop
+>
+> Status, decisions, risks and follow-ups belong on the Linear issue. The PR
+> description carries the narrative of a change. See `AGENTS.md` ("Change
+> hygiene") for the rule, and NAT-421 for why it changed.
+>
+> Two things still live in the repo rather than Linear, because they are
+> durable artifacts rather than project state: `docs/adr/` (architecture
+> decisions) and `docs/divergences.md` (each row pins a deliberate divergence
+> to the test that proves it).
+>
+> What follows is the log as it stood through 2026-09-17, kept because it
+> records how the project got here. Newest first.
 
 ## 2026-09-16 — Review of the nightshift branch, and the gates run for the first time
 
@@ -203,8 +217,12 @@ mechanically anchored and remain unverified.
   `pg_hba.conf` and `pg_ident.conf` were never compared this run, and only the
   `conf-trust` case ran. "Config files match" is not yet established.
 
-**Follow-ups**
+**Follow-ups** (now tracked in Linear, which is the source of truth from here on)
 
+- NAT-417 report pgrust's reference-tree provenance defect upstream (deferred);
+  NAT-418 the licensing defect and its fix; NAT-419 the ~32 wrong `file:line`
+  citations; NAT-420 `cleanup_directories_atexit` + `--waldir` check ordering;
+  NAT-421 this process change; NAT-422 the smaller review follow-ups.
 - NAT-374: `libpq_uri_regress` ships in no PGDG package, so its two gates still
   skip; `UNSHIPPED_TOOLS` exempts it by name.
 - NAT-399: `psql --help`. Note there is no `--help`/`--version` byte-diff gate

@@ -8,3 +8,6 @@
 
 # Scratch datadirs from local gate runs
 /tmp/
+
+# Reference binaries fetched by scripts/fetch-ref-binaries.sh
+/.ref/

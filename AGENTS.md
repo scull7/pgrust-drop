@@ -43,11 +43,25 @@ usage-rs's (clap-shaped, exit 2), not glibc getopt's; the stolen
 stderr. Long-option abbreviation (glibc unique-prefix) is a documented
 divergence. See ADR-0004.
 
+## Targets and lanes (ADR-0007)
+
+The product ships to **Alpine/musl** (Omen devices) and **aarch64 macOS**
+(developer laptops); glibc is the odd one out. A byte-diff gate is only valid
+when both sides link the same C library, so `testkit::reference` keys discovery
+on the compiled target's libc and each lane has its own variable
+(`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`). Get the reference binaries with
+`scripts/fetch-ref-binaries.sh`; never point one lane's variable at another
+lane's directory. CI runs musl on every push (`container: alpine`), then gnu and
+apple on pull requests via `needs: musl`; `gnu` is the required check. Docker is
+not a dependency of the product, the harness or the developer workflow — CI's
+container does not change that.
+
 ## Rust rules
 
 - Toolchain pinned to 1.96.0 (pgrust's pin). `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic`,
-  `cargo test --all-features` must pass before a push.
+  `cargo test --all-features` must pass before a push. Run the musl lane too
+  (`--target x86_64-unknown-linux-musl`); it is the one CI gates every push.
 - stdlib first. **No new dependencies without explicit approval.** Approved so
   far (owner, 2026-09-16): `usage-rs` (all CLIs), `thiserror` (typed errors),
   `rustls` (rlibpq TLS, ADR-0006), `redox_liner` (rpsql line editing,

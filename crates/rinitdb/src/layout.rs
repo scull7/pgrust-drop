@@ -110,24 +110,54 @@ pub fn version_file_contents() -> String {
     format!("{PG_MAJORVERSION}\n")
 }
 
+/// Pure: `create_data_directory`'s one filesystem change (`initdb.c:2890`).
+///
+/// It is its own function because C's order is: make PGDATA, *then* judge
+/// `--waldir` (`validate::classify_waldir`), and the exit handler reports the
+/// directory it made. The creation sequence applies this, records what it did
+/// (`crate::cleanup::Progress`) and only then asks about the WAL directory.
+#[must_use]
+pub fn data_directory_op(plan: &CreatePlan) -> FsOp {
+    dir_op(
+        &plan.pgdata,
+        plan.pgdata_action,
+        plan.perm.masked_dir_mode(),
+    )
+}
+
 /// Pure: every filesystem change `initialize_data_directory` makes before it
 /// starts a backend, in upstream order.
+///
+/// `waldir` is `create_xlog_or_symlink`'s verdict on `plan.waldir`, which only
+/// [`validate::classify_waldir`] can give.
 ///
 /// The order is load-bearing twice over: `pg_wal` must exist (or be a symlink)
 /// before the `subdirs[]` loop reaches `pg_wal/archive_status`, and `base`
 /// must precede `base/1`, which is why neither is created with parents.
+///
+/// [`validate::classify_waldir`]: crate::validate::classify_waldir
 #[must_use]
-pub fn layout(plan: &CreatePlan) -> Vec<FsOp> {
+pub fn layout(plan: &CreatePlan, waldir: Option<&(PathBuf, DirAction)>) -> Vec<FsOp> {
+    let mut ops = Vec::with_capacity(SUBDIRS.len() + 4);
+    ops.push(data_directory_op(plan));
+    ops.extend(wal_directory_and_below(plan, waldir));
+    ops
+}
+
+/// Pure: the rest of `initialize_data_directory` — `create_xlog_or_symlink`
+/// (`initdb.c:2948`) onwards, once PGDATA is already there.
+#[must_use]
+pub fn wal_directory_and_below(
+    plan: &CreatePlan,
+    waldir: Option<&(PathBuf, DirAction)>,
+) -> Vec<FsOp> {
     let perm = plan.perm;
     let dir_mode = perm.masked_dir_mode();
-    let mut ops = Vec::with_capacity(SUBDIRS.len() + 4);
-
-    // create_data_directory(), initdb.c:2890.
-    ops.push(dir_op(&plan.pgdata, plan.pgdata_action, dir_mode));
+    let mut ops = Vec::with_capacity(SUBDIRS.len() + 3);
 
     // create_xlog_or_symlink(), initdb.c:2948.
     let subdirloc = plan.pgdata.join("pg_wal");
-    match &plan.waldir {
+    match waldir {
         Some((xlog_dir, action)) => {
             ops.push(dir_op(xlog_dir, *action, dir_mode));
             ops.push(FsOp::Symlink {
@@ -189,8 +219,11 @@ fn dir_op(path: &Path, action: DirAction, mode: u32) -> FsOp {
 /// compares against C initdb's, and it is also what makes the op list readable
 /// in a test failure.
 #[must_use]
-pub fn tree_listing(plan: &CreatePlan) -> Vec<(PathBuf, u32)> {
-    let mut listing: Vec<(PathBuf, u32)> = layout(plan)
+pub fn tree_listing(
+    plan: &CreatePlan,
+    waldir: Option<&(PathBuf, DirAction)>,
+) -> Vec<(PathBuf, u32)> {
+    let mut listing: Vec<(PathBuf, u32)> = layout(plan, waldir)
         .into_iter()
         .filter_map(|op| match op {
             FsOp::CreateDir { path, mode, .. }
@@ -475,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_new_data_directory_is_made_then_filled() {
-        let ops = layout(&plan("/tmp/data", false));
+        let ops = layout(&plan("/tmp/data", false), None);
         assert_eq!(
             ops[0],
             FsOp::CreateDir {
@@ -509,7 +542,7 @@ mod tests {
         let mut create = plan("/tmp/data", false);
         create.pgdata_action = DirAction::ReuseEmpty;
         assert_eq!(
-            layout(&create)[0],
+            layout(&create, None)[0],
             FsOp::SetMode {
                 path: PathBuf::from("/tmp/data"),
                 mode: 0o700,
@@ -519,7 +552,7 @@ mod tests {
 
     #[test]
     fn the_last_op_is_the_top_level_version_file() {
-        let ops = layout(&plan("/tmp/data", false));
+        let ops = layout(&plan("/tmp/data", false), None);
         assert_eq!(
             ops.last().unwrap(),
             &FsOp::WriteFile {
@@ -537,7 +570,7 @@ mod tests {
 
     #[test]
     fn allow_group_access_moves_every_mode_at_once() {
-        let ops = layout(&plan("/tmp/data", true));
+        let ops = layout(&plan("/tmp/data", true), None);
         for op in &ops {
             match op {
                 FsOp::CreateDir { mode, .. } | FsOp::SetMode { mode, .. } => {
@@ -551,9 +584,9 @@ mod tests {
 
     #[test]
     fn waldir_replaces_the_pg_wal_directory_with_a_symlink() {
-        let mut create = plan("/tmp/data", false);
-        create.waldir = Some((PathBuf::from("/mnt/wal"), DirAction::Create));
-        let ops = layout(&create);
+        let create = plan("/tmp/data", false);
+        let waldir = (PathBuf::from("/mnt/wal"), DirAction::Create);
+        let ops = layout(&create, Some(&waldir));
         assert_eq!(
             ops[1],
             FsOp::CreateDir {
@@ -584,9 +617,9 @@ mod tests {
 
     #[test]
     fn an_existing_empty_waldir_is_chmodded_then_linked() {
-        let mut create = plan("/tmp/data", true);
-        create.waldir = Some((PathBuf::from("/mnt/wal"), DirAction::ReuseEmpty));
-        let ops = layout(&create);
+        let create = plan("/tmp/data", true);
+        let waldir = (PathBuf::from("/mnt/wal"), DirAction::ReuseEmpty);
+        let ops = layout(&create, Some(&waldir));
         assert_eq!(
             ops[1],
             FsOp::SetMode {
@@ -609,9 +642,9 @@ mod tests {
 
     #[test]
     fn the_tree_listing_is_relative_sorted_and_free_of_the_waldir() {
-        let mut create = plan("/tmp/data", false);
-        create.waldir = Some((PathBuf::from("/mnt/wal"), DirAction::Create));
-        let listing = tree_listing(&create);
+        let create = plan("/tmp/data", false);
+        let waldir = (PathBuf::from("/mnt/wal"), DirAction::Create);
+        let listing = tree_listing(&create, Some(&waldir));
         // The data directory itself and the WAL directory are not entries
         // under the tree; everything else is, exactly once.
         assert_eq!(listing.len(), SUBDIRS.len() + 1);

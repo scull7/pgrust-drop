@@ -77,3 +77,19 @@ Fable orchestrator that only dispatches Opus workers issue by issue on a
 - When scripting checks, branch on the command's exit status, not on grepped
   output: `cargo clippy … 2>log && echo OK` — a pipeline through `grep` returns
   grep's status and hides failures.
+
+## Agent tooling
+
+`.claude/settings.json` declares the `typesafe-ai` plugin marketplace and enables
+the `typesafe@typesafe-ai` plugin, so every session — local, web or nightshift —
+gets the TypeSafe skill without a manual install. It is the reference for
+building with TypeSafe's System One models (typed judgments and probabilities
+instead of prompt-and-parse); its live docs at `https://docs.typesafe.ai/llms.txt`
+are the source of truth.
+
+Nothing in this repo is an AI surface today: the port is deterministic,
+byte-for-byte work and stays that way. Reach for the skill only if a task
+genuinely needs semantic judgment (for example, triaging a stolen-test diff
+into "justified normalization" vs "real divergence"), never inside `testkit`,
+`rinitdb`, `rlibpq`, `rpsql` or `pgdrop` behaviour, and never as a substitute
+for a byte diff.

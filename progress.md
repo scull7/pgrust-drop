@@ -3,6 +3,34 @@
 Newest first. Each entry: what, why, checks run, risks, follow-ups.
 Linear: project *pgrust-drop* (team NAT). GitHub: `scull7/pgrust-drop`.
 
+## 2026-09-17 — TypeSafe skill installed for agent sessions
+
+**What**
+- `claude plugin marketplace add typesafe-ai/skills` + `claude plugin install
+  typesafe@typesafe-ai` (v0.5.7, user scope in this container).
+- Committed `.claude/settings.json` declaring the marketplace and enabling the
+  plugin at project scope, so the skill loads in every session instead of only
+  the ephemeral container it was installed in.
+- `AGENTS.md` gains an "Agent tooling" section: what the skill is for and the
+  explicit boundary that no crate in this repo becomes an AI surface.
+
+**Why**
+Owner request. The install itself lives in `~/.claude`, which does not survive a
+web session's container; the project-scope settings file makes it durable and
+reviewable.
+
+**Checks run**: `claude plugin list` shows `typesafe@typesafe-ai` enabled;
+`.claude/settings.json` parses as JSON; no Rust sources touched, so the fmt /
+clippy / test gates are unchanged (not re-run — nothing in `crates/` changed).
+
+**Risks**: none to the build. The plugin is third-party and fetched from GitHub
+at session start; project-scope `enabledPlugins` prompts for trust on a fresh
+clone. Skill guidance points at live docs (`docs.typesafe.ai`), so its content
+can change under us.
+
+**Follow-ups**: none open. Revisit only if a task appears that actually needs
+semantic judgment; the byte-diff gates stay deterministic.
+
 ## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
 
 **What**

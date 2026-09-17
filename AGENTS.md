@@ -1,6 +1,6 @@
 # AGENTS.md — rules for working in pgrust-drop
 
-Read this first, then `progress.md`, then the ADRs under `docs/adr/` (0001 layout/vendoring, 0002 embedded-template initdb, 0003 licensing, 0004 usage-rs, 0005 line editor, 0006 TLS).
+Read this first, then the Linear issue you are working (project **pgrust-drop**, team NAT), then the ADRs under `docs/adr/` (0001 layout/vendoring, 0002 embedded-template initdb, 0003 licensing, 0004 usage-rs, 0005 line editor, 0006 TLS, 0007 upstream source).
 
 ## What this repo is
 
@@ -18,8 +18,34 @@ Crates (`crates/`):
 | `rpsql`   | `src/bin/psql/` ported fresh from C (ADR-0003)                         |
 | `pgdrop`  | the multicall binary: `pgdrop initdb | psql | postgres | start`        |
 
-"Upstream" means the PostgreSQL 18.6 tree vendored in pgrust at
-`crates/postgres-18.6-reference/`, and pgrust itself (`malisper/pgrust`).
+## What "upstream" means
+
+"Upstream" is genuine PostgreSQL 18.6, and nothing else:
+
+- git tag `REL_18_6`, commit `724edf9bde9d356724ad384a2e196edc3c9f80f7`
+  (`github.com/postgres/postgres`), or
+- the release tarball `postgresql-18.6.tar.bz2`, published sha256
+  `555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f`.
+
+pgrust (`malisper/pgrust`) is not upstream. Neither is the PostgreSQL 18.6 tree
+vendored in pgrust at `crates/postgres-18.6-reference/`: it carries undeclared
+local modifications, while its own `README-WHY-THIS-IS-HERE.md` claims to be a
+pristine extract of the tag. Compared file-by-file against the pristine
+tarball's 7,284 files: 7,281 are byte-identical, `src/port/win32ver.rc` is
+absent, and two differ — `src/backend/utils/misc/postgresql.conf.sample`
+(41 added lines of pgrust-specific GUCs under a `# PGRUST` header) and
+`src/test/regress/data/streets.data` (one word).
+
+**Never vendor content from that tree, and never cite it as the authority for a
+`file:line`.** Vendor and cite from the tag or the tarball. Read it for
+orientation — it is a convenient local copy and 7,281 of its files are exact —
+but it is a convenience, not an authority: confirm against the tag or the
+tarball before anything taken from it lands.
+
+That distinction is not pedantry. `crates/rinitdb/share/postgresql.conf.sample`
+was vendored from that tree and carried the 41 `# PGRUST` lines into an
+MIT-licensed crate, against ADR-0003 (pgrust is AGPL-3.0). Re-vendored from
+pristine sources in PR #11. See ADR-0007.
 
 ## Method: steal the tests
 
@@ -93,11 +119,28 @@ Fable orchestrator that only dispatches Opus workers issue by issue on a
 
 ## Change hygiene
 
-- Update `progress.md` for every meaningful change (what, why, checks run,
-  risks, follow-ups) and move the Linear issue.
-- Record every deliberate divergence from upstream in `docs/divergences.md`
-  with the reason and the test that pins it.
+**Linear is the single source of truth for project state.** Status, decisions,
+risks and follow-ups live on the Linear issue — project **pgrust-drop**, team
+NAT, issues NAT-372 … — not in a file in this repo.
+
+- A meaningful change updates its Linear issue (what, why, checks run, risks,
+  follow-ups) and moves the issue's state. Work that is not on the issue did
+  not happen.
+- The PR description carries the human-readable narrative; the Linear issue
+  carries the state. Do not duplicate either into a log file.
+- `progress.md` is retired. It stays in the repo as a historical archive of
+  work up to 2026-09-16. Do not extend it, do not read it as current state, do
+  not delete it.
 - Never weaken a gate to get green. A failing stolen test is a bug report.
 - When scripting checks, branch on the command's exit status, not on grepped
   output: `cargo clippy … 2>log && echo OK` — a pipeline through `grep` returns
   grep's status and hides failures.
+
+Two things stay in the repo, because they are not project state:
+
+- **ADRs** (`docs/adr/`) — durable architecture decisions. A new decision gets
+  a new ADR; a reversal gets an amendment on the ADR it reverses. Never a
+  Linear comment instead.
+- **`docs/divergences.md`** — every deliberate divergence from upstream, with
+  the reason and the test that pins it. It binds behaviour to tests, so it
+  travels with the code.

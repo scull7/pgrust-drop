@@ -29,7 +29,8 @@ the fallback only if we must patch pgrust locally before an upstream PR lands.
 
 - Building `pgdrop` builds pgrust's server: needs `libre2-dev`/`pkg-config`
   (release), Rust 1.96.0, and a warm cache in CI (NAT-376).
-- Bumping pgrust is one line plus a `progress.md` entry.
+- Bumping pgrust is one line plus a note on the Linear issue (`progress.md` is
+  retired — see AGENTS.md, "Change hygiene").
 - License consequences are in ADR-0003.
 
 ## Amendment 2026-09-16: the auth primitives are ported, not linked

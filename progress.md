@@ -150,8 +150,9 @@ weakened to accommodate the fix.
 **Provenance audit: the blast radius is one file**
 
 Against two independent pristine sources that agree (tarball sha256
-`555610c2…` verified, and `REL_18_6` @ `724edf9b`), pgrust's reference tree is
-**7 282 of 7 284 files byte-identical**. Only two differ:
+`555610c2…` verified, and `REL_18_6` @ `724edf9b`), pgrust's reference tree is,
+of 7 284 files, **7 281 byte-identical, 2 differing, 1 absent**
+(`src/port/win32ver.rc`, a gap that tree does declare). Only two differ:
 `postgresql.conf.sample` (the `# PGRUST` block, fixed in #11) and
 `src/test/regress/data/streets.data` (one word on line 1378, collateral from a
 rename, referenced nowhere here). Of the 63 distinct upstream paths cited across
@@ -219,7 +220,9 @@ mechanically anchored and remain unverified.
 
 **Follow-ups** (now tracked in Linear, which is the source of truth from here on)
 
-- NAT-417 report pgrust's reference-tree provenance defect upstream (deferred);
+- NAT-423 propagate the new rules into `ORCHESTRATOR.md` and `README.md`, which
+  still instruct workers to append to this file and to cite pgrust's tree;
+  NAT-417 report pgrust's reference-tree provenance defect upstream (deferred);
   NAT-418 the licensing defect and its fix; NAT-419 the ~32 wrong `file:line`
   citations; NAT-420 `cleanup_directories_atexit` + `--waldir` check ordering;
   NAT-421 this process change; NAT-422 the smaller review follow-ups.

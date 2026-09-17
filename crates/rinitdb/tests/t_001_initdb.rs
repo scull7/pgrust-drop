@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rinitdb::control::{ControlFile, DataChecksums, SystemIdentifier};
+use testkit::normalize::EXTRA_VERSION;
 use testkit::{Gate, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
@@ -159,8 +160,15 @@ fn program_options_handling_ok() {
 
 /// Byte-diff gate (NAT-374): the same invocation through C `initdb` and
 /// through `rinitdb`, with stdout, stderr and exit status diffed byte for
-/// byte. No normalizer is justified here — `--help` and `--version` are fixed
-/// text — so the comparison is as strict as it gets.
+/// byte.
+///
+/// `--help` is fixed text in both builds, so it is gated as raw bytes — the
+/// strictest comparison there is. `--version` prints the `PG_VERSION` its own
+/// build was compiled with, and a distribution's `--with-extra-version`
+/// appends a vendor suffix to that constant (PGDG's Ubuntu 18.6 package says
+/// `18.6 (Ubuntu 18.6-1.pgdg24.04+2)`), so that half carries
+/// `normalize::EXTRA_VERSION` and only that half. The version number itself is
+/// still compared.
 ///
 /// Missing reference binary → `SKIP (flagged, not silent)`; the gate is real
 /// wherever PostgreSQL 18 is installed or `PGDROP_REF_BIN` points at it.
@@ -170,9 +178,10 @@ fn help_and_version_match_reference_initdb() {
         reference::skip("initdb");
         return;
     };
-    for arg in ["--help", "--version"] {
-        gate.clone().arg(arg).assert_clean();
-    }
+    gate.clone().arg("--help").assert_clean();
+    gate.arg("--version")
+        .normalizer(EXTRA_VERSION)
+        .assert_clean();
 }
 
 /// `command_fails([ 'initdb', '--sync-only', "$tempdir/nonexistent" ],

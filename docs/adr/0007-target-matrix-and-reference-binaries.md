@@ -60,8 +60,15 @@ for one lane cannot be picked up by another.
 GitHub offers no Alpine runner image, and a container is the supported way to
 get a musl userland. The `gnu` and `apple` lanes declare `needs: musl`, so they
 never start until musl is green, and carry
-`if: github.event_name == 'pull_request'`. Branch protection requires `gnu`,
-which makes it the last gate rather than a parallel one.
+`if: github.event_name == 'pull_request'`.
+
+The `main` ruleset requires **all three** checks (`musl`, `apple`, `gnu`), not
+just the last one. GitHub counts `skipped` and `neutral` as successful
+conclusions, and a job skipped because its `needs:` failed "may not block
+merging" — so requiring only `gnu` would let a red musl lane through, `gnu`
+having been skipped. Requiring `musl`, which always runs on a pull request,
+closes that. Job names are therefore plain (`musl`, `apple`, `gnu`): the
+required-check string must match the check name exactly.
 
 **Reference binaries.** `scripts/fetch-ref-binaries.sh` picks the Maven
 classifier for the running lane and architecture, unpacks it under `.ref/`, and

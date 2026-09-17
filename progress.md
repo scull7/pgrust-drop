@@ -71,9 +71,10 @@ entries in `docs/divergences.md`.
 **Risks / open questions**
 - Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
   guess; the Alpine lane fetches from Maven, so nothing depends on it yet.
-- Branch protection requiring the `gnu` check is **not** applied: this session's
-  GitHub credentials get 403 `Resource not accessible by integration` on the
-  branch-protection API and no ruleset tool is exposed. Owner action, see below.
+- The `main` ruleset is **not** applied: the classic branch-protection API
+  returns 403 `Resource not accessible by integration` for this session, and the
+  rulesets API (which does read back 200) could not be written to from here.
+  Owner action, see below.
 - Template image portability across architectures is untested → v2, via a
   `pg_controldata` comparison on an arm runner.
 - `PGDROP_REF_BIN` (lane-agnostic) is still accepted and is an unchecked
@@ -83,10 +84,17 @@ entries in `docs/divergences.md`.
 
 **Follow-ups**
 - NAT-374 gate runner: now partly done (the fetch script and both lanes run).
-- **Owner action**: make `gnu` a required status check on `main`
-  (Settings > Branches, or Rulesets > require status checks). Until then the
-  lane ordering is advisory: `needs: musl` still gates execution, but nothing
-  blocks a merge on a red `gnu`.
+- **Owner action**: create the `main` branch ruleset requiring the `musl`,
+  `apple` and `gnu` checks (Settings > Rules > Rulesets > New branch ruleset;
+  the enforcement status defaults to Disabled and must be set to Active). Until
+  then the lane ordering is advisory: `needs: musl` gates execution, but nothing
+  blocks a merge.
+- Requiring all three is not belt and braces. GitHub treats `skipped` and
+  `neutral` as successful, and its own troubleshooting docs say a job skipped
+  because a `needs:` dependency failed "may not block merging". With only `gnu`
+  required, a red musl lane would skip `gnu` and the merge would be allowed.
+  CI job names were flattened to `musl`, `apple`, `gnu` for the same reason: the
+  required-check string has to match the check name exactly.
 - ELF-interpreter check on the reference binary, to turn the lane-agnostic
   `PGDROP_REF_BIN` from a trusted assertion into an enforced one.
 

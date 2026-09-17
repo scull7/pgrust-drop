@@ -63,9 +63,11 @@ container does not change that.
   `cargo test --all-features` must pass before a push. Run the musl lane too
   (`--target x86_64-unknown-linux-musl`); it is the one CI gates every push.
 - stdlib first. **No new dependencies without explicit approval.** Approved so
-  far (owner, 2026-09-16): `usage-rs` (all CLIs), `thiserror` (typed errors),
-  `rustls` (rlibpq TLS, ADR-0006), `redox_liner` (rpsql line editing,
-  ADR-0005). `anyhow` is not approved.
+  far: `usage-rs` (all CLIs), `thiserror` (typed errors), `rustls` (rlibpq TLS,
+  ADR-0006), `redox_liner` (rpsql line editing, ADR-0005) — owner, 2026-09-16;
+  `ring` (rustls crypto provider) and `webpki-roots` (root store) — owner,
+  2026-09-17. `anyhow` is not approved. `ring` needs a musl C toolchain:
+  `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`.
 - Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rpsql` are MIT and are
   ported from PostgreSQL's C sources only. **Never copy code, comments or test
   corpora from pgrust into them.** `pgdrop` is AGPL-3.0 because it links pgrust.

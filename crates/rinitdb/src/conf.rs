@@ -709,10 +709,12 @@ mod tests {
     /// observable behaviour, and drifting from it has to be a deliberate act.
     ///
     /// A failure here means a template changed. That is legitimate when
-    /// PostgreSQL 18.x changes one — re-vendor, update the digest, and say so
-    /// in `progress.md` — and is a bug in every other case, including a stray
-    /// editor reformat or a line-ending conversion. The lengths are asserted
-    /// too so the failure says *which* file and by how much.
+    /// PostgreSQL 18.x changes one — re-vendor from upstream (tag `REL_18_6`
+    /// or the published tarball, never pgrust's tree; see ADR-0007), update
+    /// the digest, and say so on the Linear issue — and is a bug in every
+    /// other case, including a stray editor reformat or a line-ending
+    /// conversion. The lengths are asserted too so the failure says *which*
+    /// file and by how much.
     ///
     /// A digest proves only "unchanged since someone pinned it", never
     /// "upstream's". It is computed *from* the file, so whatever bytes were

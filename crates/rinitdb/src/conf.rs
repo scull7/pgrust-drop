@@ -821,8 +821,8 @@ mod tests {
             String::new(),
             String::from(
                 "Moving to a newer PostgreSQL is a deliberate act: update UPSTREAM_SAMPLES \
-                 here and crates/rinitdb/share/README.md in the same commit, and say so in \
-                 progress.md.",
+                 here and crates/rinitdb/share/README.md in the same commit, and say so on \
+                 the Linear issue.",
             ),
         ]
         .join("\n")

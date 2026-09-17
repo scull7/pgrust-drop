@@ -45,7 +45,8 @@ and from this directory with `sha256sum crates/rinitdb/share/*.sample`. The
 two must agree. The release identity above (tag, commit, tarball digest) is
 repeated verbatim in `conf.rs` next to the test, so a reader who arrives at
 either one finds the other; change them together, in the same commit, and say
-why in `progress.md`.
+why on the Linear issue (project *pgrust-drop*, team NAT) — `progress.md` is
+retired.
 
 **Do not re-vendor these from pgrust's `crates/postgres-18.6-reference/`
 tree.** It is not a pristine PostgreSQL checkout: pgrust modifies it, and its

@@ -22,13 +22,30 @@ published SHA-256 (`…/postgresql-18.6.tar.bz2.sha256`) is
 
 and cross-checked against the `postgres/postgres` GitHub mirror at tag
 `REL_18_6`, commit `724edf9bde9d356724ad384a2e196edc3c9f80f7`. The two agree
-byte for byte. The SHA-256 of each file as vendored:
+byte for byte. The SHA-256 of each file as upstream ships it — verified
+from both sources above, and therefore also the digest of each file here:
 
 | file                     | sha256                                                             |
 | ------------------------ | ------------------------------------------------------------------ |
 | `postgresql.conf.sample` | `93e3da1fc8d667ba086ee239e5f053581739648a90566f191666cc63de16357f` |
 | `pg_hba.conf.sample`     | `e3abfe29646ac6ece67e92d0b5255eb3b35d2878d23c7ea6bbd94f100054c168` |
 | `pg_ident.conf.sample`   | `bf8f1664dc42eeb78a71a3746afb6b6c93805bda55ff4504f796dbe339d1fa50` |
+
+These three digests are not a record of what happens to be in this directory:
+they are what PostgreSQL 18.6 ships, and the test
+`each_embedded_template_is_the_file_postgresql_18_6_ships` in
+`crates/rinitdb/src/conf.rs` asserts each vendored file against them on every
+`cargo test`. Recompute them from upstream with
+
+    sha256sum postgresql-18.6/src/backend/utils/misc/postgresql.conf.sample \
+              postgresql-18.6/src/backend/libpq/pg_hba.conf.sample \
+              postgresql-18.6/src/backend/libpq/pg_ident.conf.sample
+
+and from this directory with `sha256sum crates/rinitdb/share/*.sample`. The
+two must agree. The release identity above (tag, commit, tarball digest) is
+repeated verbatim in `conf.rs` next to the test, so a reader who arrives at
+either one finds the other; change them together, in the same commit, and say
+why in `progress.md`.
 
 **Do not re-vendor these from pgrust's `crates/postgres-18.6-reference/`
 tree.** It is not a pristine PostgreSQL checkout: pgrust modifies it, and its
@@ -40,10 +57,13 @@ cluster `rinitdb` created. Re-vendor only from an official PostgreSQL release
 tarball or the `postgres/postgres` tag, and record the version and digests
 above.
 
-`crates/rinitdb/src/conf.rs` pins each file's length and digest, and asserts
-that `postgresql.conf.sample` carries only upstream's section banners and no
-namespaced (extension-style) setting — the two properties a mere digest, which
-blesses whatever was vendored, cannot establish.
+`crates/rinitdb/src/conf.rs` holds the tests that keep this directory honest.
+One pins each file's length and an in-repo digest — that one proves only
+"unchanged since it was vendored", which is exactly what the contaminated
+sample satisfied. The other three state what the files must *be*, from facts
+recorded about upstream rather than read back out of the files: each file's
+upstream SHA-256 (above), the section banners `postgresql.conf.sample` may
+carry, and the absence of any namespaced (extension-style) setting.
 
 ## Licence
 

@@ -65,16 +65,49 @@ Locale correctness then comes from the machine creating the cluster, one image
 serves every libc and every locale the host supports, and the matrix is no
 longer frozen at mint time.
 
-**Fallback, if pgrust's `--single` cannot import collations or report a
-collation version** (unknown until NAT-376 vendors pgrust): ship a single
-libc-neutral image minted with `--locale-provider=builtin --builtin-locale=C.UTF-8`
-`--encoding=UTF8`, and reject any other locale request with a clear error.
-`builtin` is chosen over `--no-locale` because it is portable by construction
-(its version is PostgreSQL's, not libc's) and still gives real UTF-8 ctype, so
-`lower()` and `upper()` work on non-ASCII in a developer's test cluster.
+**pgrust supports this** (owner research, 2026-09-17). `--single` is a real
+backend, not a stub: `main_main` dispatches `DispatchOption::Single` to
+`postgres_single_user_main`, and `--boot` is the only refused mode. The session
+is the bootstrap superuser, so the import function's `superuser()` check passes.
+Both functions are ordinary SQL builtins —
+`pg_import_system_collations(regnamespace) -> int4` (foid 3445,
+`crates/backend/commands/collationcmds/src/import.rs`) and
+`pg_collation_actual_version(oid) -> text` (foid 3448) — and import writes
+`CollationForm.collversion` from `get_collation_actual_version()` as each row is
+created. NAT-376 only has to pin a rev that already contains the port; the
+`--single` script itself is NAT-383.
 
-Either way the invariant holds and is expressed as a type, not a comment: what
-may be baked is closed, and neither variant is libc-versioned.
+The image is minted `--no-locale --encoding=UTF8`, so the default database is C
+and `datcollversion` is NULL by design. After expand, `rinitdb` runs the two
+statements `initdb.c` runs:
+
+```sql
+UPDATE pg_collation SET collversion = pg_collation_actual_version(oid) WHERE collname = 'unicode';
+SELECT pg_import_system_collations('pg_catalog');
+```
+
+The import is skipped unless the user asked for a locale, and
+`ALTER DATABASE ... REFRESH COLLATION VERSION` is added only when the minted
+template's recorded version and the expand host disagree.
+
+**What a collation version is, per provider.** A NULL is not a failure:
+
+| provider | locale | `collversion` |
+| -------- | ------ | ------------- |
+| builtin | `C`, `C.UTF-8`, `PG_UNICODE_FAST` | `"1"` |
+| libc | `C`, `C.*`, `POSIX` | NULL, as in C PostgreSQL |
+| libc | anything else, linux-gnu | `gnu_get_libc_version()`, e.g. `2.39` |
+| libc | anything else, macOS or musl | NULL |
+| ICU | any loaded langtag | `ucol_getVersion`; skipped entirely when libicu is not loadable |
+
+So the apple and musl lanes must treat a NULL libc `collversion` as correct.
+That is a lane expectation, not a bug to chase.
+
+The invariant that makes this safe is expressed as a type, not a comment: the
+set of locales that may be baked is closed, and no member of it is
+libc-versioned. `--no-locale` is the recipe in use; `BuiltinCUtf8` is admissible
+if a UTF-8 ctype template is ever wanted, because its version is PostgreSQL's
+own (`"1"`), not libc's.
 
 ```rust
 /// Locales that may be baked into the embedded image. Both are versionless or
@@ -86,9 +119,13 @@ enum BakedLocale { C, BuiltinCUtf8 }
 
 - Cluster creation is an unpack plus a short single-user session: milliseconds,
   no C toolchain, no share directory on the host.
-- Run-time stamping is more work in `--single` than baking was, and it depends
-  on a pgrust capability that is not yet verified. NAT-376 must answer it before
-  M1 commits; the fallback above is the hedge.
+- Run-time stamping is more work in `--single` than baking was, but the pgrust
+  capability it needs is confirmed present, so M1 can commit to it on the gnu
+  lane. Expand-time failures to handle: no `locale` on PATH gives ERROR
+  `could not execute command "locale -a"`, which kills the statement but not
+  `--single`; zero usable locales gives WARNING `no usable system locales were
+  found` and the function still returns; re-import is idempotent, since existing
+  names are skipped.
 - Locales the host's libc does not have still fail, but they now fail on the
   machine that would have to support them, with that libc's own error, instead
   of being excluded at mint time. musl accepts locale names glibc rejects, which

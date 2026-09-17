@@ -56,12 +56,24 @@ entries in `docs/divergences.md`.
   host, `actions/checkout` in a container) has never executed; first PR run is
   its real test.
 
+**Resolved same day (owner, 2026-09-17)**
+- `webpki-roots` approved as rlibpq's root store (ADR-0006).
+- pgrust's `--single` **does** support `pg_import_system_collations()` (foid
+  3445) and `pg_collation_actual_version()` (foid 3448), and stamps
+  `collversion` as rows are created, so M1 commits to run-time stamping on the
+  gnu lane. A NULL libc `collversion` on macOS or musl is correct, not a bug.
+  NAT-376 only pins a rev containing the port; the `--single` script is NAT-383,
+  whose description now carries the statements, the provider table and the
+  failure modes.
+- Linear: NAT-383 and NAT-376 updated; NAT-425 (psql reference per lane, M3),
+  NAT-426 (arm image portability, v2), NAT-427 (Docker fixtures, v2) created.
+
 **Risks / open questions**
-- ADR-0002's run-time stamping depends on pgrust's `--single` supporting
-  `pg_import_system_collations()` and reporting a collation version. Unverified
-  until NAT-376 vendors pgrust; the `builtin` fallback is the hedge.
 - Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
   guess; the Alpine lane fetches from Maven, so nothing depends on it yet.
+- Branch protection requiring the `gnu` check is **not** applied: this session's
+  GitHub credentials get 403 `Resource not accessible by integration` on the
+  branch-protection API and no ruleset tool is exposed. Owner action, see below.
 - Template image portability across architectures is untested → v2, via a
   `pg_controldata` comparison on an arm runner.
 - `PGDROP_REF_BIN` (lane-agnostic) is still accepted and is an unchecked
@@ -71,9 +83,12 @@ entries in `docs/divergences.md`.
 
 **Follow-ups**
 - NAT-374 gate runner: now partly done (the fetch script and both lanes run).
-- Root store decision for ADR-0006 (`webpki-roots` needs approval as a new dep).
-- New Linear issues wanted: run-time locale stamping in `--single`, arm
-  portability (v2), Docker-based fixtures (v2), psql reference for M3.
+- **Owner action**: make `gnu` a required status check on `main`
+  (Settings > Branches, or Rulesets > require status checks). Until then the
+  lane ordering is advisory: `needs: musl` still gates execution, but nothing
+  blocks a merge on a red `gnu`.
+- ELF-interpreter check on the reference binary, to turn the lane-agnostic
+  `PGDROP_REF_BIN` from a trusted assertion into an enforced one.
 
 ## 2026-09-16 — Owner decisions applied (NAT-375, NAT-392, NAT-398, NAT-405)
 

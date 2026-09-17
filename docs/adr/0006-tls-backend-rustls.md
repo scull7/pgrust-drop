@@ -33,11 +33,11 @@ is never pulled in alongside it.
   lands, the workspace cross-builds to a static-pie musl binary with no C
   compiler at all, so this is a real cost, accepted for the cross-platform
   build story. CI's musl lane and `AGENTS.md` must state the prerequisite.
-- `sslmode=verify-ca|verify-full` need root stores: `webpki-roots` or the
-  system store via `rustls-native-certs`. Not yet decided —
-  `webpki-roots` suits a static musl binary with no assumption about
-  `/etc/ssl`, but it is a second new dependency and needs owner approval under
-  the AGENTS.md rule.
+- `sslmode=verify-ca|verify-full` use **`webpki-roots`** (owner approval,
+  2026-09-17), not the system store via `rustls-native-certs`: a static musl
+  binary on an Omen device cannot assume `/etc/ssl` exists or is populated, and
+  a compiled-in root set is the same on every lane. `sslrootcert` still takes
+  precedence when the connection string names a file, matching libpq.
 - `sslrootcert`, `sslcert`, `sslkey` map onto rustls' PEM loading; client
   certificates and `sslcrl` are covered by rustls, `sslpassword` for encrypted
   keys needs a small PKCS#8 decrypt (evaluate when reached).

@@ -32,7 +32,7 @@ fn program_options_handling_ok() {
 /// Byte-diff gate: `--help` and `--version` against the C initdb when present.
 #[test]
 fn help_and_version_match_reference_initdb() {
-    let Some(reference_bin) = reference::find("initdb") else {
+    let Some(reference_bin) = reference::find_or_skip("initdb") else {
         println!("{}", reference::skip_message("initdb"));
         return;
     };

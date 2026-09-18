@@ -203,7 +203,22 @@ fn the_messages_name_a_path_that_is_not_utf8_byte_for_byte() {
     let dir = PathBuf::from(OsString::from_vec(
         [parent.path().as_os_str().as_bytes(), b"/b\xffad"].concat(),
     ));
-    std::fs::create_dir(&dir).expect("create a directory whose name is not UTF-8");
+    // APFS refuses a name that is not valid UTF-8 (`EILSEQ`), so on macOS the
+    // fixture cannot exist and the case cannot be exercised there. Announced,
+    // never silent: the byte-for-byte rendering is still proved on Linux.
+    if let Err(err) = std::fs::create_dir(&dir) {
+        assert_eq!(
+            err.raw_os_error(),
+            Some(EILSEQ),
+            "create a directory whose name is not UTF-8: {err}"
+        );
+        testkit::reference::announce_skip(&format!(
+            "{}: this filesystem refuses a directory name that is not UTF-8 ({err}), \
+             so the byte-for-byte path message cannot be exercised here",
+            testkit::reference::SKIP_FLAG
+        ));
+        return;
+    }
     let psql = dir.join("psql");
     std::fs::write(&psql, b"not a link\n").expect("write psql");
 
@@ -220,6 +235,15 @@ fn the_messages_name_a_path_that_is_not_utf8_byte_for_byte() {
     contains_bytes(&installed.stdout, dir.join("initdb").as_os_str().as_bytes());
     substitutes_nothing(&installed.stdout);
 }
+
+/// `errno.h`'s "Illegal byte sequence": 92 on Darwin (`sys/errno.h`), 84 on
+/// Linux (`asm-generic/errno.h`). What a filesystem that validates names as
+/// UTF-8 answers to `mkdir`.
+const EILSEQ: i32 = if cfg!(target_vendor = "apple") {
+    92
+} else {
+    84
+};
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) {
     assert!(

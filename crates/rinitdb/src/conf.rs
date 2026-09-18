@@ -710,7 +710,7 @@ mod tests {
     ///
     /// A failure here means a template changed. That is legitimate when
     /// PostgreSQL 18.x changes one — re-vendor from upstream (tag `REL_18_6`
-    /// or the published tarball, never pgrust's tree; see ADR-0007), update
+    /// or the published tarball, never pgrust's tree; see ADR-0008), update
     /// the digest, and say so on the Linear issue — and is a bug in every
     /// other case, including a stray editor reformat or a line-ending
     /// conversion. The lengths are asserted too so the failure says *which*

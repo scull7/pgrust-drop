@@ -1,6 +1,7 @@
 # ADR-0007: target matrix, libc lanes and reference binaries
 
-Status: accepted (owner decision 2026-09-17).
+Status: accepted (owner decision 2026-09-17); amended 2026-09-18 (CI reference
+source per lane, see below).
 
 ## Context
 
@@ -103,3 +104,31 @@ are a v2 question.
 - Adding `ring` (ADR-0006) puts a C compiler back in the musl build: `musl-tools`
   plus `CC_x86_64_unknown_linux_musl=musl-gcc`. Without it the workspace
   cross-builds to a static-pie musl binary with no C toolchain at all.
+
+## Amendment 2026-09-18: CI installs one complete PostgreSQL 18 per lane
+
+Made while merging `main` into the `nightshift/2026-09-16` branch, which the
+Consequences above anticipated ("the M3 rpsql gate needs its own reference per
+lane … decided when M3 starts"). That branch's gates drive `psql`,
+`pg_controldata` and `pg_checksums` as well as `initdb`, and its cluster gate
+(`crates/rlibpq/tests/t_protocol3.rs`) refuses to pair an `initdb` from one tree
+with a `psql` from another. The Maven bundles ship only `initdb`, `postgres` and
+`pg_ctl`, so a lane whose variable pointed at a bundle would either fail every
+other gate under `PGDROP_REQUIRE_REF=1` or, if a distribution package were
+added beside it, compare two different servers.
+
+So in CI each lane installs **one complete** PostgreSQL 18 from its platform's
+packages and points its lane variable at that tree: PGDG apt on `gnu`
+(`/usr/lib/postgresql/18/bin`), Alpine's `postgresql18` + `postgresql18-client`
+on `musl` (`/usr/libexec/postgresql18`, on `alpine:3.23`, the first release
+carrying 18), Homebrew's `postgresql@18` on `apple`
+(`/opt/homebrew/opt/postgresql@18/bin`). Each lane checks every tool is present
+before the suite runs, so a missing one fails there rather than three minutes
+later inside a gate. `scripts/fetch-ref-binaries.sh` stays the laptop path.
+
+Two costs. A distribution build is not a vanilla build: PGDG moves the socket
+directory by patching `pg_config_manual.h`, and the gates already read that
+back out of the `postgresql.conf` C wrote rather than assuming the stock
+value. And the musl lane's checks run as an unprivileged user (`su -c … ci`, which also gives the gates that user's `HOME`, `USER` and `LOGNAME`)
+because container steps run as root and C `initdb`/`postgres` refuse root — a
+gate that compared two refusals would be green and prove nothing.

@@ -45,7 +45,7 @@ tarball before anything taken from it lands.
 That distinction is not pedantry. `crates/rinitdb/share/postgresql.conf.sample`
 was vendored from that tree and carried the 41 `# PGRUST` lines into an
 MIT-licensed crate, against ADR-0003 (pgrust is AGPL-3.0). Re-vendored from
-pristine sources in PR #11. See ADR-0007.
+pristine sources in PR #11. See ADR-0008.
 
 ## Method: steal the tests
 
@@ -88,12 +88,19 @@ The product ships to **Alpine/musl** (Omen devices) and **aarch64 macOS**
 (developer laptops); glibc is the odd one out. A byte-diff gate is only valid
 when both sides link the same C library, so `testkit::reference` keys discovery
 on the compiled target's libc and each lane has its own variable
-(`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`). Get the reference binaries with
-`scripts/fetch-ref-binaries.sh`; never point one lane's variable at another
-lane's directory. `scripts/setup-branch-ruleset.sh` applies the matching `main`
-ruleset (owner-run, needs `gh` as a repository admin). CI runs musl on every push (`container: alpine`), then gnu and
-apple on pull requests via `needs: musl`; `gnu` is the required check. Docker is
-not a dependency of the product, the harness or the developer workflow — CI's
+(`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`), tried before the lane-agnostic
+`PGDROP_REF_BIN`. Never point one lane's variable at another lane's directory.
+On a laptop, `scripts/fetch-ref-binaries.sh` gets the Maven bundles (`initdb`,
+`postgres`, `pg_ctl`). In CI each lane installs **one complete** PostgreSQL 18
+from its platform's packages (PGDG apt, Alpine `postgresql18`, Homebrew
+`postgresql@18`) and points the lane variable at it, because the gates also
+drive `psql`, `pg_controldata` and `pg_checksums`, and a cluster gate needs all
+of its tools from one tree (ADR-0007, amendment). `PGDROP_REQUIRE_REF=1` in CI
+turns a missing reference into a failure. `scripts/setup-branch-ruleset.sh`
+applies the matching `main` ruleset (owner-run, needs `gh` as a repository
+admin). CI runs musl on every push (`container: alpine`), then gnu and apple on
+pull requests via `needs: musl`; all three are required checks. Docker is not a
+dependency of the product, the harness or the developer workflow — CI's
 container does not change that.
 
 ## Rust rules
@@ -103,9 +110,11 @@ container does not change that.
   `cargo test --all-features` must pass before a push. Run the musl lane too
   (`--target x86_64-unknown-linux-musl`); it is the one CI gates every push.
 - stdlib first. **No new dependencies without explicit approval.** Approved so
-  far (owner, 2026-09-16): `usage-rs` (all CLIs), `thiserror` (typed errors),
-  `rustls` (rlibpq TLS, ADR-0006), `redox_liner` (rpsql line editing,
-  ADR-0005). `anyhow` is not approved.
+  far: `usage-rs` (all CLIs), `thiserror` (typed errors), `rustls` (rlibpq TLS,
+  ADR-0006), `redox_liner` (rpsql line editing, ADR-0005) — owner, 2026-09-16;
+  `ring` (rustls crypto provider) and `webpki-roots` (root store) — owner,
+  2026-09-17. `anyhow` is not approved. `ring` needs a musl C toolchain:
+  `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`.
 - **`thiserror` is deliberately not universal.** It is used where an error's
   text is a Rust string: `rinitdb` (`error.rs`, `control.rs`) and `testkit`
   (`gate.rs`, `pattern.rs`). `rlibpq` and `rpsql` depend on it not at all and

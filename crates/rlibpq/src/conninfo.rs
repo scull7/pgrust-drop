@@ -5,7 +5,7 @@
 //! - [`CONNINFO_OPTIONS`] is `fe-connect.c:200`'s table, transcribed in its
 //!   order, which the `libpq_uri_regress` printer depends on ("XXX this coding
 //!   assumes that `PQconninfoOption` structs always have the keywords in the
-//!   same order", `libpq_uri_regress.c:48`).
+//!   same order", `libpq_uri_regress.c:50`).
 //! - [`ConnInfo`] is one working copy of that table (`conninfo_init`,
 //!   `fe-connect.c:6197`), and every parser here is a pure function over bytes.
 //! - [`Env::from_process`] is the only action: reading this process's
@@ -23,7 +23,7 @@ use crate::pg_config::{
 use crate::text::RawText;
 use crate::uri;
 
-/// How a connect dialog should show a field: `fe-connect.c:186`'s `dispchar`.
+/// How a connect dialog should show a field: `fe-connect.c:185`'s `dispchar`.
 ///
 /// An enum rather than the `char *` C keeps, because the three values are the
 /// whole domain and server-side clients branch on them (`fe-connect.c:163`:
@@ -637,7 +637,7 @@ impl ConnInfo {
                 self.values[index] = env.effective_user().map(RawText::new);
             }
         }
-        // fe-connect.c:6729: sslrootcert=system with no explicit sslmode
+        // fe-connect.c:6730: sslrootcert=system with no explicit sslmode
         // strengthens the default to verify-full.
         if let Some(index) = sslmode_default
             && self.get("sslrootcert") == Some(b"system")
@@ -687,13 +687,13 @@ impl Env {
         self
     }
 
-    /// `getenv` (`fe-connect.c:6659`).
+    /// `getenv` (`fe-connect.c:6656`).
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&[u8]> {
         self.vars.get(key).map(Vec::as_slice)
     }
 
-    /// `pg_fe_getauthname(NULL)` (`fe-connect.c:6723`), which is
+    /// `pg_fe_getauthname(NULL)` (`fe-connect.c:6724`), which is
     /// `pg_fe_getusername(geteuid())` (`fe-auth.c:1349`) and so a `getpwuid`
     /// lookup.
     ///
@@ -723,7 +723,7 @@ pub fn conndefaults(env: &Env) -> ConnInfo {
     options
 }
 
-/// `uri_prefix_length` (`fe-connect.c:6255`): how long the URI designator is,
+/// `uri_prefix_length` (`fe-connect.c:6256`): how long the URI designator is,
 /// or 0 when the string does not start with one.
 #[must_use]
 pub fn uri_prefix_length(connstr: &[u8]) -> usize {
@@ -738,7 +738,7 @@ pub fn uri_prefix_length(connstr: &[u8]) -> usize {
     }
 }
 
-/// `recognized_connection_string` (`fe-connect.c:6280`).
+/// `recognized_connection_string` (`fe-connect.c:6279`).
 #[must_use]
 pub fn recognized_connection_string(connstr: &[u8]) -> bool {
     uri_prefix_length(connstr) != 0 || connstr.contains(&b'=')
@@ -822,7 +822,7 @@ pub fn parse_keyword_value(conninfo: &[u8]) -> Result<ConnInfo, ConnError> {
     Ok(options)
 }
 
-/// The unquoted arm of `conninfo_parse`'s value scanner (`fe-connect.c:6362`):
+/// The unquoted arm of `conninfo_parse`'s value scanner (`fe-connect.c:6366`):
 /// runs to the first unescaped space or to the end.
 fn read_bare_value(buf: &[u8], cp: &mut usize) -> Vec<u8> {
     let mut value = Vec::new();
@@ -845,7 +845,7 @@ fn read_bare_value(buf: &[u8], cp: &mut usize) -> Vec<u8> {
     value
 }
 
-/// The quoted arm (`fe-connect.c:6386`): `cp` is already past the opening
+/// The quoted arm (`fe-connect.c:6387`): `cp` is already past the opening
 /// quote; runs to the closing one.
 fn read_quoted_value(buf: &[u8], cp: &mut usize) -> Result<Vec<u8>, ConnError> {
     let mut value = Vec::new();
@@ -876,7 +876,7 @@ mod tests {
 
     /// The keywords of `PQconninfoOptions[]` (`fe-connect.c:200`), in its
     /// order. `libpq_uri_regress` walks the parsed options and the defaults in
-    /// lockstep and trusts that order (`libpq_uri_regress.c:48`), so a row
+    /// lockstep and trusts that order (`libpq_uri_regress.c:50`), so a row
     /// moved here is a wrong answer there, not a cosmetic change.
     const UPSTREAM_KEYWORDS: [&str; 50] = [
         "service",
@@ -1136,7 +1136,7 @@ mod tests {
         assert_eq!(explicit.get("sslmode"), Some(b"allow".as_slice()));
     }
 
-    /// `fe-connect.c:6729` — the case the last three rows of `001_uri.pl` are
+    /// `fe-connect.c:6730` — the case the last three rows of `001_uri.pl` are
     /// there to pin.
     #[test]
     fn sslrootcert_system_strengthens_the_default_sslmode_to_verify_full() {

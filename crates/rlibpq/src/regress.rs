@@ -1,6 +1,6 @@
 //! The printer `libpq_uri_regress` uses, as a calculation.
 //!
-//! `src/interfaces/libpq/test/libpq_uri_regress.c:52` walks the parsed options
+//! `src/interfaces/libpq/test/libpq_uri_regress.c:53` walks the parsed options
 //! and the defaults in lockstep and prints every option whose value differs
 //! from its default, then says whether the connection would be a Unix-domain
 //! socket or an inet one. Its own comment is the reason [`ConnInfo`] keeps
@@ -84,7 +84,7 @@ mod tests {
         );
     }
 
-    /// `libpq_uri_regress.c:60`: a host starting with `/` is a socket
+    /// `libpq_uri_regress.c:61`: a host starting with `/` is a socket
     /// directory, `hostaddr` is always inet, and an empty value decides nothing.
     #[test]
     fn the_local_and_inet_verdict_follows_the_host_value() {

@@ -19,7 +19,7 @@ pub fn at(bytes: &[u8], index: usize) -> u8 {
 /// (`Utils.pm:112` sets `LC_MESSAGES=C`) and the only one whose answer here is
 /// portable: space, tab, newline, vertical tab, form feed, carriage return.
 ///
-/// `conninfo_parse` (`fe-connect.c:6314`) calls it on `(unsigned char) *cp`, so
+/// `conninfo_parse` (`fe-connect.c:6317`) calls it on `(unsigned char) *cp`, so
 /// it is a byte question and never a character one.
 #[must_use]
 pub fn is_space(byte: u8) -> bool {

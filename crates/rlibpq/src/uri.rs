@@ -1,12 +1,12 @@
 //! The URI arm of the connection-string parser.
 //!
 //! `postgresql://[user[:password]@][netloc][:port][,...][/dbname][?p=v&...]`,
-//! transcribed from `conninfo_uri_parse_options` (`fe-connect.c:6813`), its
-//! query-parameter loop (`:7054`) and the percent-decoder (`:7187`).
+//! transcribed from `conninfo_uri_parse_options` (`fe-connect.c:6812`), its
+//! query-parameter loop (`:7053`) and the percent-decoder (`:7186`).
 //!
 //! The C routines walk a mutable copy of the URI and cut it into pieces by
 //! writing NULs; these walk the original and take slices, which is why every
-//! loop bound reads through [`crate::cstr::at`] — the terminator a C loop tests
+//! loop bound reads through `cstr::at` — the terminator a C loop tests
 //! for is "past the end" here, and nothing else about the loops changes.
 
 use crate::conninfo::{ConnInfo, uri_prefix_length};
@@ -32,7 +32,7 @@ fn store_builtin(options: &mut ConnInfo, keyword: &'static str, value: &[u8]) {
     );
 }
 
-/// `conninfo_uri_parse_options` (`fe-connect.c:6813`).
+/// `conninfo_uri_parse_options` (`fe-connect.c:6812`).
 fn parse_uri_options(options: &mut ConnInfo, uri: &[u8]) -> Result<(), ConnError> {
     let buf = uri;
 
@@ -123,7 +123,7 @@ fn parse_uri_options(options: &mut ConnInfo, uri: &[u8]) -> Result<(), ConnError
 }
 
 /// The `for (;;)` over comma-separated `netloc[:port]` pairs
-/// (`fe-connect.c:6893`), filling the two buffers whose contents become the
+/// (`fe-connect.c:6913`), filling the two buffers whose contents become the
 /// `host` and `port` values.
 fn parse_netlocs(
     buf: &[u8],
@@ -195,7 +195,7 @@ fn parse_netlocs(
     }
 }
 
-/// `conninfo_uri_parse_params` (`fe-connect.c:7054`): split on `&` and `=`
+/// `conninfo_uri_parse_params` (`fe-connect.c:7053`): split on `&` and `=`
 /// *before* decoding, then decode each half.
 fn parse_uri_params(params: &[u8], options: &mut ConnInfo) -> Result<(), ConnError> {
     let mut pos = 0usize;
@@ -252,7 +252,7 @@ fn parse_uri_params(params: &[u8], options: &mut ConnInfo) -> Result<(), ConnErr
     Ok(())
 }
 
-/// `conninfo_uri_decode` (`fe-connect.c:7187`): replace every `%xy` triplet,
+/// `conninfo_uri_decode` (`fe-connect.c:7186`): replace every `%xy` triplet,
 /// tolerate leading and trailing spaces, reject any other space.
 ///
 /// # Errors
@@ -314,7 +314,7 @@ pub fn uri_decode(str: &[u8]) -> Result<Vec<u8>, ConnError> {
     Ok(buf)
 }
 
-/// `get_hexdigit` (`fe-connect.c:7276`): lower- and upper-case A-F are treated
+/// `get_hexdigit` (`fe-connect.c:7286`): lower- and upper-case A-F are treated
 /// identically.
 fn hexdigit(digit: u8) -> Option<u8> {
     match digit {
@@ -393,7 +393,7 @@ mod tests {
     }
 
     /// The comma extension `conninfo_uri_parse_options` documents
-    /// (`fe-connect.c:6828`): one `host` and one `port` value, each a list.
+    /// (`fe-connect.c:6906`): one `host` and one `port` value, each a list.
     /// `001_uri.pl` has no case for it; NAT-394 is where it earns its tests.
     #[test]
     fn several_netlocs_become_one_comma_separated_host_and_port() {
@@ -455,7 +455,7 @@ mod tests {
 
     /// A query parameter is split on `&` and `=` before it is decoded, so a
     /// percent-encoded separator is data and not a separator
-    /// (`fe-connect.c:7068`).
+    /// (`fe-connect.c:7066`).
     #[test]
     fn a_percent_encoded_separator_does_not_split_a_parameter() {
         assert_eq!(

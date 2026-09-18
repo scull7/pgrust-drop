@@ -18,6 +18,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # A byte-diff gate that cannot find its reference binary prints SKIP and
+  # passes, which is indistinguishable from a green gate in the CI summary. In
+  # CI a missing reference is a failure.
+  PGDROP_REQUIRE_REF: 1
 
 jobs:
   musl:

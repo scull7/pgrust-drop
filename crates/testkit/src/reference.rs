@@ -115,6 +115,39 @@ pub fn find(tool: &str) -> Option<PathBuf> {
     )
 }
 
+/// Set in CI to turn a missing reference into a failure instead of a skip.
+///
+/// A skipped gate and a passing gate look identical in a CI summary, so the
+/// lane that is supposed to prove conformance can quietly stop proving it —
+/// exactly the silent narrowing `AGENTS.md` forbids. CI sets this; a laptop
+/// without the binaries still skips.
+pub const REQUIRE_REF_ENV: &str = "PGDROP_REQUIRE_REF";
+
+/// Pure: does a missing reference fail the gate, given the variable's value?
+///
+/// Absent or `0` means skip; any other value means require.
+#[must_use]
+pub fn is_required(setting: Option<&str>) -> bool {
+    matches!(setting, Some(value) if value != "0")
+}
+
+/// Action: the reference `tool`, or `None` when the gate may skip.
+///
+/// # Panics
+///
+/// When [`REQUIRE_REF_ENV`] demands the reference and it is not installed, so
+/// a lane cannot report success without having run the diff.
+#[must_use]
+pub fn find_or_skip(tool: &str) -> Option<PathBuf> {
+    let found = find(tool);
+    assert!(
+        !(found.is_none() && is_required(std::env::var(REQUIRE_REF_ENV).ok().as_deref())),
+        "{REQUIRE_REF_ENV} is set: {}",
+        skip_message(tool)
+    );
+    found
+}
+
 /// The message a gate prints when the reference tool is absent.
 ///
 /// It names the lane so a skipped gate cannot be mistaken for the wrong libc
@@ -184,6 +217,14 @@ mod tests {
                 assert_ne!(a.as_str(), b.as_str());
             }
         }
+    }
+
+    #[test]
+    fn a_missing_reference_only_fails_when_ci_demands_it() {
+        assert!(!is_required(None));
+        assert!(!is_required(Some("0")));
+        assert!(is_required(Some("1")));
+        assert!(is_required(Some("true")));
     }
 
     #[test]

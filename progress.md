@@ -68,6 +68,16 @@ entries in `docs/divergences.md`.
 - Linear: NAT-383 and NAT-376 updated; NAT-425 (psql reference per lane, M3),
   NAT-426 (arm image portability, v2), NAT-427 (Docker fixtures, v2) created.
 
+**CI, first real run (PR #15)**
+- All three lanes green on the first attempt, including the Alpine container
+  job: `actions/checkout` and rustup both work on a musl host, which was the
+  part nothing had ever exercised.
+- Green did not prove the gate *ran*, though: a missing reference binary makes
+  the byte-diff test print SKIP and pass, and the println is captured, so a lane
+  that silently stopped proving conformance looks identical to one that proved
+  it. `PGDROP_REQUIRE_REF=1` (set in CI) now turns that skip into a failure, via
+  `reference::find_or_skip`. A laptop without the binaries still skips.
+
 **Risks / open questions**
 - Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
   guess; the Alpine lane fetches from Maven, so nothing depends on it yet.

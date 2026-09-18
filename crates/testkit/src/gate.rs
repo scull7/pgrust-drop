@@ -549,6 +549,7 @@ mod tests {
 
     use super::*;
     use crate::normalize::{DEFAULT, TIMING};
+    use crate::reference::RefPolicy;
 
     fn outcome(status: i32, stdout: &str, stderr: &str) -> CommandOutcome {
         CommandOutcome::new(Some(status), stdout.as_bytes(), stderr.as_bytes())
@@ -738,10 +739,31 @@ mod tests {
     }
 
     #[test]
-    fn for_tool_or_skip_is_none_when_the_reference_is_absent() {
-        // The real wiring, announcement included: the `SKIP (flagged, not
-        // silent)` line this prints on stderr is the mechanism working.
-        assert!(Gate::for_tool_or_skip("no-such-postgres-tool", "target/debug/rinitdb").is_none());
+    fn for_tool_or_skip_follows_the_active_policy_when_the_reference_is_absent() {
+        // The real wiring, announcement included. Which arm runs is decided by
+        // the policy this process was started under, so the test asserts that
+        // arm rather than assuming the permissive default: locally the
+        // `SKIP (flagged, not silent)` line this prints on stderr is the
+        // mechanism working, and in CI, where PGDROP_REQUIRE_REF is set, the
+        // same absent reference failing the gate is the mechanism working.
+        let attempt = std::panic::catch_unwind(|| {
+            Gate::for_tool_or_skip("no-such-postgres-tool", "target/debug/rinitdb").is_none()
+        });
+
+        match reference::policy() {
+            RefPolicy::Skip => {
+                assert!(attempt.expect("the permissive policy announces, it never panics"));
+            }
+            RefPolicy::Require => {
+                let panic = attempt.expect_err("the strict policy fails the gate");
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "(panic payload is not a String)".to_owned());
+                assert!(message.contains(reference::REQUIRE_REF_ENV), "{message}");
+                assert!(message.contains("no-such-postgres-tool"), "{message}");
+            }
+        }
     }
 
     #[test]

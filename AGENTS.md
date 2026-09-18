@@ -51,7 +51,8 @@ when both sides link the same C library, so `testkit::reference` keys discovery
 on the compiled target's libc and each lane has its own variable
 (`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`). Get the reference binaries with
 `scripts/fetch-ref-binaries.sh`; never point one lane's variable at another
-lane's directory. CI runs musl on every push (`container: alpine`), then gnu and
+lane's directory. `scripts/setup-branch-ruleset.sh` applies the matching `main`
+ruleset (owner-run, needs `gh` as a repository admin). CI runs musl on every push (`container: alpine`), then gnu and
 apple on pull requests via `needs: musl`; `gnu` is the required check. Docker is
 not a dependency of the product, the harness or the developer workflow — CI's
 container does not change that.

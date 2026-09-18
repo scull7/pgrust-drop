@@ -84,11 +84,14 @@ entries in `docs/divergences.md`.
 
 **Follow-ups**
 - NAT-374 gate runner: now partly done (the fetch script and both lanes run).
-- **Owner action**: create the `main` branch ruleset requiring the `musl`,
-  `apple` and `gnu` checks (Settings > Rules > Rulesets > New branch ruleset;
-  the enforcement status defaults to Disabled and must be set to Active). Until
-  then the lane ordering is advisory: `needs: musl` gates execution, but nothing
-  blocks a merge.
+- **Owner action**: run `scripts/setup-branch-ruleset.sh` locally with an
+  admin-authenticated `gh` (`--dry-run` first). It creates or updates the `main`
+  ruleset requiring the `musl`, `apple` and `gnu` checks, deriving those names
+  from `ci.yml` so the two cannot drift. The equivalent UI path is
+  Settings > Rulesets > New branch ruleset, where the enforcement status
+  defaults to Disabled and must be set to Active. Until it is applied the lane
+  ordering is advisory: `needs: musl` gates execution, but nothing blocks a
+  merge.
 - Requiring all three is not belt and braces. GitHub treats `skipped` and
   `neutral` as successful, and its own troubleshooting docs say a job skipped
   because a `needs:` dependency failed "may not block merging". With only `gnu`

@@ -29,16 +29,17 @@ pgrust-drop copies that *method* for every crate (the method, not pgrust's corpu
 3. Every normalizer (`Time: XXX ms`, `PID NNN`, system identifier, …) is a pure
    function with a one-line justification next to it.
 4. Missing reference binary → `SKIP (flagged, not silent)` locally, a hard
-   failure in CI. `.github/workflows/ci.yml` installs the PGDG `postgresql-18`
-   and `postgresql-client-18` packages and runs the suite with
-   `PGDROP_REF_BIN=/usr/lib/postgresql/18/bin` and `PGDROP_REQUIRE_REF=1`, so
-   the gates for `initdb`, `pg_ctl`, `pg_controldata`, `pg_checksums` and
-   `psql` are real there and cannot quietly stop running. The one exception is
-   `libpq_uri_regress`: it is a PostgreSQL *test* program built from
-   `src/interfaces/libpq/test/`, no PGDG package ships it, so
-   `testkit::reference::UNSHIPPED_TOOLS` exempts it by name and its gate still
-   flagged-skips in CI (NAT-374). Announce the skip with
-   `testkit::reference::skip` / `announce_skip`, never `println!` or
+   failure in CI. Each lane of `.github/workflows/ci.yml` installs one complete
+   PostgreSQL 18 from its platform's packages (PGDG apt on gnu, Alpine
+   `postgresql18` on musl, Homebrew `postgresql@18` on apple), points its lane
+   variable (`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`) at it and runs the suite with
+   `PGDROP_REQUIRE_REF=1`, so the gates for `initdb`, `pg_ctl`,
+   `pg_controldata`, `pg_checksums` and `psql` are real there and cannot
+   quietly stop running. The one exception is `libpq_uri_regress`: it is a
+   PostgreSQL *test* program built from `src/interfaces/libpq/test/`, no
+   package ships it, so `testkit::reference::UNSHIPPED_TOOLS` exempts it by
+   name and its gate still flagged-skips in CI (NAT-374). Announce the skip
+   with `testkit::reference::skip` / `announce_skip`, never `println!` or
    `eprintln!`: libtest captures both and replays them only for a failing test
    or under `--nocapture`, so a skip announced that way is invisible in the log
    of a passing CI run — a silently narrowed gate.
@@ -47,15 +48,19 @@ pgrust-drop copies that *method* for every crate (the method, not pgrust's corpu
 
 ## Reference binary discovery
 
-`PGDROP_REF_BIN` if set, else the four defaults in
-`crates/testkit/src/reference.rs` (`DEFAULT_REF_DIRS`), in order:
+Keyed on the libc the test binary was compiled against (`testkit::reference::Libc`,
+ADR-0007): the lane's own variable (`PGDROP_REF_BIN_GNU`, `PGDROP_REF_BIN_MUSL`
+or `PGDROP_REF_BIN_APPLE`) if set, then the lane-agnostic `PGDROP_REF_BIN` if
+set, then the lane's install layouts in `Libc::default_dirs`:
 
-1. `/usr/lib/postgresql/18/bin` — PGDG Debian/Ubuntu
-2. `/opt/homebrew/opt/postgresql@18/bin` — Homebrew, Apple silicon
-3. `/usr/local/opt/postgresql@18/bin` — Homebrew, Intel
-4. `/opt/homebrew/bin`
+- gnu: `/usr/lib/postgresql/18/bin` (PGDG Debian/Ubuntu), `/usr/pgsql-18/bin`
+  (PGDG RHEL)
+- musl: `/usr/libexec/postgresql18`, `/usr/lib/postgresql18/bin` (Alpine)
+- apple: `/opt/homebrew/opt/postgresql@18/bin`, `/usr/local/opt/postgresql@18/bin`
+  (Homebrew), `/Applications/Postgres.app/Contents/Versions/18/bin`
 
-(matching pgrust's own sim-sweep search order).
+A directory found through one lane's variable is never consulted by another
+lane, so a stray export cannot pair a musl build with a glibc reference.
 
 ## `PGDROP_REQUIRE_REF`: making the gates bite
 

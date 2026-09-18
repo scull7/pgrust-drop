@@ -1,7 +1,13 @@
 //! Where the C PostgreSQL 18 tools live, for the byte-diff gates.
 //!
-//! Search order matches pgrust's own sim sweep: an explicit environment
-//! variable first, then the PGDG Debian layout, then Homebrew.
+//! A gate is only meaningful when both sides of the diff link the same C
+//! library: `initdb` asks libc to resolve locales, so a glibc reference and a
+//! musl build disagree about output that neither implementation got wrong.
+//! ADR-0007 records the measurements. Discovery is therefore keyed on the
+//! [`Libc`] of *this* test binary, decided at compile time, and each lane has
+//! its own environment variable so a stray export cannot cross the streams.
+//! The lane-agnostic [`REF_BIN_ENV`] is still honoured, after the lane's own
+//! variable, as an assertion by whoever set it that the directory matches.
 //!
 //! A machine without PostgreSQL 18 cannot run a gate at all, so by default a
 //! missing reference is a flagged skip and the test passes. That default is
@@ -26,6 +32,63 @@ pub enum Libc {
     Apple,
 }
 
+impl Libc {
+    /// The libc this test binary was compiled against.
+    pub const HOST: Self = if cfg!(target_vendor = "apple") {
+        Self::Apple
+    } else if cfg!(target_env = "musl") {
+        Self::Musl
+    } else {
+        Self::Gnu
+    };
+
+    /// Lane name, as used in environment variables and CI job names.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gnu => "gnu",
+            Self::Musl => "musl",
+            Self::Apple => "apple",
+        }
+    }
+
+    /// The environment variable that names this lane's reference directory.
+    #[must_use]
+    pub const fn env_var(self) -> &'static str {
+        match self {
+            Self::Gnu => "PGDROP_REF_BIN_GNU",
+            Self::Musl => "PGDROP_REF_BIN_MUSL",
+            Self::Apple => "PGDROP_REF_BIN_APPLE",
+        }
+    }
+
+    /// Install layouts to try when no environment variable is set.
+    ///
+    /// The gnu paths are PGDG's Debian/Ubuntu and RHEL layouts; the musl paths
+    /// are Alpine's `postgresql18` package layout, confirmed by the Alpine CI
+    /// lane rather than by hand; the Apple paths are Homebrew's and
+    /// Postgres.app's.
+    #[must_use]
+    pub const fn default_dirs(self) -> &'static [&'static str] {
+        match self {
+            Self::Gnu => &["/usr/lib/postgresql/18/bin", "/usr/pgsql-18/bin"],
+            Self::Musl => &["/usr/libexec/postgresql18", "/usr/lib/postgresql18/bin"],
+            Self::Apple => &[
+                "/opt/homebrew/opt/postgresql@18/bin",
+                "/usr/local/opt/postgresql@18/bin",
+                "/Applications/Postgres.app/Contents/Versions/18/bin",
+            ],
+        }
+    }
+}
+
+/// Lane-agnostic override, tried after the lane's own variable
+/// ([`Libc::env_var`]).
+///
+/// It carries no libc of its own, so setting it is an assertion that the
+/// directory matches [`Libc::HOST`]. Prefer the lane variable in CI.
+pub const REF_BIN_ENV: &str = "PGDROP_REF_BIN";
+
 /// Environment variable that makes a missing reference binary fatal.
 ///
 /// Set it to `1` or `true` (see [`policy_from_env`]) and a gate whose
@@ -33,21 +96,13 @@ pub enum Libc {
 /// default — behaviour is unchanged.
 pub const REQUIRE_REF_ENV: &str = "PGDROP_REQUIRE_REF";
 
-/// Directories tried after [`REF_BIN_ENV`], in order.
-pub const DEFAULT_REF_DIRS: [&str; 4] = [
-    "/usr/lib/postgresql/18/bin",
-    "/opt/homebrew/opt/postgresql@18/bin",
-    "/usr/local/opt/postgresql@18/bin",
-    "/opt/homebrew/bin",
-];
-
 /// Tools no PostgreSQL distribution packages, so [`RefPolicy::Require`] cannot
 /// demand them.
 ///
 /// `libpq_uri_regress` is built from `src/interfaces/libpq/test/` only when the
-/// source tree's own test suite is built; neither `postgresql-18` nor
-/// `postgresql-client-18` installs it. Its gate keeps flagged-skipping until
-/// something builds it from source (NAT-374).
+/// source tree's own test suite is built; no distribution's server or client
+/// package installs it. Its gate keeps flagged-skipping until something builds
+/// it from source (NAT-374).
 pub const UNSHIPPED_TOOLS: [&str; 1] = ["libpq_uri_regress"];
 
 /// Data: what a gate must do when its reference binary is absent.
@@ -98,13 +153,14 @@ pub fn missing_ref_action(policy: RefPolicy, tool: &str) -> MissingRef {
     }
 }
 
-/// Pure: the directories [`locate`] consults, in order.
+/// Pure: the directories [`locate`] consults, in order: the overrides
+/// (lane variable, then the generic one), then the lane's install layouts.
 #[must_use]
 pub fn searched_dirs<'a>(
-    env_dir: Option<&'a str>,
+    env_dirs: impl IntoIterator<Item = &'a str>,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Vec<&'a str> {
-    env_dir.into_iter().chain(candidates).collect()
+    env_dirs.into_iter().chain(candidates).collect()
 }
 
 /// Pure: pick the first candidate directory containing `tool`.
@@ -124,44 +180,32 @@ pub fn locate<'a>(
         .find(|path| exists(path))
 }
 
+/// Action: the override directories this process was given, lane variable
+/// first, then [`REF_BIN_ENV`].
+fn override_dirs() -> Vec<String> {
+    [Libc::HOST.env_var(), REF_BIN_ENV]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .collect()
+}
+
 /// Action: find the reference `tool` for this binary's libc lane, or `None`.
 ///
 /// Tests that get `None` must hand the tool to [`skip`], which applies the
 /// active [`RefPolicy`]; see `docs/test-stealing.md`.
 #[must_use]
 pub fn find(tool: &str) -> Option<PathBuf> {
-    let lane = std::env::var(Libc::HOST.env_var()).ok();
-    let generic = std::env::var(REF_BIN_ENV).ok();
-    let overrides: Vec<&str> = lane
-        .iter()
-        .chain(generic.iter())
-        .map(String::as_str)
-        .collect();
+    let overrides = override_dirs();
     locate(
         tool,
-        overrides,
+        overrides.iter().map(String::as_str),
         Libc::HOST.default_dirs().iter().copied(),
         Path::is_file,
     )
 }
 
-/// Set in CI to turn a missing reference into a failure instead of a skip.
-///
-/// A skipped gate and a passing gate look identical in a CI summary, so the
-/// lane that is supposed to prove conformance can quietly stop proving it —
-/// exactly the silent narrowing `AGENTS.md` forbids. CI sets this; a laptop
-/// without the binaries still skips.
-pub const REQUIRE_REF_ENV: &str = "PGDROP_REQUIRE_REF";
-
-/// Pure: does a missing reference fail the gate, given the variable's value?
-///
-/// Absent or `0` means skip; any other value means require.
-#[must_use]
-pub fn is_required(setting: Option<&str>) -> bool {
-    matches!(setting, Some(value) if value != "0")
-}
-
-/// Action: the reference `tool`, or `None` when the gate may skip.
+/// Action: the reference `tool`, or `None` when the gate may skip — with the
+/// skip already announced, or the test already failed, by [`skip`].
 ///
 /// # Panics
 ///
@@ -170,11 +214,9 @@ pub fn is_required(setting: Option<&str>) -> bool {
 #[must_use]
 pub fn find_or_skip(tool: &str) -> Option<PathBuf> {
     let found = find(tool);
-    assert!(
-        !(found.is_none() && is_required(std::env::var(REQUIRE_REF_ENV).ok().as_deref())),
-        "{REQUIRE_REF_ENV} is set: {}",
-        skip_message(tool)
-    );
+    if found.is_none() {
+        skip(tool);
+    }
     found
 }
 
@@ -184,22 +226,28 @@ pub const SKIP_FLAG: &str = "SKIP (flagged, not silent)";
 /// The message a gate prints when the reference tool is absent.
 ///
 /// It names the lane so a skipped gate cannot be mistaken for the wrong libc
-/// being installed.
+/// being installed, and both variables that would have found the tool.
 #[must_use]
 pub fn skip_message(tool: &str) -> String {
-    format!("{SKIP_FLAG}: reference `{tool}` not found; set {REF_BIN_ENV} or install PostgreSQL 18")
+    let lane = Libc::HOST;
+    format!(
+        "{SKIP_FLAG}: no {} reference `{tool}`; set {} or {REF_BIN_ENV}, or install PostgreSQL 18 (see scripts/fetch-ref-binaries.sh)",
+        lane.as_str(),
+        lane.env_var()
+    )
 }
 
 /// Pure: the message a gate fails with under [`RefPolicy::Require`].
 ///
 /// It names the tool and every directory searched, because the only useful
-/// answer to this failure is "install PostgreSQL 18 there, or point
-/// [`REF_BIN_ENV`] somewhere it is".
+/// answer to this failure is "install PostgreSQL 18 there, or point the lane
+/// variable somewhere it is".
 #[must_use]
 pub fn require_message(tool: &str, searched: &[&str]) -> String {
     format!(
         "{REQUIRE_REF_ENV} is set, so the byte-diff gate for `{tool}` may not be skipped, \
-         but no reference `{tool}` was found in: {}",
+         but no {} reference `{tool}` was found in: {}",
+        Libc::HOST.as_str(),
         searched.join(", ")
     )
 }
@@ -240,8 +288,11 @@ pub fn skip(tool: &str) {
     match missing_ref_action(policy(), tool) {
         MissingRef::Announce => announce_skip(&skip_message(tool)),
         MissingRef::Fail => {
-            let env_dir = std::env::var(REF_BIN_ENV).ok();
-            let searched = searched_dirs(env_dir.as_deref(), DEFAULT_REF_DIRS);
+            let overrides = override_dirs();
+            let searched = searched_dirs(
+                overrides.iter().map(String::as_str),
+                Libc::HOST.default_dirs().iter().copied(),
+            );
             panic!("{}", require_message(tool, &searched));
         }
     }
@@ -305,18 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_reference_only_fails_when_ci_demands_it() {
-        assert!(!is_required(None));
-        assert!(!is_required(Some("0")));
-        assert!(is_required(Some("1")));
-        assert!(is_required(Some("true")));
-    }
-
-    #[test]
-    fn skip_message_names_the_lane_and_its_override() {
+    fn skip_message_names_the_lane_and_both_overrides() {
         let message = skip_message("initdb");
-        assert!(message.contains(Libc::HOST.env_var()));
-        assert!(message.contains(Libc::HOST.as_str()));
+        assert!(message.contains(Libc::HOST.env_var()), "{message}");
+        assert!(message.contains(Libc::HOST.as_str()), "{message}");
+        assert!(message.contains(REF_BIN_ENV), "{message}");
     }
 
     #[test]
@@ -362,25 +406,26 @@ mod tests {
     }
 
     #[test]
-    fn the_search_list_puts_the_environment_directory_first() {
-        let searched = searched_dirs(Some("/env/bin"), ["/a/bin", "/b/bin"]);
-        assert_eq!(searched, ["/env/bin", "/a/bin", "/b/bin"]);
+    fn the_search_list_puts_the_overrides_first_lane_before_generic() {
+        let searched = searched_dirs(["/lane/bin", "/env/bin"], ["/a/bin", "/b/bin"]);
+        assert_eq!(searched, ["/lane/bin", "/env/bin", "/a/bin", "/b/bin"]);
     }
 
     #[test]
-    fn the_search_list_is_just_the_defaults_without_the_override() {
-        let searched = searched_dirs(None, DEFAULT_REF_DIRS);
-        assert_eq!(searched, DEFAULT_REF_DIRS);
+    fn the_search_list_is_just_the_lane_defaults_without_an_override() {
+        let searched = searched_dirs([], Libc::HOST.default_dirs().iter().copied());
+        assert_eq!(searched, Libc::HOST.default_dirs());
     }
 
     #[test]
-    fn the_failure_message_names_the_tool_and_every_directory_searched() {
+    fn the_failure_message_names_the_tool_the_lane_and_every_directory_searched() {
         let message = require_message(
             "pg_controldata",
             &["/env/bin", "/usr/lib/postgresql/18/bin"],
         );
         assert!(message.contains("pg_controldata"), "{message}");
         assert!(message.contains(REQUIRE_REF_ENV), "{message}");
+        assert!(message.contains(Libc::HOST.as_str()), "{message}");
         assert!(message.contains("/env/bin"), "{message}");
         assert!(message.contains("/usr/lib/postgresql/18/bin"), "{message}");
     }

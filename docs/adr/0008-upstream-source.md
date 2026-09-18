@@ -1,4 +1,4 @@
-# ADR-0007: Upstream is genuine PostgreSQL, not pgrust's vendored tree
+# ADR-0008: Upstream is genuine PostgreSQL, not pgrust's vendored tree
 
 Status: accepted (owner decision 2026-09-17), after the ADR-0003 breach in
 `crates/rinitdb/share/postgresql.conf.sample`.

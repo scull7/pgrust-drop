@@ -182,7 +182,7 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
 1. `git fetch origin main`; `git checkout -B nightshift/<UTC date YYYY-MM-DD> origin/main`;
    push it with `git push -u origin <branch>`.
 2. Read `AGENTS.md`, `docs/adr/0003-licensing.md` and
-   `docs/adr/0007-upstream-source.md`. **Do not read `progress.md`**: it is
+   `docs/adr/0008-upstream-source.md`. **Do not read `progress.md`**: it is
    retired (AGENTS.md, "Change hygiene"), it is a historical archive up to
    2026-09-16, and reading it as current state is how a worker learns yesterday's
    rules. Current state is the Linear project *pgrust-drop* (team NAT) — its
@@ -193,7 +193,7 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    `In Review`, `Done` or `Canceled` is not worked tonight.
 3. Reference sources. `AGENTS.md`'s `## What "upstream" means` is the rule, and it
    is quoted here rather than summarised because a paraphrase of it is what caused
-   a licensing breach (ADR-0007):
+   a licensing breach (ADR-0008):
 
    > "Upstream" is genuine PostgreSQL 18.6, and nothing else:
    >
@@ -243,7 +243,7 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    `sha256sum -c` are not ceremony: they are what makes the tree an authority, and
    an unverified tree is not one. If neither source can be obtained, report
    `REF_SOURCES: unavailable: <reason>` and STATUS FAILED — a night of vendoring
-   and citing without a pristine tree is exactly the failure ADR-0007 exists to
+   and citing without a pristine tree is exactly the failure ADR-0008 exists to
    stop. Do **not** substitute pgrust's `crates/postgres-18.6-reference/`; if a
    pgrust checkout is already on the box, it is for orientation only.
 
@@ -311,7 +311,7 @@ read it from and none to write:
 Read, in this order, and nothing else to start: `AGENTS.md`, the Linear issue
 `{{ISSUE}}` (`mcp__Linear__get_issue`) including its comments, and the ADRs it
 cites — always including `docs/adr/0003-licensing.md` and
-`docs/adr/0007-upstream-source.md`. **Do not read `progress.md`**: it is retired
+`docs/adr/0008-upstream-source.md`. **Do not read `progress.md`**: it is retired
 and is a historical archive up to 2026-09-16, not current state (AGENTS.md,
 "Change hygiene"). The Linear issue is the state. The issue names the upstream C
 files and tests; read those from the verified pristine tree above.
@@ -346,7 +346,7 @@ Rules (from AGENTS.md, restated because they are absolute):
 - Separate data / pure calculations / actions; unit-test the calculations;
   port upstream test names verbatim as Rust test names; cite upstream file:line.
   A `file:line` citation is a claim about the tag or the tarball and is resolved
-  against one of them (ADR-0007).
+  against one of them (ADR-0008).
 - Every deliberate divergence goes in `docs/divergences.md` with the pinning test.
 - Gates against C tools: when the reference binary exists, diff byte-for-byte;
   when it does not, print `SKIP (flagged, not silent)` and pass. Never weaken a
@@ -410,7 +410,7 @@ because each has already been breached once:
   sha256 `555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f`) and
   not from pgrust's `crates/postgres-18.6-reference/`. Resolve each new
   `file:line` citation against the tag or the tarball, not against pgrust's tree —
-  `postgresql.conf.sample` and `streets.data` differ there (ADR-0007). No pgrust
+  `postgresql.conf.sample` and `streets.data` differ there (ADR-0008). No pgrust
   Rust code, comments or corpora in an MIT crate (ADR-0003).
 - **Divergences.** Every deliberate divergence introduced by these commits has a
   row in `docs/divergences.md` naming the test that pins it, and that test exists.

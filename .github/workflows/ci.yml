@@ -9,6 +9,20 @@ name: ci
 # GitHub counts a `skipped` check as successful, and a job skipped because its
 # `needs:` failed does not block a merge. Requiring musl, which always runs on a
 # pull request, is what makes a red musl lane actually stop the merge.
+#
+# Reference binaries (ADR-0007, amendment of 2026-09-18): every lane installs
+# one complete PostgreSQL 18 from its platform's packages and points its lane
+# variable at that tree. The Maven bundles scripts/fetch-ref-binaries.sh gets
+# for a laptop ship only initdb, postgres and pg_ctl, but the gates also drive
+# psql, pg_controldata and pg_checksums, and a cluster gate insists on every
+# tool coming from one tree -- so a lane that mixed the bundle with a package
+# would compare two servers. The whole premise of this repo is byte-diffing our
+# tools against the real C ones, so CI must actually have all of them.
+#
+# NOT covered anywhere: `libpq_uri_regress` is a PostgreSQL *test* program built
+# from src/interfaces/libpq/test/ and shipped by no package, so the rlibpq URI
+# gate keeps flagged-skipping until something builds it from source (NAT-374).
+# testkit's UNSHIPPED_TOOLS exempts it by name; every other tool is required.
 
 on:
   push:
@@ -20,7 +34,9 @@ env:
   RUSTFLAGS: -D warnings
   # A byte-diff gate that cannot find its reference binary prints SKIP and
   # passes, which is indistinguishable from a green gate in the CI summary. In
-  # CI a missing reference is a failure.
+  # CI a missing reference is a failure. Not `-- --ignored`: the one
+  # #[ignore]d test (psql program_help_ok, NAT-399) is a known-unimplemented
+  # feature.
   PGDROP_REQUIRE_REF: 1
 
 jobs:
@@ -29,30 +45,60 @@ jobs:
     # GitHub offers no Alpine runner image; a container is the supported way to
     # get a musl userland. This is CI configuration only: nothing in the
     # product or the developer workflow may require a container runtime.
-    container: alpine:3.21
+    # 3.23 is the first Alpine release whose community repository carries
+    # postgresql18.
+    container: alpine:3.23
+    env:
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      PGDROP_REF_BIN_MUSL: /usr/libexec/postgresql18
     steps:
-      - name: Install the Alpine toolchain
-        run: apk add --no-cache bash build-base curl git libstdc++ musl-dev tar unzip xz
+      - name: Install the Alpine toolchain and the PostgreSQL 18 reference
+        run: |
+          apk add --no-cache bash build-base curl git libstdc++ musl-dev tar unzip xz \
+            postgresql18 postgresql18-client
       - uses: actions/checkout@v4
+      # Toolchain in a shared, world-writable prefix (the layout the official
+      # rust image uses) so the unprivileged user below can run cargo.
       - name: Install Rust
         run: |
           curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup-init.sh
           sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.96.0 \
-            --component rustfmt,clippy
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Fetch the musl reference binaries
-        run: ./scripts/fetch-ref-binaries.sh --lane musl >> "$GITHUB_ENV"
+            --component rustfmt,clippy --no-modify-path
+          chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      # The container's steps run as root, and C initdb and postgres refuse to
+      # run as root ("cannot be run as root"), so every gate that creates a
+      # cluster would compare two refusals. The checks run as an ordinary user;
+      # su without -p also gives that user its own HOME, USER and LOGNAME, which
+      # is what C initdb's getpwuid answer is compared against.
+      - name: Create the unprivileged user the gates run as
+        run: |
+          adduser -D ci
+          chown -R ci "$GITHUB_WORKSPACE"
+      # Fail here rather than three minutes later inside a gate, and branch on
+      # each command's exit status -- never on grepped output (AGENTS.md).
+      - name: verify the reference binaries are where the gates look
+        run: |
+          set -euo pipefail
+          for tool in initdb pg_ctl postgres pg_controldata pg_checksums psql; do
+            test -x "$PGDROP_REF_BIN_MUSL/$tool"
+          done
+          "$PGDROP_REF_BIN_MUSL/initdb" --version
+          "$PGDROP_REF_BIN_MUSL/psql" --version
       - name: fmt
-        run: cargo fmt --all --check
+        run: su -c 'cargo fmt --all --check' ci
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+        run: su -c 'cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic' ci
       - name: test
-        run: cargo test --all-features
+        run: su -c 'cargo test --all-features' ci
 
   apple:
     needs: musl
     if: github.event_name == 'pull_request'
     runs-on: macos-15
+    env:
+      PGDROP_REF_BIN_APPLE: /opt/homebrew/opt/postgresql@18/bin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -60,8 +106,16 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Fetch the Darwin reference binaries
-        run: ./scripts/fetch-ref-binaries.sh --lane apple >> "$GITHUB_ENV"
+      - name: Install the PostgreSQL 18 reference (Homebrew)
+        run: brew install postgresql@18
+      - name: verify the reference binaries are where the gates look
+        run: |
+          set -euo pipefail
+          for tool in initdb pg_ctl postgres pg_controldata pg_checksums psql; do
+            test -x "$PGDROP_REF_BIN_APPLE/$tool"
+          done
+          "$PGDROP_REF_BIN_APPLE/initdb" --version
+          "$PGDROP_REF_BIN_APPLE/psql" --version
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test
@@ -71,6 +125,8 @@ jobs:
     needs: musl
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      PGDROP_REF_BIN_GNU: /usr/lib/postgresql/18/bin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -78,30 +134,12 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Fetch the glibc reference binaries
-        run: ./scripts/fetch-ref-binaries.sh --lane gnu >> "$GITHUB_ENV"
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
-      # The whole premise of this repo is byte-diffing our tools against the
-      # real C ones, so CI must actually have them. Without this step every
-      # byte-diff gate prints `SKIP (flagged, not silent)` and passes, and the
-      # suite is green while proving nothing.
-      #
       # postgresql-18 + postgresql-client-18 put these under
-      # /usr/lib/postgresql/18/bin (PGDG's Debian/Ubuntu layout — versioned
+      # /usr/lib/postgresql/18/bin (PGDG's Debian/Ubuntu layout -- versioned
       # bindir, with /usr/bin holding only pg_wrapper symlinks):
       #   initdb, pg_ctl, pg_controldata, pg_checksums, postgres  (server pkg)
       #   psql                                                    (client pkg)
-      # so the gates driving those tools become real here.
-      #
-      # NOT covered: `libpq_uri_regress` is a PostgreSQL *test* program built
-      # from src/interfaces/libpq/test/ and is shipped by no PGDG package, so
-      # the rlibpq URI gate keeps flagged-skipping until something builds it
-      # from source (NAT-374). testkit's UNSHIPPED_TOOLS exempts it by name;
-      # every other tool is required below.
-      - name: install PostgreSQL 18 reference binaries (PGDG)
+      - name: Install the PostgreSQL 18 reference (PGDG)
         run: |
           set -euo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -111,22 +149,17 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-18 postgresql-client-18
-      # Fail here rather than three minutes later inside a gate, and branch on
-      # each command's exit status — never on grepped output (AGENTS.md).
       - name: verify the reference binaries are where the gates look
         run: |
           set -euo pipefail
-          for tool in initdb pg_ctl pg_controldata pg_checksums psql; do
-            test -x "/usr/lib/postgresql/18/bin/$tool"
+          for tool in initdb pg_ctl postgres pg_controldata pg_checksums psql; do
+            test -x "$PGDROP_REF_BIN_GNU/$tool"
           done
-          /usr/lib/postgresql/18/bin/initdb --version
-          /usr/lib/postgresql/18/bin/psql --version
-      # PGDROP_REQUIRE_REF turns a missing reference from a flagged skip that
-      # passes into a hard failure, so a gate can never silently stop running
-      # here. Not `-- --ignored`: the one #[ignore]d test (psql
-      # program_help_ok, NAT-399) is a known-unimplemented feature.
+          "$PGDROP_REF_BIN_GNU/initdb" --version
+          "$PGDROP_REF_BIN_GNU/psql" --version
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test
-        env:
-          PGDROP_REF_BIN: /usr/lib/postgresql/18/bin
-          PGDROP_REQUIRE_REF: "1"
         run: cargo test --all-features

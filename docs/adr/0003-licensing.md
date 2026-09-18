@@ -2,7 +2,7 @@
 
 Status: accepted (owner decision 2026-09-16); amended 2026-09-17 — the wall
 was breached through pgrust's vendored PostgreSQL tree, and the source of
-vendored content is now pinned by ADR-0007 (see Amendment below).
+vendored content is now pinned by ADR-0008 (see Amendment below).
 
 ## Context
 
@@ -63,7 +63,7 @@ Upstream is now defined as genuine PostgreSQL 18.6 only: tag `REL_18_6`, commit
 `postgresql-18.6.tar.bz2` (sha256
 `555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f`). pgrust's
 vendored tree is not a source for vendored content and not the authority for a
-`file:line`. See ADR-0007 for the measurement and the full rule.
+`file:line`. See ADR-0008 for the measurement and the full rule.
 
 The Decision above is unchanged. This amendment records what it takes to make
 it true: the wall is only as good as the tree the MIT crates copy from.

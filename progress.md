@@ -17,6 +17,114 @@
 > What follows is the log as it stood through 2026-09-17, kept because it
 > records how the project got here. Newest first.
 
+## 2026-09-17 — Target matrix: musl + Darwin primary (ADR-0002, 0006, 0007)
+
+**What**
+- ADR-0007 (new): `*-unknown-linux-musl` (Omen devices) and `aarch64-apple-darwin`
+  (developer laptops) are the primary targets; glibc is a pull-request gate only.
+  A byte-diff gate is only valid when both sides link the same C library, so
+  `testkit::reference` derives `Libc` from `cfg!` at compile time and each lane
+  has its own variable (`PGDROP_REF_BIN_{GNU,MUSL,APPLE}`).
+- ADR-0002 revised: the embedded template carries **bootstrap catalogs only**.
+  Locale is stamped at run time in the `postgres --single` phase from the host's
+  libc, so one image serves every libc and the locale matrix is not frozen at
+  mint time. Fallback if pgrust's `--single` cannot import collations: a single
+  image minted with `builtin` + `C.UTF-8`.
+- ADR-0006 completed: crypto provider is `ring` (owner decision), rustls with
+  `default-features = false`. Root store still undecided.
+- `scripts/fetch-ref-binaries.sh`: PostgreSQL 18.6.0 reference binaries per lane
+  and architecture from Maven Central, the only source covering musl and Darwin.
+- CI restructured into lanes: musl (`container: alpine:3.21`) on every push, gnu
+  and apple gated behind `needs: musl` and pull-request-only.
+
+**Why**
+The product runs on Alpine and on Apple silicon; neither has glibc. Measured on
+one host, PostgreSQL 18.6 both sides:
+
+| mint recipe (glibc initdb) | `datcollversion` | musl server on it |
+| --- | --- | --- |
+| `--no-locale` | `NULL` | clean |
+| `--locale-provider=builtin --builtin-locale=C.UTF-8` | `1` | clean |
+| `--locale=en_US.UTF-8` | `2.39` | warns on every connection |
+
+`2.39` is the *mint host's glibc version*, so per-libc images would not have
+fixed it — it would take one image per libc version. Hence: bake no locale.
+
+Also measured: `initdb --help`/`--version` are byte-identical across libcs, but
+`initdb -D data` differs in the locale block, and `--locale=xx_ZZ.UTF-8` exits 1
+on glibc and **0 on musl** (musl's `setlocale` accepts any name). Both are now
+entries in `docs/divergences.md`.
+
+**Checks run** (this container, Rust 1.96.0)
+- gnu lane: `cargo fmt --all --check`, pedantic clippy, `cargo test --all-features`
+  — all clean, 49 tests.
+- musl lane: `rustup target add x86_64-unknown-linux-musl`, pedantic clippy and
+  `cargo test --all-features --target x86_64-unknown-linux-musl` — clean.
+- **The initdb byte-diff gate ran for real for the first time**, in both lanes,
+  against Maven's 18.6.0 builds: `rinitdb --help`/`--version` are byte-identical
+  to C initdb. Previously it always printed SKIP.
+- `ring` on musl: verified it fails without a musl C toolchain
+  (`failed to find tool "x86_64-linux-musl-gcc"`) and builds with `musl-tools`
+  plus `CC_x86_64_unknown_linux_musl=musl-gcc`. Recorded in ADR-0006.
+- Not run: the CI workflow itself. The Alpine container job (rustup on a musl
+  host, `actions/checkout` in a container) has never executed; first PR run is
+  its real test.
+
+**Resolved same day (owner, 2026-09-17)**
+- `webpki-roots` approved as rlibpq's root store (ADR-0006).
+- pgrust's `--single` **does** support `pg_import_system_collations()` (foid
+  3445) and `pg_collation_actual_version()` (foid 3448), and stamps
+  `collversion` as rows are created, so M1 commits to run-time stamping on the
+  gnu lane. A NULL libc `collversion` on macOS or musl is correct, not a bug.
+  NAT-376 only pins a rev containing the port; the `--single` script is NAT-383,
+  whose description now carries the statements, the provider table and the
+  failure modes.
+- Linear: NAT-383 and NAT-376 updated; NAT-425 (psql reference per lane, M3),
+  NAT-426 (arm image portability, v2), NAT-427 (Docker fixtures, v2) created.
+
+**CI, first real run (PR #15)**
+- All three lanes green on the first attempt, including the Alpine container
+  job: `actions/checkout` and rustup both work on a musl host, which was the
+  part nothing had ever exercised.
+- Green did not prove the gate *ran*, though: a missing reference binary makes
+  the byte-diff test print SKIP and pass, and the println is captured, so a lane
+  that silently stopped proving conformance looks identical to one that proved
+  it. `PGDROP_REQUIRE_REF=1` (set in CI) now turns that skip into a failure, via
+  `reference::find_or_skip`. A laptop without the binaries still skips.
+
+**Risks / open questions**
+- Alpine's `postgresql18` package layout in `Libc::Musl::default_dirs` is a
+  guess; the Alpine lane fetches from Maven, so nothing depends on it yet.
+- The `main` ruleset is **not** applied: the classic branch-protection API
+  returns 403 `Resource not accessible by integration` for this session, and the
+  rulesets API (which does read back 200) could not be written to from here.
+  Owner action, see below.
+- Template image portability across architectures is untested → v2, via a
+  `pg_controldata` comparison on an arm runner.
+- `PGDROP_REF_BIN` (lane-agnostic) is still accepted and is an unchecked
+  assertion that the directory matches the compiled lane. A follow-up could read
+  the reference's ELF interpreter and refuse a cross-libc pairing outright.
+- No `psql` in the Maven bundles; the M3 rpsql gate needs its own reference.
+
+**Follow-ups**
+- NAT-374 gate runner: now partly done (the fetch script and both lanes run).
+- **Owner action**: run `scripts/setup-branch-ruleset.sh` locally with an
+  admin-authenticated `gh` (`--dry-run` first). It creates or updates the `main`
+  ruleset requiring the `musl`, `apple` and `gnu` checks, deriving those names
+  from `ci.yml` so the two cannot drift. The equivalent UI path is
+  Settings > Rulesets > New branch ruleset, where the enforcement status
+  defaults to Disabled and must be set to Active. Until it is applied the lane
+  ordering is advisory: `needs: musl` gates execution, but nothing blocks a
+  merge.
+- Requiring all three is not belt and braces. GitHub treats `skipped` and
+  `neutral` as successful, and its own troubleshooting docs say a job skipped
+  because a `needs:` dependency failed "may not block merging". With only `gnu`
+  required, a red musl lane would skip `gnu` and the merge would be allowed.
+  CI job names were flattened to `musl`, `apple`, `gnu` for the same reason: the
+  required-check string has to match the check name exactly.
+- ELF-interpreter check on the reference binary, to turn the lane-agnostic
+  `PGDROP_REF_BIN` from a trusted assertion into an enforced one.
+
 ## 2026-09-16 — Review of the nightshift branch, and the gates run for the first time
 
 **What**

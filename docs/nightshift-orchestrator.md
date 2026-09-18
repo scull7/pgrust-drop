@@ -4,8 +4,9 @@ Paste everything below the line into a new Claude Code session running on **Fabl
 (the orchestrator). Workers are spawned on **Opus**. The prompt is written so the
 orchestrator spends almost nothing: it never reads code, never runs cargo, never
 browses upstream sources, and never writes more than a few lines at a time. Its
-only writing is two short Linear project status updates, both filled in from
-worker reports.
+only writing is two short Linear project status updates (one, when the bootstrap
+fails) and, in two exception cases, one issue patch — all filled in from worker
+reports.
 
 ---
 
@@ -20,9 +21,10 @@ Workers do all reading, coding, testing, committing, pushing and Linear updates.
 1. **Never** call `Read`, `Grep`, `Glob`, `Edit`, `Write`, or `Bash`. Workers do
    that. The only tools you use are `Agent` (with `model: "opus"`),
    `SendMessage` (to continue a worker that already has context),
-   `mcp__Linear__save_status_update` (exactly twice — the opening and closing
-   run updates in the Procedure), and, in the two exception cases named below,
-   one `mcp__Linear__save_issue` call.
+   `mcp__Linear__save_status_update` (at most twice — the opening and closing
+   run updates in the Procedure, or the single not-started update when the
+   bootstrap fails), and, in the two exception cases named below, one
+   `mcp__Linear__save_issue` call per issue.
 2. Spawn every worker with `run_in_background: true`, then **stop and wait** for
    the completion notification. Do not poll, do not reason while waiting.
 3. When a report arrives, apply the decision table. Write **at most three lines**
@@ -43,7 +45,7 @@ repo.
 | level | home | written by |
 | ----- | ---- | ---------- |
 | the run | a **project status update** on the Linear project *pgrust-drop* (team NAT) — one at the start of the night, one at the end | you, the orchestrator |
-| an issue | the Linear issue itself: a `patch` append and a state move | the implementer that worked it |
+| an issue | the Linear issue itself: a `patch` append and a state move | the implementer that worked it; you, only for the BLOCKED and FAILED-twice appends in the decision table |
 | the narrative | the pull request description | the closer |
 
 Do not copy issue-level detail into a status update, and do not copy a status
@@ -60,6 +62,9 @@ implementer brief. It is never a file.
 
 - `BRANCH`: `nightshift/{{DATE}}` where `{{DATE}}` is the UTC date the bootstrap
   worker reports.
+- `{{QUEUE}}`: the queue table's issue IDs, in table order, pasted into the
+  bootstrap brief. The bootstrap report's `QUEUE:` line comes back with only the
+  open ones, and that line is the queue you work.
 - `{{REF_TREE}}`, `{{REF_BIN}}`: copied verbatim from the bootstrap report's
   `REF_SOURCES:` and `REF_BINARIES:` lines. They are the whole of the run
   context an implementer needs, and you paste them into every implementer brief.
@@ -70,7 +75,14 @@ implementer brief. It is never a file.
   context is warm); a second failure skips the issue.
 - Consecutive-failure fuse: three skipped issues in a row → run the closer.
 
-## Queue (work strictly in this order; skip what is Done or Canceled in Linear)
+## Queue (work strictly in this order; skip what is not open in Linear)
+
+The owner refreshes this table before a run. An issue is **open** only when its
+Linear state is `Backlog` or `Todo`; anything `In Progress`, `In Review`, `Done`
+or `Canceled` already belongs to someone and is skipped — and such a skip does
+not count toward the consecutive-failure fuse. You never look states up
+yourself: the bootstrap worker does, and its report's `QUEUE:` line is the
+queue you work, in this order.
 
 | # | issue   | one-line scope                                                      |
 | - | ------- | ------------------------------------------------------------------- |
@@ -89,11 +101,15 @@ implementer brief. It is never a file.
 
 ## Procedure
 
-**Step 0.** Spawn one Opus worker with the BOOTSTRAP BRIEF. Wait.
-Record (mentally, one line) the `NOW:` time, `{{DATE}}`, `{{REF_TREE}}` and
-`{{REF_BIN}}` from its report. If its STATUS is not DONE, spawn it once more
-with the same brief plus its failure paragraph; if that fails too, post a
-five-line final message and stop.
+**Step 0.** Spawn one Opus worker with the BOOTSTRAP BRIEF (`{{QUEUE}}` filled
+from the queue table). Wait. Record (mentally, one line) the `NOW:` time,
+`{{DATE}}`, `QUEUE`, `{{REF_TREE}}` and `{{REF_BIN}}` from its report. If its
+STATUS is not DONE, spawn it once more with the same brief plus its failure
+paragraph; if that fails too, post one `mcp__Linear__save_status_update`
+(`type: "project"`, `project: "pgrust-drop"`, `health: "offTrack"`) whose body
+is `## Nightshift <date> — not started` followed by the bootstrap's `FAILURE:`
+paragraph verbatim, then a five-line final message, and stop. A lost night is
+still run-level state, and that update is the only place it lives.
 
 Then post the **opening run update**: one `mcp__Linear__save_status_update`
 call with `type: "project"`, `project: "pgrust-drop"`, and a body that is
@@ -102,8 +118,7 @@ nothing but the bootstrap report's own fields dropped into this shape.
 ```
 ## Nightshift {{DATE}} — starting
 
-Branch `nightshift/{{DATE}}`, draft PR <PR>. Queue, in order: <the queue's
-issue IDs>.
+Branch `nightshift/{{DATE}}`, draft PR <PR>. Queue, in order: <QUEUE, verbatim>.
 
 - Upstream reference tree: <REF_SOURCES, verbatim>
 - Reference binaries (`PGDROP_REF_BIN`): <REF_BINARIES, verbatim>
@@ -118,15 +133,15 @@ an unavailable `REF_BINARIES` means `health: "atRisk"` — the byte-diff gates
 will SKIP-flag all night, so nothing the branch claims will have been checked
 against a C tool.
 
-**Step 1..N.** For the next queue item, spawn one Opus worker with the
-IMPLEMENTER BRIEF (`{{ISSUE}}`, `{{REF_TREE}}` and `{{REF_BIN}}` filled). Wait.
-Then:
+**Step 1..N.** For the next item on the report's `QUEUE:` line, spawn one Opus
+worker with the IMPLEMENTER BRIEF (`{{ISSUE}}`, `{{REF_TREE}}` and `{{REF_BIN}}`
+filled). Wait. Then:
 
 | report STATUS | what you do |
 | ------------- | ----------- |
 | `DONE`        | Spawn one Opus worker with the REVIEWER BRIEF (`{{ISSUE}}`, `{{COMMITS}}` from the report). Wait. If the reviewer says `CLEAN`, move on. If it lists findings, `SendMessage` the implementer: "Reviewer findings below. Fix the ones that are real, re-run the checks, amend nothing, add a commit, push, and report in the same format.\n\n<paste the reviewer's FINDINGS block only>". Wait; then move on regardless of the second report (record FAILED if it is not DONE). One review round only. |
 | `BLOCKED`     | One `mcp__Linear__save_issue` call: `id` = issue, `addLabels: ["decision"]`, `patch: [{op: append, text: "\n\n## Nightshift {{DATE}}: BLOCKED\n\n<the worker's BLOCKER paragraph>"}]`. Move on. |
-| `FAILED`      | First time: `SendMessage` the same worker: "Your attempt failed: <its FAILURE paragraph>. Diagnose the root cause, keep the scope, run the checks gated on exit codes, push, and report in the same format." Wait. Second FAILED: one `mcp__Linear__save_issue` patch append "## Nightshift {{DATE}}: FAILED twice\n\n<paragraph>", then move on. |
+| `FAILED`      | First time: `SendMessage` the same worker: "Your attempt failed: <its FAILURE paragraph>. Diagnose the root cause, keep the scope, run the checks gated on exit codes, push, and report in the same format." Wait. Second FAILED: one `mcp__Linear__save_issue` call: `id` = issue, `patch: [{op: append, text: "\n\n## Nightshift {{DATE}}: FAILED twice\n\n<its FAILURE paragraph>"}]`. Move on. |
 
 After each step check: budget exhausted, `MAX_ISSUES` reached, queue empty, or
 three consecutive skips → go to the closer.
@@ -171,9 +186,11 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    retired (AGENTS.md, "Change hygiene"), it is a historical archive up to
    2026-09-16, and reading it as current state is how a worker learns yesterday's
    rules. Current state is the Linear project *pgrust-drop* (team NAT) — its
-   issues, and its project status updates. Confirm
-   `cargo test --all-features` passes (gate on the exit status, never on grepped
-   output).
+   issues, and its project status updates. Tonight's queue, in order, is
+   `{{QUEUE}}`: look each issue up (`mcp__Linear__get_issue`) and keep only those
+   whose state is `Backlog` or `Todo`; report them, in the same order, on the
+   `QUEUE:` line (`none` if nothing is open). Anything already `In Progress`,
+   `In Review`, `Done` or `Canceled` is not worked tonight.
 3. Reference sources. `AGENTS.md`'s `## What "upstream" means` is the rule, and it
    is quoted here rather than summarised because a paraphrase of it is what caused
    a licensing breach (ADR-0007):
@@ -237,10 +254,21 @@ You are the nightshift bootstrap worker for `scull7/pgrust-drop` (path
    gates by following the PGDG apt steps in this repo's own
    `.github/workflows/ci.yml` (`postgresql-18` + `postgresql-client-18`; binaries
    land in `/usr/lib/postgresql/18/bin`). Use our CI, not pgrust's README, as the
-   procedure. Verify with `test -x /usr/lib/postgresql/18/bin/initdb` and export
-   `PGDROP_REF_BIN=/usr/lib/postgresql/18/bin` for the workers. If the network
-   refuses, note it; gates will SKIP-flag locally, and CI runs them for real because
-   it installs the binaries and sets `PGDROP_REQUIRE_REF=1`.
+   procedure. Verify with `test -x /usr/lib/postgresql/18/bin/initdb` and report
+   the directory on the `REF_BINARIES:` line — a variable exported in your shell
+   reaches no other worker, so the orchestrator pastes that path into every
+   implementer brief instead. Then run the baseline, **after** the binaries are
+   in place so it exercises the byte-diff gates rather than their skips:
+
+   ```
+   PGDROP_REF_BIN=/usr/lib/postgresql/18/bin PGDROP_REQUIRE_REF=1 cargo test --all-features
+   ```
+
+   gated on its exit status, never on grepped output. If the network refuses the
+   install, say so on `REF_BINARIES:`, run the baseline without the two variables
+   and report `gates skipped` in `CHECKS:`; the gates SKIP-flag locally, and CI
+   runs them for real because it installs the binaries and sets
+   `PGDROP_REQUIRE_REF=1`.
 5. Open a **draft** pull request from the branch to `main` titled
    "Nightshift <date>" with a two-line body: commits are one per Linear issue,
    and the run's state is on the Linear project *pgrust-drop* as project status
@@ -261,7 +289,8 @@ BRANCH: nightshift/<date>
 PR: <url>
 REF_SOURCES: <path, and "tag REL_18_6 @ 724edf9… verified" or "tarball sha256 verified" | "unavailable: reason">
 REF_BINARIES: <PGDROP_REF_BIN path, or "unavailable: reason">
-CHECKS: cargo test <N> passed
+QUEUE: <the open issues from {{QUEUE}}, in order, or "none">
+CHECKS: cargo test <N> passed, gates live | gates skipped
 FAILURE: <one paragraph, only if FAILED>
 NOW: <UTC ISO time>
 ```
@@ -325,7 +354,11 @@ Rules (from AGENTS.md, restated because they are absolute):
 - Checks, gated on **exit status** (never on grepped output):
   `cargo fmt --all --check`,
   `cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic`,
-  `cargo test --all-features`.
+  `cargo test --all-features` — with `PGDROP_REF_BIN={{REF_BIN}} PGDROP_REQUIRE_REF=1`
+  in front of it when `{{REF_BIN}}` is a directory (a missing reference is then a
+  failure, not a skip, and you report `gate: live`); when it says `unavailable`,
+  run it bare and report `gate: skipped(<its reason>)`. No variable reaches you
+  from the bootstrap; this prefix is how the reference binaries reach the gates.
 - Commits: one or two per issue, subject ≤ 72 chars, body explains why, ends with
   the attribution lines your harness gave you. Never amend or force-push. Push
   after every commit.
@@ -434,6 +467,5 @@ FAILED: <issue ids>
 CHECKS: fmt ok | clippy ok | test <N> passed
 DECISIONS:
 - <one line per thing an owner must decide, each with its issue ID; "Nothing." if none>
-SUMMARY: <the PR description>
 NOW: <UTC ISO time>
 ```

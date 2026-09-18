@@ -58,18 +58,18 @@ never silently narrows.
 Porting rule: keep upstream test names as Rust test names (grep-able), keep the
 order, and cite the upstream file and line in a comment.
 
-**Accepted gap, NAT-374.** `crates/rinitdb/src/control.rs` carries hand-computed
+**Struct layout, NAT-374.** `crates/rinitdb/src/control.rs` carries hand-computed
 byte offsets (`offset`) and padding runs (`PADDING`) for `ControlFileData` on a
-64-bit `MAXIMUM_ALIGNOF 8` build. Today they are proved only *self-consistent*:
-`the_fields_and_the_padding_tile_the_struct` checks that the two tile
-`[0, SIZEOF_CONTROL_FILE_DATA)` exactly. Nothing yet proves they match what a
-real C compiler lays out — the assertion that would is the stolen
+64-bit `MAXIMUM_ALIGNOF 8` build. `the_fields_and_the_padding_tile_the_struct`
+proves only that the two tile `[0, SIZEOF_CONTROL_FILE_DATA)` exactly; what
+proves they match a real C compiler's layout is the stolen
 `command_like(['pg_controldata', $datadir], …)` run against the C binary
-(`assert_data_page_checksum_version`, `crates/rinitdb/tests/t_001_initdb.rs:654`),
-and it prints `SKIP (flagged, not silent)` because this box has no PostgreSQL 18.
-That is accepted for now. **Remove the skip once NAT-374 lands the reference
-binaries in CI** — not by weakening the gate, by letting it run. Until then,
-treat the offset tables as unverified against C.
+(`assert_data_page_checksum_version`, `crates/rinitdb/tests/t_001_initdb.rs:670`).
+CI runs it for real: `.github/workflows/ci.yml` installs PGDG PostgreSQL 18 and
+sets `PGDROP_REQUIRE_REF=1`, so a missing reference fails the job rather than
+skipping. On a box without PostgreSQL 18 it prints `SKIP (flagged, not silent)`
+and passes, so a local green says nothing about the layout — a CI green does.
+Never weaken the gate to get either.
 
 ## CLI framework
 

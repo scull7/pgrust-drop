@@ -1409,17 +1409,57 @@ fn shared_buffers_blocks(announced: &str) -> u32 {
     }
 }
 
-/// This port's `postgresql.conf` for the gate: its own rendering, with
-/// `setup_config`'s `unix_socket_directories` fix-up (`initdb.c:1370`) redone
-/// for the reference build's constant.
+/// The `share_path` the reference `initdb` reads its samples from
+/// (`get_share_path`, `initdb.c:2676`): the prefix layouts beside the binary
+/// (stock, the Maven bundles, Homebrew), then the two distribution layouts
+/// that move it — PGDG's Debian/Ubuntu `/usr/lib/postgresql/18/bin` reads
+/// `/usr/share/postgresql/18`, Alpine's `/usr/libexec/postgresql18` reads
+/// `/usr/share/postgresql18`.
 #[cfg(unix)]
-fn our_postgresql_conf(rendered: &str, socketdir: &str, tag: &str) -> String {
+fn reference_share_dir(initdb: &Path) -> Option<PathBuf> {
+    let bin = initdb.parent()?;
+    let prefix = bin.parent()?;
+    let mut candidates = vec![
+        prefix.join("share/postgresql"),
+        prefix.join("share/postgresql@18"),
+        prefix.join("share"),
+    ];
+    if bin.ends_with("lib/postgresql/18/bin") {
+        candidates.push(PathBuf::from("/usr/share/postgresql/18"));
+    }
+    if bin.ends_with("libexec/postgresql18") {
+        candidates.push(PathBuf::from("/usr/share/postgresql18"));
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("postgresql.conf.sample").is_file())
+}
+
+/// The three samples the reference `initdb` rendered from, when its
+/// `share_path` can be found: `postgresql.conf.sample`, `pg_hba.conf.sample`,
+/// `pg_ident.conf.sample`.
+#[cfg(unix)]
+fn reference_samples(initdb: &Path) -> Option<[String; 3]> {
+    let share = reference_share_dir(initdb)?;
+    let read = |name: &str| std::fs::read_to_string(share.join(name)).ok();
+    Some([
+        read("postgresql.conf.sample")?,
+        read("pg_hba.conf.sample")?,
+        read("pg_ident.conf.sample")?,
+    ])
+}
+
+/// This port's `postgresql.conf` for the gate: its own rendering over
+/// `sample`, with `setup_config`'s `unix_socket_directories` fix-up
+/// (`initdb.c:1370`) redone for the reference build's constant.
+#[cfg(unix)]
+fn our_postgresql_conf(rendered: &str, sample: &str, socketdir: &str, tag: &str) -> String {
     let retargeted = retarget_socket_directory(rendered, socketdir);
     // Redoing the replacement over a line this port has already rewritten must
-    // land exactly where C's single pass over the pristine sample lands — same
+    // land exactly where C's single pass over the sample lands — same
     // quoting, same comment column. Without this the retarget could be
     // papering over the rendering instead of supplying the one constant.
-    let single_pass = retarget_socket_directory(rinitdb::conf::POSTGRESQL_CONF_SAMPLE, socketdir);
+    let single_pass = retarget_socket_directory(sample, socketdir);
     assert_eq!(
         socket_directory_line(&retargeted),
         socket_directory_line(&single_pass),
@@ -1467,6 +1507,33 @@ fn the_configuration_files_match_reference_initdb() {
     // below kept `postgresql.auto.conf`, `pg_hba.conf`, `pg_ident.conf`,
     // `-A md5` and `--auth-host scram-sha-256` from ever being compared at all.
     let mut differences: Vec<String> = Vec::new();
+
+    // Render from the samples C initdb itself read whenever they can be found,
+    // so both renderings start from the same bytes and the diff is about the
+    // rendering. A distribution may patch its samples: Alpine moves
+    // `unix_socket_directories` in the sample itself, and its re-aligned
+    // comment tab is not reproducible from the pristine sample by any retarget.
+    // The embedded samples are pinned to PostgreSQL 18.6 by their own unit
+    // test (`conf.rs`), so nothing about the product is taken from the
+    // reference here.
+    let reference_samples = reference_samples(&reference);
+    let samples = if let Some([conf, hba, ident]) = &reference_samples {
+        rinitdb::conf::ConfSamples {
+            postgresql_conf: conf,
+            pg_hba_conf: hba,
+            pg_ident_conf: ident,
+        }
+    } else {
+        reference::announce_skip(&format!(
+            "{}: the reference initdb at {} has no share directory with \
+             postgresql.conf.sample beside it, so this port's embedded \
+             samples stand in and a distribution patch to them would show \
+             up as a diff",
+            reference::SKIP_FLAG,
+            reference.display()
+        ));
+        rinitdb::conf::ConfSamples::EMBEDDED
+    };
 
     for (tag, auth, needs_password) in [
         ("conf-trust", ["-A", "trust"], false),
@@ -1523,9 +1590,9 @@ fn the_configuration_files_match_reference_initdb() {
             &slurp(rinitdb::conf::CONF_FILES[0]),
         );
 
-        for (name, ours) in rinitdb::conf::render_all(&settings) {
+        for (name, ours) in rinitdb::conf::render_all_from(samples, &settings) {
             let ours = if name == rinitdb::conf::CONF_FILES[0] {
-                our_postgresql_conf(&ours, &socketdir, tag)
+                our_postgresql_conf(&ours, samples.postgresql_conf, &socketdir, tag)
             } else {
                 ours
             };

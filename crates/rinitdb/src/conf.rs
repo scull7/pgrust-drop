@@ -644,24 +644,59 @@ pub fn render_pg_ident_conf(sample: &str) -> String {
     sample.to_owned()
 }
 
-/// The four files, in `setup_config` order, as `(name, contents)`.
+/// The three sample files `setup_config` reads from `share_path`
+/// (`initdb.c:1296`, `:1462`, `:1529`): the input the rendering is a function
+/// of.
+///
+/// The product renders from [`ConfSamples::EMBEDDED`], the vendored PostgreSQL
+/// 18.6 bytes (ADR-0002). A byte-diff gate may instead hand in the samples the
+/// reference `initdb` actually read, because a distribution can patch its
+/// samples (Alpine moves `unix_socket_directories` in the sample itself) and
+/// the rendering can only be compared against C's on the same input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfSamples<'a> {
+    pub postgresql_conf: &'a str,
+    pub pg_hba_conf: &'a str,
+    pub pg_ident_conf: &'a str,
+}
+
+impl ConfSamples<'static> {
+    /// The samples compiled into the binary.
+    pub const EMBEDDED: Self = Self {
+        postgresql_conf: POSTGRESQL_CONF_SAMPLE,
+        pg_hba_conf: PG_HBA_CONF_SAMPLE,
+        pg_ident_conf: PG_IDENT_CONF_SAMPLE,
+    };
+}
+
+/// The four files, in `setup_config` order, as `(name, contents)`, rendered
+/// from the embedded samples.
 ///
 /// Every one of them is then `chmod`ed to `pg_file_create_mode`
 /// (`initdb.c:1441`, `:1457`, `:1523`, `:1532`); the mode is
 /// [`Settings::perm`]'s `file_mode` and belongs to whoever writes them.
 #[must_use]
 pub fn render_all(settings: &Settings) -> Vec<(&'static str, String)> {
+    render_all_from(ConfSamples::EMBEDDED, settings)
+}
+
+/// [`render_all`] over the given samples instead of the embedded ones.
+#[must_use]
+pub fn render_all_from(
+    samples: ConfSamples<'_>,
+    settings: &Settings,
+) -> Vec<(&'static str, String)> {
     vec![
         (
             CONF_FILES[0],
-            render_postgresql_conf(POSTGRESQL_CONF_SAMPLE, settings),
+            render_postgresql_conf(samples.postgresql_conf, settings),
         ),
         (CONF_FILES[1], render_postgresql_auto_conf()),
         (
             CONF_FILES[2],
-            render_pg_hba_conf(PG_HBA_CONF_SAMPLE, settings),
+            render_pg_hba_conf(samples.pg_hba_conf, settings),
         ),
-        (CONF_FILES[3], render_pg_ident_conf(PG_IDENT_CONF_SAMPLE)),
+        (CONF_FILES[3], render_pg_ident_conf(samples.pg_ident_conf)),
     ]
 }
 

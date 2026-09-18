@@ -470,11 +470,13 @@ fn identify_system_timezone(src: &impl TzSource, system: &State) -> Option<Strin
 }
 
 /// The zone definition the C library's `localtime()` is working from: `TZ` if
-/// it names one, else `/etc/localtime`.
+/// it names one, else `/etc/localtime`, else UTC.
 ///
 /// Upstream calls `localtime()` itself. This port cannot — see the
 /// `docs/divergences.md` row — so it reads the same file the C library reads
-/// and interprets it with the same code it uses for a candidate zone.
+/// and interprets it with the same code it uses for a candidate zone. When
+/// that file is absent or unreadable (a fresh container, a host whose zone was
+/// never set) glibc and musl both run on UTC, and so does this.
 #[must_use]
 pub fn system_state(src: &impl TzSource) -> Option<State> {
     if let Some(name) = src.tz_env() {
@@ -490,6 +492,8 @@ pub fn system_state(src: &impl TzSource) -> Option<State> {
     }
     src.read_path(TZDEFAULT)
         .and_then(|image| tz::load(&image, true))
+        // No /etc/localtime: the C library's localtime() answers in UTC.
+        .or_else(|| tz::parse("UTC0", false))
 }
 
 /// `select_default_timezone` (`findtimezone.c:1756`): `TZ` if it names a zone
@@ -559,6 +563,12 @@ mod tests {
 
         fn linked_to(mut self, target: &str) -> Self {
             self.link = Some(target.to_owned());
+            self
+        }
+
+        /// A machine whose zone was never set: no `/etc/localtime` at all.
+        fn without_localtime(mut self) -> Self {
+            self.localtime = None;
             self
         }
 
@@ -673,6 +683,29 @@ mod tests {
             Some(String::from("America/New_York"))
         );
         assert_eq!(src.scans.get(), 1);
+    }
+
+    /// A container or a host whose zone was never set has a timezone database
+    /// but no `/etc/localtime`. The C library then runs on UTC, and C initdb's
+    /// scan finds the zone that behaves that way; without this the port
+    /// answered `None` and wrote no `timezone` line where C writes one.
+    #[test]
+    fn a_machine_without_etc_localtime_runs_on_utc_as_the_c_library_does() {
+        let src = FakeTz::new(
+            &[
+                ("America/New_York", eastern()),
+                ("Etc/UTC", fixed("UTC", 0)),
+                ("UTC", fixed("UTC", 0)),
+            ],
+            &eastern(),
+        )
+        .without_localtime();
+        assert_eq!(select_default_timezone(&src), Some(String::from("UTC")));
+        assert_eq!(
+            src.scans.get(),
+            1,
+            "there is no symlink to short-cut the scan"
+        );
     }
 
     #[test]
@@ -795,17 +828,19 @@ mod tests {
         );
     }
 
+    /// No timezone database and no `/etc/localtime`: the C library is on UTC,
+    /// the scan has nothing to score, and the constructed-name stage
+    /// (`findtimezone.c:479`) tries `UTC` (no offset, so not a POSIX zone) and
+    /// then `UTC0`, which parses. That is the line C initdb writes on such a
+    /// machine; `None`, `setup_config`'s commented-out pair (`initdb.c:1348`),
+    /// is reserved for the `Factory` zone.
     #[test]
-    fn no_timezone_database_and_no_machine_answer_means_gmt() {
+    fn no_timezone_database_and_no_localtime_still_constructs_utc0() {
         let src = FakeTz {
             now: 1_789_128_000,
             ..FakeTz::default()
         };
-        assert_eq!(
-            select_default_timezone(&src),
-            None,
-            "None is `setup_config`'s commented-out pair (initdb.c:1348)"
-        );
+        assert_eq!(select_default_timezone(&src), Some(String::from("UTC0")));
     }
 
     #[test]

@@ -631,6 +631,17 @@ mod unix {
 #[cfg(unix)]
 pub use unix::{expand, read_tree};
 
+/// Non-Unix builds have no file modes; the port targets Unix (ADR-0001).
+#[cfg(not(unix))]
+#[allow(clippy::missing_errors_doc)]
+pub fn expand(
+    _entries: &[Entry<&[u8]>],
+    _target: &std::path::Path,
+    _perm: crate::file_perm::DataDirPerm,
+) -> Result<Expanded, crate::error::InitdbError> {
+    unimplemented!("rinitdb creates a data directory on Unix only")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

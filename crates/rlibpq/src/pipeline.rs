@@ -554,7 +554,7 @@ impl PipelineState {
     /// # Errors
     /// The message cannot appear here at all — a DataRow with no preceding
     /// RowDescription, a field count that disagrees with it, a startup
-    /// message, or a type this port does not handle yet (the COPY messages)
+    /// message, or a type this port does not handle yet (FunctionCallResponse)
     /// or that libpq never provokes (PortalSuspended, `fe-protocol3.c:446`).
     /// Upstream turns these into an error result and carries on; here they
     /// end the exchange.

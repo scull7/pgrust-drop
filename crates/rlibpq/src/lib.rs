@@ -59,7 +59,10 @@ pub use conninfo::{
 };
 pub use error::ConnError;
 pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
-pub use message::{Backend, Frame, Frontend, ProtocolError, Target, TransactionStatus, next_frame};
+pub use message::{
+    Backend, CopyFormat, Frame, Frontend, ProtocolError, Target, TransactionStatus,
+    next_copy_frame, next_frame,
+};
 pub use pipeline::{
     AsyncStatus, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass, QueryRunner,
     RowMode,

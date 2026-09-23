@@ -271,6 +271,10 @@ pub struct QueryResult {
     /// `paramDescs`: the parameter types a ParameterDescription reported
     /// (`getParamDescriptions`, `fe-protocol3.c:690`).
     params: Vec<u32>,
+    /// `binary`: set only by a COPY response (`getCopyStart`,
+    /// `fe-protocol3.c:1719`); a RowDescription's columns carry their own
+    /// formats instead.
+    binary: bool,
 }
 
 impl QueryResult {
@@ -284,6 +288,7 @@ impl QueryResult {
             command_status: Vec::new(),
             error: None,
             params: Vec::new(),
+            binary: false,
         }
     }
 
@@ -296,7 +301,31 @@ impl QueryResult {
             command_status: Vec::new(),
             error: Some(error),
             params: Vec::new(),
+            binary: false,
         }
+    }
+
+    /// The `PGRES_COPY_*` result `getCopyStart` builds (`fe-protocol3.c:1707`):
+    /// one column per format code, with nothing but the format filled in —
+    /// `attDescs` are zeroed there (`:1732`), so every name is empty here.
+    #[must_use]
+    pub fn copy(status: ExecStatus, format: &crate::message::CopyFormat) -> Self {
+        let mut result = Self::new(status);
+        result.binary = format.overall != 0;
+        result.fields = format
+            .column_formats
+            .iter()
+            .map(|&format| FieldDescription {
+                name: Vec::new(),
+                tableid: 0,
+                columnid: 0,
+                typid: 0,
+                typlen: 0,
+                atttypmod: 0,
+                format,
+            })
+            .collect();
+        result
     }
 
     /// `PQresultStatus`, `fe-exec.c:3442`.
@@ -352,6 +381,20 @@ impl QueryResult {
 
     pub(crate) fn set_params(&mut self, params: Vec<u32>) {
         self.params = params;
+    }
+
+    /// `PQbinaryTuples`, `fe-exec.c:3528`: whether a COPY result's data is
+    /// binary.
+    #[must_use]
+    pub fn binary_tuples(&self) -> bool {
+        self.binary
+    }
+
+    /// `PQfformat`, `fe-exec.c:3739` — the column's format code, 0 for text
+    /// and 1 for binary.
+    #[must_use]
+    pub fn fformat(&self, column: usize) -> Option<i16> {
+        self.fields.get(column).map(|f| f.format)
     }
 
     /// `PQfname`, `fe-exec.c:3598`.

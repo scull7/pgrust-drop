@@ -12,8 +12,10 @@
 //!
 //! All nine traces upstream ships are compared here. Not here yet:
 //! `test_pipelined_insert` and `test_uniqviol`, which have no trace to compare,
-//! and `test_cancel` and `test_protocol_version`, which need cancellation and
-//! protocol 3.2 (NAT-391).
+//! `test_protocol_version`, which needs protocol 3.2 (NAT-391), and the second
+//! half of `test_cancel`, which drives `PQcancelStart` and `PQcancelPoll`
+//! with `select()` and waits for NAT-520's readiness wait; its blocking half
+//! is `test_cancel_blocking`.
 //!
 //! Without the reference tools every test prints `SKIP (flagged, not silent)`
 //! and passes; with `PGDROP_REQUIRE_REF=1` a missing reference fails instead.
@@ -28,7 +30,10 @@ use rlibpq::{
 
 mod common;
 
-use common::{Cluster, finish_and_compare_trace, traced_like_libpq_pipeline};
+use common::{
+    Cluster, confirm_query_canceled, finish_and_compare_trace, send_cancellable_query,
+    traced_like_libpq_pipeline,
+};
 
 /// `INT4OID`, `pg_type_d.h`.
 const INT4OID: u32 = 23;
@@ -1041,4 +1046,60 @@ fn test_transaction() {
     );
 
     finish_and_compare_trace(conn, &sink, "transaction.trace");
+}
+
+/// `test_cancel`, `libpq_pipeline.c:244`, up to `:290`: the blocking calls —
+/// `PQcancel` twice with one `PGcancel`, `PQrequestCancel`, and
+/// `PQcancelBlocking` — each against a running `pg_sleep`, each confirmed by
+/// the query failing with 57014. From `:292` the C test polls with
+/// `PQcancelStart`/`PQcancelPoll` and `select()`, which wait for NAT-520.
+///
+/// It runs under protocol 3.0, the one this crate speaks, which is
+/// `001_libpq_pipeline.pl:78`'s "libpq_pipeline cancel with protocol 3.0".
+/// `PQsetnonblocking(conn, 1)` (`:253`) has no counterpart: this crate's
+/// sends always block, and every send here is one short message.
+#[test]
+fn test_cancel_blocking() {
+    let Some(cluster) = Cluster::start("trust", 55_469) else {
+        return;
+    };
+    let mut conn = cluster.connect();
+
+    // :260 — "a separate connection to the database to monitor the query".
+    let mut monitor = cluster.connect();
+
+    // :263 — test PQcancel.
+    send_cancellable_query(&mut conn, &mut monitor);
+    let cancel = conn.get_cancel().expect("PQgetCancel");
+    if let Err(err) = cancel.cancel() {
+        panic!("failed to run PQcancel: {err}");
+    }
+    confirm_query_canceled(&mut conn);
+
+    // :270 — "PGcancel object can be reused for the next query".
+    send_cancellable_query(&mut conn, &mut monitor);
+    if let Err(err) = cancel.cancel() {
+        panic!("failed to run PQcancel: {err}");
+    }
+    confirm_query_canceled(&mut conn);
+
+    drop(cancel); // :276, PQfreeCancel
+
+    // :278 — test PQrequestCancel.
+    send_cancellable_query(&mut conn, &mut monitor);
+    if let Err(err) = conn.request_cancel() {
+        panic!("failed to run PQrequestCancel: {err}");
+    }
+    confirm_query_canceled(&mut conn);
+
+    // :284 — test PQcancelBlocking.
+    send_cancellable_query(&mut conn, &mut monitor);
+    let mut cancel_conn = conn.cancel_create();
+    assert!(
+        cancel_conn.blocking(),
+        "failed to run PQcancelBlocking: {}",
+        String::from_utf8_lossy(cancel_conn.error_message())
+    );
+    confirm_query_canceled(&mut conn);
+    drop(cancel_conn); // :290, PQcancelFinish
 }

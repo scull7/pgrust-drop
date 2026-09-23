@@ -39,8 +39,10 @@ pub const C_TEXT_SEARCH_CONFIG: &str = "english";
 ///
 /// - `-E` naming any encoding but UTF8;
 /// - `--locale-provider` other than `libc` (the template's databases are
-///   `datlocprovider = 'c'`), and `--locale`, `--lc-*` naming any locale but
-///   `C` or `POSIX`;
+///   `datlocprovider = 'c'`), and `--locale`, `--lc-collate`, `--lc-ctype`
+///   naming any locale but `C` or `POSIX`. The other four categories are not
+///   refused: C writes them to `postgresql.conf` only (`initdb.c:1315`-`:1325`)
+///   and never into the catalogs, so [`settings`] writes them too;
 /// - `--wal-segsize` other than 16;
 /// - a superuser other than `postgres`, `-W` and `--pwfile`: renaming the
 ///   superuser and setting its password happen after expansion, in
@@ -69,10 +71,6 @@ pub fn check_template_can_make(options: &Options, plan: &CreatePlan) -> Result<(
         ("--locale", &options.locale),
         ("--lc-collate", &options.lc_collate),
         ("--lc-ctype", &options.lc_ctype),
-        ("--lc-monetary", &options.lc_monetary),
-        ("--lc-numeric", &options.lc_numeric),
-        ("--lc-time", &options.lc_time),
-        ("--lc-messages", &options.lc_messages),
     ];
     for (option, value) in locales {
         if let Some(value) = value.as_deref()
@@ -111,9 +109,11 @@ fn is_c_locale(name: &str) -> bool {
 /// Pure: what `setup_config` (`initdb.c:1283`) writes the configuration files
 /// from, for a cluster made from the template.
 ///
-/// The locale settings are C's, because the template's are
-/// ([`check_template_can_make`] has refused anything else, and the
-/// environment's locale is not consulted — `docs/divergences.md`).
+/// `lc_messages`, `lc_monetary`, `lc_numeric` and `lc_time` are the
+/// command line's, as [`conf_locale`] resolves them; `date_order` stays
+/// `DATEORDER_MDY`, because `locale_date_order` (`initdb.c:2143`) runs
+/// `strftime` under `setlocale` and this crate reaches neither. The
+/// environment's locale is not consulted (`docs/divergences.md`).
 /// `max_connections`, `shared_buffers` and `dynamic_shared_memory_type` are
 /// the first values `test_config_settings` (`initdb.c:1118`) and
 /// `choose_dsm_implementation` (`:1076`) try, because probing them means
@@ -130,11 +130,54 @@ pub fn settings(
             .clone()
             .unwrap_or_else(|| C_TEXT_SEARCH_CONFIG.to_owned()),
         default_timezone,
+        lc_messages: conf_locale(options.lc_messages.as_deref(), options),
+        lc_monetary: conf_locale(options.lc_monetary.as_deref(), options),
+        lc_numeric: conf_locale(options.lc_numeric.as_deref(), options),
+        lc_time: conf_locale(options.lc_time.as_deref(), options),
         auth: AuthMethods::resolve(options),
         perm: plan.perm,
         gucs: plan.gucs.clone(),
         ..Settings::default()
     }
+}
+
+/// Pure: the value `setup_config` writes for one of the four locale
+/// categories that only reach `postgresql.conf`.
+///
+/// `setlocales` (`initdb.c:2424`): the category's own `--lc-*`, else
+/// `--locale` (`:2432`-`:2443`; `--no-locale` is `locale = "C"`, `:3338`),
+/// then `check_locale_name` (`:2202`) canonicalizes it through `setlocale`.
+/// That call is out of reach (`#![deny(unsafe_code)]`, no libc dependency),
+/// so the name is written as given, except that `POSIX` is written `C`, as
+/// musl's and glibc's `setlocale` return it. Nothing given — where C asks
+/// the environment — is `C` (`docs/divergences.md`).
+fn conf_locale(category: Option<&str>, options: &Options) -> String {
+    let given = category
+        .filter(|name| !name.is_empty())
+        .or_else(|| options.locale.as_deref().filter(|name| !name.is_empty()));
+    match given {
+        None | Some("POSIX") => "C".to_owned(),
+        Some(name) => name.to_owned(),
+    }
+}
+
+/// Pure: `setup_text_search`'s warning (`initdb.c:2850`-`:2861`) for a `-T`
+/// that is not the configuration `lc_ctype` suggests.
+///
+/// `lc_ctype` is C here ([`check_template_can_make`]), for which
+/// `find_matching_ts_config` finds [`C_TEXT_SEARCH_CONFIG`], so the
+/// `is unknown` branch (`:2854`) cannot be taken. Compared as C compares
+/// it, with `strcmp` on the name as given.
+#[must_use]
+pub fn text_search_warning(options: &Options) -> Option<String> {
+    let given = options.text_search_config.as_deref()?;
+    (given != C_TEXT_SEARCH_CONFIG).then(|| {
+        format!(
+            "{}: warning: specified text search configuration \"{given}\" might not match \
+             locale \"C\"",
+            crate::help::PROGNAME
+        )
+    })
 }
 
 /// Pure: `-k` / `--no-data-checksums` (`initdb.c:3311`, `:3393`).
@@ -186,12 +229,19 @@ pub fn generated_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conf::DateOrder;
     use crate::control::{DbState, MOCK_AUTH_NONCE_LEN, PG_CONTROL_FILE_SIZE, SystemIdentifier};
     use crate::validate::{Environment, FsProbe, Plan, RealFs, validate};
     use std::ffi::OsString;
 
-    /// Parse and validate `args` (after the program name) with `-D` added.
+    /// Parse and validate `args` (after the program name) with `-D` added,
+    /// as the effective user `postgres`.
     fn parsed(words: &[&str]) -> (Options, CreatePlan) {
+        parsed_as("postgres", words)
+    }
+
+    /// [`parsed`], as the effective user `user`.
+    fn parsed_as(user: &str, words: &[&str]) -> (Options, CreatePlan) {
         let mut argv: Vec<OsString> = words.iter().map(OsString::from).collect();
         let dir = std::env::temp_dir().join(format!(
             "rinitdb-cluster-unit-{}-does-not-exist",
@@ -203,7 +253,7 @@ mod tests {
         };
         let env = Environment {
             pgdata: None,
-            effective_user: Some("postgres".to_owned()),
+            effective_user: Some(user.to_owned()),
         };
         let fs: &dyn FsProbe = &RealFs;
         let Ok(Plan::Create(plan)) = validate(&options, &env, fs) else {
@@ -225,6 +275,12 @@ mod tests {
             &["-E", "UTF8"],
             &["--encoding=utf-8", "--locale=C"],
             &["--lc-ctype=POSIX", "--lc-collate=C", "--lc-messages=C"],
+            &[
+                "--lc-messages=fr_FR.UTF-8",
+                "--lc-monetary=de_DE",
+                "--lc-numeric=xx_ZZ",
+            ],
+            &["--lc-time=de_DE", "--locale=C"],
             &["--locale-provider=libc"],
             &["--wal-segsize=16"],
             &["-U", "postgres"],
@@ -260,8 +316,8 @@ mod tests {
              template cluster has encoding \"UTF8\" and locale \"C\""
         );
         assert_eq!(
-            first_line(&["--lc-time=de_DE"]),
-            "initdb: error: locale \"de_DE\" (--lc-time) is not supported yet: the embedded \
+            first_line(&["--lc-ctype=de_DE", "--lc-time=de_DE"]),
+            "initdb: error: locale \"de_DE\" (--lc-ctype) is not supported yet: the embedded \
              template cluster has encoding \"UTF8\" and locale \"C\""
         );
         assert_eq!(
@@ -280,6 +336,21 @@ mod tests {
     fn the_superuser_is_the_templates_until_it_can_be_changed() {
         let (options, mut plan) = parsed(&[]);
         plan.username = Some("alice".to_owned());
+        assert_eq!(
+            check_template_can_make(&options, &plan)
+                .unwrap_err()
+                .render()
+                .lines()
+                .next(),
+            Some(
+                "initdb: error: superuser name \"alice\" is not supported yet: the embedded \
+                 template cluster's superuser is \"postgres\" and renaming it is not implemented"
+            )
+        );
+        // No -U: validate's `username = effective_user` (initdb.c:3475)
+        // reaches the same refusal.
+        let (options, plan) = parsed_as("alice", &[]);
+        assert_eq!(options.username, None);
         assert_eq!(
             check_template_can_make(&options, &plan)
                 .unwrap_err()
@@ -338,6 +409,66 @@ mod tests {
             super::settings(&options, &plan, None).default_text_search_config,
             "simple"
         );
+    }
+
+    #[test]
+    fn the_four_conf_only_locales_are_written_as_given() {
+        // initdb.c:1315-:1325: lc_messages, lc_monetary, lc_numeric and
+        // lc_time reach postgresql.conf and nothing else, so the template
+        // takes any of them. The reference initdb on musl writes the same
+        // four lines for this command line.
+        let (options, plan) = parsed(&[
+            "--no-locale",
+            "--lc-messages=fr_FR.UTF-8",
+            "--lc-numeric=xx_ZZ",
+            "--lc-time=de_DE",
+        ]);
+        let settings = settings(&options, &plan, None);
+        assert_eq!(settings.lc_messages, "fr_FR.UTF-8");
+        assert_eq!(settings.lc_monetary, "C");
+        assert_eq!(settings.lc_numeric, "xx_ZZ");
+        assert_eq!(settings.lc_time, "de_DE");
+        // locale_date_order is not run (docs/divergences.md).
+        assert_eq!(settings.date_order, DateOrder::Mdy);
+        let conf = &conf::render_all(&settings)[0].1;
+        for line in [
+            "lc_messages = 'fr_FR.UTF-8'\t\t# locale for system error message",
+            "lc_monetary = C\t\t\t\t# locale for monetary formatting",
+            "lc_numeric = 'xx_ZZ'\t\t\t# locale for number formatting",
+            "lc_time = 'de_DE'\t\t\t# locale for time formatting",
+            "datestyle = 'iso, mdy'",
+        ] {
+            assert!(conf.lines().any(|l| l == line), "{line:?}");
+        }
+
+        // --locale fills the ones not given (initdb.c:2432-:2443), and
+        // setlocale returns POSIX as C.
+        let (options, plan) = parsed(&["--locale=POSIX", "--lc-time=de_DE"]);
+        let settings = super::settings(&options, &plan, None);
+        assert_eq!(
+            [
+                settings.lc_messages.as_str(),
+                &settings.lc_monetary,
+                &settings.lc_numeric,
+                &settings.lc_time,
+            ],
+            ["C", "C", "C", "de_DE"]
+        );
+    }
+
+    #[test]
+    fn a_text_search_config_other_than_english_warns_as_c_does() {
+        // initdb.c:2859; the reference initdb writes exactly this line for
+        // `--no-locale -E UTF8 -T simple`.
+        assert_eq!(
+            text_search_warning(&parsed(&["-T", "simple"]).0).as_deref(),
+            Some(
+                "initdb: warning: specified text search configuration \"simple\" might not \
+                 match locale \"C\""
+            )
+        );
+        assert_eq!(text_search_warning(&parsed(&["-T", "english"]).0), None);
+        assert_eq!(text_search_warning(&parsed(&[]).0), None);
     }
 
     #[test]

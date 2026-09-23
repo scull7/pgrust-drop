@@ -195,9 +195,11 @@ fn two_clusters_share_neither_identifier_nor_nonce() {
 
 /// The divergence `docs/divergences.md` records for the template: it fixes
 /// encoding UTF8 and locale C. Anything else on the command line is refused
-/// before a directory is made; the environment's locale is not consulted,
-/// and `--no-locale` gets UTF8 where C `initdb` derives SQL_ASCII from the C
-/// locale (`setup_locale_encoding`, `initdb.c:2685`).
+/// before a directory is made; the environment's locale is not consulted —
+/// under `LC_ALL=en_US.UTF-8` and no locale switch, where C `initdb` makes an
+/// `en_US.UTF-8` cluster, this one is C throughout — and `--no-locale` gets
+/// UTF8 where C derives SQL_ASCII from the C locale
+/// (`setup_locale_encoding`, `initdb.c:2685`).
 #[test]
 fn the_template_fixes_encoding_utf8_and_locale_c() {
     let tempdir = TempDir::new("expanded-locale");
@@ -233,24 +235,71 @@ fn the_template_fixes_encoding_utf8_and_locale_c() {
         assert!(!pgdata.exists(), "{argv:?}: nothing is made");
     }
 
-    let pgdata = tempdir.join("data");
     let env = Environment::inherited()
         .with("LANG", "en_US.UTF-8")
         .with("LC_ALL", "en_US.UTF-8");
+    let no_locale = tempdir.join("data");
     rinitdb_ok(
         &["-U", "postgres", "--no-sync", "--no-locale"],
-        &pgdata,
+        &no_locale,
         &env,
     );
-    let Some(outcome) = reference_single_user(
-        &pgdata,
-        "select pg_encoding_to_char(encoding) as enc, datcollate as coll, datctype as ctype \
-         from pg_database where datname = 'postgres';\n",
-    ) else {
-        return;
-    };
-    let stdout = outcome.stdout_text();
-    assert_eq!(single_user_values(&stdout, "enc"), ["UTF8"], "{stdout}");
-    assert_eq!(single_user_values(&stdout, "coll"), ["C"], "{stdout}");
-    assert_eq!(single_user_values(&stdout, "ctype"), ["C"], "{stdout}");
+    // No locale switch at all: C's setlocales would take all six categories
+    // from LC_ALL (check_locale_name with NULL, initdb.c:2452-:2468).
+    let from_env = tempdir.join("data-env");
+    rinitdb_ok(&["-U", "postgres", "--no-sync"], &from_env, &env);
+    let conf = std::fs::read_to_string(from_env.join("postgresql.conf")).expect("postgresql.conf");
+    for guc in ["lc_messages", "lc_monetary", "lc_numeric", "lc_time"] {
+        assert!(
+            conf.lines()
+                .any(|line| line.starts_with(&format!("{guc} = C\t"))),
+            "{guc} is C, not the environment's"
+        );
+    }
+
+    for pgdata in [&no_locale, &from_env] {
+        let Some(outcome) = reference_single_user(
+            pgdata,
+            "select pg_encoding_to_char(encoding) as enc, datcollate as coll, datctype as ctype \
+             from pg_database where datname = 'postgres';\n",
+        ) else {
+            return;
+        };
+        let stdout = outcome.stdout_text();
+        assert_eq!(single_user_values(&stdout, "enc"), ["UTF8"], "{stdout}");
+        assert_eq!(single_user_values(&stdout, "coll"), ["C"], "{stdout}");
+        assert_eq!(single_user_values(&stdout, "ctype"), ["C"], "{stdout}");
+    }
+}
+
+/// `setup_text_search`'s warning (`initdb.c:2859`): a `-T` other than the
+/// `english` that locale C suggests is taken, with the line C writes for
+/// `--no-locale -E UTF8 -T simple`.
+#[test]
+fn a_text_search_config_that_does_not_match_locale_c_warns() {
+    let tempdir = TempDir::new("expanded-tsearch");
+    let pgdata = tempdir.join("data");
+    let argv = args(&[
+        "-U",
+        "postgres",
+        "--no-sync",
+        "--no-locale",
+        "-E",
+        "UTF8",
+        "-T",
+        "simple",
+        &pgdata.to_string_lossy(),
+    ]);
+    let outcome = testkit::run(Path::new(RINITDB), &argv).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    assert_eq!(
+        outcome.stderr_text(),
+        "initdb: warning: specified text search configuration \"simple\" might not match \
+         locale \"C\"\n"
+    );
+    let conf = std::fs::read_to_string(pgdata.join("postgresql.conf")).expect("postgresql.conf");
+    assert!(
+        conf.lines()
+            .any(|line| line == "default_text_search_config = 'pg_catalog.simple'")
+    );
 }

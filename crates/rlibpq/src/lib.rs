@@ -15,9 +15,10 @@
 //! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`) or asynchronously
 //! (`PQsendQuery` and its siblings, `PQgetResult`, single-row and chunked
 //! modes) and in pipeline mode (`PQenterPipelineMode` … `PQpipelineSync`),
-//! over the pure state machine in `pipeline`; and the `fe-trace.c` protocol
-//! trace behind `PQtrace` and `PQsetTraceFlags`. The rest is tracked in
-//! Linear NAT-390 … NAT-396.
+//! over the pure state machine in `pipeline`; the COPY data transfer in both
+//! directions (`PQputCopyData`, `PQputCopyEnd`, `PQgetCopyData`); and the
+//! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
+//! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -51,7 +52,9 @@ pub mod trace;
 pub mod uri;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
-pub use connection::{Address, Connection, ConnectionError, Stream, Tracer, socket_address};
+pub use connection::{
+    Address, Connection, ConnectionError, CopyRead, Stream, Tracer, socket_address,
+};
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,
     conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,

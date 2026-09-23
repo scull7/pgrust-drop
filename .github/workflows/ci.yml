@@ -23,6 +23,14 @@ name: ci
 # from src/interfaces/libpq/test/ and shipped by no package, so the rlibpq URI
 # gate keeps flagged-skipping until something builds it from source (NAT-374).
 # testkit's UNSHIPPED_TOOLS exempts it by name; every other tool is required.
+#
+# pgrust (ADR-0001, amendment of 2026-09-23): pgdrop depends on pgrust's
+# `main_main`, ~870 crates from a 727 MB git repository. Cold, that is roughly
+# 3-4 minutes of compilation per build flavour (clippy's check and the test
+# build are separate) on a 4-core runner, plus the clone; warm, every lane
+# restores ~/.cargo (registry + git) and target/ from Swatinem/rust-cache and
+# compiles none of it. Budget: a cold lane ~15 minutes, a warm one no more than
+# before pgrust arrived plus a few seconds of cache restore.
 
 on:
   push:
@@ -38,6 +46,15 @@ env:
   # #[ignore]d test (psql program_help_ok, NAT-399) is a known-unimplemented
   # feature.
   PGDROP_REQUIRE_REF: 1
+  # pgrust's regexp_alt links RE2 when libre2 is installed and otherwise, in a
+  # dev profile, falls back to its Spencer-only engine with a warning (release
+  # profiles refuse to build without RE2). CI builds dev profiles only and
+  # takes the fallback on every lane deliberately, instead of depending on
+  # whether a runner image happens to ship libre2. A release build with RE2 is
+  # later work (ADR-0001, amendment of 2026-09-23).
+  PGRUST_FORCE_NO_RE2: 1
+  # The pgrust repository is large; the git CLI fetches it faster than libgit2.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   musl:
@@ -55,8 +72,8 @@ jobs:
     steps:
       - name: Install the Alpine toolchain and the PostgreSQL 18 reference
         run: |
-          apk add --no-cache bash build-base curl git libstdc++ musl-dev tar unzip xz \
-            postgresql18 postgresql18-client
+          apk add --no-cache bash build-base curl git libstdc++ linux-headers musl-dev \
+            perl tar unzip xz postgresql18 postgresql18-client
       - uses: actions/checkout@v4
       # Toolchain in a shared, world-writable prefix (the layout the official
       # rust image uses) so the unprivileged user below can run cargo.
@@ -67,6 +84,10 @@ jobs:
             --component rustfmt,clippy --no-modify-path
           chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      # Restores ~/.cargo (registry, and the pgrust clone under git/) and
+      # target/. It runs as root, so the next step hands the restored trees to
+      # the unprivileged user.
+      - uses: Swatinem/rust-cache@v2
       # The container's steps run as root, and C initdb and postgres refuse to
       # run as root ("cannot be run as root"), so every gate that creates a
       # cluster would compare two refusals. The checks run as an ordinary user;
@@ -75,7 +96,7 @@ jobs:
       - name: Create the unprivileged user the gates run as
         run: |
           adduser -D ci
-          chown -R ci "$GITHUB_WORKSPACE"
+          chown -R ci "$GITHUB_WORKSPACE" "$CARGO_HOME"
       # Fail here rather than three minutes later inside a gate, and branch on
       # each command's exit status -- never on grepped output (AGENTS.md).
       - name: verify the reference binaries are where the gates look
@@ -88,6 +109,8 @@ jobs:
           "$PGDROP_REF_BIN_MUSL/psql" --version
       - name: fmt
         run: su -c 'cargo fmt --all --check' ci
+      - name: license wall (no pgrust crate reachable from an MIT crate)
+        run: su -c 'scripts/check-license-wall.sh' ci
       - name: clippy
         run: su -c 'cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic' ci
       - name: test
@@ -116,6 +139,8 @@ jobs:
           done
           "$PGDROP_REF_BIN_APPLE/initdb" --version
           "$PGDROP_REF_BIN_APPLE/psql" --version
+      - name: license wall (no pgrust crate reachable from an MIT crate)
+        run: scripts/check-license-wall.sh
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test
@@ -159,6 +184,8 @@ jobs:
           "$PGDROP_REF_BIN_GNU/psql" --version
       - name: fmt
         run: cargo fmt --all --check
+      - name: license wall (no pgrust crate reachable from an MIT crate)
+        run: scripts/check-license-wall.sh
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test

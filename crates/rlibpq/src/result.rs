@@ -268,6 +268,9 @@ pub struct QueryResult {
     rows: Vec<Vec<Option<Vec<u8>>>>,
     command_status: Vec<u8>,
     error: Option<ResultError>,
+    /// `paramDescs`: the parameter types a ParameterDescription reported
+    /// (`getParamDescriptions`, `fe-protocol3.c:690`).
+    params: Vec<u32>,
 }
 
 impl QueryResult {
@@ -280,6 +283,7 @@ impl QueryResult {
             rows: Vec::new(),
             command_status: Vec::new(),
             error: None,
+            params: Vec::new(),
         }
     }
 
@@ -291,6 +295,7 @@ impl QueryResult {
             rows: Vec::new(),
             command_status: Vec::new(),
             error: Some(error),
+            params: Vec::new(),
         }
     }
 
@@ -323,6 +328,30 @@ impl QueryResult {
 
     pub(crate) fn push_row(&mut self, row: Vec<Option<Vec<u8>>>) {
         self.rows.push(row);
+    }
+
+    /// `PQftype`, `fe-exec.c:3750` — the column's type OID. Out of range is
+    /// `InvalidOid` there and `None` here.
+    #[must_use]
+    pub fn ftype(&self, column: usize) -> Option<u32> {
+        self.fields.get(column).map(|f| f.typid)
+    }
+
+    /// `PQnparams`, `fe-exec.c:3946` — how many parameters a described
+    /// prepared statement takes.
+    #[must_use]
+    pub fn nparams(&self) -> usize {
+        self.params.len()
+    }
+
+    /// `PQparamtype`, `fe-exec.c:3957`.
+    #[must_use]
+    pub fn paramtype(&self, param: usize) -> Option<u32> {
+        self.params.get(param).copied()
+    }
+
+    pub(crate) fn set_params(&mut self, params: Vec<u32>) {
+        self.params = params;
     }
 
     /// `PQfname`, `fe-exec.c:3598`.

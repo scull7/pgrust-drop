@@ -58,8 +58,6 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
-use error::Unsupported;
-
 pub use cleanup::Progress;
 pub use cli::{Invocation, Options};
 pub use conf::{AuthMethods, DateOrder, Settings};
@@ -136,7 +134,7 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
 /// the directories exist, so a `--waldir` that fails here and passes there
 /// cannot skip it. `setup_text_search`'s warning (`initdb.c:3492`) comes
 /// next, before the first `mkdir` as in C — also ahead of a waiting refusal,
-/// unless that refusal is the locale's, whose "C" the warning would misstate.
+/// unless `lc_ctype` is not C ([`cluster::text_search_warning`]).
 /// Progress output and the closing
 /// instructions are C's stdout and are not printed yet (NAT-387).
 fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write) -> ExitCode {
@@ -147,14 +145,9 @@ fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write)
             let _ = writeln!(stderr, "{}", err.render());
             return ExitCode::from(EXIT_FAILURE);
         }
-        // Its locale "C" is untrue only when the refusal is the locale's;
-        // `-U`, `-W`, `--pwfile` and `--wal-segsize` leave `lc_ctype` at C,
-        // so behind a failing `--waldir` C writes the warning first.
-        Err(InitdbError::NotSupportedYet {
-            why: Unsupported::EncodingOrLocale,
-            ..
-        }) => {}
-        Ok(()) | Err(_) => {
+        // Behind a failing `--waldir`, C writes the warning first whatever
+        // is refused; text_search_warning is None when `lc_ctype` is not C.
+        _ => {
             if let Some(warning) = cluster::text_search_warning(options) {
                 let _ = writeln!(stderr, "{warning}");
             }

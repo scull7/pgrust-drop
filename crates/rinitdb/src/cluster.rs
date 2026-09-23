@@ -187,15 +187,29 @@ pub fn musl_setlocale_name(name: &str) -> &str {
 }
 
 /// Pure: `setup_text_search`'s warning (`initdb.c:2850`-`:2861`) for a `-T`
-/// that is not the configuration `lc_ctype` suggests.
+/// that is not the configuration `lc_ctype` suggests, when `lc_ctype` is C.
 ///
-/// `lc_ctype` is C here ([`check_template_can_make`]), for which
-/// `find_matching_ts_config` finds [`C_TEXT_SEARCH_CONFIG`], so the
-/// `is unknown` branch (`:2854`) cannot be taken. Compared as C compares
-/// it, with `strcmp` on the name as given.
+/// `lc_ctype` is `--lc-ctype`, else `--locale` (`setlocales`, `initdb.c:2432`;
+/// `--no-locale` is `locale = "C"`, `:3338`, and never overrides either);
+/// an empty or absent one is the environment's (`check_locale_name`,
+/// `:2202`), which this port takes to be C (`docs/divergences.md`), and
+/// `setlocale` names `POSIX` `C`. For C, `find_matching_ts_config` finds
+/// [`C_TEXT_SEARCH_CONFIG`], so the `is unknown` branch (`:2854`) cannot be
+/// taken; the name is compared as C compares it, with `strcmp` as given.
+///
+/// Any other `lc_ctype` is `None`: [`check_template_can_make`] refuses it,
+/// and C's line would name it as `setlocale` canonicalizes it and compare
+/// `-T` with whatever `find_matching_ts_config` makes of it, neither of
+/// which this crate reaches. Every other refusal — `-E`, `--locale-provider`,
+/// `--lc-collate`, `-U`, `-W`, `--pwfile`, `--wal-segsize` — leaves
+/// `lc_ctype` alone, so the line is C's whatever else is refused.
 #[must_use]
 pub fn text_search_warning(options: &Options) -> Option<String> {
     let given = options.text_search_config.as_deref()?;
+    let lc_ctype = options.lc_ctype.as_deref().or(options.locale.as_deref());
+    if !lc_ctype.is_none_or(|name| name.is_empty() || is_c_locale(name)) {
+        return None;
+    }
     (given != C_TEXT_SEARCH_CONFIG).then(|| {
         format!(
             "{}: warning: specified text search configuration \"{given}\" might not match \
@@ -553,6 +567,41 @@ mod tests {
         );
         assert_eq!(text_search_warning(&parsed(&["-T", "english"]).0), None);
         assert_eq!(text_search_warning(&parsed(&[]).0), None);
+    }
+
+    #[test]
+    fn the_text_search_warning_follows_lc_ctype_not_the_refusal() {
+        // setup_text_search names lc_ctype (initdb.c:2859), which is
+        // --lc-ctype, else --locale (:2432). The reference initdb writes the
+        // line naming "C" for each command line in the first list, with
+        // `--no-locale -E UTF8 -T simple -U postgres` before it.
+        let warning = Some(
+            "initdb: warning: specified text search configuration \"simple\" might not match \
+             locale \"C\""
+                .to_owned(),
+        );
+        for extra in [
+            &["--lc-collate", "de_DE"][..],
+            &["-E", "LATIN1"],
+            &["--locale-provider", "builtin", "--builtin-locale", "C"],
+            &["--locale", "de_DE", "--lc-ctype", "C"],
+            &["--lc-ctype", "POSIX"],
+            &["--locale", "POSIX"],
+            &["--wal-segsize", "32"],
+        ] {
+            let argv = [&["--no-locale", "-T", "simple"][..], extra].concat();
+            assert_eq!(text_search_warning(&parsed(&argv).0), warning, "{extra:?}");
+        }
+        // lc_ctype is not C: the refusal follows, and C's line would name it.
+        for extra in [
+            &["--lc-ctype", "de_DE"][..],
+            &["--locale", "de_DE"],
+            &["--lc-ctype", "de_DE", "--locale", "C"],
+            &["--lc-ctype", "C.UTF-8"],
+        ] {
+            let argv = [&["--no-locale", "-T", "simple"][..], extra].concat();
+            assert_eq!(text_search_warning(&parsed(&argv).0), None, "{extra:?}");
+        }
     }
 
     #[test]

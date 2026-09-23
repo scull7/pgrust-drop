@@ -173,7 +173,7 @@ mod unix {
     ///
     /// `ENOENT` is allowed and skipped, for the `stat` and for the directory
     /// read alike: "a running server can delete files, such as those in
-    /// `pg_stat`" (`Utils.pm:601`), and a directory can vanish between the two
+    /// `pg_stat`" (`Utils.pm:621`), and a directory can vanish between the two
     /// calls just as a file can. Every other failure is returned, where
     /// upstream dies.
     ///

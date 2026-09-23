@@ -9,7 +9,7 @@
 //!
 //! This is deliberately the *small* reader: the handful of fields the stolen
 //! assertions name, read straight out of the image the way `pg_controldata`'s
-//! own `get_controlfile()` does (`src/common/controldata_utils.c:66`). The full
+//! own `get_controlfile()` does (`src/common/controldata_utils.c:52`). The full
 //! `ControlFileData` port — every field, plus writing one back — belongs to the
 //! tool that writes clusters, and lives in `rinitdb::control`. Keeping the two
 //! apart keeps `testkit` free of a dependency on the crate it tests;
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub const XLOG_CONTROL_FILE: &str = "global/pg_control";
 
 /// `sizeof(ControlFileData)` on a 64-bit build; `get_controlfile` reads exactly
-/// this many bytes (`src/common/controldata_utils.c:99`).
+/// this many bytes (`src/common/controldata_utils.c:101`).
 const SIZEOF_CONTROL_FILE_DATA: usize = 296;
 
 /// `offsetof(ControlFileData, system_identifier)`.
@@ -53,7 +53,7 @@ impl ControlData {
     ///
     /// `None` when the image is shorter than `sizeof(ControlFileData)`, which
     /// is the short read `get_controlfile_by_exact_path` calls a fatal error
-    /// (`src/common/controldata_utils.c:113`).
+    /// (`src/common/controldata_utils.c:119`).
     #[must_use]
     pub fn parse(image: &[u8]) -> Option<Self> {
         if image.len() < SIZEOF_CONTROL_FILE_DATA {

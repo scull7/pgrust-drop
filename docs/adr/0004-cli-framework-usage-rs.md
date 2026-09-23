@@ -32,7 +32,7 @@ tree, builds on Rust 1.96 in ~9 s).
 - For `rinitdb`, `program_help_ok` / `program_version_ok` pass and
   `help_and_version_match_reference_initdb` diffs both flags against the C
   binary with no normalizer at all
-  (`crates/rinitdb/tests/t_001_initdb.rs:168`); it prints
+  (`crates/rinitdb/tests/t_001_initdb.rs:176`); it prints
   `SKIP (flagged, not silent)` where PostgreSQL 18 is not installed. For
   `rpsql` only `program_version_ok` passes today — see the amendment.
 - Divergences pinned in `docs/divergences.md`: glibc getopt error text and exit
@@ -44,7 +44,7 @@ tree, builds on Rust 1.96 in ~9 s).
 ## Amendment 2026-09-16: the psql half is not true yet
 
 `rpsql` does not print upstream's `--help` text. `run`
-(`crates/rpsql/src/lib.rs:152`) answers `Invocation::PrintHelp` by writing
+(`crates/rpsql/src/lib.rs:127`) answers `Invocation::PrintHelp` by writing
 
 ```
 psql: error: --help is not implemented yet (Linear NAT-399)
@@ -53,7 +53,7 @@ psql: error: --help is not implemented yet (Linear NAT-399)
 to **stderr** and exiting **1** — not upstream's text on stdout with status 0.
 The stolen `program_help_ok('psql')` is therefore declared in upstream's
 position and `#[ignore]`d with NAT-399 as its reason
-(`crates/rpsql/tests/t_001_basic.rs:30`), the only `#[ignore]` in the
+(`crates/rpsql/tests/t_001_basic.rs:31`), the only `#[ignore]` in the
 repository. That is deliberate and stays: keeping the assertion with a named
 reason makes the gap visible, where deleting it would hide it. Do not weaken
 it to something `rpsql` can pass today.

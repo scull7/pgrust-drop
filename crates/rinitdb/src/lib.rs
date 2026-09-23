@@ -38,6 +38,7 @@ pub mod findtimezone;
 pub mod help;
 pub mod layout;
 pub mod pg_config;
+pub mod strerror;
 pub mod sync;
 pub mod tz;
 pub mod validate;

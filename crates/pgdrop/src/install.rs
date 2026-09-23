@@ -33,7 +33,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rinitdb::validate::strerror;
+use rinitdb::strerror::strerror;
 use usage::Args;
 
 use crate::dispatch::Applet;

@@ -372,7 +372,7 @@ fn fsync_fname(path: &Path, isdir: bool) -> Result<Option<InitdbError>, InitdbEr
         Err(err) => {
             return Ok(Some(InitdbError::CouldNotOpenFile {
                 path: display(path),
-                reason: crate::validate::strerror(&err),
+                reason: crate::strerror::strerror(&err),
             }));
         }
     };
@@ -384,7 +384,7 @@ fn fsync_fname(path: &Path, isdir: bool) -> Result<Option<InitdbError>, InitdbEr
         Err(err) if isdir && (is(&err, errno::EBADF) || is(&err, errno::EINVAL)) => Ok(None),
         Err(err) => Err(InitdbError::CouldNotFsyncFile {
             path: display(path),
-            reason: crate::validate::strerror(&err),
+            reason: crate::strerror::strerror(&err),
         }),
     }
 }
@@ -407,18 +407,18 @@ impl SyncProbe for RealFs {
     fn lstat(&self, path: &Path) -> Result<FileKind, String> {
         std::fs::symlink_metadata(path)
             .map(|meta| kind_of(&meta))
-            .map_err(|err| crate::validate::strerror(&err))
+            .map_err(|err| crate::strerror::strerror(&err))
     }
 
     fn stat(&self, path: &Path) -> Result<FileKind, String> {
         std::fs::metadata(path)
             .map(|meta| kind_of(&meta))
-            .map_err(|err| crate::validate::strerror(&err))
+            .map_err(|err| crate::strerror::strerror(&err))
     }
 
     fn read_dir(&self, path: &Path) -> Result<DirListing, String> {
         // Only the `opendir` failure is an Err: file_utils.c:302.
-        let entries = std::fs::read_dir(path).map_err(|err| crate::validate::strerror(&err))?;
+        let entries = std::fs::read_dir(path).map_err(|err| crate::strerror::strerror(&err))?;
         let mut listing = DirListing::default();
         for entry in entries {
             // file_utils.c:308 — `while (errno = 0, (de = readdir(dir)) !=
@@ -430,7 +430,7 @@ impl SyncProbe for RealFs {
                 // `read_dir` already skips "." and ".." (file_utils.c:312).
                 Ok(entry) => listing.names.push(entry.file_name()),
                 Err(err) => {
-                    listing.read_error = Some(crate::validate::strerror(&err));
+                    listing.read_error = Some(crate::strerror::strerror(&err));
                     break;
                 }
             }

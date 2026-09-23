@@ -2,7 +2,9 @@
 
 Status: accepted for M1 (2026-09-16); locale handling revised 2026-09-17
 (ADR-0007 target matrix); amended 2026-09-23 (the image already holds imported
-collations; committed blob minted on musl — see Amendment below); superseded by
+collations; committed blob minted on musl — see Amendment below); amended
+2026-09-23 again (the template's `pg_control` is committed beside the image,
+and the first WAL segment is regenerated); superseded by
 M5 when pgrust gains `--boot`.
 
 ## Context
@@ -200,3 +202,31 @@ expanding host may not have.
   with the committed bytes: CI's musl container (`alpine:3.23`) is not the
   minting host (3.24). The manifest is the record; a re-mint is committed
   together with it and explained on the Linear issue.
+
+## Amendment 2026-09-23: the template's pg_control, and a regenerated first WAL segment
+
+The Decision's step 2 says "write a fresh `pg_control`". A fresh one cannot
+be derived from the image alone: the catalogs in it are consistent with one
+next XID, next OID and multixact state, and with a WAL position every page
+LSN is behind, and all of that lived in the minted cluster's `pg_control`
+and `pg_wal`, both of which the image strips as per-cluster files.
+
+**Decision.** The mint keeps the minted `global/pg_control` as
+`crates/rinitdb/image/template.control`, in template form: the system
+identifier, both timestamps and the mock authentication nonce zeroed
+(`ControlFile::as_template`), so two mints agree on it byte for byte and the
+mint tool requires them to. The manifest records its SHA-256 (`control`). A
+new cluster's `pg_control` is that file with those four fields set afresh and
+the checkpoint moved the way `pg_resetwal -f` moves it
+(`control::for_new_cluster`: one segment past the old redo pointer, just after
+the segment's long page header), and its only WAL segment holds the one
+shutdown checkpoint record `WriteEmptyXLOG` would write (`wal::segment`). The
+template's own `wal_level` and `max_*` settings are kept, not reset as
+`pg_resetwal` resets them, since they are what C initdb's server recorded for
+the very settings `postgresql.conf` is rendered with.
+
+**Consequences.** `crates/rinitdb/tests/first_segment.rs` holds this to C:
+for a reference-minted cluster reset by the reference `pg_resetwal -f`, our
+checkpoint placement is `pg_resetwal`'s and our segment is its segment file,
+byte for byte. A re-mint commits three files together: image, control file,
+manifest.

@@ -22,7 +22,7 @@ pub const PG_FILE_MODE_GROUP: u32 = 0o640;
 /// The three modes `initdb` creates PGDATA with.
 ///
 /// `mode_mask` is what `initialize_data_directory` passes to `umask()`
-/// (`initdb.c:3057`); it is carried because it is one of the three values
+/// (`initdb.c:3058`); it is carried because it is one of the three values
 /// `SetDataDirectoryCreatePerm` sets, and because the arithmetic it implies is
 /// what lets [`crate::layout`] state a final mode per entry — see
 /// [`DataDirPerm::masked_dir_mode`].
@@ -88,7 +88,7 @@ impl DataDirPerm {
 
     /// The mode a file actually ends up with: `fopen` asks for 0666 and
     /// `umask(mode_mask)` takes it down to `file_create_mode`
-    /// (`write_version_file`, `initdb.c:1034`, creates PG_VERSION this way).
+    /// (`write_version_file`, `initdb.c:1024`, creates PG_VERSION this way).
     #[must_use]
     pub fn masked_file_mode(self) -> u32 {
         0o666 & !self.mode_mask

@@ -2,7 +2,7 @@
 //! stderr block each one prints.
 //!
 //! `pg_log_error`, `pg_log_error_detail` and `pg_log_error_hint` all go through
-//! `pg_log_generic_v` (`src/common/logging.c:99`), which writes
+//! `pg_log_generic_v` (`src/common/logging.c:219`), which writes
 //! `"<progname>: "`, then `"error: "` / `"detail: "` / `"hint: "`, then the
 //! formatted message and one newline. A message may itself contain a newline —
 //! `warn_on_mount_point` (`src/bin/initdb/initdb.c:3038`) sends a two-line hint
@@ -46,7 +46,7 @@ impl DirRole {
 
 /// Why `pg_check_dir` judged a directory non-empty.
 ///
-/// `initdb.c:2931` branches on the code: 4 gets the "remove or empty it" hint,
+/// `initdb.c:2930` branches on the code: 4 gets the "remove or empty it" hint,
 /// 2 and 3 get `warn_on_mount_point` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotEmpty {
@@ -68,7 +68,7 @@ pub enum LocaleProvider {
     Builtin,
     /// `--locale-provider=icu`.
     Icu,
-    /// `--locale-provider=libc`, the default (`initdb.c:139`).
+    /// `--locale-provider=libc`, the default (`initdb.c:147`).
     #[default]
     Libc,
 }
@@ -213,7 +213,7 @@ pub enum InitdbError {
     #[error("could not open directory \"{path}\": {reason}")]
     CouldNotOpenDirectory { path: String, reason: String },
 
-    /// `src/common/file_utils.c:337` (`walkdir`) — `readdir` itself failed
+    /// `src/common/file_utils.c:338` (`walkdir`) — `readdir` itself failed
     /// part-way through. Reported after the entries it did read have been
     /// acted on, and the directory is still fsync'd.
     #[error("could not read directory \"{path}\": {reason}")]
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn a_lost_and_found_directory_gets_the_mount_point_detail_and_a_two_line_hint() {
         // The second hint line carries no "initdb: hint: " prefix: logging.c
-        // prints the whole message with one fprintf (src/common/logging.c:212).
+        // prints the whole message with one fprintf (src/common/logging.c:334).
         let err = InitdbError::DirectoryNotEmpty {
             path: "/tmp/pgxlog".to_owned(),
             role: DirRole::Wal,

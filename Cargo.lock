@@ -7,6 +7,7 @@ name = "pgdrop"
 version = "0.1.0"
 dependencies = [
  "rinitdb",
+ "rlibpq",
  "rpsql",
  "testkit",
  "usage-rs",

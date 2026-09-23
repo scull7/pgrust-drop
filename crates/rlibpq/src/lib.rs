@@ -16,7 +16,9 @@
 //! (`PQsendQuery` and its siblings, `PQgetResult`, single-row and chunked
 //! modes) and in pipeline mode (`PQenterPipelineMode` … `PQpipelineSync`),
 //! over the pure state machine in `pipeline`; the COPY data transfer in both
-//! directions (`PQputCopyData`, `PQputCopyEnd`, `PQgetCopyData`); and the
+//! directions (`PQputCopyData`, `PQputCopyEnd`, `PQgetCopyData`); the
+//! blocking query cancel calls (`PQgetCancel`, `PQcancel`, `PQrequestCancel`,
+//! `PQcancelCreate`, `PQcancelBlocking`); and the
 //! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
@@ -33,6 +35,7 @@
 
 pub mod auth;
 pub mod base64;
+pub mod cancel;
 pub mod connection;
 pub mod conninfo;
 mod cstr;
@@ -52,6 +55,7 @@ pub mod trace;
 pub mod uri;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
+pub use cancel::{Cancel, CancelConn, CancelError, CancelStatus, CancelStep, Peer};
 pub use connection::{
     Address, Connection, ConnectionError, CopyRead, Stream, Tracer, socket_address,
 };

@@ -12550,10 +12550,13 @@ dependencies = [
 name = "pgdrop"
 version = "0.1.0"
 dependencies = [
+ "elog",
+ "ipc",
  "main_main",
  "rinitdb",
  "rlibpq",
  "rpsql",
+ "seams_init",
  "testkit",
  "usage-rs",
 ]

@@ -13,8 +13,9 @@
 #   --show  print the pinned repository and rev, and exit
 #
 # Resolves REF to a commit, checks the commit carries what this repo depends on
-# (below), rewrites the `main_main` line in the workspace Cargo.toml and
-# refreshes Cargo.lock. Then run the checks, including a musl build.
+# (below), rewrites every pgrust line in the workspace Cargo.toml (`main_main`
+# and the crates pgdrop's postgres applet names beside it) and refreshes
+# Cargo.lock. Then run the checks, including a musl build.
 #
 # It records nothing: a bump is recorded on its Linear issue (project
 # pgrust-drop) -- the new rev, why that rev, the checks run. progress.md is
@@ -30,6 +31,9 @@ readonly MANIFEST
 # builtins.rs registers.
 readonly REQUIRED_PATHS=(
   crates/backend/main/main_main/Cargo.toml
+  crates/_support/seams_init/Cargo.toml
+  crates/backend/storage/ipc/ipc/Cargo.toml
+  crates/backend/utils/error/elog/Cargo.toml
   crates/backend/commands/collationcmds/src/import.rs
   crates/backend/commands/collationcmds/src/builtins.rs
 )
@@ -93,9 +97,10 @@ if [ "$repo" = "$old_repo" ] && [ "$new_rev" = "$old_rev" ]; then
   exit 0
 fi
 
-sed -i.bak "s|^main_main = { git = \"https://github.com/$old_repo\", rev = \"$old_rev\" }\$|main_main = { git = \"https://github.com/$repo\", rev = \"$new_rev\" }|" "$MANIFEST"
+sed -i.bak "s|^\([a-z_]*\) = { git = \"https://github.com/$old_repo\", rev = \"$old_rev\" }\$|\1 = { git = \"https://github.com/$repo\", rev = \"$new_rev\" }|" "$MANIFEST"
 rm -f "$MANIFEST.bak"
-if [ "$(pinned 1) $(pinned 2)" != "$repo $new_rev" ]; then
+if [ "$(pinned 1) $(pinned 2)" != "$repo $new_rev" ] ||
+  grep -q "rev = \"$old_rev\"" "$MANIFEST"; then
   echo "pgrust-rev: failed to rewrite the pin in $MANIFEST" >&2
   exit 1
 fi

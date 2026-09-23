@@ -24,6 +24,9 @@ usage = { workspace = true }
 rinitdb = { workspace = true }
 rpsql = { workspace = true }
 main_main = { workspace = true }
+seams_init = { workspace = true }
+ipc = { workspace = true }
+elog = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

@@ -8,11 +8,12 @@
 //! function here is a calculation from arguments to [`Frontend`] messages;
 //! sending them and folding the replies is [`crate::Connection`]'s job.
 //!
-//! Outside pipeline mode — the only mode this port has so far — each command
-//! ends with its own Sync (`fe-exec.c:1610`, `:1903`, `:2628`).
+//! Each plan ends with the command's own Sync, as it is sent outside pipeline
+//! mode (`fe-exec.c:1610`, `:1903`, `:2628`); in pipeline mode the Sync is
+//! the caller's to send, and [`Plan::without_sync`] is the plan then.
 
-use crate::connection::QueryClass;
 use crate::message::{Frontend, Target};
+use crate::pipeline::QueryClass;
 
 /// `PQ_QUERY_PARAM_MAX_LIMIT`, `libpq-fe.h:507`: the most parameters a
 /// Parse or Bind can carry, since both count them in two bytes.
@@ -116,6 +117,19 @@ impl std::error::Error for ArgumentError {}
 pub struct Plan {
     pub messages: Vec<Frontend>,
     pub class: QueryClass,
+}
+
+impl Plan {
+    /// The plan as pipeline mode sends it: "Add a Sync, unless in pipeline
+    /// mode" (`fe-exec.c:1610`, `:1903`, `:2628`), so the command's own
+    /// trailing Sync is dropped and `PQpipelineSync` sends one later.
+    #[must_use]
+    pub fn without_sync(mut self) -> Self {
+        if self.messages.last() == Some(&Frontend::Sync) {
+            self.messages.pop();
+        }
+        self
+    }
 }
 
 /// `fe-exec.c:1527` — the parameter count must fit the two-byte counts.
@@ -461,6 +475,29 @@ mod tests {
         assert_eq!(
             String::from_utf8(error.message()).unwrap(),
             "paramFormats has 1 entries for 2 parameters"
+        );
+    }
+
+    /// In pipeline mode each command goes out without its Sync:
+    /// `traces/multi_pipelines.trace` lines 1-4 are the four messages of
+    /// `query_params` less the Sync, which line 5 is `PQpipelineSync`'s.
+    #[test]
+    fn a_pipelined_command_sends_no_sync_of_its_own() {
+        let plan = query_params(b"SELECT $1", &[23], &Params::text(&[Some(b"1")]))
+            .unwrap()
+            .without_sync();
+        let ids: Vec<u8> = plan.messages.iter().map(|m| m.encode()[0]).collect();
+        assert_eq!(ids, b"PBDE");
+        assert_eq!(plan.class, QueryClass::Extended);
+
+        let plan = prepare(b"s", b"SELECT 1", &[]).unwrap().without_sync();
+        assert_eq!(plan.messages.len(), 1);
+        let plan = typed_command(TypedCommand::Close, Target::Statement, b"s").without_sync();
+        assert_eq!(plan.messages.len(), 1);
+        assert_eq!(
+            plan.clone().without_sync(),
+            plan,
+            "a plan without a Sync is left alone"
         );
     }
 }

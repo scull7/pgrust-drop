@@ -1,17 +1,19 @@
-//! The actions: a socket, the startup exchange, and `PQexec` over it.
+//! The actions: a socket, the startup exchange, and the query calls over it.
 //!
 //! Ported from `src/interfaces/libpq/fe-connect.c` (`pqConnectDBComplete`'s
 //! blocking loop, `:2782`, and `PQconnectPoll`'s `CONNECTION_AWAITING_RESPONSE`
-//! state, `:3982`) and `fe-exec.c` (`PQexec`, `:2279`, which sends one Query and
-//! collects results until ReadyForQuery, and its extended-query siblings from
-//! `PQexecParams`, `:2293`, to `PQclosePortal`, `:2556`, which send the plans
-//! `crate::extended` builds and collect the same way).
+//! state, `:3982`) and `fe-exec.c`: the asynchronous calls — `PQsendQuery`
+//! (`:1433`) and its extended-query siblings, `PQgetResult` (`:2079`),
+//! `PQisBusy` (`:2048`), `PQconsumeInput` (`:2001`), and pipeline mode from
+//! `PQenterPipelineMode` (`:3073`) to `PQsendFlushRequest` (`:3402`) — and
+//! the blocking ones built on them, `PQexec` (`:2279`) to `PQclosePortal`
+//! (`:2556`), which are `PQexecStart`, one send, and `PQexecFinish`.
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]
 //! and [`socket_address`] are functions of the `ConnInfo` alone, and
-//! [`QueryRunner`] turns a stream of [`Backend`] messages into results without
-//! knowing where they came from — which is what lets the tests below replay a
-//! whole authenticated session over a scripted stream.
+//! [`PipelineState`] decides what every message means and when it may be
+//! parsed, without knowing where it came from — which is what lets the tests
+//! below replay a whole authenticated session over a scripted stream.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -27,6 +29,9 @@ use crate::message::{
     next_frame,
 };
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
+use crate::pipeline::{
+    Admit, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass, message_id,
+};
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
 use crate::trace::{self, AuthResponse, Origin, TraceFlags};
@@ -54,6 +59,10 @@ pub enum ConnectionError {
     /// An extended-query argument refused before anything was sent
     /// (`PQsendQueryParams` and its siblings, `fe-exec.c:1509`).
     Argument(ArgumentError),
+    /// A call the connection's state refuses before anything is sent — a
+    /// blocking call in pipeline mode, a second command outside it, leaving
+    /// pipeline mode with results outstanding.
+    Pipeline(PipelineError),
 }
 
 impl ConnectionError {
@@ -78,6 +87,7 @@ impl ConnectionError {
             }
             ConnectionError::Conninfo(err) => err.message(),
             ConnectionError::Argument(err) => err.message(),
+            ConnectionError::Pipeline(err) => err.message(),
         }
     }
 }
@@ -111,6 +121,12 @@ impl From<AuthError> for ConnectionError {
 impl From<ArgumentError> for ConnectionError {
     fn from(err: ArgumentError) -> Self {
         ConnectionError::Argument(err)
+    }
+}
+
+impl From<PipelineError> for ConnectionError {
+    fn from(err: PipelineError) -> Self {
+        ConnectionError::Pipeline(err)
     }
 }
 
@@ -331,6 +347,17 @@ impl Stream {
             Address::Unix(path) => Ok(Stream::Unix(UnixStream::connect(path)?)),
         }
     }
+
+    /// Switch the socket between blocking and non-blocking reads.
+    ///
+    /// # Errors
+    /// The socket refused the change.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_nonblocking(nonblocking),
+            Stream::Unix(s) => s.set_nonblocking(nonblocking),
+        }
+    }
 }
 
 impl Read for Stream {
@@ -355,236 +382,6 @@ impl Write for Stream {
             Stream::Tcp(s) => s.flush(),
             Stream::Unix(s) => s.flush(),
         }
-    }
-}
-
-/// `PGQueryClass`, `libpq-int.h:318`: what the command at the head of the
-/// queue asked for, which decides what the replies mean. `PGQUERY_SYNC`
-/// belongs to pipeline mode and is not here yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QueryClass {
-    /// `PGQUERY_SIMPLE`: a Query message (`PQexec`).
-    #[default]
-    Simple,
-    /// `PGQUERY_EXTENDED`: Parse (optional), Bind, Describe portal, Execute
-    /// (`PQexecParams`, `PQexecPrepared`).
-    Extended,
-    /// `PGQUERY_PREPARE`: Parse only (`PQprepare`).
-    Prepare,
-    /// `PGQUERY_DESCRIBE`: Describe a statement or a portal.
-    Describe,
-    /// `PGQUERY_CLOSE`: Close a statement or a portal.
-    Close,
-}
-
-/// Where a query's messages are accumulating — `pqParseInput3`'s BUSY-state
-/// switch (`fe-protocol3.c:203`) as a fold over messages.
-#[derive(Debug, Default)]
-pub struct QueryRunner {
-    /// `conn->cmd_queue_head->queryclass`.
-    class: QueryClass,
-    results: Vec<QueryResult>,
-    current: Option<QueryResult>,
-    notices: Vec<ResultError>,
-    notifications: Vec<(i32, Vec<u8>, Vec<u8>)>,
-    parameters: Vec<(Vec<u8>, Vec<u8>)>,
-    transaction_status: Option<TransactionStatus>,
-    /// Once an error result is set up, later DataRows are ignored
-    /// (`fe-protocol3.c:882`).
-    saw_error: bool,
-}
-
-/// Whether the caller should keep reading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flow {
-    Continue,
-    /// ReadyForQuery arrived: the command is over.
-    Done,
-}
-
-impl QueryRunner {
-    /// A runner for a simple Query.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A runner for a command of the given class.
-    #[must_use]
-    pub fn for_class(class: QueryClass) -> Self {
-        Self {
-            class,
-            ..Self::default()
-        }
-    }
-
-    /// One message in. `Err` is the connection-fatal case; everything else
-    /// becomes a result, a notice or state.
-    ///
-    /// # Errors
-    /// The message cannot appear here at all — a DataRow with no preceding
-    /// RowDescription, a field count that disagrees with it, or a message type
-    /// this port does not handle yet (the COPY messages) or that libpq never
-    /// provokes (PortalSuspended, `fe-protocol3.c:446`).
-    pub fn push(&mut self, message: Backend) -> Result<Flow, ProtocolError> {
-        match message {
-            // getRowDescriptions, fe-protocol3.c:527 — a Describe fills the
-            // result ParameterDescription already made (or a new COMMAND_OK
-            // one) and is then done (`:627`); anything else starts a
-            // TUPLES_OK result the rows go into.
-            Backend::RowDescription(fields) if self.class == QueryClass::Describe => {
-                let mut result = self
-                    .current
-                    .take()
-                    .unwrap_or_else(|| QueryResult::new(ExecStatus::CommandOk));
-                result.set_fields(fields);
-                self.results.push(result);
-            }
-            Backend::RowDescription(fields) => {
-                let mut result = QueryResult::new(ExecStatus::TuplesOk);
-                result.set_fields(fields);
-                self.finish_current();
-                self.current = Some(result);
-            }
-            // getParamDescriptions, fe-protocol3.c:690 — a new COMMAND_OK
-            // result holding the parameter types; the RowDescription or
-            // NoData that follows completes it.
-            Backend::ParameterDescription(types) => {
-                let mut result = QueryResult::new(ExecStatus::CommandOk);
-                result.set_params(types);
-                self.current = Some(result);
-            }
-            // fe-protocol3.c:266 — "If we're doing PQprepare, we're done;
-            // else ignore".
-            Backend::ParseComplete => {
-                if self.class == QueryClass::Prepare {
-                    self.command_ok_ready();
-                }
-            }
-            // fe-protocol3.c:287 — the same rule for a Close.
-            Backend::CloseComplete => {
-                if self.class == QueryClass::Close {
-                    self.command_ok_ready();
-                }
-            }
-            // fe-protocol3.c:351 — a Describe of something that returns no
-            // rows still owes the caller a COMMAND_OK result.
-            Backend::NoData => {
-                if self.class == QueryClass::Describe {
-                    self.command_ok_ready();
-                }
-            }
-            Backend::DataRow(values) => {
-                if self.saw_error {
-                    return Ok(Flow::Continue);
-                }
-                let Some(result) = self.current.as_mut() else {
-                    return Err(ProtocolError::DataWithoutRowDescription);
-                };
-                // fe-protocol3.c:796 — the field count must match "T".
-                if values.len() != result.nfields() {
-                    return Err(ProtocolError::UnexpectedFieldCount);
-                }
-                result.push_row(values);
-            }
-            Backend::CommandComplete(tag) => {
-                let mut result = self
-                    .current
-                    .take()
-                    .unwrap_or_else(|| QueryResult::new(ExecStatus::CommandOk));
-                result.set_command_status(tag);
-                self.results.push(result);
-            }
-            Backend::EmptyQueryResponse => {
-                self.finish_current();
-                self.results.push(QueryResult::new(ExecStatus::EmptyQuery));
-            }
-            Backend::ErrorResponse(error) => {
-                // fe-protocol3.c:915 — an error discards the partial result.
-                self.current = None;
-                self.saw_error = true;
-                self.results
-                    .push(QueryResult::with_error(ExecStatus::FatalError, error));
-            }
-            Backend::NoticeResponse(notice) => self.notices.push(notice),
-            Backend::NotificationResponse {
-                pid,
-                channel,
-                payload,
-            } => self.notifications.push((pid, channel, payload)),
-            Backend::ParameterStatus { name, value } => self.parameters.push((name, value)),
-            Backend::ReadyForQuery(status) => {
-                self.finish_current();
-                self.transaction_status = Some(status);
-                return Ok(Flow::Done);
-            }
-            // Both belong to the startup exchange; naming the byte that
-            // actually arrived is the whole point of upstream's message
-            // (`fe-protocol3.c:447`).
-            Backend::Authentication(_) => return Err(ProtocolError::UnexpectedResponse(b'R')),
-            Backend::BackendKeyData { .. } => {
-                return Err(ProtocolError::UnexpectedResponse(b'K'));
-            }
-            // BindComplete: "Nothing to do for this message type"
-            // (fe-protocol3.c:284).
-            Backend::BindComplete | Backend::NegotiateProtocolVersion { .. } => {}
-            // fe-protocol3.c:446 — PortalSuspended has no case of its own.
-            other @ (Backend::PortalSuspended | Backend::Other { .. }) => {
-                return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
-            }
-        }
-        Ok(Flow::Continue)
-    }
-
-    /// The `if (!pgHavePendingResult(conn)) conn->result =
-    /// PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK)` step shared by
-    /// ParseComplete, CloseComplete and NoData (`fe-protocol3.c:271`), then
-    /// `PGASYNC_READY`: the pending result is handed over, or a fresh
-    /// COMMAND_OK one when there is none. An error result already handed over
-    /// does not count as pending: `PQgetResult` took it through
-    /// `pqPrepareAsyncResult`, which empties `conn->result` and clears
-    /// `error_result` (`fe-exec.c:927-928`), so C would follow it with a
-    /// COMMAND_OK here too. The server never sends that sequence (it discards
-    /// until Sync after an error), and this fold does not pretend otherwise.
-    fn command_ok_ready(&mut self) {
-        let result = self
-            .current
-            .take()
-            .unwrap_or_else(|| QueryResult::new(ExecStatus::CommandOk));
-        self.results.push(result);
-    }
-
-    /// A RowDescription with no CommandComplete after it (an error arrived
-    /// instead) still produced a result; `PQgetResult` returns it.
-    fn finish_current(&mut self) {
-        if let Some(result) = self.current.take() {
-            self.results.push(result);
-        }
-    }
-
-    #[must_use]
-    pub fn results(&self) -> &[QueryResult] {
-        &self.results
-    }
-
-    #[must_use]
-    pub fn into_results(self) -> Vec<QueryResult> {
-        self.results
-    }
-
-    #[must_use]
-    pub fn notices(&self) -> &[ResultError] {
-        &self.notices
-    }
-
-    #[must_use]
-    pub fn notifications(&self) -> &[(i32, Vec<u8>, Vec<u8>)] {
-        &self.notifications
-    }
-
-    #[must_use]
-    pub fn transaction_status(&self) -> Option<TransactionStatus> {
-        self.transaction_status
     }
 }
 
@@ -624,8 +421,8 @@ fn auth_response(message: &Frontend) -> AuthResponse {
     }
 }
 
-/// A live connection: `PGconn`, minus everything the simple query path does
-/// not need yet.
+/// A live connection: `PGconn`, minus everything the query paths do not
+/// need yet.
 #[derive(Debug)]
 pub struct Connection<S = Stream> {
     stream: S,
@@ -633,11 +430,19 @@ pub struct Connection<S = Stream> {
     /// Consumed prefix of `inbuf`, so a read does not shift the buffer per
     /// message (`conn->inStart`).
     start: usize,
+    /// `conn->outBuffer`: messages put but not yet flushed. In pipeline mode
+    /// they wait here until a flush (`pqPipelineFlush`, `fe-exec.c:4047`).
+    outbuf: Vec<u8>,
+    /// `asyncStatus`, `pipelineStatus`, the command queue and the result
+    /// being built.
+    state: PipelineState,
     parameters: Vec<(Vec<u8>, Vec<u8>)>,
     backend_pid: i32,
     cancel_key: Vec<u8>,
     transaction_status: TransactionStatus,
     notices: Vec<ResultError>,
+    /// `conn->notifyHead` … `notifyTail`: pid, channel, payload.
+    notifications: Vec<(i32, Vec<u8>, Vec<u8>)>,
     trace: Option<Tracer>,
 }
 
@@ -662,6 +467,21 @@ impl Connection<Stream> {
         let stream = Stream::connect(&address)?;
         let nonce = strong_random(RAW_NONCE_LEN)?;
         Connection::start_up(stream, conninfo, &nonce)
+    }
+
+    /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
+    /// already sent, without waiting for more and without parsing it.
+    ///
+    /// # Errors
+    /// The socket failed, or the server closed the connection.
+    pub fn consume_input(&mut self) -> Result<(), ConnectionError> {
+        self.stream.set_nonblocking(true)?;
+        let read = self.read_more();
+        self.stream.set_nonblocking(false)?;
+        match read {
+            Err(ConnectionError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            other => other,
+        }
     }
 }
 
@@ -701,11 +521,14 @@ impl<S: Read + Write> Connection<S> {
             stream,
             inbuf: Vec::new(),
             start: 0,
+            outbuf: Vec::new(),
+            state: PipelineState::new(),
             parameters: Vec::new(),
             backend_pid: 0,
             cancel_key: Vec::new(),
             transaction_status: TransactionStatus::Unknown,
             notices: Vec::new(),
+            notifications: Vec::new(),
             trace: None,
         };
 
@@ -739,197 +562,503 @@ impl<S: Read + Write> Connection<S> {
     /// `PQexec`, `fe-exec.c:2279`: one Query message, then every result up to
     /// ReadyForQuery.
     ///
+    /// Every result is returned; `PQexec` itself returns the last of them
+    /// (`PQexecFinish`, `fe-exec.c:2427`). Results a previous asynchronous
+    /// command left uncollected are discarded first, as `PQexecStart` does
+    /// (`fe-exec.c:2386`).
+    ///
     /// # Errors
-    /// The connection broke, or the server sent something the simple-query
-    /// path cannot make a result of. A *failed query* is not an error here: it
-    /// is a `PGRES_FATAL_ERROR` result, exactly as in libpq.
+    /// In pipeline mode (`fe-exec.c:2376`, nothing is sent), or the
+    /// connection broke, or the server sent something the query path cannot
+    /// make a result of. A *failed query* is not an error here: it is a
+    /// `PGRES_FATAL_ERROR` result, exactly as in libpq.
     pub fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.run(&Plan {
-            messages: vec![Frontend::Query(query.to_vec())],
-            class: QueryClass::Simple,
-        })
+        self.exec_start()?;
+        self.send_query(query)?;
+        self.exec_finish()
     }
 
     /// `PQexecParams`, `fe-exec.c:2293`: `command` through the unnamed
     /// statement with out-of-line parameters.
     ///
-    /// Every result is returned, as [`Connection::exec`] does; `PQexecParams`
-    /// itself returns the last of them (`PQexecFinish`, `fe-exec.c:2427`).
+    /// Every result is returned, as [`Connection::exec`] does.
     /// `param_types` is `paramTypes`, empty for NULL.
     ///
     /// # Errors
-    /// An argument `PQsendQueryParams` refuses (nothing is sent), or the
-    /// connection broke. A failed command is a `PGRES_FATAL_ERROR` result.
+    /// In pipeline mode, an argument `PQsendQueryParams` refuses (nothing is
+    /// sent), or the connection broke. A failed command is a
+    /// `PGRES_FATAL_ERROR` result.
     pub fn exec_params(
         &mut self,
         command: &[u8],
         param_types: &[u32],
         params: &Params<'_>,
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.run(&extended::query_params(command, param_types, params)?)
+        self.exec_start()?;
+        self.send_query_params(command, param_types, params)?;
+        self.exec_finish()
     }
 
     /// `PQprepare`, `fe-exec.c:2323`: Parse `query` as the statement
     /// `statement`; the result is COMMAND_OK or the server's error.
     ///
     /// # Errors
-    /// More than 65535 parameter types (nothing is sent), or the connection
-    /// broke.
+    /// In pipeline mode, more than 65535 parameter types (nothing is sent),
+    /// or the connection broke.
     pub fn prepare(
         &mut self,
         statement: &[u8],
         query: &[u8],
         param_types: &[u32],
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.run(&extended::prepare(statement, query, param_types)?)
+        self.exec_start()?;
+        self.send_prepare(statement, query, param_types)?;
+        self.exec_finish()
     }
 
     /// `PQexecPrepared`, `fe-exec.c:2340`: run a prepared statement.
     ///
     /// # Errors
-    /// An argument `PQsendQueryPrepared` refuses (nothing is sent), or the
-    /// connection broke.
+    /// In pipeline mode, an argument `PQsendQueryPrepared` refuses (nothing
+    /// is sent), or the connection broke.
     pub fn exec_prepared(
         &mut self,
         statement: &[u8],
         params: &Params<'_>,
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.run(&extended::query_prepared(statement, params)?)
+        self.exec_start()?;
+        self.send_query_prepared(statement, params)?;
+        self.exec_finish()
     }
 
     /// `PQdescribePrepared`, `fe-exec.c:2472`: a COMMAND_OK result whose
     /// `nparams`/`paramtype` and `nfields`/`ftype` describe the statement.
     ///
     /// # Errors
-    /// The connection broke.
+    /// In pipeline mode, or the connection broke.
     pub fn describe_prepared(
         &mut self,
         statement: &[u8],
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.typed(TypedCommand::Describe, Target::Statement, statement)
+        self.exec_typed(TypedCommand::Describe, Target::Statement, statement)
     }
 
     /// `PQdescribePortal`, `fe-exec.c:2491`.
     ///
     /// # Errors
-    /// The connection broke.
+    /// In pipeline mode, or the connection broke.
     pub fn describe_portal(&mut self, portal: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.typed(TypedCommand::Describe, Target::Portal, portal)
+        self.exec_typed(TypedCommand::Describe, Target::Portal, portal)
     }
 
     /// `PQclosePrepared`, `fe-exec.c:2538`. Closing a statement that does not
     /// exist is not an error.
     ///
     /// # Errors
-    /// The connection broke.
+    /// In pipeline mode, or the connection broke.
     pub fn close_prepared(
         &mut self,
         statement: &[u8],
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.typed(TypedCommand::Close, Target::Statement, statement)
+        self.exec_typed(TypedCommand::Close, Target::Statement, statement)
     }
 
     /// `PQclosePortal`, `fe-exec.c:2556`.
     ///
     /// # Errors
-    /// The connection broke.
+    /// In pipeline mode, or the connection broke.
     pub fn close_portal(&mut self, portal: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.typed(TypedCommand::Close, Target::Portal, portal)
+        self.exec_typed(TypedCommand::Close, Target::Portal, portal)
     }
 
-    fn typed(
+    fn exec_typed(
         &mut self,
         command: TypedCommand,
         target: Target,
         name: &[u8],
     ) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.run(&extended::typed_command(command, target, name))
+        self.exec_start()?;
+        self.send_typed(command, target, name)?;
+        self.exec_finish()
     }
 
-    /// Send a plan's messages in one write — libpq buffers them and flushes
-    /// once (`pqPipelineFlush`, `fe-exec.c:4047`) — then fold every reply up
-    /// to ReadyForQuery as the plan's query class reads them.
-    fn run(&mut self, plan: &Plan) -> Result<Vec<QueryResult>, ConnectionError> {
-        let mut bytes = Vec::new();
-        for message in &plan.messages {
-            let encoded = message.encode();
-            self.trace_sent(message, &encoded);
-            bytes.extend_from_slice(&encoded);
-        }
-        self.stream.write_all(&bytes)?;
-        self.stream.flush()?;
-
-        let mut runner = QueryRunner::for_class(plan.class);
-        loop {
-            let message = self.read_message()?;
-            if runner.push(message)? == Flow::Done {
-                break;
-            }
-        }
-        if let Some(status) = runner.transaction_status() {
-            self.transaction_status = status;
-        }
-        for (name, value) in std::mem::take(&mut runner.parameters) {
-            self.parameters.push((name, value));
-        }
-        self.notices.append(&mut runner.notices);
-        Ok(runner.into_results())
+    /// `PQexecStart`, `fe-exec.c:2361`: refused in pipeline mode; otherwise
+    /// "silently discard any prior query result that application didn't
+    /// eat" (`:2386`).
+    fn exec_start(&mut self) -> Result<(), ConnectionError> {
+        self.state.begin_exec()?;
+        while self.get_result()?.is_some() {}
+        Ok(())
     }
 
-    /// `PQfinish`'s Terminate, `fe-connect.c:5239`.
+    /// `PQexecFinish`, `fe-exec.c:2427`, keeping every result rather than
+    /// the last.
+    fn exec_finish(&mut self) -> Result<Vec<QueryResult>, ConnectionError> {
+        let mut results = Vec::new();
+        while let Some(result) = self.get_result()? {
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// `PQsendQuery`, `fe-exec.c:1433`: send one Query message and return;
+    /// the results come from [`Connection::get_result`].
     ///
     /// # Errors
-    /// The message could not be written to the socket.
-    pub fn terminate(&mut self) -> Result<(), ConnectionError> {
-        self.send(&Frontend::Terminate)
+    /// In pipeline mode (`fe-exec.c:1459`), another command is still running,
+    /// or the message could not be written.
+    pub fn send_query(&mut self, query: &[u8]) -> Result<(), ConnectionError> {
+        self.state.begin_send(QueryClass::Simple)?;
+        self.dispatch(&Plan {
+            messages: vec![Frontend::Query(query.to_vec())],
+            class: QueryClass::Simple,
+        })
     }
 
-    fn send(&mut self, message: &Frontend) -> Result<(), ConnectionError> {
-        let encoded = message.encode();
-        self.trace_sent(message, &encoded);
-        self.stream.write_all(&encoded)?;
+    /// `PQsendQueryParams`, `fe-exec.c:1509`.
+    ///
+    /// # Errors
+    /// Another command is running outside pipeline mode, an argument is
+    /// refused, or the messages could not be written.
+    pub fn send_query_params(
+        &mut self,
+        command: &[u8],
+        param_types: &[u32],
+        params: &Params<'_>,
+    ) -> Result<(), ConnectionError> {
+        self.state.begin_send(QueryClass::Extended)?;
+        let plan = extended::query_params(command, param_types, params)?;
+        self.dispatch(&plan)
+    }
+
+    /// `PQsendPrepare`, `fe-exec.c:1553`.
+    ///
+    /// # Errors
+    /// Another command is running outside pipeline mode, more than 65535
+    /// parameter types, or the messages could not be written.
+    pub fn send_prepare(
+        &mut self,
+        statement: &[u8],
+        query: &[u8],
+        param_types: &[u32],
+    ) -> Result<(), ConnectionError> {
+        self.state.begin_send(QueryClass::Prepare)?;
+        let plan = extended::prepare(statement, query, param_types)?;
+        self.dispatch(&plan)
+    }
+
+    /// `PQsendQueryPrepared`, `fe-exec.c:1650`.
+    ///
+    /// # Errors
+    /// Another command is running outside pipeline mode, an argument is
+    /// refused, or the messages could not be written.
+    pub fn send_query_prepared(
+        &mut self,
+        statement: &[u8],
+        params: &Params<'_>,
+    ) -> Result<(), ConnectionError> {
+        self.state.begin_send(QueryClass::Extended)?;
+        let plan = extended::query_prepared(statement, params)?;
+        self.dispatch(&plan)
+    }
+
+    /// `PQsendDescribePrepared`, `fe-exec.c:2508`.
+    ///
+    /// # Errors
+    /// Another command is running outside pipeline mode, or the messages
+    /// could not be written.
+    pub fn send_describe_prepared(&mut self, statement: &[u8]) -> Result<(), ConnectionError> {
+        self.send_typed(TypedCommand::Describe, Target::Statement, statement)
+    }
+
+    /// `PQsendDescribePortal`, `fe-exec.c:2521`.
+    ///
+    /// # Errors
+    /// As [`Connection::send_describe_prepared`].
+    pub fn send_describe_portal(&mut self, portal: &[u8]) -> Result<(), ConnectionError> {
+        self.send_typed(TypedCommand::Describe, Target::Portal, portal)
+    }
+
+    /// `PQsendClosePrepared`, `fe-exec.c:2573`.
+    ///
+    /// # Errors
+    /// As [`Connection::send_describe_prepared`].
+    pub fn send_close_prepared(&mut self, statement: &[u8]) -> Result<(), ConnectionError> {
+        self.send_typed(TypedCommand::Close, Target::Statement, statement)
+    }
+
+    /// `PQsendClosePortal`, `fe-exec.c:2586`.
+    ///
+    /// # Errors
+    /// As [`Connection::send_describe_prepared`].
+    pub fn send_close_portal(&mut self, portal: &[u8]) -> Result<(), ConnectionError> {
+        self.send_typed(TypedCommand::Close, Target::Portal, portal)
+    }
+
+    /// `PQsendTypedCommand`, `fe-exec.c:2606`.
+    fn send_typed(
+        &mut self,
+        command: TypedCommand,
+        target: Target,
+        name: &[u8],
+    ) -> Result<(), ConnectionError> {
+        let plan = extended::typed_command(command, target, name);
+        self.state.begin_send(plan.class)?;
+        self.dispatch(&plan)
+    }
+
+    /// The common tail of every `PQsend*`: put the plan's messages (less
+    /// its Sync in pipeline mode), give them a push if `pqPipelineFlush`
+    /// would (`fe-exec.c:4047`), and queue the command
+    /// (`pqAppendCmdQueueEntry`, `:1356`).
+    fn dispatch(&mut self, plan: &Plan) -> Result<(), ConnectionError> {
+        let own_sync = self.state.sends_own_sync();
+        let messages = match plan.messages.split_last() {
+            Some((Frontend::Sync, rest)) if !own_sync => rest,
+            _ => &plan.messages[..],
+        };
+        for message in messages {
+            self.put_message(message);
+        }
+        if self.state.flushes_now(self.outbuf.len()) {
+            self.flush()?;
+        }
+        self.state.append(plan.class);
+        Ok(())
+    }
+
+    /// `PQenterPipelineMode`, `fe-exec.c:3073`. Nothing is sent.
+    ///
+    /// # Errors
+    /// A command is still running outside pipeline mode.
+    pub fn enter_pipeline_mode(&mut self) -> Result<(), ConnectionError> {
+        Ok(self.state.enter_pipeline_mode()?)
+    }
+
+    /// `PQexitPipelineMode`, `fe-exec.c:3104`: back to one command at a
+    /// time, flushing whatever is still buffered. Leaving a mode that is not
+    /// on succeeds.
+    ///
+    /// # Errors
+    /// Results are still to be collected, or a command is still running, or
+    /// the flush failed.
+    pub fn exit_pipeline_mode(&mut self) -> Result<(), ConnectionError> {
+        if self.state.exit_pipeline_mode()? {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// `PQpipelineStatus`.
+    #[must_use]
+    pub fn pipeline_status(&self) -> PipelineStatus {
+        self.state.pipeline_status()
+    }
+
+    /// `PQpipelineSync`, `fe-exec.c:3303`: end the pipeline with a Sync and
+    /// flush everything queued.
+    ///
+    /// # Errors
+    /// Not in pipeline mode, or the flush failed.
+    pub fn pipeline_sync(&mut self) -> Result<(), ConnectionError> {
+        self.pipeline_sync_internal(true)
+    }
+
+    /// `PQsendPipelineSync`, `fe-exec.c:3313`: the Sync without the flush,
+    /// unless the buffer is past the threshold.
+    ///
+    /// # Errors
+    /// Not in pipeline mode, or a flush past the threshold failed.
+    pub fn send_pipeline_sync(&mut self) -> Result<(), ConnectionError> {
+        self.pipeline_sync_internal(false)
+    }
+
+    /// `pqPipelineSyncInternal`, `fe-exec.c:3325`.
+    fn pipeline_sync_internal(&mut self, immediate_flush: bool) -> Result<(), ConnectionError> {
+        self.state.begin_pipeline_sync()?;
+        self.put_message(&Frontend::Sync);
+        if immediate_flush || self.state.flushes_now(self.outbuf.len()) {
+            self.flush()?;
+        }
+        self.state.append(QueryClass::Sync);
+        Ok(())
+    }
+
+    /// `PQsendFlushRequest`, `fe-exec.c:3402`: ask the server to send what
+    /// it has, without ending the pipeline. No command is queued.
+    ///
+    /// # Errors
+    /// Another command is running outside pipeline mode, or a flush failed.
+    pub fn send_flush_request(&mut self) -> Result<(), ConnectionError> {
+        self.state.begin_flush_request()?;
+        self.put_message(&Frontend::Flush);
+        if self.state.flushes_now(self.outbuf.len()) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// `PQsetSingleRowMode`, `fe-exec.c:1965`: `true` when the mode was
+    /// set, which is only right after a command is sent.
+    pub fn set_single_row_mode(&mut self) -> bool {
+        self.state.set_single_row_mode()
+    }
+
+    /// `PQsetChunkedRowsMode`, `fe-exec.c:1982`.
+    pub fn set_chunked_rows_mode(&mut self, chunk_size: usize) -> bool {
+        self.state.set_chunked_rows_mode(chunk_size)
+    }
+
+    /// `PQgetResult`, `fe-exec.c:2079`: the next result, or `None` for the
+    /// NULL that ends a command — blocking until the server has said enough.
+    ///
+    /// # Errors
+    /// The connection broke, or the server sent something no result can be
+    /// made of.
+    pub fn get_result(&mut self) -> Result<Option<QueryResult>, ConnectionError> {
+        self.parse_input()?;
+        loop {
+            match self.state.next_result() {
+                Next::Result(result) => return Ok(Some(result)),
+                Next::Null => return Ok(None),
+                // fe-exec.c:2094 — send what is unsent, else we may be
+                // waiting for a reply to a command the server never got;
+                // then wait for more and parse it.
+                Next::Block => {
+                    self.flush()?;
+                    self.read_more()?;
+                    self.parse_input()?;
+                }
+            }
+        }
+    }
+
+    /// `PQisBusy`, `fe-exec.c:2048`: would [`Connection::get_result`] block?
+    /// Parses what has already been read, and reads nothing.
+    ///
+    /// # Errors
+    /// What has been read does not parse.
+    pub fn is_busy(&mut self) -> Result<bool, ConnectionError> {
+        self.parse_input()?;
+        Ok(self.state.is_busy())
+    }
+
+    /// `PQflush`, `fe-exec.c:4031`: write everything buffered.
+    ///
+    /// # Errors
+    /// The socket write failed.
+    pub fn flush(&mut self) -> Result<(), ConnectionError> {
+        if !self.outbuf.is_empty() {
+            self.stream.write_all(&self.outbuf)?;
+            self.outbuf.clear();
+        }
         self.stream.flush()?;
         Ok(())
     }
 
-    /// `pqParseInput3` plus `pqReadData`: return the next whole message,
-    /// reading more bytes when the buffer does not hold one yet.
-    fn read_message(&mut self) -> Result<Backend, ConnectionError> {
+    /// `pqPutMsgStart` … `pqPutMsgEnd`: encode one message into the output
+    /// buffer, tracing it as `pqPutMsgEnd` does (`fe-misc.c:546`).
+    fn put_message(&mut self, message: &Frontend) {
+        let encoded = message.encode();
+        self.trace_sent(message, &encoded);
+        self.outbuf.extend_from_slice(&encoded);
+    }
+
+    /// `pqParseInput3`, `fe-protocol3.c:71`: parse every whole message in
+    /// the buffer that the state admits, stopping at the first it does not.
+    /// Reads nothing.
+    fn parse_input(&mut self) -> Result<(), ConnectionError> {
         loop {
-            match next_frame(&self.inbuf[self.start..]) {
-                Frame::Message { id, body } => {
-                    let start = self.start;
-                    let message =
-                        Backend::decode(id, &self.inbuf[start + body.start..start + body.end])?;
-                    // fe-misc.c:448 — `pqParseDone` traces a message once it
-                    // has been parsed, and only then.
-                    if let Some(tracer) = &mut self.trace {
-                        let line = trace::message_line(
-                            &self.inbuf[start..start + body.end],
-                            Origin::Backend,
-                            tracer.flags,
-                            AuthResponse::None,
-                        );
-                        tracer.write(&line);
-                    }
-                    self.start += body.end;
-                    if self.start == self.inbuf.len() {
-                        self.inbuf.clear();
-                        self.start = 0;
-                    }
-                    return Ok(message);
-                }
+            let (id, body) = match next_frame(&self.inbuf[self.start..]) {
+                Frame::Incomplete => return Ok(()),
                 Frame::SyncLoss { id, length } => {
                     return Err(ProtocolError::LostSynchronization { id, length }.into());
                 }
-                Frame::Incomplete => {
-                    let mut chunk = [0u8; 8192];
-                    let n = self.stream.read(&mut chunk)?;
-                    if n == 0 {
-                        return Err(ConnectionError::ServerClosedConnection);
-                    }
-                    self.inbuf.extend_from_slice(&chunk[..n]);
+                Frame::Message { id, body } => (id, body),
+            };
+            if self.state.admit(id) == Admit::Wait {
+                return Ok(());
+            }
+            let message = self.parse_frame(id, body)?;
+            match self.state.apply(message)? {
+                None => {}
+                Some(Event::Notice(notice)) => self.notices.push(notice),
+                Some(Event::Notification {
+                    pid,
+                    channel,
+                    payload,
+                }) => self.notifications.push((pid, channel, payload)),
+                Some(Event::ParameterStatus { name, value }) => {
+                    self.parameters.push((name, value));
                 }
+                Some(Event::ReadyForQuery(status)) => self.transaction_status = status,
+            }
+        }
+    }
+
+    /// `PQfinish`'s Terminate, `fe-connect.c:5239`, flushed with whatever is
+    /// still buffered.
+    ///
+    /// # Errors
+    /// The message could not be written to the socket.
+    pub fn terminate(&mut self) -> Result<(), ConnectionError> {
+        self.put_message(&Frontend::Terminate);
+        self.flush()
+    }
+
+    fn send(&mut self, message: &Frontend) -> Result<(), ConnectionError> {
+        self.put_message(message);
+        self.flush()
+    }
+
+    /// Decode the whole message at the head of the buffer, trace it, and
+    /// consume it — `pqParseDone` traces a message once it has been parsed,
+    /// and only then (`fe-misc.c:448`).
+    fn parse_frame(
+        &mut self,
+        id: u8,
+        body: std::ops::Range<usize>,
+    ) -> Result<Backend, ConnectionError> {
+        let start = self.start;
+        let message = Backend::decode(id, &self.inbuf[start + body.start..start + body.end])?;
+        if let Some(tracer) = &mut self.trace {
+            let line = trace::message_line(
+                &self.inbuf[start..start + body.end],
+                Origin::Backend,
+                tracer.flags,
+                AuthResponse::None,
+            );
+            tracer.write(&line);
+        }
+        self.start += body.end;
+        if self.start == self.inbuf.len() {
+            self.inbuf.clear();
+            self.start = 0;
+        }
+        Ok(message)
+    }
+
+    /// `pqReadData`, blocking: append what one read returns.
+    fn read_more(&mut self) -> Result<(), ConnectionError> {
+        let mut chunk = [0u8; 8192];
+        let n = self.stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(ConnectionError::ServerClosedConnection);
+        }
+        self.inbuf.extend_from_slice(&chunk[..n]);
+        Ok(())
+    }
+
+    /// The startup exchange's reader: the next whole message, reading more
+    /// bytes when the buffer does not hold one yet.
+    fn read_message(&mut self) -> Result<Backend, ConnectionError> {
+        loop {
+            match next_frame(&self.inbuf[self.start..]) {
+                Frame::Message { id, body } => return self.parse_frame(id, body),
+                Frame::SyncLoss { id, length } => {
+                    return Err(ProtocolError::LostSynchronization { id, length }.into());
+                }
+                Frame::Incomplete => self.read_more()?,
             }
         }
     }
@@ -1021,31 +1150,12 @@ impl<S: Read + Write> Connection<S> {
     pub fn notices(&self) -> &[ResultError] {
         &self.notices
     }
-}
 
-/// The type byte a decoded message came from, for the "unexpected response"
-/// error that names it.
-fn message_id(message: &Backend) -> u8 {
-    match message {
-        Backend::Authentication(_) => b'R',
-        Backend::BackendKeyData { .. } => b'K',
-        Backend::ParameterStatus { .. } => b'S',
-        Backend::ReadyForQuery(_) => b'Z',
-        Backend::RowDescription(_) => b'T',
-        Backend::DataRow(_) => b'D',
-        Backend::CommandComplete(_) => b'C',
-        Backend::EmptyQueryResponse => b'I',
-        Backend::ErrorResponse(_) => b'E',
-        Backend::NoticeResponse(_) => b'N',
-        Backend::NotificationResponse { .. } => b'A',
-        Backend::NegotiateProtocolVersion { .. } => b'v',
-        Backend::ParseComplete => b'1',
-        Backend::BindComplete => b'2',
-        Backend::CloseComplete => b'3',
-        Backend::NoData => b'n',
-        Backend::PortalSuspended => b's',
-        Backend::ParameterDescription(_) => b't',
-        Backend::Other { id, .. } => *id,
+    /// The notifications collected so far, oldest first — what `PQnotifies`
+    /// hands out one at a time: pid, channel, payload.
+    #[must_use]
+    pub fn notifications(&self) -> &[(i32, Vec<u8>, Vec<u8>)] {
+        &self.notifications
     }
 }
 
@@ -1072,17 +1182,46 @@ mod tests {
 
     /// A stream that plays back recorded server bytes and records what the
     /// client wrote — the replay harness for a captured trace.
+    ///
+    /// A server answers only what it has been sent, so the bytes are
+    /// released in turns: the recording is cut after each ReadyForQuery, and
+    /// each write from the client releases the next turn. Replaying it all
+    /// at once would put a query's replies in the buffer before the query,
+    /// where `pqParseInput3` treats them as arriving while idle.
     #[derive(Debug)]
     struct Scripted {
+        turns: std::collections::VecDeque<Vec<u8>>,
         from_server: Vec<u8>,
         read_pos: usize,
         to_server: Vec<u8>,
     }
 
     impl Scripted {
-        fn new(from_server: Vec<u8>) -> Self {
+        fn new(recording: impl AsRef<[u8]>) -> Self {
+            let recording = recording.as_ref();
+            let mut turns = std::collections::VecDeque::new();
+            let mut turn = Vec::new();
+            let mut rest = recording;
+            while rest.len() >= 5 {
+                let length = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+                // A broken or cut-off message is replayed as it is, whole.
+                if length < 4 || 1 + length > rest.len() {
+                    break;
+                }
+                let end = 1 + length;
+                turn.extend_from_slice(&rest[..end]);
+                if rest[0] == b'Z' {
+                    turns.push_back(std::mem::take(&mut turn));
+                }
+                rest = &rest[end..];
+            }
+            turn.extend_from_slice(rest);
+            if !turn.is_empty() {
+                turns.push_back(turn);
+            }
             Self {
-                from_server,
+                turns,
+                from_server: Vec::new(),
                 read_pos: 0,
                 to_server: Vec::new(),
             }
@@ -1101,6 +1240,9 @@ mod tests {
     impl Write for Scripted {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.to_server.extend_from_slice(buf);
+            if let Some(turn) = self.turns.pop_front() {
+                self.from_server.extend(turn);
+            }
             Ok(buf.len())
         }
 
@@ -1569,203 +1711,6 @@ mod tests {
         );
     }
 
-    /// Two statements in one simple-query string produce two results, and an
-    /// empty query string produces PGRES_EMPTY_QUERY.
-    #[test]
-    fn a_multi_statement_query_produces_one_result_per_statement() {
-        let mut runner = QueryRunner::new();
-        runner
-            .push(Backend::CommandComplete(b"CREATE TABLE".to_vec()))
-            .unwrap();
-        runner
-            .push(Backend::CommandComplete(b"INSERT 0 1".to_vec()))
-            .unwrap();
-        assert_eq!(
-            runner.push(Backend::ReadyForQuery(TransactionStatus::Idle)),
-            Ok(Flow::Done)
-        );
-        let results = runner.into_results();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].command_status(), b"CREATE TABLE");
-        assert_eq!(results[1].command_status(), b"INSERT 0 1");
-
-        let mut runner = QueryRunner::new();
-        runner.push(Backend::EmptyQueryResponse).unwrap();
-        runner
-            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
-            .unwrap();
-        assert_eq!(runner.results()[0].status(), ExecStatus::EmptyQuery);
-    }
-
-    /// Feed a runner of `class` the replies and return its results.
-    fn replay(class: QueryClass, replies: Vec<Backend>) -> Vec<QueryResult> {
-        let mut runner = QueryRunner::for_class(class);
-        for reply in replies {
-            runner.push(reply).unwrap();
-        }
-        runner.into_results()
-    }
-
-    fn int4_field(name: &[u8]) -> FieldDescription {
-        FieldDescription {
-            typid: 23,
-            typlen: 4,
-            ..text_field(name)
-        }
-    }
-
-    /// `PQdescribePrepared`: the replies of `traces/prepared.trace` lines
-    /// 4-7 (ParseComplete aside) — ParameterDescription, RowDescription,
-    /// ReadyForQuery — make *one* COMMAND_OK result carrying both the
-    /// parameter types and the columns (`fe-protocol3.c:527`).
-    #[test]
-    fn a_describe_statement_is_one_command_ok_result_with_params_and_fields() {
-        let results = replay(
-            QueryClass::Describe,
-            vec![
-                Backend::ParameterDescription(vec![23]),
-                Backend::RowDescription(vec![int4_field(b"?column?"), text_field(b"?column?")]),
-                Backend::ReadyForQuery(TransactionStatus::Idle),
-            ],
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::CommandOk);
-        assert_eq!(results[0].nparams(), 1);
-        assert_eq!(results[0].paramtype(0), Some(23));
-        assert_eq!(results[0].paramtype(1), None);
-        assert_eq!(results[0].nfields(), 2);
-        assert_eq!(results[0].ftype(0), Some(23));
-        assert_eq!(results[0].ftype(1), Some(25));
-        assert_eq!(results[0].ntuples(), 0);
-    }
-
-    /// A Describe of a statement that returns no rows: ParameterDescription
-    /// then NoData is still one COMMAND_OK result (`fe-protocol3.c:351`);
-    /// and a Describe of a portal, which has no ParameterDescription, gets a
-    /// fresh one.
-    #[test]
-    fn a_describe_of_something_without_rows_is_still_a_result() {
-        let results = replay(
-            QueryClass::Describe,
-            vec![
-                Backend::ParameterDescription(vec![23, 25]),
-                Backend::NoData,
-                Backend::ReadyForQuery(TransactionStatus::Idle),
-            ],
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::CommandOk);
-        assert_eq!(results[0].nparams(), 2);
-        assert_eq!(results[0].nfields(), 0);
-
-        let results = replay(
-            QueryClass::Describe,
-            vec![
-                Backend::RowDescription(vec![int4_field(b"?column?")]),
-                Backend::ReadyForQuery(TransactionStatus::InTransaction),
-            ],
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::CommandOk);
-        assert_eq!(results[0].nparams(), 0);
-        assert_eq!(results[0].ftype(0), Some(23));
-    }
-
-    /// ParseComplete is a result only for `PQprepare`, CloseComplete only for
-    /// a Close, NoData only for a Describe (`fe-protocol3.c:266`, `:287`,
-    /// `:351`); to every other class they are nothing.
-    #[test]
-    fn each_completion_message_is_a_result_only_for_its_own_class() {
-        let ready = Backend::ReadyForQuery(TransactionStatus::Idle);
-        for (message, class) in [
-            (Backend::ParseComplete, QueryClass::Prepare),
-            (Backend::CloseComplete, QueryClass::Close),
-            (Backend::NoData, QueryClass::Describe),
-        ] {
-            let results = replay(class, vec![message.clone(), ready.clone()]);
-            assert_eq!(results.len(), 1, "{message:?} for {class:?}");
-            assert_eq!(results[0].status(), ExecStatus::CommandOk);
-
-            for other in [
-                QueryClass::Simple,
-                QueryClass::Extended,
-                QueryClass::Prepare,
-                QueryClass::Describe,
-                QueryClass::Close,
-            ] {
-                if other != class {
-                    assert!(
-                        replay(other, vec![message.clone(), ready.clone()]).is_empty(),
-                        "{message:?} for {other:?}"
-                    );
-                }
-            }
-        }
-        assert!(replay(QueryClass::Extended, vec![Backend::BindComplete, ready]).is_empty());
-    }
-
-    /// `PQexecParams("SELECT $1", …, {"1"})`: the replies of
-    /// `traces/simple_pipeline.trace` lines 6-11 make one TUPLES_OK result
-    /// with the row and the tag.
-    #[test]
-    fn an_extended_query_collects_its_rows() {
-        let results = replay(
-            QueryClass::Extended,
-            vec![
-                Backend::ParseComplete,
-                Backend::BindComplete,
-                Backend::RowDescription(vec![int4_field(b"?column?")]),
-                Backend::DataRow(vec![Some(b"1".to_vec())]),
-                Backend::CommandComplete(b"SELECT 1".to_vec()),
-                Backend::ReadyForQuery(TransactionStatus::Idle),
-            ],
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::TuplesOk);
-        assert_eq!(results[0].value(0, 0), Some(&b"1"[..]));
-        assert_eq!(results[0].command_status(), b"SELECT 1");
-    }
-
-    /// `traces/prepared.trace` lines 12-15: a Describe of a statement that
-    /// does not exist gets ErrorResponse and ReadyForQuery back, and its one
-    /// result is the error.
-    #[test]
-    fn an_error_is_the_only_result_of_its_command() {
-        let error = ResultError::new(vec![
-            (diag::SEVERITY, b"ERROR".to_vec()),
-            (diag::SQLSTATE, b"26000".to_vec()),
-            (
-                diag::MESSAGE_PRIMARY,
-                b"prepared statement \"select_one\" does not exist".to_vec(),
-            ),
-        ]);
-        let results = replay(
-            QueryClass::Describe,
-            vec![
-                Backend::ErrorResponse(error.clone()),
-                Backend::ReadyForQuery(TransactionStatus::Idle),
-            ],
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::FatalError);
-        assert_eq!(
-            results[0].error().and_then(ResultError::sqlstate),
-            Some(&b"26000"[..])
-        );
-    }
-
-    /// PortalSuspended has no case in `pqParseInput3` (libpq never sets a
-    /// row limit), so it is the "unexpected response" default
-    /// (`fe-protocol3.c:446`).
-    #[test]
-    fn a_portal_suspended_is_an_unexpected_response() {
-        let mut runner = QueryRunner::for_class(QueryClass::Extended);
-        assert_eq!(
-            runner.push(Backend::PortalSuspended),
-            Err(ProtocolError::UnexpectedResponse(b's'))
-        );
-    }
-
     /// `PQexecParams` over the wire: the client writes Parse, Bind,
     /// Describe, Execute and Sync in one go, and the replies of
     /// `traces/simple_pipeline.trace` lines 6-11 come back as one TUPLES_OK
@@ -1833,57 +1778,11 @@ mod tests {
         assert_eq!(conn.stream.to_server.len(), written_before);
     }
 
-    /// The two malformed-stream cases `pqParseInput3` names for "D".
-    #[test]
-    fn a_data_row_out_of_place_is_refused() {
-        let mut runner = QueryRunner::new();
-        assert_eq!(
-            runner.push(Backend::DataRow(vec![None])),
-            Err(ProtocolError::DataWithoutRowDescription)
-        );
-
-        let mut runner = QueryRunner::new();
-        runner
-            .push(Backend::RowDescription(vec![text_field(b"a")]))
-            .unwrap();
-        assert_eq!(
-            runner.push(Backend::DataRow(vec![None, None])),
-            Err(ProtocolError::UnexpectedFieldCount)
-        );
-    }
-
-    /// After an error result, later DataRows are ignored rather than
-    /// misfiled (`fe-protocol3.c:882`).
-    #[test]
-    fn data_rows_after_an_error_are_ignored() {
-        let mut runner = QueryRunner::new();
-        runner
-            .push(Backend::RowDescription(vec![text_field(b"a")]))
-            .unwrap();
-        runner
-            .push(Backend::ErrorResponse(ResultError::new(vec![(
-                diag::MESSAGE_PRIMARY,
-                b"boom".to_vec(),
-            )])))
-            .unwrap();
-        assert_eq!(
-            runner.push(Backend::DataRow(vec![Some(b"x".to_vec())])),
-            Ok(Flow::Continue)
-        );
-        runner
-            .push(Backend::ReadyForQuery(TransactionStatus::InError))
-            .unwrap();
-        let results = runner.into_results();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status(), ExecStatus::FatalError);
-    }
-
     /// A server that hangs up mid-message is reported, not hung on.
     #[test]
     fn a_truncated_stream_reports_the_closed_connection() {
         let info = conninfo("user=alice");
-        let err =
-            Connection::start_up(Scripted::new(b"R\0\0\0".to_vec()), &info, &[0; 18]).unwrap_err();
+        let err = Connection::start_up(Scripted::new(b"R\0\0\0"), &info, &[0; 18]).unwrap_err();
         assert!(matches!(err, ConnectionError::ServerClosedConnection));
         assert!(
             String::from_utf8(err.message())
@@ -1897,8 +1796,7 @@ mod tests {
     #[test]
     fn a_broken_length_word_is_lost_synchronization() {
         let info = conninfo("user=alice");
-        let err = Connection::start_up(Scripted::new(b"Z\0\0\0\x01".to_vec()), &info, &[0; 18])
-            .unwrap_err();
+        let err = Connection::start_up(Scripted::new(b"Z\0\0\0\x01"), &info, &[0; 18]).unwrap_err();
         assert_eq!(
             String::from_utf8(err.message()).unwrap(),
             "lost synchronization with server: got message type \"Z\", length 1"
@@ -2055,5 +1953,97 @@ mod tests {
             AuthResponse::Sasl
         );
         assert_eq!(auth_response(&Frontend::Sync), AuthResponse::None);
+    }
+
+    /// `test_simple_pipeline` (`libpq_pipeline.c:1593`) replayed without a
+    /// server: the replies of `traces/simple_pipeline.trace` lines 6-11 as
+    /// recorded bytes, and the whole trace this connection writes compared
+    /// with the file, byte for byte. The live gate is
+    /// `tests/t_001_libpq_pipeline.rs`; this one needs no PostgreSQL.
+    #[test]
+    fn simple_pipeline_trace_replayed_without_a_server() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend(message(b'1', b""));
+        script.extend(message(b'2', b""));
+        let mut row_description = 1u16.to_be_bytes().to_vec();
+        row_description.extend_from_slice(b"?column?\0");
+        row_description.extend_from_slice(&0u32.to_be_bytes());
+        row_description.extend_from_slice(&0i16.to_be_bytes());
+        row_description.extend_from_slice(&23u32.to_be_bytes());
+        row_description.extend_from_slice(&4i16.to_be_bytes());
+        row_description.extend_from_slice(&(-1i32).to_be_bytes());
+        row_description.extend_from_slice(&0i16.to_be_bytes());
+        script.extend(message(b'T', &row_description));
+        let mut data_row = 1u16.to_be_bytes().to_vec();
+        data_row.extend_from_slice(&1u32.to_be_bytes());
+        data_row.push(b'1');
+        script.extend(message(b'D', &data_row));
+        script.extend(message(b'C', b"SELECT 1\0"));
+        script.extend(ready(b'I'));
+
+        let info = conninfo("user=alice dbname=postgres");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        let sink = SharedSink::default();
+        conn.trace(Box::new(sink.clone()));
+        conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS | TraceFlags::REGRESS_MODE);
+
+        conn.enter_pipeline_mode().unwrap();
+        let written = conn.stream.to_server.len();
+        conn.send_query_params(b"SELECT $1", &[23], &Params::text(&[Some(b"1")]))
+            .unwrap();
+        assert_eq!(
+            conn.stream.to_server.len(),
+            written,
+            "a pipelined command waits in the buffer"
+        );
+        assert!(matches!(
+            conn.exit_pipeline_mode(),
+            Err(ConnectionError::Pipeline(PipelineError::Busy))
+        ));
+        conn.pipeline_sync().unwrap();
+        let result = conn.get_result().unwrap().expect("a result");
+        assert_eq!(result.status(), ExecStatus::TuplesOk);
+        assert!(conn.get_result().unwrap().is_none());
+        assert!(conn.exit_pipeline_mode().is_err());
+        let sync = conn.get_result().unwrap().expect("the sync");
+        assert_eq!(sync.status(), ExecStatus::PipelineSync);
+        assert!(conn.get_result().unwrap().is_none());
+        assert_eq!(conn.pipeline_status(), PipelineStatus::On);
+        conn.exit_pipeline_mode().unwrap();
+        assert_eq!(conn.pipeline_status(), PipelineStatus::Off);
+        conn.terminate().unwrap();
+
+        let expected = include_bytes!("../tests/traces/simple_pipeline.trace");
+        assert_eq!(
+            String::from_utf8_lossy(&sink.0.lock().unwrap()),
+            String::from_utf8_lossy(expected)
+        );
+    }
+
+    /// The blocking calls are refused in pipeline mode before anything is
+    /// sent or read, with upstream's message (`fe-exec.c:2378`), and so is
+    /// `PQsendQuery` (`:1461`).
+    #[test]
+    fn a_blocking_call_in_pipeline_mode_sends_nothing() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        let info = conninfo("user=alice");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        conn.enter_pipeline_mode().unwrap();
+        let written = conn.stream.to_server.len();
+        let error = conn.exec(b"SELECT 1").unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"synchronous command execution functions are not allowed in pipeline mode".to_vec()
+        );
+        assert!(conn.describe_prepared(b"s").is_err());
+        let error = conn.send_query(b"SELECT 1").unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"PQsendQuery not allowed in pipeline mode".to_vec()
+        );
+        assert_eq!(conn.stream.to_server.len(), written);
+        assert!(!conn.is_busy().unwrap());
     }
 }

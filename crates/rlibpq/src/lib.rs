@@ -9,12 +9,15 @@
 //! (`PQconninfoOptions[]` and the two parsers that fill a working copy of it,
 //! proved against `t/001_uri.pl`) and the protocol version 3 core: the wire
 //! messages, the authentication methods a build without TLS or GSSAPI can do
-//! (trust, password, md5, SCRAM-SHA-256), and a blocking `Connection` that
-//! runs simple queries and the extended-query commands outside pipeline mode
-//! (`PQexecParams`, `PQprepare`, `PQexecPrepared`, `PQdescribePrepared`,
-//! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`), and the
-//! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
-//! rest is tracked in Linear NAT-390 … NAT-396.
+//! (trust, password, md5, SCRAM-SHA-256), and a `Connection` that runs simple
+//! queries and the extended-query commands, blocking (`PQexec`,
+//! `PQexecParams`, `PQprepare`, `PQexecPrepared`, `PQdescribePrepared`,
+//! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`) or asynchronously
+//! (`PQsendQuery` and its siblings, `PQgetResult`, single-row and chunked
+//! modes) and in pipeline mode (`PQenterPipelineMode` … `PQpipelineSync`),
+//! over the pure state machine in `pipeline`; and the `fe-trace.c` protocol
+//! trace behind `PQtrace` and `PQsetTraceFlags`. The rest is tracked in
+//! Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -38,6 +41,7 @@ pub mod hmac;
 pub mod md5;
 pub mod message;
 pub mod pg_config;
+pub mod pipeline;
 pub mod regress;
 pub mod result;
 pub mod scram;
@@ -47,9 +51,7 @@ pub mod trace;
 pub mod uri;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
-pub use connection::{
-    Address, Connection, ConnectionError, QueryClass, QueryRunner, Stream, Tracer, socket_address,
-};
+pub use connection::{Address, Connection, ConnectionError, Stream, Tracer, socket_address};
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,
     conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,
@@ -58,6 +60,10 @@ pub use conninfo::{
 pub use error::ConnError;
 pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
 pub use message::{Backend, Frame, Frontend, ProtocolError, Target, TransactionStatus, next_frame};
+pub use pipeline::{
+    AsyncStatus, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass, QueryRunner,
+    RowMode,
+};
 pub use regress::regress_report;
 pub use result::{
     ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,

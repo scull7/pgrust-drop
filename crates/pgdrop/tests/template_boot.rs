@@ -12,10 +12,12 @@
 //! pgrust reads `timezonesets` and `timezone` from `<bindir>/../share` of the
 //! executable it runs as (`find_my_exec`), and pgdrop does not embed those
 //! yet (NAT-408). So the server runs as a hard link named `postgres` in a
-//! scratch `bin/`, beside a `share/` that points at the reference
-//! installation's `timezonesets` and at a timezone database. Without a
-//! reference installation the test prints `SKIP (flagged, not silent)` and
-//! passes; `PGDROP_REQUIRE_REF=1` makes it fail instead.
+//! scratch `bin/`, beside a `share/` of the test's own: an empty
+//! `timezonesets/Default` (zero abbreviations, which `load_tzoffsets` takes)
+//! and a link to this machine's timezone database. The pgrust half needs
+//! nothing else and always runs. Without a reference installation the C
+//! half prints `SKIP (flagged, not silent)` and passes;
+//! `PGDROP_REQUIRE_REF=1` makes it fail instead.
 
 #![cfg(unix)]
 // Integration tests are their own crate; see the library root for why this lint is off.
@@ -48,54 +50,25 @@ impl Drop for Scratch {
     }
 }
 
-/// The reference installation's share directory: the one holding
-/// `timezonesets`, looked for where each lane's packages put it.
-fn reference_share_dir(postgres: &Path) -> Option<PathBuf> {
-    let bin = postgres.parent()?;
-    let prefix = bin.parent()?;
-    let mut candidates = vec![
-        prefix.join("share/postgresql"),
-        prefix.join("share/postgresql@18"),
-        prefix.join("share"),
-    ];
-    // PGDG's Debian layout and Alpine's.
-    if bin.ends_with("lib/postgresql/18/bin") {
-        candidates.push(PathBuf::from("/usr/share/postgresql/18"));
-    }
-    if bin.ends_with("libexec/postgresql18") {
-        candidates.push(PathBuf::from("/usr/share/postgresql18"));
-    }
-    candidates
-        .into_iter()
-        .find(|dir| dir.join("timezonesets").is_dir())
-}
-
 /// `<scratch>/bin/postgres`, a hard link to pgdrop (so `argv[0]` selects the
 /// applet and `find_my_exec` lands in `<scratch>/bin`), and `<scratch>/share`
-/// with the two directories pgrust reads at startup.
-fn install(scratch: &Path, share: &Path) -> PathBuf {
+/// with the two things pgrust reads at startup: `timezonesets/Default`, empty,
+/// and `timezone`, linked to the timezone database rinitdb reads too.
+fn install(scratch: &Path) -> PathBuf {
     let bin = scratch.join("bin");
-    let our_share = scratch.join("share");
+    let timezonesets = scratch.join("share/timezonesets");
     std::fs::create_dir_all(&bin).expect("create bin/");
-    std::fs::create_dir_all(&our_share).expect("create share/");
+    std::fs::create_dir_all(&timezonesets).expect("create share/timezonesets/");
     let postgres = bin.join("postgres");
     if std::fs::hard_link(PGDROP, &postgres).is_err() {
         std::fs::copy(PGDROP, &postgres).expect("copy pgdrop");
     }
-    std::os::unix::fs::symlink(share.join("timezonesets"), our_share.join("timezonesets"))
-        .expect("link timezonesets");
-    // A build with its own timezone database has share/timezone; one built
-    // --with-system-tzdata (Alpine, PGDG) reads the system's, which is where
-    // rinitdb looks too.
-    let tzdir = if share.join("timezone").is_dir() {
-        share.join("timezone")
-    } else {
-        rinitdb::RealTzSource::from_env()
-            .expect("a timezone database on this machine")
-            .tzdir()
-            .to_path_buf()
-    };
-    std::os::unix::fs::symlink(tzdir, our_share.join("timezone")).expect("link timezone");
+    std::fs::write(timezonesets.join("Default"), b"").expect("write timezonesets/Default");
+    let tzdir = rinitdb::RealTzSource::from_env()
+        .expect("a timezone database on this machine")
+        .tzdir()
+        .to_path_buf();
+    std::os::unix::fs::symlink(tzdir, scratch.join("share/timezone")).expect("link timezone");
     postgres
 }
 
@@ -150,17 +123,8 @@ fn select_one(postgres: &Path, pgdata: &Path) -> String {
 
 #[test]
 fn the_expanded_template_boots_under_pgrust_single_user_mode() {
-    let Some(reference_postgres) = reference::find_or_skip("postgres") else {
-        return;
-    };
-    let share = reference_share_dir(&reference_postgres).unwrap_or_else(|| {
-        panic!(
-            "no share/timezonesets beside {}",
-            reference_postgres.display()
-        )
-    });
     let scratch = Scratch::new("template-boot");
-    let pgrust = install(&scratch.0, &share);
+    let pgrust = install(&scratch.0);
 
     let pgdata = scratch.0.join("data");
     pgdrop_initdb(&pgdata);
@@ -169,6 +133,9 @@ fn the_expanded_template_boots_under_pgrust_single_user_mode() {
 
     // The second oracle: the reference C server, on a cluster of its own
     // from the same binary.
+    let Some(reference_postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
     let c_pgdata = scratch.0.join("data-c");
     pgdrop_initdb(&c_pgdata);
     let version = select_one(&reference_postgres, &c_pgdata);

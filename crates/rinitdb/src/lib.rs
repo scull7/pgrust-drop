@@ -130,13 +130,26 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
 /// take back — unless `--waldir` is going to fail. C reports that failure
 /// after making PGDATA (and then removes it), and an upstream error keeps
 /// precedence over this port's refusal, so then the refusal waits and the
-/// sequence below fails where C's does. Progress output and the closing
+/// sequence below fails where C's does. The refusal is evaluated again once
+/// the directories exist, so a `--waldir` that fails here and passes there
+/// cannot skip it. `setup_text_search`'s warning (`initdb.c:3492`) comes
+/// next, before the first `mkdir` as in C. Progress output and the closing
 /// instructions are C's stdout and are not printed yet (NAT-387).
 fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write) -> ExitCode {
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
-    if !waldir_will_fail && let Err(err) = cluster::check_template_can_make(options, plan) {
-        let _ = writeln!(stderr, "{}", err.render());
-        return ExitCode::from(EXIT_FAILURE);
+    let can_make = cluster::check_template_can_make(options, plan);
+    match can_make {
+        Err(err) if !waldir_will_fail => {
+            let _ = writeln!(stderr, "{}", err.render());
+            return ExitCode::from(EXIT_FAILURE);
+        }
+        // Its locale "C" is only true of a cluster the template can make.
+        Ok(()) => {
+            if let Some(warning) = cluster::text_search_warning(options) {
+                let _ = writeln!(stderr, "{warning}");
+            }
+        }
+        Err(_) => {}
     }
     let mut progress = Progress::default();
     let created = initialize_data_directory(plan, options, &mut progress)
@@ -166,6 +179,9 @@ fn initialize_data_directory(
     progress: &mut Progress,
 ) -> Result<(), InitdbError> {
     create_directories(plan, progress)?;
+    // Again, on the path that writes the image: create_cluster's check is
+    // skipped when its `--waldir` probe fails, and that probe is not this one.
+    cluster::check_template_can_make(options, plan)?;
 
     let template = image::parse(image::TEMPLATE).map_err(|err| InitdbError::TemplateDamaged {
         reason: err.to_string(),

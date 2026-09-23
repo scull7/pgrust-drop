@@ -1,6 +1,6 @@
 //! The `pgdrop` executable: route `argv`, then hand the streams to the applet.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -19,7 +19,12 @@ fn main() -> ExitCode {
             rpsql::run(&applet_args, &mut stdout, &mut stderr)
         }
         Dispatch::Applet(Applet::Postgres, applet_args) => {
-            postgres::run(&applet_args, &mut stdout, &mut stderr)
+            // Unlocked: the server writes to both streams itself.
+            drop((stdout, stderr));
+            let argv0 = argv
+                .first()
+                .map_or(OsStr::new("postgres"), OsString::as_os_str);
+            postgres::run(argv0, &applet_args, &mut std::io::stdout())
         }
         Dispatch::InstallLinks(link_args) => install::run(&link_args, &mut stdout, &mut stderr),
         Dispatch::Start(_) => {

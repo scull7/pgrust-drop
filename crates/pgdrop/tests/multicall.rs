@@ -59,7 +59,8 @@ fn psql_symlink_reports_its_version() {
 }
 
 /// NAT-376 acceptance: `pgdrop postgres --version` prints pgrust's version
-/// string. The rest of the applet is still NAT-407's.
+/// string. Only `argv[1]` asks for it (`main.c:168`); anything else is a
+/// server command line and goes to pgrust, which refuses this one.
 #[test]
 fn postgres_subcommand_reports_pgrusts_version() {
     let pgdrop = Path::new(PGDROP);
@@ -72,11 +73,8 @@ fn postgres_subcommand_reports_pgrusts_version() {
     }
     let server = testkit::run(pgdrop, ["postgres", "-D", "x", "--version"]).expect("run");
     assert!(!server.succeeded());
-    assert!(
-        server.stderr_text().contains("NAT-407"),
-        "{}",
-        server.stderr_text()
-    );
+    assert_ne!(server.stdout_text(), pgdrop::postgres::VERSION_LINE);
+    assert!(!server.stderr.is_empty());
 }
 
 /// Through a `postgres` symlink, pgrust's version line is C's byte for byte

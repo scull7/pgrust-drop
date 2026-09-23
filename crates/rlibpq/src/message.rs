@@ -94,7 +94,7 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// The `pqGetc` / `pqGetInt` / `pqGets` family (`fe-misc.c:130`-`:260`) over
+/// The `pqGetc` / `pqGetInt` / `pqGets` family (`fe-misc.c:79`-`:247`) over
 /// one message body: running out of bytes is the message type's own
 /// "insufficient data" error.
 #[derive(Debug)]
@@ -114,7 +114,7 @@ impl<'a> Reader<'a> {
         ProtocolError::InsufficientData(self.id)
     }
 
-    /// `pqGetnchar`, `fe-misc.c:194`.
+    /// `pqGetnchar`, `fe-misc.c:167`.
     ///
     /// # Errors
     /// The message body has fewer than `n` bytes left.
@@ -127,7 +127,7 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    /// `pqGetc`, `fe-misc.c:130`.
+    /// `pqGetc`, `fe-misc.c:79`.
     ///
     /// # Errors
     /// The body is exhausted.
@@ -173,7 +173,7 @@ impl<'a> Reader<'a> {
         Ok(self.u16()? as i16)
     }
 
-    /// `pqGets`, `fe-misc.c:157` — up to the NUL, which is consumed.
+    /// `pqGets`, `fe-misc.c:138` — up to the NUL, which is consumed.
     ///
     /// # Errors
     /// There is no NUL in what is left of the body.
@@ -193,7 +193,7 @@ impl<'a> Reader<'a> {
         &self.buf[self.pos..]
     }
 
-    /// True when the whole body was consumed — `fe-protocol3.c:468`'s check
+    /// True when the whole body was consumed — `fe-protocol3.c:458`'s check
     /// that the contents agree with the length.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -392,7 +392,7 @@ impl Backend {
             },
         };
 
-        // fe-protocol3.c:468 — the body must be exactly consumed. Three kinds
+        // fe-protocol3.c:458 — the body must be exactly consumed. Three kinds
         // read the whole body by construction and leave this reader at zero:
         // an authentication request (`AuthRequest::decode` has its own reader
         // over the same bytes), BackendKeyData's variable-length cancel key,
@@ -528,7 +528,7 @@ impl Frontend {
     }
 }
 
-/// `pqPacketSend`, `fe-misc.c:1129`: type byte, length including itself but
+/// `pqPacketSend`, `fe-connect.c:5409`: type byte, length including itself but
 /// not the type byte, then the body.
 fn packet(id: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 5);
@@ -539,7 +539,7 @@ fn packet(id: u8, body: &[u8]) -> Vec<u8> {
 }
 
 /// The four-byte length word: the body plus the word itself, as
-/// `pqPutMsgEnd` writes it (`fe-misc.c:1043`). A message longer than a `u32`
+/// `pqPutMsgEnd` writes it (`fe-misc.c:542`). A message longer than a `u32`
 /// cannot be sent at all, and nothing here builds one.
 fn length_word(body_len: usize) -> [u8; 4] {
     u32::try_from(body_len + 4)

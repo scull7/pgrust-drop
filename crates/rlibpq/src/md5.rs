@@ -138,7 +138,7 @@ impl Md5 {
     }
 
     /// `pg_md5_final`, `md5.c:432`, which is `md5_pad` (`:310`) then
-    /// `md5_result` (`:348`): the 0x80 pad of `md5_paddat` (`:143`), zeroes,
+    /// `md5_result` (`:348`): the 0x80 pad of `md5_paddat` (`:142`), zeroes,
     /// then the bit count as a little-endian 64-bit word.
     #[must_use]
     pub fn finish(mut self) -> [u8; DIGEST_LENGTH] {
@@ -205,7 +205,7 @@ impl Md5 {
     }
 }
 
-/// `pg_md5_binary`, `md5_common.c:107`.
+/// `pg_md5_binary`, `md5_common.c:108`.
 #[must_use]
 pub fn md5(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     let mut ctx = Md5::new();
@@ -213,7 +213,7 @@ pub fn md5(data: &[u8]) -> [u8; DIGEST_LENGTH] {
     ctx.finish()
 }
 
-/// `bytesToHex`, `md5_common.c:27`.
+/// `bytesToHex`, `md5_common.c:28`.
 #[must_use]
 fn bytes_to_hex(bytes: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -225,7 +225,7 @@ fn bytes_to_hex(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `pg_md5_hash`, `md5_common.c:73`: the digest as 32 lowercase hex digits.
+/// `pg_md5_hash`, `md5_common.c:74`: the digest as 32 lowercase hex digits.
 #[must_use]
 pub fn md5_hash(data: &[u8]) -> Vec<u8> {
     bytes_to_hex(&md5(data))

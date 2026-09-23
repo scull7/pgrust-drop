@@ -7,11 +7,11 @@
 //! table becomes one `match` per state in [`Scanner::step`]. Flex's
 //! longest-match-then-first-rule tie-break is reproduced by ordering each
 //! state's arms the way the `%%` section orders its rules and by measuring the
-//! candidates whose lengths can differ (`psqlscan.l:96`-`:101` states the rule).
+//! candidates whose lengths can differ (`psqlscan.l:97`-`:99` states the rule).
 //!
 //! Everything here is a pure calculation over bytes: the only outside world it
 //! touches is the [`VariableSource`] callback, which stands in for upstream's
-//! `PsqlScanCallbacks.get_variable` (`psqlscan.h:64`).
+//! `PsqlScanCallbacks.get_variable` (`psqlscan.h:68`).
 
 use crate::variables::{escape_identifier, escape_literal};
 
@@ -26,7 +26,7 @@ enum LexRes {
     Backslash,
 }
 
-/// Termination states for [`Scanner::scan`] (`psqlscan.h:33`-`:38`).
+/// Termination states for [`Scanner::scan`] (`psqlscan.h:33`-`:39`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanResult {
     /// `PSCAN_SEMICOLON`: found command-ending semicolon.
@@ -39,7 +39,7 @@ pub enum ScanResult {
     Eol,
 }
 
-/// Prompt type returned by `psql_scan()` (`psqlscan.h:41`-`:51`).
+/// Prompt type returned by `psql_scan()` (`psqlscan.h:42`-`:52`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PromptStatus {
     /// `PROMPT_READY`
@@ -62,7 +62,7 @@ pub enum PromptStatus {
 }
 
 /// Quoting request types for the `get_variable()` callback
-/// (`psqlscan.h:54`-`:60`).
+/// (`psqlscan.h:55`-`:61`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteType {
     /// `PQUOTE_PLAIN`: just return the actual value.
@@ -73,7 +73,7 @@ pub enum QuoteType {
     SqlIdent,
     /// `PQUOTE_SHELL_ARG`: quote if needed to be safe in a shell command.
     ///
-    /// Only `<xslashbackquote>` asks for this (`psqlscanslash.l:397`), and
+    /// Only `<xslashbackquote>` asks for this (`psqlscanslash.l:396`), and
     /// this port does not run backquotes, so nothing produces it yet. The
     /// variable source refuses it rather than quoting it wrongly; the
     /// specification NAT-405 needs is at that arm in `variables.rs`.
@@ -83,7 +83,7 @@ pub enum QuoteType {
 /// Upstream's `PsqlScanCallbacks.get_variable` as a trait.
 ///
 /// `None` means the variable is unset, in which case the lexer copies the text
-/// through unchanged (`psqlscan.l:750`).
+/// through unchanged (`psqlscan.l:754`).
 pub trait VariableSource {
     /// Value of `name`, already quoted as `quote` asks.
     fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String>;
@@ -91,7 +91,7 @@ pub trait VariableSource {
 
 /// A [`VariableSource`] in which nothing is ever set.
 ///
-/// Upstream allows a NULL `get_variable` pointer (`psqlscan.h:66`); this is
+/// Upstream allows a NULL `get_variable` pointer (`psqlscan.h:67`); this is
 /// that, without the pointer.
 pub struct NoVariables;
 
@@ -104,7 +104,7 @@ impl VariableSource for NoVariables {
 /// The flex exclusive start conditions (`psqlscan.l:124`-`:133`).
 ///
 /// `xeu` is deliberately absent, exactly as upstream says it is: "we
-/// intentionally don't mimic the backend's `<xeu>` state" (`psqlscan.l:115`).
+/// intentionally don't mimic the backend's `<xeu>` state" (`psqlscan.l:118`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartState {
     /// Flex's `INITIAL`.
@@ -132,7 +132,7 @@ pub enum StartState {
     Xus,
 }
 
-// --- character classes, from the definitions section (`psqlscan.l:151`-`:360`)
+// --- character classes, from the definitions section (`psqlscan.l:153`-`:374`)
 
 /// `space  [ \t\n\r\f\v]`
 const fn is_space(c: u8) -> bool {
@@ -220,8 +220,8 @@ const fn is_op_char(c: u8) -> bool {
     )
 }
 
-/// The eight characters that let a trailing `+`/`-` stay part of an operator
-/// (`psqlscan.l:834`-`:841`).
+/// The ten characters that let a trailing `+`/`-` stay part of an operator
+/// (`psqlscan.l:852`-`:855`).
 const fn qualifies_trailing_sign(c: u8) -> bool {
     matches!(
         c,
@@ -232,7 +232,7 @@ const fn qualifies_trailing_sign(c: u8) -> bool {
 /// One input buffer: the outer line, or the value of a variable being expanded.
 ///
 /// Upstream keeps these on `state->buffer_stack` as flex buffers
-/// (`psqlscan_int.h:66`); the data and the read position are all we need.
+/// (`psqlscan_int.h:90`); the data and the read position are all we need.
 #[derive(Debug, Clone)]
 struct Buf {
     data: Vec<u8>,
@@ -242,7 +242,7 @@ struct Buf {
 }
 
 /// State that lives across successive input lines until [`Scanner::reset`]
-/// (`psqlscan_int.h:110`-`:129`).
+/// (`psqlscan_int.h:112`-`:130`).
 #[derive(Debug, Clone, Default)]
 pub struct ScanState {
     /// `start_state`: yylex's starting/finishing state.
@@ -268,7 +268,7 @@ pub struct ScanState {
 }
 
 /// The lexer, holding both the cross-line [`ScanState`] and the buffers being
-/// read (`PsqlScanStateData`, `psqlscan_int.h:78`).
+/// read (`PsqlScanStateData`, `psqlscan_int.h:84`).
 #[derive(Debug, Clone)]
 pub struct Scanner {
     state: ScanState,
@@ -365,7 +365,7 @@ impl Scanner {
             LexRes::Semi => (ScanResult::Semicolon, PromptStatus::Ready),
             LexRes::Backslash => (ScanResult::Backslash, PromptStatus::Ready),
             LexRes::Eol => match self.state.start_state {
-                // `xqs` is treated like INITIAL (`psqlscan.l:1259`).
+                // `xqs` is treated like INITIAL (`psqlscan.l:1263`).
                 StartState::Initial | StartState::Xqs => {
                     if self.state.paren_depth > 0 {
                         (ScanResult::Incomplete, PromptStatus::Paren)
@@ -414,7 +414,7 @@ impl Scanner {
     /// One `yylex()` rule firing. `None` means "keep lexing".
     fn step(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> Option<LexRes> {
         if self.rest().is_empty() {
-            // The `<<EOF>>` rule (`psqlscan.l:945`).
+            // The `<<EOF>>` rule (`psqlscan.l:942`).
             if self.stack.len() > 1 {
                 self.stack.pop();
                 return None;
@@ -436,7 +436,7 @@ impl Scanner {
         None
     }
 
-    /// `<xc>` (`psqlscan.l:426`-`:451`).
+    /// `<xc>` (`psqlscan.l:426`-`:453`).
     fn step_xc(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest();
         if rest.starts_with(b"/*") {
@@ -461,7 +461,7 @@ impl Scanner {
         }
     }
 
-    /// `<xb>`/`<xh>` (`psqlscan.l:456`-`:461`) plus the shared end-quote rule.
+    /// `<xb>`/`<xh>` (`psqlscan.l:459`-`:462`) plus the shared end-quote rule.
     fn step_xb_xh(&mut self, out: &mut Vec<u8>, here: StartState) {
         let rest = self.rest();
         if rest[0] == b'\'' {
@@ -474,7 +474,7 @@ impl Scanner {
         }
     }
 
-    /// `<xq>` and `<xus>` (`psqlscan.l:520`-`:526`).
+    /// `<xq>` and `<xus>` (`psqlscan.l:530`-`:535`).
     fn step_xq(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest();
         if rest.starts_with(b"''") {
@@ -489,7 +489,7 @@ impl Scanner {
         }
     }
 
-    /// `<xe>` (`psqlscan.l:520`-`:552`).
+    /// `<xe>` (`psqlscan.l:530`-`:557`).
     fn step_xe(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest();
         if rest.starts_with(b"''") {
@@ -512,7 +512,7 @@ impl Scanner {
         }
     }
 
-    /// `<xqs>` (`psqlscan.l:504`-`:519`): look ahead for a string continuation.
+    /// `<xqs>` (`psqlscan.l:509`-`:528`): look ahead for a string continuation.
     fn step_xqs(&mut self, out: &mut Vec<u8>) {
         if let Some(n) = match_quotecontinue(self.rest()) {
             self.state.start_state = self.state.state_before_str_stop;
@@ -523,7 +523,7 @@ impl Scanner {
         }
     }
 
-    /// `<xdolq>` (`psqlscan.l:566`-`:592`).
+    /// `<xdolq>` (`psqlscan.l:569`-`:596`).
     fn step_xdolq(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest();
         if let Some(n) = match_dolqdelim(rest) {
@@ -546,7 +546,7 @@ impl Scanner {
         }
     }
 
-    /// `<xd>` and `<xui>` (`psqlscan.l:601`-`:616`).
+    /// `<xd>` and `<xui>` (`psqlscan.l:606`-`:619`).
     fn step_xd(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest();
         if rest.starts_with(b"\"\"") {
@@ -570,7 +570,7 @@ impl Scanner {
         let c = rest[0];
 
         // {whitespace} — suppressed until some non-whitespace has been
-        // collected (`psqlscan.l:405`).
+        // collected (`psqlscan.l:410`).
         if is_space(c) {
             let n = rest.iter().take_while(|&&b| is_space(b)).count();
             if out.is_empty() {
@@ -599,7 +599,7 @@ impl Scanner {
         }
 
         // {xbstart} / {xhstart} / {xnstart} / {xqstart} / {xestart} /
-        // {xusstart} / {xuistart} (`psqlscan.l:455`-`:499`).
+        // {xusstart} / {xuistart} (`psqlscan.l:455`-`:494`, `:602`).
         if rest.len() >= 2 && rest[1] == b'\'' {
             match c {
                 b'b' | b'B' => {
@@ -655,7 +655,7 @@ impl Scanner {
             return None;
         }
 
-        // {dolqdelim} / {dolqfailed} (`psqlscan.l:556`-`:565`).
+        // {dolqdelim} / {dolqfailed} (`psqlscan.l:559`-`:568`).
         if c == b'$' {
             if let Some(n) = match_dolqdelim(rest) {
                 self.state.dolqstart = Some(rest[..n].to_vec());
@@ -687,7 +687,7 @@ impl Scanner {
         }
 
         // The psql-specific rules, which must precede {self}
-        // (`psqlscan.l:684`-`:723`).
+        // (`psqlscan.l:660`-`:715`).
         if c == b'(' {
             self.state.paren_depth += 1;
             self.echo(1, out);
@@ -729,7 +729,7 @@ impl Scanner {
                 }
             }
             // The `"\\"` rule consumes the backslash without echoing it
-            // (`psqlscan.l:715`); the slash lexer resumes at the command name.
+            // (`psqlscan.l:711`); the slash lexer resumes at the command name.
             self.skip(1);
             return Some(LexRes::Backslash);
         }
@@ -774,7 +774,7 @@ impl Scanner {
     }
 
     /// The four `:`-prefixed psql variable rules and their no-backup
-    /// companions (`psqlscan.l:725`-`:800`).
+    /// companions (`psqlscan.l:717`-`:803`).
     fn step_colon(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) {
         let rest = self.rest().to_vec();
 
@@ -800,7 +800,7 @@ impl Scanner {
                 };
                 let value = vars.get_variable(&name, quote).unwrap_or_else(|| {
                     // `psqlscan_escape_variable` emits the *name*, quoted, when
-                    // the variable is unset (`psqlscan.l:1592`).
+                    // the variable is unset (`psqlscan.l:1735`).
                     if delim == b'\'' {
                         escape_literal("")
                     } else {
@@ -848,7 +848,7 @@ impl Scanner {
             Some(value) => {
                 if self.var_is_current_source(&name) {
                     // Recursive expansion — copy the string as is
-                    // (`psqlscan.l:760`).
+                    // (`psqlscan.l:740`).
                     self.echo(1 + name_len, out);
                 } else {
                     self.skip(1 + name_len);
@@ -863,14 +863,14 @@ impl Scanner {
         }
     }
 
-    /// `psqlscan_var_is_current_source()` (`psqlscan.l:1517`).
+    /// `psqlscan_var_is_current_source()` (`psqlscan.l:1581`).
     fn var_is_current_source(&self, name: &str) -> bool {
         self.stack
             .iter()
             .any(|b| b.varname.as_deref() == Some(name))
     }
 
-    /// The `{operator}` rule (`psqlscan.l:809`-`:878`): how many bytes of the
+    /// The `{operator}` rule (`psqlscan.l:813`-`:878`): how many bytes of the
     /// op_chars run actually belong to this token.
     fn operator_length(&self) -> usize {
         let rest = self.rest();
@@ -907,7 +907,7 @@ impl Scanner {
         nchars.max(1)
     }
 
-    /// `psqlscan_track_identifier()` (`psqlscan.l:1059`).
+    /// `psqlscan_track_identifier()` (`psqlscan.l:1060`).
     fn track_identifier(&mut self, identifier: &[u8]) {
         if self.state.paren_depth != 0 {
             return;
@@ -930,7 +930,7 @@ impl Scanner {
         }
     }
 
-    /// `psqlscan_record_initial_keyword()` (`psqlscan.l:970`).
+    /// `psqlscan_record_initial_keyword()` (`psqlscan.l:971`).
     fn record_initial_keyword(&mut self, identifier: &[u8]) {
         let n = self.state.init_idents_count;
         if n < self.state.init_idents.len() {
@@ -950,7 +950,7 @@ impl Scanner {
         }
     }
 
-    /// `psqlscan_is_copy_from_stdin()` (`psqlscan.l:1017`).
+    /// `psqlscan_is_copy_from_stdin()` (`psqlscan.l:1018`).
     fn is_copy_from_stdin(&self) -> bool {
         let idents = &self.state.init_idents;
         if idents[0] != b'C' {
@@ -966,7 +966,7 @@ impl Scanner {
     }
 }
 
-/// `psqlscan_is_create_routine()` (`psqlscan.l:1005`).
+/// `psqlscan_is_create_routine()` (`psqlscan.l:1006`).
 fn is_create_routine(idents: [u8; 8]) -> bool {
     idents[0] == b'c'
         && (idents[1] == b'f'
@@ -1017,7 +1017,7 @@ fn match_dolqdelim(rest: &[u8]) -> Option<usize> {
     }
 }
 
-/// The `<xe>` backslash rules, longest match first (`psqlscan.l:528`-`:548`).
+/// The `<xe>` backslash rules, longest match first (`psqlscan.l:539`-`:553`).
 fn match_xe_escape(rest: &[u8]) -> usize {
     // {xeunicode}  [\\](u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})
     // {xeunicodefail}  [\\](u[0-9A-Fa-f]{0,3}|U[0-9A-Fa-f]{0,7})
@@ -1098,7 +1098,7 @@ fn match_quotecontinue(rest: &[u8]) -> Option<usize> {
     }
 }
 
-/// The numeric rules (`psqlscan.l:880`-`:931`): how many bytes this number
+/// The numeric rules (`psqlscan.l:880`-`:930`): how many bytes this number
 /// token covers, including the `{numericfail}` throw-back of a trailing `..`.
 fn match_number(rest: &[u8]) -> usize {
     let digits = |from: usize| {
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn leading_whitespace_is_suppressed_until_there_is_data() {
-        // `psqlscan.l:405`: whitespace is suppressed until some
+        // `psqlscan.l:410`: whitespace is suppressed until some
         // non-whitespace data has been collected.
         assert_eq!(
             first("   select 1;"),
@@ -1233,12 +1233,12 @@ mod tests {
 
     #[test]
     fn dollar_quoting_is_opaque() {
-        // The comment at `psqlscan.l:227`: no processing of the quoted text.
+        // The comment at `psqlscan.l:225`: no processing of the quoted text.
         let (res, buf) = first("select $$a;b$$;");
         assert_eq!(res, ScanResult::Semicolon);
         assert_eq!(buf, "select $$a;b$$;");
 
-        // `$delim$...$junk$delim$` from the comment at `psqlscan.l:576`.
+        // `$delim$...$junk$delim$` from the comment at `psqlscan.l:581`.
         let (res, buf) = first("select $d$x$junk$d$;");
         assert_eq!(res, ScanResult::Semicolon);
         assert_eq!(buf, "select $d$x$junk$d$;");
@@ -1270,7 +1270,7 @@ mod tests {
 
     #[test]
     fn dash_dash_comment_runs_to_end_of_line() {
-        // `psqlscan.l:146`: with no newline after --, absorb to end of input.
+        // `psqlscan.l:142`: with no newline after --, absorb to end of input.
         let (res, buf) = first("select 1 -- ;");
         assert_eq!(res, ScanResult::Eol);
         assert_eq!(buf, "select 1 -- ;");
@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn plus_slash_star_lexes_as_operator_then_comment() {
-        // The comment at `psqlscan.l:263`: plus-slash-star is a `+` operator
+        // The comment at `psqlscan.l:261`: plus-slash-star is a `+` operator
         // and a comment start, not a three-character operator.
         let mut scanner = Scanner::new();
         scanner.setup(b"select 1 +/* c */ 2;", true);
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn equals_dash_dash_lexes_as_equals_then_comment() {
-        // The trailing `-` is dropped from `=--` (`psqlscan.l:824`), leaving
+        // The trailing `-` is dropped from `=--` (`psqlscan.l:821`-`:833`), leaving
         // `=` and a comment that swallows the semicolon.
         let mut scanner = Scanner::new();
         scanner.setup(b"select 1 =-- ;", true);
@@ -1301,7 +1301,7 @@ mod tests {
 
     #[test]
     fn trailing_sign_survives_a_non_sql_operator_character() {
-        // `?-` is a legal operator name (`psqlscan.l:838`), so the `-` stays.
+        // `?-` is a legal operator name (`psqlscan.l:840`), so the `-` stays.
         let mut scanner = Scanner::new();
         scanner.setup(b"select a ?- b;", true);
         let mut out = Vec::new();
@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn dot_dot_throws_back_from_an_integer() {
-        // `1..10` lexes as 1, dot_dot, 10 (`psqlscan.l:322`).
+        // `1..10` lexes as 1, dot_dot, 10 (`psqlscan.l:321`).
         assert_eq!(match_number(b"1..10"), 1);
         assert_eq!(match_number(b"1.10"), 4);
         assert_eq!(match_number(b"0x1234"), 6);
@@ -1330,7 +1330,7 @@ mod tests {
 
     #[test]
     fn backslash_semicolon_forces_a_semicolon_into_the_buffer() {
-        // `"\\"[;:]` emits the second character only (`psqlscan.l:700`).
+        // `"\\"[;:]` emits the second character only (`psqlscan.l:696`).
         let mut scanner = Scanner::new();
         scanner.setup(b"select 1\\;", true);
         let mut out = Vec::new();
@@ -1342,7 +1342,7 @@ mod tests {
     #[test]
     fn string_continuation_needs_a_newline() {
         // SQL requires at least one newline between concatenated literals
-        // (`psqlscan.l:167`).
+        // (`psqlscan.l:163`).
         assert!(match_quotecontinue(b"\n  '").is_some());
         assert!(match_quotecontinue(b"   '").is_none());
         assert!(match_quotecontinue(b" -- c\n'").is_some());
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn create_function_body_semicolons_do_not_end_the_statement() {
-        // The BEGIN..END heuristic (`psqlscan.l:1040`).
+        // The BEGIN..END heuristic (`psqlscan.l:1048`).
         let mut scanner = Scanner::new();
         scanner.setup(
             b"CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql;",
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn national_character_start_eats_only_the_n() {
-        // {xnstart} does yyless(1) (`psqlscan.l:474`), so the quote is lexed
+        // {xnstart} does yyless(1) (`psqlscan.l:476`), so the quote is lexed
         // by the normal rule and the state is xq, not something n-specific.
         let mut scanner = Scanner::new();
         scanner.setup(b"select n'abc", true);
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn an_empty_buffer_is_never_sent() {
-        // `psqlscan.l:1276`: never bother to send an empty buffer.
+        // `psqlscan.l:1281`: never bother to send an empty buffer.
         let mut scanner = Scanner::new();
         scanner.setup(b"   ", true);
         let mut out = Vec::new();

@@ -13,7 +13,7 @@
 //! Not here yet: `test_singlerowmode` (`singlerow.trace`, which also needs
 //! `PQsetChunkedRowsMode` checked end to end), `test_pipelined_insert`,
 //! `test_uniqviol`, `test_cancel` and `test_protocol_version`, which have no
-//! trace to compare or need cancellation and protocol 3.2 (NAT-391, NAT-394).
+//! trace to compare or need cancellation and protocol 3.2 (NAT-391).
 //!
 //! Without the reference tools every test prints `SKIP (flagged, not silent)`
 //! and passes; with `PGDROP_REQUIRE_REF=1` a missing reference fails instead.

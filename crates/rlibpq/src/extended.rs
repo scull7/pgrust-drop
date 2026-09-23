@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(plan.messages[1], Frontend::Sync);
     }
 
-    /// `traces/prepared.trace` lines 11-12 and 15-16: Describe S and Close S
+    /// `traces/prepared.trace` lines 12-13 and 16-17: Describe S and Close S
     /// of `select_one`, each followed by its own Sync.
     #[test]
     fn a_typed_command_is_the_command_and_a_sync() {

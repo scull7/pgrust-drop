@@ -319,7 +319,7 @@ fn push_action(actions: &mut Vec<Action>, is_file: bool, value: Option<String>) 
 ///
 /// # Errors
 /// The message `-v NAME=VALUE`'s `SetVariable` would have logged before
-/// `exit(EXIT_FAILURE)` (`startup.c:659`).
+/// `exit(EXIT_FAILURE)` (`startup.c:660`).
 // The body is one table, one `if` per row of upstream's `long_options[]` and
 // in its order; splitting it would only move the rows somewhere else.
 #[allow(clippy::too_many_lines)]

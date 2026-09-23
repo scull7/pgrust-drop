@@ -1098,7 +1098,7 @@ fn match_quotecontinue(rest: &[u8]) -> Option<usize> {
     }
 }
 
-/// The numeric rules (`psqlscan.l:880`-`:930`): how many bytes this number
+/// The numeric rules (`psqlscan.l:887`-`:930`): how many bytes this number
 /// token covers, including the `{numericfail}` throw-back of a trailing `..`.
 fn match_number(rest: &[u8]) -> usize {
     let digits = |from: usize| {

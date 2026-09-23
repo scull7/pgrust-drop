@@ -21,6 +21,11 @@ use crate::result::{FieldDescription, ResultError};
 /// work, and 3.0 is what every supported server accepts.
 pub const PROTOCOL_VERSION_3_0: u32 = 3 << 16; // PG_PROTOCOL(3, 0): minor 0.
 
+/// `CANCEL_REQUEST_CODE`, `pqcomm.h:137` — `PG_PROTOCOL(1234,5678)`, sent
+/// where a startup packet's version would be. `PG_PROTOCOL` is an `|`
+/// (`pqcomm.h:90`), written with `+` since the minor never reaches bit 16.
+pub const CANCEL_REQUEST_CODE: u32 = (1234 << 16) + 5678;
+
 /// `fe-protocol3.c:102` — lengths above this are believed only for the
 /// message types that can legitimately be long.
 pub const LONG_MESSAGE_THRESHOLD: i32 = 30000;
@@ -622,6 +627,12 @@ pub enum Frontend {
     /// `PqMsg_CopyFail`, `protocol.h:29` (`PQputCopyEnd`, `fe-exec.c:2784`):
     /// the error message, sent with `pqPuts`, so NUL-terminated.
     CopyFail(Vec<u8>),
+    /// `CancelRequestPacket`, `pqcomm.h:139`: no type byte, the length word,
+    /// [`CANCEL_REQUEST_CODE`], the backend's PID and its cancel key, as
+    /// `PQgetCancel` (`fe-cancel.c:450`) and `PQsendCancelRequest`
+    /// (`:481`) lay it out. The key is as long as BackendKeyData made it —
+    /// four bytes under protocol 3.0.
+    CancelRequest { pid: i32, cancel_key: Vec<u8> },
 }
 
 /// What a Describe or Close names: the `type` byte of `PQsendTypedCommand`
@@ -747,6 +758,16 @@ impl Frontend {
             Frontend::CopyData(data) => packet(b'd', data),
             Frontend::CopyDone => packet(b'c', b""),
             Frontend::CopyFail(message) => packet(b'f', &cstring(message)),
+            Frontend::CancelRequest { pid, cancel_key } => {
+                let mut body = CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+                body.extend_from_slice(&pid.to_be_bytes());
+                body.extend_from_slice(cancel_key);
+                // fe-cancel.c:454 — "include the length field itself".
+                let mut out = Vec::with_capacity(body.len() + 4);
+                out.extend_from_slice(&length_word(body.len()));
+                out.extend_from_slice(&body);
+                out
+            }
         }
     }
 }
@@ -846,6 +867,45 @@ mod tests {
         assert_eq!(&encoded[4..8], &[0, 3, 0, 0], "PG_PROTOCOL(3,0)");
         assert_eq!(&encoded[8..], b"user\0alice\0database\0postgres\0\0");
         assert_eq!(PROTOCOL_VERSION_3_0, 196_608);
+    }
+
+    /// A CancelRequest for backend 4242 with a protocol 3.0 key, byte for
+    /// byte: the length word counting itself (16), `1234 5678`, the PID and
+    /// the key, as `PQgetCancel` builds it (`fe-cancel.c:450`-`:455`).
+    #[test]
+    fn the_cancel_request_packet_is_upstreams_layout() {
+        let encoded = Frontend::CancelRequest {
+            pid: 4242,
+            cancel_key: vec![0xde, 0xad, 0xbe, 0xef],
+        }
+        .encode();
+        assert_eq!(
+            encoded,
+            [
+                0, 0, 0, 16, // length, itself included
+                0x04, 0xd2, 0x16, 0x2e, // 1234, 5678
+                0, 0, 0x10, 0x92, // 4242
+                0xde, 0xad, 0xbe, 0xef, // the key
+            ]
+        );
+        assert_eq!(CANCEL_REQUEST_CODE, 80_877_102);
+        assert_eq!(
+            crate::trace::no_type_byte_message_line(&encoded, crate::TraceFlags::REGRESS_MODE),
+            b"F\t16\tCancelRequest\t 1234 5678 NNNN 'BBBB'\n"
+        );
+    }
+
+    /// Protocol 3.2 allows a longer key (`fe-protocol3.c:1588`); the length
+    /// word follows it.
+    #[test]
+    fn a_longer_cancel_key_lengthens_the_packet() {
+        let encoded = Frontend::CancelRequest {
+            pid: 1,
+            cancel_key: vec![7; 32],
+        }
+        .encode();
+        assert_eq!(&encoded[0..4], &44u32.to_be_bytes());
+        assert_eq!(&encoded[12..], &[7; 32]);
     }
 
     /// `PqMsg_Query`: 'Q', the length, the NUL-terminated query.

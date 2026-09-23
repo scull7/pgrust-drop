@@ -547,8 +547,7 @@ impl PipelineState {
             Backend::ParseComplete
             | Backend::CloseComplete
             | Backend::NoData
-            | Backend::BindComplete
-            | Backend::NegotiateProtocolVersion { .. } => {}
+            | Backend::BindComplete => {}
             Backend::ParameterStatus { name, value } => {
                 return Ok(Some(Event::ParameterStatus { name, value }));
             }
@@ -590,8 +589,12 @@ impl PipelineState {
             Backend::BackendKeyData { .. } => {
                 return Err(ProtocolError::UnexpectedResponse(b'K'));
             }
-            // fe-protocol3.c:446 — PortalSuspended has no case of its own.
-            other @ (Backend::PortalSuspended | Backend::Other { .. }) => {
+            // fe-protocol3.c:446 — PortalSuspended has no case of its own,
+            // and neither has NegotiateProtocolVersion: it is read only by
+            // the startup loop (`fe-connect.c:4148`), never mid-query.
+            other @ (Backend::PortalSuspended
+            | Backend::NegotiateProtocolVersion { .. }
+            | Backend::Other { .. }) => {
                 return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
             }
             Backend::NotificationResponse { .. } | Backend::NoticeResponse(_) => {
@@ -1617,6 +1620,23 @@ mod tests {
         assert_eq!(
             state.apply(Backend::PortalSuspended),
             Err(ProtocolError::UnexpectedResponse(b's'))
+        );
+    }
+
+    /// NegotiateProtocolVersion is a startup message: the BUSY switch of
+    /// `pqParseInput3` (`fe-protocol3.c:203`-`:447`) has no case for it, so
+    /// mid-query it is the "unexpected response" default (`:446`).
+    #[test]
+    fn a_negotiate_protocol_version_is_an_unexpected_response() {
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Extended).unwrap();
+        state.append(QueryClass::Extended);
+        assert_eq!(
+            state.apply(Backend::NegotiateProtocolVersion {
+                newest: 0x0003_0000,
+                unrecognized: Vec::new(),
+            }),
+            Err(ProtocolError::UnexpectedResponse(b'v'))
         );
     }
 

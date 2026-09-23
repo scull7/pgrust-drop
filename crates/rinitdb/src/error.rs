@@ -91,6 +91,53 @@ impl fmt::Display for LocaleProvider {
     }
 }
 
+/// What the embedded template (ADR-0002) fixed at mint time, and so what a
+/// command line cannot have yet ([`InitdbError::NotSupportedYet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsupported {
+    /// Any encoding but UTF8, any locale but C, any provider but libc.
+    EncodingOrLocale,
+    /// Any WAL segment size but 16 MB.
+    WalSegmentSize,
+    /// A superuser other than the template's `postgres` (NAT-383).
+    Superuser,
+    /// `-W` / `--pwfile` (NAT-383).
+    Password,
+}
+
+impl Unsupported {
+    /// The reason, as the tail of the error line.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Unsupported::EncodingOrLocale => {
+                "the embedded template cluster has encoding \"UTF8\" and locale \"C\""
+            }
+            Unsupported::WalSegmentSize => "the embedded template cluster has 16 MB WAL segments",
+            Unsupported::Superuser => {
+                "the embedded template cluster's superuser is \"postgres\" and renaming it is \
+                 not implemented"
+            }
+            Unsupported::Password => "setting the superuser's password is not implemented",
+        }
+    }
+
+    /// The hint that follows the error line.
+    #[must_use]
+    pub fn hint(self) -> &'static str {
+        match self {
+            Unsupported::EncodingOrLocale | Unsupported::WalSegmentSize => {
+                "Clusters with another encoding, locale or WAL segment size need bootstrap \
+                 mode, which this initdb does not have yet."
+            }
+            Unsupported::Superuser => "Run initdb with -U postgres.",
+            Unsupported::Password => {
+                "Create the cluster without a password and set one with ALTER ROLE."
+            }
+        }
+    }
+}
+
 /// A pre-flight failure, one variant per `pg_fatal` / `pg_log_error` site.
 ///
 /// Every variant names the `initdb.c` line it reproduces. The `Display`
@@ -228,6 +275,21 @@ pub enum InitdbError {
     /// the walk: `pg_log_error` then `exit(EXIT_FAILURE)`.
     #[error("could not fsync file \"{path}\": {reason}")]
     CouldNotFsyncFile { path: String, reason: String },
+
+    /// Not an upstream site: the command line asks for something the embedded
+    /// template cannot make (`crate::cluster::check_template_can_make`,
+    /// ADR-0002, `docs/divergences.md`). Reported before anything is created.
+    #[error("{what} is not supported yet: {}", why.reason())]
+    NotSupportedYet { what: String, why: Unsupported },
+
+    /// Not an upstream site: the image or control file compiled into this
+    /// binary does not parse — a build defect, not a user error.
+    #[error("the embedded template is damaged: {reason}")]
+    TemplateDamaged { reason: String },
+
+    /// `xlog.c:4213` (`InitControlFile`): `pg_strong_random` failed.
+    #[error("could not generate secret authorization token")]
+    CouldNotGenerateSecretToken,
 }
 
 impl InitdbError {
@@ -289,6 +351,7 @@ impl InitdbError {
                     )],
                 },
             },
+            InitdbError::NotSupportedYet { why, .. } => vec![why.hint().to_owned()],
             _ => Vec::new(),
         }
     }

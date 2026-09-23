@@ -621,33 +621,19 @@ fn the_data_directory_tree_matches_reference_initdb() {
 
 // --- pg_control (Linear NAT-382) --------------------------------------------
 
-/// The `pg_control` a template cluster brings with it (ADR-0002).
-///
-/// The template itself lands with Linear NAT-381, so this is the stand-in: the
-/// fields a PostgreSQL 18.6 cluster carries that `pg_controldata` reads on its
-/// way to the data-checksum line, and zero everywhere else. That is faithful to
-/// what this issue does — `rewrite` treats everything but the system identifier
-/// and the checksum version as the template's opaque bytes — and it is what the
-/// gate below will be handed for real once the unpack exists.
-fn a_template_control_file() -> [u8; rinitdb::control::PG_CONTROL_FILE_SIZE] {
-    let zeroed = [0u8; rinitdb::control::PG_CONTROL_FILE_SIZE];
-    let mut template = ControlFile::parse(&zeroed).expect("a zeroed image is long enough");
-    template.pg_control_version = rinitdb::control::PG_CONTROL_VERSION;
-    template.catalog_version_no = rinitdb::control::CATALOG_VERSION_NO;
-    // `InitControlFile`, xlog.c:4219.
-    template.state = rinitdb::control::DbState::Shutdowned;
-    // `IsValidWalSegSize` (`src/include/access/xlog_internal.h:96`): any other
-    // value makes `pg_controldata` warn that the file is corrupt, so the
-    // stand-in carries `initdb.c:169`'s default like a real template would.
-    template.xlog_seg_size = rinitdb::pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB * 1024 * 1024;
-    template.to_bytes()
+/// The `pg_control` a template cluster brings with it (ADR-0002): the
+/// committed `template.control` (NAT-381), which is what `rinitdb` makes a
+/// new cluster's from. `rewrite` treats everything but the system identifier
+/// and the checksum version as the template's opaque bytes.
+fn a_template_control_file() -> &'static [u8] {
+    rinitdb::image::TEMPLATE_CONTROL
 }
 
 /// Expand one cluster's `$PGDATA/global/pg_control` from the template, which is
 /// `rewrite` plus the one write to disk, and answer with the identifier it got.
 fn expand_control_file(datadir: &Path, checksums: DataChecksums) -> SystemIdentifier {
     let system_identifier = SystemIdentifier::generate();
-    let image = rinitdb::control::rewrite(&a_template_control_file(), system_identifier, checksums)
+    let image = rinitdb::control::rewrite(a_template_control_file(), system_identifier, checksums)
         .expect("rewrite the template's pg_control");
     let path = testkit::control_file_path(datadir);
     std::fs::create_dir_all(path.parent().expect("pg_control is inside global/"))

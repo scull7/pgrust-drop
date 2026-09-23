@@ -2,13 +2,13 @@
 //!
 //! SCRAM-SHA-256 is the only caller (`fe-auth-scram.c:114` sets
 //! `state->hash_type = PG_SHA256`), through [`crate::hmac`] and
-//! `scram_H` (`scram-common.c:111`).
+//! `scram_H` (`scram-common.c:112`).
 //!
 //! Upstream builds this file only when there is no OpenSSL to defer to
 //! (`sha2.c` vs `sha2_openssl.c`); the two compute the same function, and this
 //! crate has no OpenSSL to defer to at all.
 
-/// `sha2.h:22` — `PG_SHA256_DIGEST_LENGTH`.
+/// `sha2.h:23` — `PG_SHA256_DIGEST_LENGTH`.
 pub const DIGEST_LENGTH: usize = 32;
 /// `sha2.h` — `PG_SHA256_BLOCK_LENGTH`.
 pub const BLOCK_LENGTH: usize = 64;

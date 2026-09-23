@@ -16,12 +16,12 @@ use crate::sha256;
 pub const SCRAM_SHA_256_NAME: &[u8] = b"SCRAM-SHA-256";
 /// `scram-common.h:21` — the channel-binding variant.
 pub const SCRAM_SHA_256_PLUS_NAME: &[u8] = b"SCRAM-SHA-256-PLUS";
-/// `scram-common.h:25` — `SCRAM_SHA_256_KEY_LEN`.
+/// `scram-common.h:24` — `SCRAM_SHA_256_KEY_LEN`.
 pub const KEY_LEN: usize = sha256::DIGEST_LENGTH;
-/// `scram-common.h:38` — `SCRAM_RAW_NONCE_LEN`, in bytes before base64.
+/// `scram-common.h:37` — `SCRAM_RAW_NONCE_LEN`, in bytes before base64.
 pub const RAW_NONCE_LEN: usize = 18;
 
-/// `scram_SaltedPassword`, `scram-common.c:37` — PBKDF2-HMAC-SHA-256 with one
+/// `scram_SaltedPassword`, `scram-common.c:38` — PBKDF2-HMAC-SHA-256 with one
 /// output block, which is all a 32-byte key needs.
 #[must_use]
 pub fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> [u8; KEY_LEN] {
@@ -42,19 +42,19 @@ pub fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> [u8; KE
     result
 }
 
-/// `scram_H`, `scram-common.c:111`.
+/// `scram_H`, `scram-common.c:112`.
 #[must_use]
 pub fn scram_h(input: &[u8]) -> [u8; KEY_LEN] {
     sha256::sha256(input)
 }
 
-/// `scram_ClientKey`, `scram-common.c:141`.
+/// `scram_ClientKey`, `scram-common.c:142`.
 #[must_use]
 pub fn client_key(salted_password: &[u8]) -> [u8; KEY_LEN] {
     hmac_sha256(salted_password, b"Client Key")
 }
 
-/// `scram_ServerKey`, `scram-common.c:171`.
+/// `scram_ServerKey`, `scram-common.c:172`.
 #[must_use]
 pub fn server_key(salted_password: &[u8]) -> [u8; KEY_LEN] {
     hmac_sha256(salted_password, b"Server Key")
@@ -197,7 +197,7 @@ impl std::fmt::Display for ScramError {
 
 impl std::error::Error for ScramError {}
 
-/// `read_attr_value`, `fe-auth-scram.c:307`: `attr=value` up to the next comma.
+/// `read_attr_value`, `fe-auth-scram.c:308`: `attr=value` up to the next comma.
 /// Returns the value and the rest of the input after the comma.
 fn read_attr_value(input: &[u8], attr: u8) -> Result<(&[u8], &[u8]), ScramError> {
     let mut begin = input;
@@ -249,7 +249,7 @@ pub struct ScramClient {
 }
 
 impl ScramClient {
-    /// `scram_init`, `fe-auth-scram.c:96`, plus the nonce draw that
+    /// `scram_init`, `fe-auth-scram.c:97`, plus the nonce draw that
     /// `build_client_first_message` does at `:363`: `raw_nonce` is the
     /// [`RAW_NONCE_LEN`] bytes `pg_strong_random` would have produced.
     #[must_use]
@@ -277,7 +277,7 @@ impl ScramClient {
         &self.appended
     }
 
-    /// `scram_channel_bound`, `fe-auth-scram.c:157`.
+    /// `scram_channel_bound`, `fe-auth-scram.c:158`.
     #[must_use]
     pub fn channel_bound(&self) -> bool {
         self.state == State::Finished && self.mechanism == Mechanism::ScramSha256Plus
@@ -290,7 +290,7 @@ impl ScramClient {
         self.state == State::Finished
     }
 
-    /// `build_client_first_message`, `fe-auth-scram.c:349`.
+    /// `build_client_first_message`, `fe-auth-scram.c:350`.
     ///
     /// Without TLS the gs2-header is always `n`, the `#ifdef USE_SSL` arm at
     /// `:404` being compiled out; `SCRAM-SHA-256-PLUS` cannot be reached
@@ -318,8 +318,8 @@ impl ScramClient {
         Ok(out)
     }
 
-    /// `read_server_first_message` (`fe-auth-scram.c:606`) followed by
-    /// `build_client_final_message` (`:454`).
+    /// `read_server_first_message` (`fe-auth-scram.c:607`) followed by
+    /// `build_client_final_message` (`:455`).
     ///
     /// # Errors
     /// The server-first-message is malformed, or its nonce does not extend
@@ -345,8 +345,8 @@ impl ScramClient {
         Ok(out)
     }
 
-    /// `read_server_final_message` (`fe-auth-scram.c:692`) and
-    /// `verify_server_signature` (`:845`).
+    /// `read_server_final_message` (`fe-auth-scram.c:693`) and
+    /// `verify_server_signature` (`:846`).
     ///
     /// # Errors
     /// The server reported an error, the message is malformed, or the
@@ -387,7 +387,7 @@ impl ScramClient {
         Ok(())
     }
 
-    /// `read_server_first_message`, `fe-auth-scram.c:606`.
+    /// `read_server_first_message`, `fe-auth-scram.c:607`.
     fn read_server_first_message(&mut self, input: &[u8]) -> Result<(), ScramError> {
         self.server_first_message = input.to_vec();
 
@@ -420,7 +420,7 @@ impl ScramClient {
         Ok(())
     }
 
-    /// `read_server_final_message`, `fe-auth-scram.c:692`.
+    /// `read_server_final_message`, `fe-auth-scram.c:693`.
     fn read_server_final_message(&mut self, input: &[u8]) -> Result<(), ScramError> {
         // fe-auth-scram.c:708 — an `e=` message is the server's error.
         if input.first() == Some(&b'e') {
@@ -443,7 +443,7 @@ impl ScramClient {
         Ok(())
     }
 
-    /// `calculate_client_proof`, `fe-auth-scram.c:765`.
+    /// `calculate_client_proof`, `fe-auth-scram.c:766`.
     fn calculate_client_proof(&mut self) -> [u8; KEY_LEN] {
         self.salted_password = salted_password(&self.password, &self.salt, self.iterations);
         let client_key = client_key(&self.salted_password);
@@ -576,7 +576,7 @@ mod tests {
         assert!(!final_message.ends_with(b",p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k="));
     }
 
-    /// `read_attr_value`, `fe-auth-scram.c:307`, including its two errors.
+    /// `read_attr_value`, `fe-auth-scram.c:308`, including its two errors.
     #[test]
     fn read_attr_value_stops_at_the_comma() {
         assert_eq!(

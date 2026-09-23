@@ -115,7 +115,7 @@ pub enum Address {
     Unix(PathBuf),
 }
 
-/// `is_unixsock_path`, `pqcomm.h:66`: an absolute path or a `@`-prefixed
+/// `is_unixsock_path`, `pqcomm.h:67`: an absolute path or a `@`-prefixed
 /// abstract name is a socket directory, not a host name.
 #[must_use]
 pub fn is_unixsock_path(host: &[u8]) -> bool {

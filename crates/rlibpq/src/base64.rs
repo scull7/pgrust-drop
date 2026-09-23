@@ -2,7 +2,7 @@
 //!
 //! SCRAM sends the salt, the nonces, the client proof and the server signature
 //! through this encoder, so it has to agree with C byte for byte — including
-//! its strictness: `pg_b64_decode` (`base64.c:115`) rejects whitespace, stray
+//! its strictness: `pg_b64_decode` (`base64.c:116`) rejects whitespace, stray
 //! `=` and every character outside the table rather than skipping it.
 
 /// `base64.c:27` — the encoding alphabet.
@@ -27,20 +27,20 @@ fn b64lookup(c: u8) -> i8 {
     -1
 }
 
-/// `pg_b64_enc_len`, `base64.c:218`.
+/// `pg_b64_enc_len`, `base64.c:224`.
 #[must_use]
 pub fn enc_len(srclen: usize) -> usize {
     // `(srclen + 2) / 3 * 4` upstream: three bytes become four characters.
     srclen.div_ceil(3) * 4
 }
 
-/// `pg_b64_dec_len`, `base64.c:233`.
+/// `pg_b64_dec_len`, `base64.c:239`.
 #[must_use]
 pub fn dec_len(srclen: usize) -> usize {
     (srclen * 3) >> 2
 }
 
-/// `pg_b64_encode`, `base64.c:48`.
+/// `pg_b64_encode`, `base64.c:49`.
 ///
 /// The C function writes into a caller-sized buffer and returns -1 when it
 /// would overflow; every caller sizes that buffer with `pg_b64_enc_len`, so
@@ -76,7 +76,7 @@ pub fn encode(src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `pg_b64_decode`, `base64.c:115`. `None` is the C function's `-1`.
+/// `pg_b64_decode`, `base64.c:116`. `None` is the C function's `-1`.
 #[must_use]
 pub fn decode(src: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(dec_len(src.len()));

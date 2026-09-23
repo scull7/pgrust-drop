@@ -6,7 +6,7 @@
 //! the error fields, and `pqBuildErrorMessage3`, `:1031`, which renders them).
 //! Everything here is a calculation over bytes; nothing touches a socket.
 
-/// `ExecStatusType`, `libpq-fe.h:123`.
+/// `ExecStatusType`, `libpq-fe.h:122`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecStatus {
     EmptyQuery,

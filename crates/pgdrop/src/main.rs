@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use pgdrop::dispatch::{self, Applet, Dispatch};
-use pgdrop::install;
+use pgdrop::{install, postgres};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -18,12 +18,8 @@ fn main() -> ExitCode {
         Dispatch::Applet(Applet::Psql, applet_args) => {
             rpsql::run(&applet_args, &mut stdout, &mut stderr)
         }
-        Dispatch::Applet(Applet::Postgres, _) => {
-            let _ = writeln!(
-                stderr,
-                "pgdrop: error: the pgrust server is not embedded yet (Linear NAT-407)"
-            );
-            ExitCode::FAILURE
+        Dispatch::Applet(Applet::Postgres, applet_args) => {
+            postgres::run(&applet_args, &mut stdout, &mut stderr)
         }
         Dispatch::InstallLinks(link_args) => install::run(&link_args, &mut stdout, &mut stderr),
         Dispatch::Start(_) => {

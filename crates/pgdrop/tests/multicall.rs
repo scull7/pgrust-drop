@@ -56,6 +56,38 @@ fn psql_symlink_reports_its_version() {
     assert_eq!(ours.stdout_text(), "psql (PostgreSQL) 18.6\n");
 }
 
+/// NAT-376 acceptance: `pgdrop postgres --version` prints pgrust's version
+/// string. The rest of the applet is still NAT-407's.
+#[test]
+fn postgres_subcommand_reports_pgrusts_version() {
+    let pgdrop = Path::new(PGDROP);
+    for flag in ["--version", "-V"] {
+        let out = testkit::run(pgdrop, ["postgres", flag]).expect("run");
+        assert!(out.succeeded(), "{flag}");
+        assert_eq!(out.stdout_text(), pgdrop::postgres::VERSION_LINE, "{flag}");
+        assert_eq!(out.stdout_text(), "postgres (PostgreSQL) 18.6\n", "{flag}");
+        assert_eq!(out.stderr_text(), "", "{flag}");
+    }
+    let server = testkit::run(pgdrop, ["postgres", "-D", "x", "--version"]).expect("run");
+    assert!(!server.succeeded());
+    assert!(
+        server.stderr_text().contains("NAT-407"),
+        "{}",
+        server.stderr_text()
+    );
+}
+
+/// Through a `postgres` symlink, pgrust's version line is C's byte for byte
+/// (`main.c:170`, `PG_BACKEND_VERSIONSTR`).
+#[test]
+fn postgres_symlink_version_matches_the_c_server() {
+    let link = symlinked_as("postgres");
+    let Some(gate) = testkit::Gate::for_tool_or_skip("postgres", link) else {
+        return; // The flagged skip is already on stderr.
+    };
+    gate.arg("--version").assert_clean();
+}
+
 #[test]
 fn root_help_and_unknown_subcommand() {
     let pgdrop = Path::new(PGDROP);

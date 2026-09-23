@@ -149,15 +149,40 @@ pub fn settings(
 /// then `check_locale_name` (`:2202`) canonicalizes it through `setlocale`.
 /// That call is out of reach (`#![deny(unsafe_code)]`, no libc dependency),
 /// so the name is written as given, except that `POSIX` is written `C`, as
-/// musl's and glibc's `setlocale` return it. Nothing given — where C asks
-/// the environment — is `C` (`docs/divergences.md`).
+/// musl's and glibc's `setlocale` return it, and on musl every name
+/// [`musl_setlocale_name`] folds to `C` is written `C`. Nothing given —
+/// where C asks the environment — is `C` (`docs/divergences.md`).
 fn conf_locale(category: Option<&str>, options: &Options) -> String {
     let given = category
         .filter(|name| !name.is_empty())
         .or_else(|| options.locale.as_deref().filter(|name| !name.is_empty()));
     match given {
         None | Some("POSIX") => "C".to_owned(),
+        Some(name) if cfg!(target_env = "musl") => musl_setlocale_name(name).to_owned(),
         Some(name) => name.to_owned(),
+    }
+}
+
+/// musl's `LOCALE_NAME_MAX` (`src/internal/locale_impl.h`).
+const MUSL_LOCALE_NAME_MAX: usize = 23;
+
+/// Pure: the name musl's `setlocale` returns for `name` in any category but
+/// `LC_CTYPE` — which is all four [`conf_locale`] resolves.
+///
+/// musl's `__get_locale` (`src/locale/locale_map.c`) replaces a name longer
+/// than `LOCALE_NAME_MAX` bytes, one containing `/` or one starting with `.`
+/// by `C.UTF-8`; outside `LC_CTYPE`, `C`, `C.UTF-8` and `POSIX` then are the
+/// built-in C locale, which `setlocale` names `C`. Every other name is kept
+/// as given. Checked against the reference initdb on Alpine (musl 1.2.6):
+/// `C.UTF-8`, a 24-byte name, `a/b`, `/abc` and `.foo` are written `C`;
+/// `C.utf8`, `c.UTF-8`, `POSIX.UTF-8`, `a.foo` and `C.UTF-8@euro` as given.
+#[must_use]
+pub fn musl_setlocale_name(name: &str) -> &str {
+    let folded = name.len() > MUSL_LOCALE_NAME_MAX || name.contains('/') || name.starts_with('.');
+    if folded || matches!(name, "C" | "C.UTF-8" | "POSIX") {
+        "C"
+    } else {
+        name
     }
 }
 
@@ -454,6 +479,65 @@ mod tests {
             ],
             ["C", "C", "C", "de_DE"]
         );
+
+        // On musl, setlocale names what it folds to the C locale "C", and
+        // the reference initdb writes `lc_messages = C` for these.
+        let (options, plan) = parsed(&[
+            "--no-locale",
+            "--lc-messages=C.UTF-8",
+            "--lc-monetary=abcdefghijklmnopqrstuvwxyz0123",
+            "--lc-numeric=a/b",
+            "--lc-time=.foo",
+        ]);
+        let settings = super::settings(&options, &plan, None);
+        let written = [
+            settings.lc_messages.as_str(),
+            &settings.lc_monetary,
+            &settings.lc_numeric,
+            &settings.lc_time,
+        ];
+        if cfg!(target_env = "musl") {
+            assert_eq!(written, ["C", "C", "C", "C"]);
+            let conf = &conf::render_all(&settings)[0].1;
+            assert!(
+                conf.lines()
+                    .any(|l| l == "lc_messages = C\t\t\t\t# locale for system error message"),
+                "{conf}"
+            );
+        } else {
+            assert_eq!(
+                written,
+                ["C.UTF-8", "abcdefghijklmnopqrstuvwxyz0123", "a/b", ".foo"]
+            );
+        }
+    }
+
+    #[test]
+    fn musl_setlocale_folds_what_it_does_not_keep_to_c() {
+        // musl's __get_locale (src/locale/locale_map.c), as the reference
+        // initdb on Alpine writes each name to postgresql.conf.
+        for (given, written) in [
+            ("C", "C"),
+            ("POSIX", "C"),
+            ("C.UTF-8", "C"),
+            ("C.utf8", "C.utf8"),
+            ("c.UTF-8", "c.UTF-8"),
+            ("POSIX.UTF-8", "POSIX.UTF-8"),
+            ("C.UTF-8@euro", "C.UTF-8@euro"),
+            ("en_US.UTF-8", "en_US.UTF-8"),
+            // LOCALE_NAME_MAX is 23: 23 bytes are kept, 24 are not. (With
+            // 23, the reference's bootstrap backend then dies of SIGSEGV;
+            // --no-clean keeps its postgresql.conf, which has the name.)
+            ("abcdefghijklmnopqrstuvw", "abcdefghijklmnopqrstuvw"),
+            ("abcdefghijklmnopqrstuvwx", "C"),
+            ("a/b", "C"),
+            ("/abc", "C"),
+            (".foo", "C"),
+            ("a.foo", "a.foo"),
+            ("foo.", "foo."),
+        ] {
+            assert_eq!(musl_setlocale_name(given), written, "{given:?}");
+        }
     }
 
     #[test]

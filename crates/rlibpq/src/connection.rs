@@ -29,6 +29,7 @@ use crate::message::{
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
+use crate::trace::{self, AuthResponse, Origin, TraceFlags};
 
 /// Anything that can stop a connection or a query.
 #[derive(Debug)]
@@ -587,6 +588,42 @@ impl QueryRunner {
     }
 }
 
+/// Where `PQtrace` writes: `conn->Pfdebug` and `conn->traceFlags`.
+pub struct Tracer {
+    sink: Box<dyn Write + Send>,
+    flags: TraceFlags,
+}
+
+impl std::fmt::Debug for Tracer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracer")
+            .field("flags", &self.flags)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Tracer {
+    /// Action: write one record. C ignores what `fprintf` returns, so a
+    /// failing sink does not fail the query it is tracing.
+    fn write(&mut self, line: &[u8]) {
+        let mut record = trace::timestamp_prefix(self.flags, std::time::SystemTime::now());
+        record.extend_from_slice(line);
+        let _ = self.sink.write_all(&record);
+    }
+}
+
+/// Calculation: which `p` message a frontend message is, as
+/// `conn->current_auth_response` records it before each is sent
+/// (`fe-auth.c:674`, `:781`, `:857`).
+fn auth_response(message: &Frontend) -> AuthResponse {
+    match message {
+        Frontend::PasswordMessage(_) => AuthResponse::Password,
+        Frontend::SaslInitialResponse { .. } => AuthResponse::SaslInitial,
+        Frontend::SaslResponse(_) => AuthResponse::Sasl,
+        _ => AuthResponse::None,
+    }
+}
+
 /// A live connection: `PGconn`, minus everything the simple query path does
 /// not need yet.
 #[derive(Debug)]
@@ -601,6 +638,7 @@ pub struct Connection<S = Stream> {
     cancel_key: Vec<u8>,
     transaction_status: TransactionStatus,
     notices: Vec<ResultError>,
+    trace: Option<Tracer>,
 }
 
 impl Connection<Stream> {
@@ -668,6 +706,7 @@ impl<S: Read + Write> Connection<S> {
             cancel_key: Vec::new(),
             transaction_status: TransactionStatus::Unknown,
             notices: Vec::new(),
+            trace: None,
         };
 
         loop {
@@ -811,7 +850,12 @@ impl<S: Read + Write> Connection<S> {
     /// once (`pqPipelineFlush`, `fe-exec.c:4047`) — then fold every reply up
     /// to ReadyForQuery as the plan's query class reads them.
     fn run(&mut self, plan: &Plan) -> Result<Vec<QueryResult>, ConnectionError> {
-        let bytes: Vec<u8> = plan.messages.iter().flat_map(Frontend::encode).collect();
+        let mut bytes = Vec::new();
+        for message in &plan.messages {
+            let encoded = message.encode();
+            self.trace_sent(message, &encoded);
+            bytes.extend_from_slice(&encoded);
+        }
         self.stream.write_all(&bytes)?;
         self.stream.flush()?;
 
@@ -841,7 +885,9 @@ impl<S: Read + Write> Connection<S> {
     }
 
     fn send(&mut self, message: &Frontend) -> Result<(), ConnectionError> {
-        self.stream.write_all(&message.encode())?;
+        let encoded = message.encode();
+        self.trace_sent(message, &encoded);
+        self.stream.write_all(&encoded)?;
         self.stream.flush()?;
         Ok(())
     }
@@ -855,6 +901,17 @@ impl<S: Read + Write> Connection<S> {
                     let start = self.start;
                     let message =
                         Backend::decode(id, &self.inbuf[start + body.start..start + body.end])?;
+                    // fe-misc.c:448 — `pqParseDone` traces a message once it
+                    // has been parsed, and only then.
+                    if let Some(tracer) = &mut self.trace {
+                        let line = trace::message_line(
+                            &self.inbuf[start..start + body.end],
+                            Origin::Backend,
+                            tracer.flags,
+                            AuthResponse::None,
+                        );
+                        tracer.write(&line);
+                    }
                     self.start += body.end;
                     if self.start == self.inbuf.len() {
                         self.inbuf.clear();
@@ -875,6 +932,55 @@ impl<S: Read + Write> Connection<S> {
                 }
             }
         }
+    }
+
+    /// `PQtrace`, `fe-trace.c:35`: from now on, write every message sent and
+    /// parsed to `sink`, with the flags reset. A previous sink is flushed and
+    /// dropped first, as `PQuntrace` does.
+    ///
+    /// Tracing starts on a connected `Connection`, so the startup exchange is
+    /// never traced — as with `PQconnectdb` followed by `PQtrace`.
+    pub fn trace(&mut self, sink: Box<dyn Write + Send>) {
+        self.untrace();
+        self.trace = Some(Tracer {
+            sink,
+            flags: TraceFlags::NONE,
+        });
+    }
+
+    /// `PQuntrace`, `fe-trace.c:49`: flush the sink and stop tracing. The sink
+    /// is handed back, since C's `FILE *` was never libpq's to close
+    /// (`fe-connect.c:5114`).
+    pub fn untrace(&mut self) -> Option<Box<dyn Write + Send>> {
+        let mut tracer = self.trace.take()?;
+        let _ = tracer.sink.flush();
+        Some(tracer.sink)
+    }
+
+    /// `PQsetTraceFlags`, `fe-trace.c:64`: does nothing when not tracing.
+    pub fn set_trace_flags(&mut self, flags: TraceFlags) {
+        if let Some(tracer) = &mut self.trace {
+            tracer.flags = flags;
+        }
+    }
+
+    /// `pqPutMsgEnd`'s trace, `fe-misc.c:546`: each message is traced as it
+    /// is completed, before it is written.
+    fn trace_sent(&mut self, message: &Frontend, encoded: &[u8]) {
+        let Some(tracer) = &mut self.trace else {
+            return;
+        };
+        let line = if matches!(message, Frontend::Startup { .. }) {
+            trace::no_type_byte_message_line(encoded, tracer.flags)
+        } else {
+            trace::message_line(
+                encoded,
+                Origin::Frontend,
+                tracer.flags,
+                auth_response(message),
+            )
+        };
+        tracer.write(&line);
     }
 
     /// `PQparameterStatus`, `fe-connect.c:7593` — the last value the server
@@ -1851,5 +1957,100 @@ mod tests {
         assert_eq!(second.len(), RAW_NONCE_LEN);
         assert_ne!(first, second, "two draws must differ");
         assert_ne!(first, vec![0u8; RAW_NONCE_LEN]);
+    }
+
+    /// A sink the test can read back while the connection still owns it.
+    #[derive(Clone, Default)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `PQtrace` + `PQsetTraceFlags`: every message sent is traced before
+    /// it is written and every message parsed after it is read, in the order
+    /// libpq writes them (`fe-misc.c:546`, `:448`); `PQuntrace` stops it.
+    #[test]
+    fn a_traced_exchange_writes_one_line_per_message_sent_and_parsed() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend(message(b'3', b""));
+        script.extend(ready(b'I'));
+        script.extend(message(b'C', b"BEGIN\0"));
+        script.extend(ready(b'T'));
+
+        let info = conninfo("user=alice dbname=postgres");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        let sink = SharedSink::default();
+        conn.trace(Box::new(sink.clone()));
+        conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS | TraceFlags::REGRESS_MODE);
+
+        conn.close_prepared(b"select_one").unwrap();
+        let expected: &[u8] = b"F\t16\tClose\t S \"select_one\"\n\
+              F\t4\tSync\n\
+              B\t4\tCloseComplete\n\
+              B\t5\tReadyForQuery\t I\n";
+        assert_eq!(sink.0.lock().unwrap().as_slice(), expected);
+
+        assert!(conn.untrace().is_some());
+        conn.exec(b"BEGIN").unwrap();
+        conn.set_trace_flags(TraceFlags::REGRESS_MODE);
+        assert!(
+            conn.untrace().is_none(),
+            "untraced, and flags are not a trace"
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            expected,
+            "nothing after PQuntrace"
+        );
+    }
+
+    /// A connection that is not traced writes nothing and keeps no flags:
+    /// `PQsetTraceFlags` before `PQtrace` does nothing (`fe-trace.c:68`),
+    /// and `PQtrace` resets the flags to 0 (`fe-trace.c:44`).
+    #[test]
+    fn trace_flags_need_a_trace_and_a_new_trace_resets_them() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend(message(b'Z', b"I"));
+        let info = conninfo("user=alice dbname=postgres");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS);
+        let sink = SharedSink::default();
+        conn.trace(Box::new(sink.clone()));
+        conn.terminate().unwrap();
+        let written = sink.0.lock().unwrap().clone();
+        // Timestamps on: `YYYY-MM-DD HH:MM:SS.uuuuuu\t` then the record.
+        assert_eq!(written.len(), 27 + b"F\t4\tTerminate\n".len());
+        assert_eq!(written[26], b'\t');
+        assert!(written.ends_with(b"F\t4\tTerminate\n"));
+    }
+
+    #[test]
+    fn each_p_message_records_which_auth_response_it_is() {
+        assert_eq!(
+            auth_response(&Frontend::PasswordMessage(b"x".to_vec())),
+            AuthResponse::Password
+        );
+        assert_eq!(
+            auth_response(&Frontend::SaslInitialResponse {
+                mechanism: b"SCRAM-SHA-256".to_vec(),
+                initial_response: None,
+            }),
+            AuthResponse::SaslInitial
+        );
+        assert_eq!(
+            auth_response(&Frontend::SaslResponse(Vec::new())),
+            AuthResponse::Sasl
+        );
+        assert_eq!(auth_response(&Frontend::Sync), AuthResponse::None);
     }
 }

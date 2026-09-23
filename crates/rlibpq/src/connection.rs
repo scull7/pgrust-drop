@@ -709,7 +709,7 @@ impl<S: Read + Write> Connection<S> {
     /// or the message could not be written.
     pub fn send_query(&mut self, query: &[u8]) -> Result<(), ConnectionError> {
         self.state.begin_send(QueryClass::Simple)?;
-        self.dispatch(&Plan {
+        self.dispatch(Plan {
             messages: vec![Frontend::Query(query.to_vec())],
             class: QueryClass::Simple,
         })
@@ -728,7 +728,7 @@ impl<S: Read + Write> Connection<S> {
     ) -> Result<(), ConnectionError> {
         self.state.begin_send(QueryClass::Extended)?;
         let plan = extended::query_params(command, param_types, params)?;
-        self.dispatch(&plan)
+        self.dispatch(plan)
     }
 
     /// `PQsendPrepare`, `fe-exec.c:1553`.
@@ -744,7 +744,7 @@ impl<S: Read + Write> Connection<S> {
     ) -> Result<(), ConnectionError> {
         self.state.begin_send(QueryClass::Prepare)?;
         let plan = extended::prepare(statement, query, param_types)?;
-        self.dispatch(&plan)
+        self.dispatch(plan)
     }
 
     /// `PQsendQueryPrepared`, `fe-exec.c:1650`.
@@ -759,7 +759,7 @@ impl<S: Read + Write> Connection<S> {
     ) -> Result<(), ConnectionError> {
         self.state.begin_send(QueryClass::Extended)?;
         let plan = extended::query_prepared(statement, params)?;
-        self.dispatch(&plan)
+        self.dispatch(plan)
     }
 
     /// `PQsendDescribePrepared`, `fe-exec.c:2508`.
@@ -804,20 +804,20 @@ impl<S: Read + Write> Connection<S> {
     ) -> Result<(), ConnectionError> {
         let plan = extended::typed_command(command, target, name);
         self.state.begin_send(plan.class)?;
-        self.dispatch(&plan)
+        self.dispatch(plan)
     }
 
     /// The common tail of every `PQsend*`: put the plan's messages (less
     /// its Sync in pipeline mode), give them a push if `pqPipelineFlush`
     /// would (`fe-exec.c:4047`), and queue the command
     /// (`pqAppendCmdQueueEntry`, `:1356`).
-    fn dispatch(&mut self, plan: &Plan) -> Result<(), ConnectionError> {
-        let own_sync = self.state.sends_own_sync();
-        let messages = match plan.messages.split_last() {
-            Some((Frontend::Sync, rest)) if !own_sync => rest,
-            _ => &plan.messages[..],
+    fn dispatch(&mut self, plan: Plan) -> Result<(), ConnectionError> {
+        let plan = if self.state.sends_own_sync() {
+            plan
+        } else {
+            plan.without_sync()
         };
-        for message in messages {
+        for message in &plan.messages {
             self.put_message(message);
         }
         if self.state.flushes_now(self.outbuf.len()) {

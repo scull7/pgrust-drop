@@ -343,10 +343,31 @@ impl Write for Stream {
     }
 }
 
+/// `PGQueryClass`, `libpq-int.h:318`: what the command at the head of the
+/// queue asked for, which decides what the replies mean. `PGQUERY_SYNC`
+/// belongs to pipeline mode and is not here yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueryClass {
+    /// `PGQUERY_SIMPLE`: a Query message (`PQexec`).
+    #[default]
+    Simple,
+    /// `PGQUERY_EXTENDED`: Parse (optional), Bind, Describe portal, Execute
+    /// (`PQexecParams`, `PQexecPrepared`).
+    Extended,
+    /// `PGQUERY_PREPARE`: Parse only (`PQprepare`).
+    Prepare,
+    /// `PGQUERY_DESCRIBE`: Describe a statement or a portal.
+    Describe,
+    /// `PGQUERY_CLOSE`: Close a statement or a portal.
+    Close,
+}
+
 /// Where a query's messages are accumulating — `pqParseInput3`'s BUSY-state
 /// switch (`fe-protocol3.c:203`) as a fold over messages.
 #[derive(Debug, Default)]
 pub struct QueryRunner {
+    /// `conn->cmd_queue_head->queryclass`.
+    class: QueryClass,
     results: Vec<QueryResult>,
     current: Option<QueryResult>,
     notices: Vec<ResultError>,
@@ -367,9 +388,19 @@ pub enum Flow {
 }
 
 impl QueryRunner {
+    /// A runner for a simple Query.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A runner for a command of the given class.
+    #[must_use]
+    pub fn for_class(class: QueryClass) -> Self {
+        Self {
+            class,
+            ..Self::default()
+        }
     }
 
     /// One message in. `Err` is the connection-fatal case; everything else
@@ -381,11 +412,51 @@ impl QueryRunner {
     /// the simple-query path does not handle.
     pub fn push(&mut self, message: Backend) -> Result<Flow, ProtocolError> {
         match message {
+            // getRowDescriptions, fe-protocol3.c:527 — a Describe fills the
+            // result ParameterDescription already made (or a new COMMAND_OK
+            // one) and is then done (`:627`); anything else starts a
+            // TUPLES_OK result the rows go into.
+            Backend::RowDescription(fields) if self.class == QueryClass::Describe => {
+                let mut result = self
+                    .current
+                    .take()
+                    .unwrap_or_else(|| QueryResult::new(ExecStatus::CommandOk));
+                result.set_fields(fields);
+                self.results.push(result);
+            }
             Backend::RowDescription(fields) => {
                 let mut result = QueryResult::new(ExecStatus::TuplesOk);
                 result.set_fields(fields);
                 self.finish_current();
                 self.current = Some(result);
+            }
+            // getParamDescriptions, fe-protocol3.c:690 — a new COMMAND_OK
+            // result holding the parameter types; the RowDescription or
+            // NoData that follows completes it.
+            Backend::ParameterDescription(types) => {
+                let mut result = QueryResult::new(ExecStatus::CommandOk);
+                result.set_params(types);
+                self.current = Some(result);
+            }
+            // fe-protocol3.c:266 — "If we're doing PQprepare, we're done;
+            // else ignore".
+            Backend::ParseComplete => {
+                if self.class == QueryClass::Prepare {
+                    self.command_ok_ready();
+                }
+            }
+            // fe-protocol3.c:287 — the same rule for a Close.
+            Backend::CloseComplete => {
+                if self.class == QueryClass::Close {
+                    self.command_ok_ready();
+                }
+            }
+            // fe-protocol3.c:351 — a Describe of something that returns no
+            // rows still owes the caller a COMMAND_OK result.
+            Backend::NoData => {
+                if self.class == QueryClass::Describe {
+                    self.command_ok_ready();
+                }
             }
             Backend::DataRow(values) => {
                 if self.saw_error {
@@ -438,18 +509,33 @@ impl QueryRunner {
             Backend::BackendKeyData { .. } => {
                 return Err(ProtocolError::UnexpectedResponse(b'K'));
             }
-            Backend::NegotiateProtocolVersion { .. } => {}
-            other @ (Backend::ParseComplete
-            | Backend::BindComplete
-            | Backend::CloseComplete
-            | Backend::NoData
-            | Backend::PortalSuspended
-            | Backend::ParameterDescription(_)
-            | Backend::Other { .. }) => {
+            // BindComplete: "Nothing to do for this message type"
+            // (fe-protocol3.c:284).
+            Backend::BindComplete | Backend::NegotiateProtocolVersion { .. } => {}
+            // fe-protocol3.c:446 — PortalSuspended has no case of its own.
+            other @ (Backend::PortalSuspended | Backend::Other { .. }) => {
                 return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
             }
         }
         Ok(Flow::Continue)
+    }
+
+    /// The `if (!pgHavePendingResult(conn)) conn->result =
+    /// PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK)` step shared by
+    /// ParseComplete, CloseComplete and NoData (`fe-protocol3.c:271`), then
+    /// `PGASYNC_READY`: the pending result is handed over, or a fresh
+    /// COMMAND_OK one when there is none. An error result already handed over
+    /// counts as pending (`pgHavePendingResult`, `libpq-int.h:936`), so it is
+    /// not followed by a spurious success.
+    fn command_ok_ready(&mut self) {
+        if self.saw_error {
+            return;
+        }
+        let result = self
+            .current
+            .take()
+            .unwrap_or_else(|| QueryResult::new(ExecStatus::CommandOk));
+        self.results.push(result);
     }
 
     /// A RowDescription with no CommandComplete after it (an error arrived
@@ -1276,6 +1362,177 @@ mod tests {
             .push(Backend::ReadyForQuery(TransactionStatus::Idle))
             .unwrap();
         assert_eq!(runner.results()[0].status(), ExecStatus::EmptyQuery);
+    }
+
+    /// Feed a runner of `class` the replies and return its results.
+    fn replay(class: QueryClass, replies: Vec<Backend>) -> Vec<QueryResult> {
+        let mut runner = QueryRunner::for_class(class);
+        for reply in replies {
+            runner.push(reply).unwrap();
+        }
+        runner.into_results()
+    }
+
+    fn int4_field(name: &[u8]) -> FieldDescription {
+        FieldDescription {
+            typid: 23,
+            typlen: 4,
+            ..text_field(name)
+        }
+    }
+
+    /// `PQdescribePrepared`: the replies of `traces/prepared.trace` lines
+    /// 4-7 (ParseComplete aside) — ParameterDescription, RowDescription,
+    /// ReadyForQuery — make *one* COMMAND_OK result carrying both the
+    /// parameter types and the columns (`fe-protocol3.c:527`).
+    #[test]
+    fn a_describe_statement_is_one_command_ok_result_with_params_and_fields() {
+        let results = replay(
+            QueryClass::Describe,
+            vec![
+                Backend::ParameterDescription(vec![23]),
+                Backend::RowDescription(vec![int4_field(b"?column?"), text_field(b"?column?")]),
+                Backend::ReadyForQuery(TransactionStatus::Idle),
+            ],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::CommandOk);
+        assert_eq!(results[0].nparams(), 1);
+        assert_eq!(results[0].paramtype(0), Some(23));
+        assert_eq!(results[0].paramtype(1), None);
+        assert_eq!(results[0].nfields(), 2);
+        assert_eq!(results[0].ftype(0), Some(23));
+        assert_eq!(results[0].ftype(1), Some(25));
+        assert_eq!(results[0].ntuples(), 0);
+    }
+
+    /// A Describe of a statement that returns no rows: ParameterDescription
+    /// then NoData is still one COMMAND_OK result (`fe-protocol3.c:351`);
+    /// and a Describe of a portal, which has no ParameterDescription, gets a
+    /// fresh one.
+    #[test]
+    fn a_describe_of_something_without_rows_is_still_a_result() {
+        let results = replay(
+            QueryClass::Describe,
+            vec![
+                Backend::ParameterDescription(vec![23, 25]),
+                Backend::NoData,
+                Backend::ReadyForQuery(TransactionStatus::Idle),
+            ],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::CommandOk);
+        assert_eq!(results[0].nparams(), 2);
+        assert_eq!(results[0].nfields(), 0);
+
+        let results = replay(
+            QueryClass::Describe,
+            vec![
+                Backend::RowDescription(vec![int4_field(b"?column?")]),
+                Backend::ReadyForQuery(TransactionStatus::InTransaction),
+            ],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::CommandOk);
+        assert_eq!(results[0].nparams(), 0);
+        assert_eq!(results[0].ftype(0), Some(23));
+    }
+
+    /// ParseComplete is a result only for `PQprepare`, CloseComplete only for
+    /// a Close, NoData only for a Describe (`fe-protocol3.c:266`, `:287`,
+    /// `:351`); to every other class they are nothing.
+    #[test]
+    fn each_completion_message_is_a_result_only_for_its_own_class() {
+        let ready = Backend::ReadyForQuery(TransactionStatus::Idle);
+        for (message, class) in [
+            (Backend::ParseComplete, QueryClass::Prepare),
+            (Backend::CloseComplete, QueryClass::Close),
+            (Backend::NoData, QueryClass::Describe),
+        ] {
+            let results = replay(class, vec![message.clone(), ready.clone()]);
+            assert_eq!(results.len(), 1, "{message:?} for {class:?}");
+            assert_eq!(results[0].status(), ExecStatus::CommandOk);
+
+            for other in [
+                QueryClass::Simple,
+                QueryClass::Extended,
+                QueryClass::Prepare,
+                QueryClass::Describe,
+                QueryClass::Close,
+            ] {
+                if other != class {
+                    assert!(
+                        replay(other, vec![message.clone(), ready.clone()]).is_empty(),
+                        "{message:?} for {other:?}"
+                    );
+                }
+            }
+        }
+        assert!(replay(QueryClass::Extended, vec![Backend::BindComplete, ready]).is_empty());
+    }
+
+    /// `PQexecParams("SELECT $1", …, {"1"})`: the replies of
+    /// `traces/simple_pipeline.trace` lines 6-11 make one TUPLES_OK result
+    /// with the row and the tag.
+    #[test]
+    fn an_extended_query_collects_its_rows() {
+        let results = replay(
+            QueryClass::Extended,
+            vec![
+                Backend::ParseComplete,
+                Backend::BindComplete,
+                Backend::RowDescription(vec![int4_field(b"?column?")]),
+                Backend::DataRow(vec![Some(b"1".to_vec())]),
+                Backend::CommandComplete(b"SELECT 1".to_vec()),
+                Backend::ReadyForQuery(TransactionStatus::Idle),
+            ],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::TuplesOk);
+        assert_eq!(results[0].value(0, 0), Some(&b"1"[..]));
+        assert_eq!(results[0].command_status(), b"SELECT 1");
+    }
+
+    /// `traces/prepared.trace` lines 11-14: a Describe of a statement that
+    /// does not exist is the error alone, and an error already handed over
+    /// is not followed by a COMMAND_OK for a completion message
+    /// (`pgHavePendingResult`, `libpq-int.h:936`).
+    #[test]
+    fn an_error_is_the_only_result_of_its_command() {
+        let error = ResultError::new(vec![
+            (diag::SEVERITY, b"ERROR".to_vec()),
+            (diag::SQLSTATE, b"26000".to_vec()),
+            (
+                diag::MESSAGE_PRIMARY,
+                b"prepared statement \"select_one\" does not exist".to_vec(),
+            ),
+        ]);
+        let results = replay(
+            QueryClass::Describe,
+            vec![
+                Backend::ErrorResponse(error.clone()),
+                Backend::NoData,
+                Backend::ReadyForQuery(TransactionStatus::Idle),
+            ],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::FatalError);
+        assert_eq!(
+            results[0].error().and_then(ResultError::sqlstate),
+            Some(&b"26000"[..])
+        );
+    }
+
+    /// PortalSuspended has no case in `pqParseInput3` (libpq never sets a
+    /// row limit), so it is the "unexpected response" default
+    /// (`fe-protocol3.c:446`).
+    #[test]
+    fn a_portal_suspended_is_an_unexpected_response() {
+        let mut runner = QueryRunner::for_class(QueryClass::Extended);
+        assert_eq!(
+            runner.push(Backend::PortalSuspended),
+            Err(ProtocolError::UnexpectedResponse(b's'))
+        );
     }
 
     /// The two malformed-stream cases `pqParseInput3` names for "D".

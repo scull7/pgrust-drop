@@ -25,9 +25,16 @@
 //! the ICU collator version and the `pg_collation` rows each provider added
 //! ([`super::manifest::Manifest::icu`], [`super::manifest::Manifest::collations`]).
 //! When two mints differ, [`first_difference`] names where.
+//!
+//! The minted cluster's `global/pg_control` is not in the image (it is
+//! per-cluster, [`super::STRIPPED_FILES`]), but what it says about the
+//! catalogs is needed to start a cluster from them: the next XID, OID and
+//! multixact, where the last checkpoint was. [`template_control`] keeps it,
+//! in template form, as `template.control`.
 
 use super::manifest::{MINT_INITDB_VERSION, MINT_LIBC};
 use super::parse;
+use crate::control::{ControlFile, DbState, PG_CONTROL_FILE_SIZE};
 
 /// The query the mint tool feeds `postgres --single -D <first mint>
 /// postgres` on stdin: the host inputs that move the image's digest, as two
@@ -117,6 +124,32 @@ pub enum MintRefusal {
         binary: String,
         interpreter: Option<String>,
     },
+    #[error("the minted cluster's pg_control cannot be a template: {reason}")]
+    BadControlFile { reason: &'static str },
+}
+
+/// Pure: the minted cluster's `global/pg_control` as `template.control` —
+/// [`ControlFile::as_template`], written back with a fresh CRC.
+///
+/// # Errors
+/// [`MintRefusal::BadControlFile`] when the file is short, fails its CRC,
+/// is not from a cleanly shut down cluster, or has data checksums off. The
+/// last one matters because the image's pages carry whatever checksums the
+/// mint wrote: with them on, a cluster can run with checksums on or off;
+/// with them off, `-k` would claim checksums the pages do not have.
+pub fn template_control(pg_control: &[u8]) -> Result<[u8; PG_CONTROL_FILE_SIZE], MintRefusal> {
+    let bad = |reason| MintRefusal::BadControlFile { reason };
+    let control = ControlFile::parse(pg_control).map_err(|_| bad("it is too short"))?;
+    if !control.crc_is_valid() {
+        return Err(bad("its CRC does not match"));
+    }
+    if control.state != DbState::Shutdowned {
+        return Err(bad("the cluster was not shut down cleanly"));
+    }
+    if control.data_checksum_version == 0 {
+        return Err(bad("data checksums are off"));
+    }
+    Ok(control.as_template().to_bytes())
 }
 
 /// Pure: `output` of `initdb --version` names the required release.
@@ -213,6 +246,51 @@ mod tests {
         out[0x60..0x68].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
         out.extend_from_slice(&bytes);
         out
+    }
+
+    #[test]
+    fn the_template_control_file_is_the_template_form() {
+        use crate::control::{MOCK_AUTH_NONCE_LEN, SystemIdentifier};
+        let mut control = ControlFile::parse(&[0u8; PG_CONTROL_FILE_SIZE]).unwrap();
+        control.system_identifier = SystemIdentifier::from_raw(42);
+        control.time = 1;
+        control.check_point_copy.time = 2;
+        control.check_point_copy.next_oid = 13589;
+        control.mock_authentication_nonce = [3; MOCK_AUTH_NONCE_LEN];
+        control.state = DbState::Shutdowned;
+        control.data_checksum_version = 1;
+        let minted = control.to_bytes();
+
+        let template = ControlFile::parse(&template_control(&minted).unwrap()).unwrap();
+        assert!(template.crc_is_valid());
+        assert_eq!(template, template.as_template());
+        assert_eq!(template.check_point_copy.next_oid, 13589);
+
+        let refused = |mutate: fn(&mut ControlFile)| {
+            let mut other = control;
+            mutate(&mut other);
+            template_control(&other.to_bytes())
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            refused(|c| c.state = DbState::InProduction),
+            "the minted cluster's pg_control cannot be a template: the cluster was not shut \
+             down cleanly"
+        );
+        assert!(refused(|c| c.data_checksum_version = 0).ends_with("data checksums are off"));
+        let mut damaged = minted;
+        // `checkPointCopy.nextOid`: a field, so the CRC covers it.
+        damaged[72] ^= 1;
+        assert!(
+            template_control(&damaged)
+                .is_err_and(|err| err.to_string().ends_with("its CRC does not match"))
+        );
+        assert!(
+            template_control(&minted[..10])
+                .is_err_and(|err| err.to_string().ends_with("it is too short"))
+        );
     }
 
     #[test]

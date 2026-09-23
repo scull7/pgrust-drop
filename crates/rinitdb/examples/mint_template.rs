@@ -12,12 +12,16 @@
 //! musl ([`rinitdb::image::mint`]), mints two clusters with
 //! [`rinitdb::image::MINT_ARGS`], strips and packs each, and refuses unless
 //! the two images are byte-identical — a mint that is not reproducible is not
-//! worth recording; the refusal names the first entry that differs. Between
+//! worth recording; the refusal names the first entry that differs. It keeps
+//! each mint's `global/pg_control` in template form
+//! ([`rinitdb::image::mint::template_control`]) and requires those to agree
+//! too. Between
 //! the two it measures what the host put into `pg_collation`, by running
 //! [`rinitdb::image::mint::HOST_QUERY`] through the same `postgres` in
 //! single-user mode on the first cluster, after it is packed (the query's
 //! shutdown checkpoint writes to the directory). Then it writes
-//! `<out-dir>/template.img` and `<out-dir>/template.manifest`.
+//! `<out-dir>/template.img`, `<out-dir>/template.control` and
+//! `<out-dir>/template.manifest`.
 
 // Crate attributes are the only level that outranks CI's `-W clippy::pedantic`;
 // the library root says why this lint is off, and `sha256.rs` is included here.
@@ -71,14 +75,21 @@ fn run(initdb: &Path, out_dir: &Path) -> Result<Manifest, String> {
 
     let scratch = Scratch::new()?;
     let first_dir = scratch.0.join("first");
-    let first = mint_and_pack(initdb, &first_dir)?;
+    let (first, first_control) = mint_and_pack(initdb, &first_dir)?;
     let host = host_facts(&postgres, &first_dir)?;
-    let second = mint_and_pack(initdb, &scratch.0.join("second"))?;
+    let (second, second_control) = mint_and_pack(initdb, &scratch.0.join("second"))?;
     if let Some(difference) = mint::first_difference(&first, &second) {
         return Err(format!(
             "two mints packed to different images (first difference: {difference}); \
              the mint is not reproducible"
         ));
+    }
+    if first_control != second_control {
+        return Err(
+            "two mints left different pg_control files in template form; \
+             the mint is not reproducible"
+                .to_owned(),
+        );
     }
 
     let manifest = Manifest {
@@ -90,6 +101,7 @@ fn run(initdb: &Path, out_dir: &Path) -> Result<Manifest, String> {
         options: MINT_ARGS.join(" "),
         bytes: first.len() as u64,
         sha256: sha256::digest_hex(&first),
+        control: sha256::digest_hex(&first_control),
     };
     let write = |name: &str, bytes: &[u8]| {
         let path = out_dir.join(name);
@@ -97,12 +109,15 @@ fn run(initdb: &Path, out_dir: &Path) -> Result<Manifest, String> {
             .map_err(|err| format!("could not write \"{}\": {err}", path.display()))
     };
     write("template.img", &first)?;
+    write("template.control", &first_control)?;
     write("template.manifest", manifest.render().as_bytes())?;
     Ok(manifest)
 }
 
-/// `initdb -D <dir> MINT_ARGS`, then read, strip and pack `<dir>`.
-fn mint_and_pack(initdb: &Path, dir: &Path) -> Result<Vec<u8>, String> {
+/// `initdb -D <dir> MINT_ARGS`, then read, strip and pack `<dir>`, and keep
+/// its `pg_control` in template form. Both are taken before anything else
+/// runs a server on `<dir>`.
+fn mint_and_pack(initdb: &Path, dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let output = Command::new(initdb)
         .arg("-D")
         .arg(dir)
@@ -118,7 +133,12 @@ fn mint_and_pack(initdb: &Path, dir: &Path) -> Result<Vec<u8>, String> {
     }
     let entries = image::read_tree(dir)
         .map_err(|err| format!("could not read \"{}\": {err}", dir.display()))?;
-    image::pack(&image::strip(entries)).map_err(|err| err.to_string())
+    let control_path = dir.join("global").join("pg_control");
+    let control = std::fs::read(&control_path)
+        .map_err(|err| format!("could not read \"{}\": {err}", control_path.display()))?;
+    let control = mint::template_control(&control).map_err(|err| err.to_string())?;
+    let packed = image::pack(&image::strip(entries)).map_err(|err| err.to_string())?;
+    Ok((packed, control.to_vec()))
 }
 
 /// What the minting host put into `pg_collation`.

@@ -1,6 +1,7 @@
 //! The template image's provenance manifest: which `initdb` minted the image,
 //! on which C library, what the host's ICU and locales put into
-//! `pg_collation`, with which options, and the SHA-256 of the result.
+//! `pg_collation`, with which options, and the SHA-256 of the result and of
+//! the template `pg_control` minted with it.
 //!
 //! The image is a committed blob (NAT-381, owner decision 2026-09-23), so a
 //! build never runs PostgreSQL; the manifest is what lets a reader check,
@@ -26,6 +27,7 @@
 //! options: --no-locale --encoding=UTF8 …     MINT_ARGS, space-separated, after `-D <dir>`
 //! bytes: 23633969                            the image's length
 //! sha256: 0123…                              the image's SHA-256, lowercase hex
+//! control: 4567…                             template.control's SHA-256, lowercase hex
 //! ```
 //!
 //! `icu` and `collations` are measured by the mint tool, not asserted: it
@@ -47,7 +49,7 @@ pub const MINT_LIBC: &str = "musl";
 
 /// The keys, in the order [`Manifest::render`] writes them and
 /// [`Manifest::parse`] requires them.
-const KEYS: [&str; 8] = [
+const KEYS: [&str; 9] = [
     "format",
     "initdb",
     "libc",
@@ -56,6 +58,7 @@ const KEYS: [&str; 8] = [
     "options",
     "bytes",
     "sha256",
+    "control",
 ];
 
 /// What a template image records about itself.
@@ -79,6 +82,10 @@ pub struct Manifest {
     pub bytes: u64,
     /// The image's SHA-256, 64 lowercase hex digits.
     pub sha256: String,
+    /// The SHA-256 of `template.control`, the minted cluster's `pg_control`
+    /// in template form (`crate::control::ControlFile::as_template`), 64
+    /// lowercase hex digits.
+    pub control: String,
 }
 
 /// Why text is not a manifest.
@@ -142,6 +149,7 @@ impl Manifest {
             self.options.clone(),
             self.bytes.to_string(),
             self.sha256.clone(),
+            self.control.clone(),
         ];
         for (key, value) in KEYS.iter().zip(values) {
             // Writing to a String cannot fail.
@@ -204,13 +212,19 @@ impl Manifest {
             return Err(bad("icu", values[3]));
         }
         let bytes = values[6].parse().map_err(|_| bad("bytes", values[6]))?;
+        let is_digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
         let sha256 = values[7];
-        if sha256.len() != 64
-            || !sha256
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
+        if !is_digest(sha256) {
             return Err(bad("sha256", sha256));
+        }
+        let control = values[8];
+        if !is_digest(control) {
+            return Err(bad("control", control));
         }
         Ok(Self {
             format,
@@ -221,6 +235,7 @@ impl Manifest {
             options: values[5].to_owned(),
             bytes,
             sha256: sha256.to_owned(),
+            control: control.to_owned(),
         })
     }
 }
@@ -239,6 +254,7 @@ mod tests {
             options: "--no-locale --encoding=UTF8".to_owned(),
             bytes: 42,
             sha256: "ab".repeat(32),
+            control: "cd".repeat(32),
         }
     }
 
@@ -281,6 +297,7 @@ mod tests {
                 "options: --no-locale --encoding=UTF8",
                 "bytes: 42",
                 &format!("sha256: {}", "ab".repeat(32)),
+                &format!("control: {}", "cd".repeat(32)),
             ]
         );
     }
@@ -303,14 +320,16 @@ mod tests {
         assert_eq!(
             Manifest::parse(&format!("{good}extra: 1\n")),
             Err(ManifestError::ExtraKey {
-                line: 12,
+                line: 13,
                 found: "extra".to_owned()
             })
         );
-        let truncated = good.replace(&format!("sha256: {}\n", "ab".repeat(32)), "");
+        let truncated = good.replace(&format!("control: {}\n", "cd".repeat(32)), "");
         assert_eq!(
             Manifest::parse(&truncated),
-            Err(ManifestError::Missing { expected: "sha256" })
+            Err(ManifestError::Missing {
+                expected: "control"
+            })
         );
         assert_eq!(
             Manifest::parse(&good.replace("bytes: 42", "bytes: many")),
@@ -332,6 +351,13 @@ mod tests {
             Err(ManifestError::BadValue {
                 key: "sha256",
                 value: upper
+            })
+        );
+        assert_eq!(
+            Manifest::parse(&good.replace(&"cd".repeat(32), "cd")),
+            Err(ManifestError::BadValue {
+                key: "control",
+                value: "cd".to_owned()
             })
         );
     }

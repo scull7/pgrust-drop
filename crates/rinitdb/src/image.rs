@@ -63,6 +63,12 @@ pub static TEMPLATE: &[u8] = include_bytes!("../image/template.img");
 /// length and SHA-256 ([`manifest::Manifest`]).
 pub const TEMPLATE_MANIFEST: &str = include_str!("../image/template.manifest");
 
+/// The `global/pg_control` of the cluster [`TEMPLATE`] was minted from, in
+/// template form (`crate::control::ControlFile::as_template`,
+/// [`mint::template_control`]). The image leaves the file out; this is what
+/// a new cluster's own is made from (`crate::control::for_new_cluster`).
+pub static TEMPLATE_CONTROL: &[u8] = include_bytes!("../image/template.control");
+
 /// `"RINITDB"` followed by the format version.
 pub const MAGIC: [u8; 8] = *b"RINITDB\x01";
 
@@ -243,7 +249,8 @@ pub enum ImageError {
 ///   standalone backends: one `--boot` (`initdb.c:1612`), then `--single`
 ///   sessions (`initdb.c:226`). This entry guards a mint that started a server.
 /// - `global/pg_control` carries the mint's system identifier and timestamps;
-///   a fresh one is written (`crate::control`).
+///   the mint keeps the rest as [`TEMPLATE_CONTROL`], and a new cluster's is
+///   written from that (`crate::control::for_new_cluster`).
 /// - `PG_VERSION` at the top level is written by `crate::layout`
 ///   (`write_version_file(NULL)`, `initdb.c:3087`); the per-database ones
 ///   under `base/` are not, so they stay.
@@ -669,6 +676,34 @@ mod tests {
             manifest.icu,
             manifest.collations
         );
+        assert_eq!(
+            manifest.control,
+            crate::sha256::digest_hex(TEMPLATE_CONTROL),
+            "template.control's digest; re-mint and commit all three files together"
+        );
+    }
+
+    /// The committed control file is a PostgreSQL 18.6 `pg_control` in
+    /// template form, from a cleanly shut down cluster with checksums on, and
+    /// its last checkpoint is behind the segment a new cluster starts in.
+    #[test]
+    fn the_embedded_control_file_is_a_template() {
+        use crate::control::{
+            CATALOG_VERSION_NO, ControlFile, DbState, PG_CONTROL_FILE_SIZE, PG_CONTROL_VERSION,
+        };
+        assert_eq!(TEMPLATE_CONTROL.len(), PG_CONTROL_FILE_SIZE);
+        let control = ControlFile::parse(TEMPLATE_CONTROL).unwrap();
+        assert!(control.crc_is_valid());
+        assert_eq!(control, control.as_template());
+        assert_eq!(control.pg_control_version, PG_CONTROL_VERSION);
+        assert_eq!(control.catalog_version_no, CATALOG_VERSION_NO);
+        assert_eq!(control.state, DbState::Shutdowned);
+        assert_ne!(control.data_checksum_version, 0);
+        assert_eq!(
+            control.xlog_seg_size,
+            crate::pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB * 1024 * 1024
+        );
+        assert_eq!(control.check_point, control.check_point_copy.redo);
     }
 
     /// The committed image is a well-formed, stripped PostgreSQL 18 cluster.

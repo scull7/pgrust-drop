@@ -64,8 +64,8 @@ pub use message::{
     next_copy_frame, next_frame,
 };
 pub use pipeline::{
-    AsyncStatus, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass, QueryRunner,
-    RowMode,
+    AsyncStatus, CopyStep, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass,
+    QueryRunner, RowMode,
 };
 pub use regress::regress_report;
 pub use result::{

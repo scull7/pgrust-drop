@@ -10,7 +10,10 @@
 //! proved against `t/001_uri.pl`) and the protocol version 3 core: the wire
 //! messages, the authentication methods a build without TLS or GSSAPI can do
 //! (trust, password, md5, SCRAM-SHA-256), and a blocking `Connection` that
-//! runs simple queries. The rest is tracked in Linear NAT-390 … NAT-396.
+//! runs simple queries and the extended-query commands outside pipeline mode
+//! (`PQexecParams`, `PQprepare`, `PQexecPrepared`, `PQdescribePrepared`,
+//! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`). The rest is
+//! tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -29,6 +32,7 @@ pub mod connection;
 pub mod conninfo;
 mod cstr;
 pub mod error;
+pub mod extended;
 pub mod hmac;
 pub mod md5;
 pub mod message;
@@ -50,6 +54,7 @@ pub use conninfo::{
     uri_prefix_length,
 };
 pub use error::ConnError;
+pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
 pub use message::{Backend, Frame, Frontend, ProtocolError, Target, TransactionStatus, next_frame};
 pub use regress::regress_report;
 pub use result::{

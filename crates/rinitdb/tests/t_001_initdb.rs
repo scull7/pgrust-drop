@@ -248,7 +248,7 @@ fn existing_nonempty_xlog_directory() {
 /// `command_fails([ 'initdb', '--waldir' => 'pgxlog', $datadir ],
 /// 'relative xlog directory not allowed');` — 001_initdb.pl:33.
 ///
-/// `initdb.c:2962`, then `cleanup_directories_atexit` (`:771`) for the same
+/// `initdb.c:2962`, then `cleanup_directories_atexit` (`:762`) for the same
 /// reason as [`existing_nonempty_xlog_directory`]: the absolute-path rule
 /// lives in `create_xlog_or_symlink`, which C runs after PGDATA is made.
 #[test]
@@ -313,7 +313,7 @@ fn create_plan(argv: &[OsString]) -> rinitdb::validate::CreatePlan {
 }
 
 /// The chunk of `initdb` this port has: everything
-/// `initialize_data_directory` (`initdb.c:3049`) does before it starts a
+/// `initialize_data_directory` (`initdb.c:3044`) does before it starts a
 /// backend. The real path — parse, validate, lay out, apply — not a fixture.
 ///
 /// # Panics
@@ -336,7 +336,7 @@ fn build_layout(argv: &[OsString]) -> PathBuf {
 /// on Windows only, which is why this is `cfg(unix)` too.
 ///
 /// Upstream runs it over a *finished* cluster; rinitdb has the directory tree
-/// (`initdb.c:2890` … `:3086`) and not yet what the backend writes into it, so
+/// (`initdb.c:2890` … `:3087`) and not yet what the backend writes into it, so
 /// the walk covers the entries `layout()` makes — which is all of what this
 /// port creates, so nothing is excluded from it. The case widens to the
 /// finished cluster with Linear NAT-381 … NAT-387, and the comparison against
@@ -382,7 +382,7 @@ fn check_pgdata_permissions_with_group_access() {
 /// (001_initdb.pl:56), from the success side this time; the two
 /// `command_fails` cases above cover a relative and a non-empty `--waldir`.
 ///
-/// `initdb.c:3015` — `$PGDATA/pg_wal` becomes a symbolic link to the directory
+/// `initdb.c:3014` — `$PGDATA/pg_wal` becomes a symbolic link to the directory
 /// given, and the `subdirs[]` loop then makes `archive_status` and `summaries`
 /// through it (`:3068`).
 #[cfg(unix)]
@@ -639,7 +639,7 @@ fn a_template_control_file() -> [u8; rinitdb::control::PG_CONTROL_FILE_SIZE] {
     template.catalog_version_no = rinitdb::control::CATALOG_VERSION_NO;
     // `InitControlFile`, xlog.c:4219.
     template.state = rinitdb::control::DbState::Shutdowned;
-    // `IsValidWalSegSize` (`src/include/access/xlog_internal.h:104`): any other
+    // `IsValidWalSegSize` (`src/include/access/xlog_internal.h:96`): any other
     // value makes `pg_controldata` warn that the file is corrupt, so the
     // stand-in carries `initdb.c:169`'s default like a real template would.
     template.xlog_seg_size = rinitdb::pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB * 1024 * 1024;
@@ -743,8 +743,8 @@ fn sync_only() {
 /// `command_ok([ 'initdb', '--sync-only', '--no-sync-data-files', $datadir ],
 /// '--no-sync-data-files');` — 001_initdb.pl:79.
 ///
-/// `initdb.c:3396` clears `sync_data_files`, which `file_utils.c:190` turns
-/// into an `exclude_dir` of `$PGDATA/base` and `:219` into a skipped
+/// `initdb.c:3396` clears `sync_data_files`, which `file_utils.c:193` turns
+/// into an `exclude_dir` of `$PGDATA/base` and `:220` into a skipped
 /// `pg_tblspc`. Neither shows up in the output, which is the point: the case
 /// pins that the option is accepted and changes nothing a user can see. What
 /// it excludes is pinned by the unit test
@@ -1353,7 +1353,7 @@ fn reference_progress(reference: &Path, argv: &[OsString]) -> String {
 }
 
 /// The [`rinitdb::conf::Settings`] for one gate case: the four values
-/// `test_config_settings` (`initdb.c:1140`) probed the machine for, read off
+/// `test_config_settings` (`initdb.c:1118`) probed the machine for, read off
 /// the lines where C announces each one, over the command line's own answers.
 #[cfg(unix)]
 fn probed_settings(
@@ -1474,7 +1474,7 @@ fn our_postgresql_conf(rendered: &str, sample: &str, socketdir: &str, tag: &str)
 ///
 /// `setup_config` writes values it probed the machine for — the DSM
 /// implementation, `max_connections`, `shared_buffers` and the time zone
-/// (`test_config_settings`, `initdb.c:1140`). Probing is a separate stage and
+/// (`test_config_settings`, `initdb.c:1118`). Probing is a separate stage and
 /// is not ported yet, so those four arrive here from C's own stdout, which is
 /// where it announces each one (`selecting default "max_connections" ... 100`).
 /// They are read from the *progress output*, never from the files under
@@ -1615,7 +1615,7 @@ fn the_configuration_files_match_reference_initdb() {
 /// needs no reference binary: how the `unix_socket_directories` line comes out
 /// for the two builds that exist in the wild.
 ///
-/// `replace_guc_value`'s indentation loop (`initdb.c:604`) tabs to the comment
+/// `replace_guc_value`'s indentation loop (`initdb.c:593`) tabs to the comment
 /// column the sample used, which is 40, but never closer than one space. A tab
 /// fits after the 33-column `'/tmp'`; a single space is all that fits after
 /// the 48-column `'/var/run/postgresql'`. So the whitespace difference between
@@ -1769,7 +1769,7 @@ fn the_default_time_zone_is_the_one_etc_localtime_names() {
 
     // `check_system_link_file` walks the target left to right, skipping the
     // first component, and takes the *first* tail that names the zone
-    // (`findtimezone.c:566`). Anything shorter is a different spelling of the
+    // (`findtimezone.c:544`). Anything shorter is a different spelling of the
     // same instant — on this machine the brute-force scan answers "UTC" where
     // the symlink answers "Etc/UTC", because `zone_name_pref` prefers the
     // bare name — so a suffix test would pass for the wrong reason. Compare

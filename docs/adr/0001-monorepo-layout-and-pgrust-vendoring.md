@@ -81,10 +81,13 @@ constants in `pg_locale`. With those two fixed, the whole tree builds on musl.
 Nothing else in pgrust needed a change.
 
 **Decision.** The pin is a fork, `github.com/scull7/pgrust`, branch
-`musl-build`: `79ad992` plus one commit carrying the two fixes (both behind
-`cfg(target_env = "musl")`). The same commit is prepared as a pull request to
-malisper/pgrust. Once upstream has the fixes, we switch back to malisper/pgrust
-at the first upstream rev that contains them
+`musl-build`, pinned at `75f1d3985d9841de3ddfa8c139ca308df0f80fcd`: `79ad992`
+plus two commits, both behind `cfg(target_env = "musl")`. `118a287` carries the
+two fixes; `75f1d39` makes the musl `getrandom` arm retry `EINTR` and resume
+after a short read, as glibc's and musl's `getentropy` do, instead of falling
+back to `/dev/urandom` (answering a review on malisper/pgrust#115). The same
+commits are that pull request to malisper/pgrust. Once upstream has the fixes,
+we switch back to malisper/pgrust at the first upstream rev that contains them
 (`scripts/pgrust-rev.sh --repo malisper/pgrust`) and delete the fork branch.
 It is still a Cargo git dependency pinned by `rev`. The Decision named a git
 submodule as the fallback for local patches; a fork keeps the manifest shape and

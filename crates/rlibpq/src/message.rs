@@ -860,7 +860,7 @@ mod tests {
     }
 
     /// `PQsendPrepare`'s Parse and `PQsendTypedCommand`'s Describe and Close,
-    /// against `traces/prepared.trace` lines 1, 2 and 6 (lengths 68, 16, 16).
+    /// against `traces/prepared.trace` lines 1, 2 and 8 (lengths 68, 16, 16).
     #[test]
     fn a_named_parse_describe_and_close_have_the_lengths_upstream_traced() {
         let parse = Frontend::Parse {

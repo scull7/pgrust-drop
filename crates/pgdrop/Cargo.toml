@@ -23,6 +23,7 @@ path = "src/main.rs"
 usage = { workspace = true }
 rinitdb = { workspace = true }
 rpsql = { workspace = true }
+main_main = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

@@ -40,6 +40,9 @@
 //! cluster is about 24 MB, inside the issue's 50 MB budget. The format
 //! version byte is there so a compressed encoding can follow without guessing.
 
+pub mod manifest;
+pub mod mint;
+
 use std::cmp::Ordering;
 use std::fmt;
 

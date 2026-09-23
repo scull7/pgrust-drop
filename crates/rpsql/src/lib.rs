@@ -57,7 +57,7 @@ use crate::variables::VarView;
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
 pub const PG_VERSION: &str = "18.6";
 
-/// `showVersion()` (`startup.c:832`).
+/// `showVersion()` (`startup.c:844`).
 #[must_use]
 pub fn version_line() -> String {
     format!("psql (PostgreSQL) {PG_VERSION}")
@@ -159,7 +159,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     if session.actions.is_empty() && session.pset.notty {
         session.actions.push(Action::File(None));
     }
-    // `startup.c:222`.
+    // `startup.c:224`.
     if session.single_txn && session.actions.is_empty() {
         let _ = writeln!(
             stderr,
@@ -210,7 +210,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         if single_txn {
             // Roll back only when ON_ERROR_STOP made a failure fatal; other-
             // wise COMMIT, which the server itself turns into a rollback if
-            // the transaction is already aborted (`startup.c:432`).
+            // the transaction is already aborted (`startup.c:439`).
             let finish = single_txn_finish(code, session.pset.on_error_stop);
             if !psql_exec(&mut executor, finish, stderr) && session.pset.on_error_stop {
                 code = EXIT_USER;
@@ -224,7 +224,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     ExitCode::from(code)
 }
 
-/// Which statement closes a `-1` transaction (`startup.c:432`).
+/// Which statement closes a `-1` transaction (`startup.c:439`).
 ///
 /// Upstream rolls back only when `ON_ERROR_STOP` made a failure fatal — the
 /// check "needs to match the one done a couple of lines above", which is the
@@ -240,7 +240,7 @@ pub fn single_txn_finish(code: u8, on_error_stop: bool) -> &'static [u8] {
     }
 }
 
-/// `PSQLexec()` (`common.c:501`): run a query psql issues for itself, printing
+/// `PSQLexec()` (`common.c:657`): run a query psql issues for itself, printing
 /// nothing on success and the server's error on failure.
 fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write) -> bool {
     match executor.exec(query) {
@@ -248,7 +248,7 @@ fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write)
             let mut ok = true;
             for result in &results {
                 // `AcceptResult`'s list of statuses that are not a failure
-                // (`common.c:439`).
+                // (`common.c:427`-`:435`).
                 let accepted = matches!(
                     result.status(),
                     ExecStatus::CommandOk
@@ -279,7 +279,7 @@ fn run_action(
     stderr: &mut impl Write,
 ) -> u8 {
     match action {
-        // `ACT_SINGLE_QUERY` (`startup.c:370`).
+        // `ACT_SINGLE_QUERY` (`startup.c:382`).
         Action::SingleQuery(sql) => {
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
@@ -290,7 +290,7 @@ fn run_action(
                 EXIT_FAILURE
             }
         }
-        // `ACT_SINGLE_SLASH` (`startup.c:380`).
+        // `ACT_SINGLE_SLASH` (`startup.c:392`).
         Action::SingleSlash(text) => {
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{text}");
@@ -317,7 +317,7 @@ fn run_action(
                 EXIT_SUCCESS
             }
         }
-        // `ACT_FILE` (`startup.c:403`): `None` is stdin.
+        // `ACT_FILE` (`startup.c:418`): `None` is stdin.
         Action::File(name) => {
             let read = if let Some(name) = name {
                 std::fs::read(name).map_err(|err| format!("{name}: {err}"))
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn a_single_transaction_commits_unless_on_error_stop_made_it_fatal() {
-        // `startup.c:432`. Without ON_ERROR_STOP upstream still COMMITs after
+        // `startup.c:439`. Without ON_ERROR_STOP upstream still COMMITs after
         // a failed statement; the server has aborted the transaction, so the
         // commit discards the work anyway. With ON_ERROR_STOP it ROLLBACKs.
         assert_eq!(single_txn_finish(EXIT_SUCCESS, false), b"COMMIT");

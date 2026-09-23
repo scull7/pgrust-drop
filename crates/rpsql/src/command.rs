@@ -1,6 +1,6 @@
 //! The backslash-command dispatcher: `src/bin/psql/command.c`.
 //!
-//! `HandleSlashCmds` (`command.c:214`) parses the command name, dispatches,
+//! `HandleSlashCmds` (`command.c:231`) parses the command name, dispatches,
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code. Everything
@@ -14,7 +14,7 @@ use crate::settings::PsqlSettings;
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
-/// `backslashResult` (`command.h:18`).
+/// `backslashResult` (`command.h:15`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandResult {
     /// `PSQL_CMD_UNKNOWN`: not a recognized command.
@@ -27,14 +27,14 @@ pub enum CommandResult {
     Terminate,
     /// `PSQL_CMD_ERROR`: the command failed.
     Error,
-    /// `\c`'s reconnection, which the caller performs (`command.c:3462`).
+    /// `\c`'s reconnection, `do_connect`, which the caller performs (`command.c:3919`).
     Connect(Box<ConnectRequest>),
 }
 
-/// The four arguments `\connect` takes (`command.c:731`).
+/// The four arguments `\connect` takes (`command.c:645`-`:648`).
 ///
 /// `None` means "keep what the current connection uses"; `Some("-")` is
-/// upstream's explicit "use the default" (`command.c:756`).
+/// upstream's explicit "use the default" (`command.c:3660`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectRequest {
     /// `dbname`
@@ -48,7 +48,7 @@ pub struct ConnectRequest {
 }
 
 impl ConnectRequest {
-    /// `read_connect_arg()` (`command.c:960`): a literal `-` means "unset".
+    /// `read_connect_arg()` (`command.c:3638`): a literal `-` means "unset".
     fn from_options(options: &[SlashOption]) -> Self {
         let arg = |i: usize| options.get(i).map(|o| o.value.clone()).filter(|v| v != "-");
         Self {
@@ -112,7 +112,7 @@ pub fn dispatch_slash(
     status
 }
 
-/// `HandleSlashCmds()` (`command.c:214`).
+/// `HandleSlashCmds()` (`command.c:231`).
 ///
 /// The scanner must be positioned just past the backslash, which is where
 /// [`crate::scan::ScanResult::Backslash`] leaves it.
@@ -134,7 +134,7 @@ pub fn handle_slash_cmds(
         status
     };
 
-    // Eat any remaining arguments after a valid command (`command.c:245`).
+    // Eat any remaining arguments after a valid command (`command.c:271`).
     // `slash_options` above already consumed them, so what is left is the
     // warning upstream prints for the ones a command did not use.
     if status != CommandResult::Error {
@@ -166,7 +166,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         .collect()
 }
 
-/// `exec_command()` (`command.c:301`), for the commands this issue ports.
+/// `exec_command()` (`command.c:315`), for the commands this issue ports.
 fn exec_command(
     cmd: &str,
     options: &[SlashOption],
@@ -175,19 +175,19 @@ fn exec_command(
     stderr: &mut dyn Write,
 ) -> CommandResult {
     match cmd {
-        // `exec_command_quit()` (`command.c:2620`).
+        // `exec_command_quit()` (`command.c:2750`).
         "q" | "quit" => CommandResult::Terminate,
-        // `exec_command_connect()` (`command.c:731`).
+        // `exec_command_connect()` (`command.c:638`).
         "c" | "connect" => CommandResult::Connect(Box::new(ConnectRequest::from_options(options))),
-        // `exec_command_echo()` (`command.c:1187`).
+        // `exec_command_echo()` (`command.c:1559`).
         "echo" | "qecho" | "warn" => {
             let sink: &mut dyn Write = if cmd == "warn" { stderr } else { stdout };
             let _ = sink.write_all(&echo_text(options));
             CommandResult::SkipLine
         }
-        // `exec_command_set()` (`command.c:2744`).
+        // `exec_command_set()` (`command.c:2881`).
         "set" => exec_command_set(options, ctx, stdout, stderr),
-        // `exec_command_unset()` (`command.c:2955`).
+        // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
                 let _ = writeln!(stderr, "psql: error: \\unset: missing required argument");
@@ -205,7 +205,7 @@ fn exec_command(
     }
 }
 
-/// The pure half of `exec_command_echo` (`command.c:1187`): the bytes `\echo`
+/// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
 /// writes, including the `-n` handling and the trailing newline.
 #[must_use]
 pub fn echo_text(options: &[SlashOption]) -> Vec<u8> {
@@ -238,12 +238,12 @@ fn exec_command_set(
     stderr: &mut dyn Write,
 ) -> CommandResult {
     let Some(name) = options.first() else {
-        // No arguments: list all variables (`command.c:2752`).
+        // No arguments: list all variables (`command.c:2892`).
         let _ = stdout.write_all(ctx.vars.print().as_bytes());
         return CommandResult::SkipLine;
     };
     // The value is the concatenation of the remaining arguments
-    // (`command.c:2765`).
+    // (`command.c:2899`).
     let value: String = options[1..].iter().map(|o| o.value.as_str()).collect();
     match ctx.vars.set(&name.value, Some(&value)) {
         Ok(()) => CommandResult::SkipLine,
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn echo_minus_n_suppresses_the_newline_only_when_unquoted_and_first() {
         assert_eq!(run("\\echo -n hi").stdout, "hi");
-        // Quoted, it is just text (`command.c:1206`).
+        // Quoted, it is just text (`command.c:1579`).
         assert_eq!(run("\\echo '-n' hi").stdout, "-n hi\n");
         // Not first, it is just text.
         assert_eq!(run("\\echo hi -n").stdout, "hi -n\n");
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn set_stores_the_concatenation_of_the_remaining_arguments() {
-        // `command.c:2765`.
+        // `command.c:2899`.
         let run = run("\\set x a b");
         assert_eq!(run.result, CommandResult::SkipLine);
         assert_eq!(run.vars.get("x"), Some("ab"));
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn extra_arguments_draw_a_warning() {
-        // `command.c:252`.
+        // `command.c:282`.
         let run = run("\\q one");
         assert_eq!(
             run.stderr,

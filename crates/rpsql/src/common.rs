@@ -1,6 +1,6 @@
 //! Sending a query and printing what came back: `src/bin/psql/common.c`.
 //!
-//! `SendQuery` (`common.c:1180`) is an action — it writes to a socket and to
+//! `SendQuery` (`common.c:1126`) is an action — it writes to a socket and to
 //! two streams — so it is a thin shell here over two pure calculations:
 //! [`echo_line`], which decides what `ECHO` puts on stdout before the query
 //! runs, and [`crate::print::print_query`], which renders the result.
@@ -40,7 +40,7 @@ impl ErrorMessage {
     }
 
     /// The bytes psql writes to stderr: `pg_log_error`'s prefix, the message,
-    /// and the newline that call adds (`logging.c:224`).
+    /// and the newline that call adds (`logging.c:334`).
     #[must_use]
     pub fn rendered(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.0.len() + 14);
@@ -61,8 +61,8 @@ impl From<ConnectionError> for ErrorMessage {
 /// crate that holds a connection, which keeps every other module testable
 /// without a server.
 pub trait Executor {
-    /// `PQexec` plus `ProcessResult` (`common.c:1428`): run `query` and hand
-    /// back every result it produced.
+    /// `ExecQueryAndProcessResults` (`common.c:1581`), minus the printing: run
+    /// `query` and hand back every result it produced.
     ///
     /// # Errors
     /// The connection broke, and [`ErrorMessage`] is libpq's error buffer. A
@@ -70,7 +70,7 @@ pub trait Executor {
     /// result, as in libpq.
     fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage>;
 
-    /// `pset.db != NULL` (`mainloop.c:557`).
+    /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
 }
 
@@ -89,7 +89,7 @@ pub fn echo_line(query: &[u8], pset: &PsqlSettings) -> Option<Vec<u8>> {
     }
 }
 
-/// `PrintQueryStatus()` (`common.c:344`): the command tag, unless this is a
+/// `PrintQueryStatus()` (`common.c:996`): the command tag, unless this is a
 /// `TUPLES_OK` result that did not come from a RETURNING clause.
 #[must_use]
 pub fn query_status_line(result: &QueryResult, pset: &PsqlSettings) -> Option<Vec<u8>> {
@@ -110,7 +110,7 @@ pub fn query_status_line(result: &QueryResult, pset: &PsqlSettings) -> Option<Ve
     Some(line)
 }
 
-/// `SendQuery()` (`common.c:1180`), for the simple-query path.
+/// `SendQuery()` (`common.c:1126`), for the simple-query path.
 ///
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`.
@@ -166,8 +166,8 @@ pub fn send_query(
             }
             ExecStatus::EmptyQuery => {}
             _ => {
-                // `pqBuildErrorMessage3`'s rendering, at the configured
-                // verbosity (`common.c:594`).
+                // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at
+                // the configured verbosity (`common.c:1831`).
                 let message = match result.error() {
                     Some(error) => {
                         error.message(result.status(), pset.verbosity, pset.show_context)
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_plain_select_tag_is_not_printed_but_a_returning_one_is() {
-        // `PrintQueryStatus` (`common.c:352`).
+        // `PrintQueryStatus` (`common.c:996`).
         let pset = PsqlSettings::default();
         let results = one_row();
         assert_eq!(query_status_line(&results[0], &pset), None);

@@ -1,7 +1,7 @@
 //! The backslash-command lexer: `src/bin/psql/psqlscanslash.l`.
 //!
 //! Upstream bolts a second flex lexer onto the same buffer stack as
-//! `psqlscan.l` (`psqlscan_int.h:20` calls it "a compatible add-on lexer"), so
+//! `psqlscan.l` (`psqlscan.h:9` calls it "a compatible add-on lexer"), so
 //! this module extends [`Scanner`] rather than owning a buffer of its own. It
 //! covers `<xslashcmd>`, `<xslashargstart>`, `<xslasharg>`, `<xslashquote>`,
 //! `<xslashdquote>` and `<xslashend>`; `<xslashbackquote>` runs a shell and is
@@ -12,7 +12,7 @@ use crate::scan::{QuoteType, Scanner, VariableSource, is_variable_char};
 
 /// One argument, with the quoting mark that produced it.
 ///
-/// `psql_scan_slash_option`'s `quote` out-parameter (`psqlscanslash.l:511`) is
+/// `psql_scan_slash_option`'s `quote` out-parameter (`psqlscanslash.l:527`) is
 /// `'\0'` for an unquoted word, `'\''`, `'"'`, '`' or `':'`; commands read it
 /// to tell `\echo -n` from `\echo '-n'`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ impl SlashOption {
 }
 
 impl Scanner {
-    /// `psql_scan_slash_command()` (`psqlscanslash.l:487`): the command name,
+    /// `psql_scan_slash_command()` (`psqlscanslash.l:480`): the command name,
     /// which ends at whitespace or a backslash.
     pub fn slash_command(&mut self) -> String {
         let rest = self.rest();
@@ -46,7 +46,7 @@ impl Scanner {
         name
     }
 
-    /// `psql_scan_slash_option(OT_NORMAL)` (`psqlscanslash.l:530`): the next
+    /// `psql_scan_slash_option(OT_NORMAL)` (`psqlscanslash.l:539`): the next
     /// argument, or `None` at end of command.
     pub fn slash_option(&mut self, vars: &dyn VariableSource) -> Option<SlashOption> {
         // <xslashargstart>: discard whitespace before the argument.
@@ -113,7 +113,7 @@ impl Scanner {
     }
 
     /// Every remaining argument, which is how `HandleSlashCmds` eats the tail
-    /// of a command line (`command.c:288`).
+    /// of a command line (`command.c:278`).
     pub fn slash_options(&mut self, vars: &dyn VariableSource) -> Vec<SlashOption> {
         let mut all = Vec::new();
         while let Some(option) = self.slash_option(vars) {
@@ -122,7 +122,7 @@ impl Scanner {
         all
     }
 
-    /// `psql_scan_slash_command_end()` (`psqlscanslash.l:565`): swallow a
+    /// `psql_scan_slash_command_end()` (`psqlscanslash.l:678`): swallow a
     /// trailing `\\`, which separates one backslash command from the next.
     pub fn slash_command_end(&mut self) {
         let skip = self
@@ -174,7 +174,7 @@ impl Scanner {
         }
     }
 
-    /// `<xslashdquote>` (`psqlscanslash.l:346`): everything up to the closing
+    /// `<xslashdquote>` (`psqlscanslash.l:411`): everything up to the closing
     /// double quote, which stays in the value.
     fn read_double_quoted(&mut self, out: &mut Vec<u8>) {
         let rest = self.rest().to_vec();
@@ -187,7 +187,7 @@ impl Scanner {
         }
     }
 
-    /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:216`-`:270`).
+    /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`).
     /// Returns whether a substitution actually happened.
     fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> bool {
         let rest = self.rest().to_vec();
@@ -312,14 +312,14 @@ mod tests {
 
     #[test]
     fn backslash_escapes_inside_single_quotes_are_expanded() {
-        // `psqlscanslash.l:325`.
+        // `psqlscanslash.l:331`-`:347`.
         let (_, options) = slash("\\echo 'a\\tb'", &NoVariables);
         assert_eq!(values(&options), ["a\tb"]);
     }
 
     #[test]
     fn double_quotes_are_kept_in_the_value() {
-        // `<xslasharg>{dquote}` echoes the quote (`psqlscanslash.l:207`).
+        // `<xslasharg>{dquote}` echoes the quote (`psqlscanslash.l:223`).
         let (_, options) = slash("\\echo \"a b\"", &NoVariables);
         assert_eq!(values(&options), ["\"a b\""]);
         assert_eq!(options[0].quote, Some('"'));

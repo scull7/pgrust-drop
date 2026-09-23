@@ -767,8 +767,12 @@ fn test_singlerowmode() {
     for i in 0..3 {
         let param = format!("{}", 44 + i);
         let values: [Option<&[u8]>; 1] = [Some(param.as_bytes())];
-        conn.send_query_params(b"SELECT generate_series(42, $1)", &[], &Params::text(&values))
-            .expect("failed to send query");
+        conn.send_query_params(
+            b"SELECT generate_series(42, $1)",
+            &[],
+            &Params::text(&values),
+        )
+        .expect("failed to send query");
     }
     conn.pipeline_sync().expect("pipeline sync failed");
 

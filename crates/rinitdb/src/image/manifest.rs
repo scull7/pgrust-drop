@@ -101,6 +101,30 @@ pub enum ManifestError {
 }
 
 impl Manifest {
+    /// Pure: whether the two measured host facts agree with each other.
+    ///
+    /// `unicode` is a bootstrap `i` row on every host
+    /// (`src/include/catalog/pg_collation.dat:30` at REL_18_6), so there is
+    /// always at least one `i` row. Without libicu its `collversion` is NULL
+    /// (`get_collation_actual_version`, the `#ifdef USE_ICU` branch in
+    /// `src/backend/utils/adt/pg_locale.c:1266`) and
+    /// `pg_import_system_collations` adds no ICU rows
+    /// (`src/backend/commands/collationcmds.c:978`, also under `USE_ICU`).
+    /// So `icu` is `none` exactly when `unicode` is the only `i` row.
+    #[must_use]
+    pub fn host_facts_agree(&self) -> bool {
+        let icu_rows = self
+            .collations
+            .split(' ')
+            .find_map(|token| token.strip_prefix("i="))
+            .and_then(|count| count.parse::<u64>().ok());
+        match icu_rows {
+            Some(1) => self.icu == "none",
+            Some(2..) => self.icu != "none",
+            None | Some(0) => false,
+        }
+    }
+
     /// Pure: the manifest as the text [`Manifest::parse`] reads.
     #[must_use]
     pub fn render(&self) -> String {
@@ -216,6 +240,25 @@ mod tests {
             bytes: 42,
             sha256: "ab".repeat(32),
         }
+    }
+
+    #[test]
+    fn the_host_facts_agree_with_and_without_libicu() {
+        let with = |icu: &str, collations: &str| Manifest {
+            icu: icu.to_owned(),
+            collations: collations.to_owned(),
+            ..sample()
+        };
+        // Built with ICU: libicu imported rows and reports a version.
+        assert!(sample().host_facts_agree());
+        // Built without ICU: `unicode` is the only `i` row, and NULL.
+        assert!(with("none", "b=3 c=2 d=1 i=1").host_facts_agree());
+        // Disagreements.
+        assert!(!with("none", "b=3 c=2 d=1 i=805").host_facts_agree());
+        assert!(!with("153.136", "b=3 c=2 d=1 i=1").host_facts_agree());
+        // No `i` row at all cannot come from 18.6, whose bootstrap has one.
+        assert!(!with("none", "b=3 c=2 d=1").host_facts_agree());
+        assert!(!with("153.136", "b=3 c=2 d=1").host_facts_agree());
     }
 
     #[test]

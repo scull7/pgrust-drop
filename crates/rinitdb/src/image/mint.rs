@@ -34,8 +34,9 @@ use super::parse;
 /// text columns.
 ///
 /// - `icu`: the `collversion` of the `unicode` collation, the minting host's
-///   ICU collator version, or `none` when there is no such row or it is NULL
-///   (no libicu).
+///   ICU collator version, or `none` when it is NULL (no libicu). The row
+///   itself always exists: `unicode` is a bootstrap `i` row
+///   (`src/include/catalog/pg_collation.dat:30` at REL_18_6).
 /// - `collations`: `pg_collation` rows per `collprovider`, as
 ///   `provider=count` sorted by provider (`b=3 c=2 d=1 i=805`): the `c` count
 ///   is what `locale -a` added, the `i` count what libicu did.

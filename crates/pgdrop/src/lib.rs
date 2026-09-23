@@ -8,7 +8,9 @@
 //! `pgdrop install-links DIR` ([`install`], Linear NAT-416) is what creates
 //! those symlinks.
 //!
-//! The pgrust server (NAT-407) and `start` (NAT-409) are not embedded yet.
+//! [`postgres`] links pgrust's `main_main` (NAT-376) but answers only
+//! `--version` so far; the server itself (NAT-407) and `start` (NAT-409) are
+//! not embedded yet.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -20,3 +22,4 @@
 
 pub mod dispatch;
 pub mod install;
+pub mod postgres;

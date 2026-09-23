@@ -233,7 +233,7 @@ pub fn md5_hash(data: &[u8]) -> Vec<u8> {
 
 /// `pg_md5_encrypt`, `md5_common.c:145`: `"md5"` followed by the hex MD5 of
 /// `passwd` concatenated with `salt`. The salt goes last "because it may be
-/// known by users trying to crack the MD5 output" (`md5_common.c:160`).
+/// known by users trying to crack the MD5 output" (`md5_common.c:161`).
 ///
 /// `MD5_PASSWD_LEN` (`md5.h:26`) is 35: three plus thirty-two.
 #[must_use]
@@ -286,7 +286,7 @@ mod tests {
 
     /// The block boundary: a message of exactly one block, and one that spills
     /// the length word into a second block (`md5_pad`'s `gap <= 8` arm,
-    /// `md5.c:320`).
+    /// `md5.c:321`).
     #[test]
     fn the_padding_spills_into_a_second_block() {
         for len in [55usize, 56, 57, 63, 64, 65, 119, 120, 128] {

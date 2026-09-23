@@ -471,7 +471,7 @@ mod tests {
 
     /// RFC 7677 section 3's transcript, computed here from its own inputs:
     /// password `pencil`, salt `W22ZaJ0SNY7soEsUEjb6gQ==` (the sixteen bytes
-    /// `scram-common.h:43` points at), 4096 iterations and the client nonce
+    /// `scram-common.h:44` points at), 4096 iterations and the client nonce
     /// `rOprNGfwEbeRWgbNEkqO`. This is the third-party vector — the proof and
     /// the signature below are the RFC's own `p=` and `v=` — and it pins
     /// PBKDF2, ClientKey, StoredKey, ServerKey and both signatures without

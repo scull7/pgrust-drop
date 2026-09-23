@@ -2,7 +2,7 @@
 //!
 //! Ported from `src/interfaces/libpq/fe-auth.c`: `pg_fe_sendauth` (`:1066`)
 //! decides what to do with an AuthenticationRequest, `pg_password_sendauth`
-//! (`:795`) builds the PasswordMessage, and `pg_SASL_init` (`:435`) /
+//! (`:796`) builds the PasswordMessage, and `pg_SASL_init` (`:435`) /
 //! `pg_SASL_continue` (`:704`) drive SCRAM.
 //!
 //! [`Authenticator`] is the whole decision as a calculation: a request in, the

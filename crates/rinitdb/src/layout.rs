@@ -1,10 +1,10 @@
 //! The data directory tree: which entries `initdb` makes, in which order,
 //! with which modes.
 //!
-//! This is `initialize_data_directory` (`initdb.c:3049`) as far as its first
+//! This is `initialize_data_directory` (`initdb.c:3044`) as far as its first
 //! call into the server — `create_data_directory` (`:2890`),
 //! `create_xlog_or_symlink` (`:2948`), the `subdirs[]` loop (`:3068`) and the
-//! top-level `write_version_file(NULL)` (`:3086`).
+//! top-level `write_version_file(NULL)` (`:3087`).
 //!
 //! Data / Calculations / Actions: [`FsOp`] is the data, [`layout`] is the
 //! whole decision as a pure function of a [`CreatePlan`], and [`apply`] is the
@@ -12,7 +12,7 @@
 //!
 //! ## Why the ops carry final modes
 //!
-//! C sets a process-wide `umask(pg_mode_mask)` (`initdb.c:3057`) and then
+//! C sets a process-wide `umask(pg_mode_mask)` (`initdb.c:3058`) and then
 //! passes `pg_dir_create_mode` to every `mkdir`. `umask` is not reachable from
 //! the standard library and this crate is `#![deny(unsafe_code)]` with no
 //! approved libc dependency, so each op names the mode the entry must end up
@@ -78,7 +78,7 @@ pub enum FsOp {
     },
     /// `chmod(path, mode)` on a directory that was already there and empty.
     SetMode { path: PathBuf, mode: u32 },
-    /// `symlink(target, link)` (`initdb.c:3015`).
+    /// `symlink(target, link)` (`initdb.c:3014`).
     Symlink { target: PathBuf, link: PathBuf },
     /// `fopen(path, "wb")`, write, `fclose` — `write_version_file` at
     /// `initdb.c:1024`.
@@ -165,7 +165,7 @@ pub fn wal_directory_and_below(
                 link: subdirloc,
             });
         }
-        // initdb.c:3021 — "just make the subdirectory normally".
+        // initdb.c:3020 — "just make the subdirectory normally".
         None => ops.push(FsOp::CreateDir {
             path: subdirloc,
             mode: dir_mode,
@@ -173,7 +173,7 @@ pub fn wal_directory_and_below(
         }),
     }
 
-    // initdb.c:3068 — mkdir(), not pg_mkdir_p(): "the parent directory already
+    // initdb.c:3075 — mkdir(), not pg_mkdir_p(): "the parent directory already
     // exists, so we only need mkdir() not pg_mkdir_p() here, which avoids some
     // failure modes; cf bug #13853".
     ops.extend(SUBDIRS.iter().map(|subdir| FsOp::CreateDir {
@@ -183,7 +183,7 @@ pub fn wal_directory_and_below(
     }));
 
     // initdb.c:3086 — "Top level PG_VERSION is checked by bootstrapper, so
-    // make it first". `base/1/PG_VERSION` (`:3097`) is written only after
+    // make it first". `base/1/PG_VERSION` (`:3102`) is written only after
     // bootstrap and so is not part of this layout.
     ops.push(FsOp::WriteFile {
         path: plan.pgdata.join("PG_VERSION"),
@@ -233,7 +233,7 @@ pub fn tree_listing(
                 Some((relative, mode))
             }
             // A symlink's own mode is not the tree's business: `check_mode_recursive`
-            // stats through it (`Utils.pm:601`), reporting the target's mode.
+            // stats through it (`Utils.pm:623`), reporting the target's mode.
             FsOp::Symlink { .. } => None,
         })
         // `strip_prefix` leaves the data directory itself as "", and the WAL
@@ -311,8 +311,8 @@ mod unix {
         Ok(())
     }
 
-    /// `mkdir(path, mode)` / `pg_mkdir_p(path, mode)` (`initdb.c:2903`,
-    /// `:2974`, `:3022`, `:3079`).
+    /// `mkdir(path, mode)` / `pg_mkdir_p(path, mode)` (`initdb.c:2902`,
+    /// `:2973`, `:3021`, `:3078`).
     fn create_dir(path: &Path, mode: u32, parents: bool) -> Result<(), InitdbError> {
         let fail = |dir: &Path, err: &std::io::Error| InitdbError::CouldNotCreateDirectory {
             path: dir.display().to_string(),
@@ -328,7 +328,7 @@ mod unix {
         for dir in super::missing_ancestors(path, &|dir| dir.exists()) {
             match mkdir(&dir, mode) {
                 Ok(()) => {}
-                // pgmkdirp.c:129 — "If we got EEXIST because there's already a
+                // pgmkdirp.c:124 — "If we got EEXIST because there's already a
                 // directory there, don't complain", and leave its mode alone.
                 // Only pg_mkdir_p forgives this; the plain `mkdir` above does
                 // not, which is how `initdb $existing_datadir` still fails.
@@ -349,7 +349,7 @@ mod unix {
         std::fs::set_permissions(path, Permissions::from_mode(mode))
     }
 
-    /// `chmod(path, mode)` (`initdb.c:2917`, `:2989`).
+    /// `chmod(path, mode)` (`initdb.c:2916`, `:2988`).
     fn set_mode(path: &Path, mode: u32) -> Result<(), InitdbError> {
         std::fs::set_permissions(path, Permissions::from_mode(mode)).map_err(|err| {
             InitdbError::CouldNotChangePermissionsOfDirectory {

@@ -40,9 +40,13 @@ pub const C_TEXT_SEARCH_CONFIG: &str = "english";
 /// - `-E` naming any encoding but UTF8;
 /// - `--locale-provider` other than `libc` (the template's databases are
 ///   `datlocprovider = 'c'`), and `--locale`, `--lc-collate`, `--lc-ctype`
-///   naming any locale but `C` or `POSIX`. The other four categories are not
-///   refused: C writes them to `postgresql.conf` only (`initdb.c:1315`-`:1325`)
-///   and never into the catalogs, so [`settings`] writes them too;
+///   naming any locale but `C` or `POSIX`. An empty one is not refused:
+///   `setlocales` keeps it (`initdb.c:2432`-`:2443`) and `check_locale_name`
+///   (`:2202`) reads it as the environment's, like no switch at all, which
+///   this port takes to be C (`docs/divergences.md`), as [`conf_locale`] and
+///   [`text_search_warning`] do. The other four categories are not refused:
+///   C writes them to `postgresql.conf` only (`initdb.c:1315`-`:1325`) and
+///   never into the catalogs, so [`settings`] writes them too;
 /// - `--wal-segsize` other than 16;
 /// - a superuser other than `postgres`, `-W` and `--pwfile`: renaming the
 ///   superuser and setting its password happen after expansion, in
@@ -73,7 +77,7 @@ pub fn check_template_can_make(options: &Options, plan: &CreatePlan) -> Result<(
         ("--lc-ctype", &options.lc_ctype),
     ];
     for (option, value) in locales {
-        if let Some(value) = value.as_deref()
+        if let Some(value) = value.as_deref().filter(|value| !value.is_empty())
             && !is_c_locale(value)
         {
             return refuse(
@@ -324,6 +328,12 @@ mod tests {
             &["--wal-segsize=16"],
             &["-U", "postgres"],
             &["-T", "simple", "-k", "-g"],
+            // Empty is the environment's (check_locale_name, initdb.c:2202),
+            // as no switch at all is.
+            &["--locale", ""],
+            &["--lc-collate", ""],
+            &["--lc-ctype", ""],
+            &["--locale=C", "--lc-collate="],
         ] {
             assert_eq!(verdict(ok), Ok(()), "{ok:?}");
         }

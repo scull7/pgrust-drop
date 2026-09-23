@@ -354,12 +354,13 @@ const NON_C_LOCALE: &str = if cfg!(target_os = "macos") {
 };
 
 /// `<tool> --no-sync -T simple -U postgres <extra> --waldir=<non-empty> <pgdata>`
-/// in `tempdir`, and the stderr it is expected to end with: C's `--waldir`
-/// error, its hint and the removal of the data directory it made.
+/// in `tempdir` and `env`, and the stderr it is expected to end with: C's
+/// `--waldir` error, its hint and the removal of the data directory it made.
 fn behind_a_failing_waldir(
     tool: &Path,
     tempdir: &TempDir,
     extra: &[&str],
+    env: &Environment,
 ) -> (testkit::CommandOutcome, String) {
     let pgdata = tempdir.join("data");
     let waldir = tempdir.join("wal");
@@ -372,7 +373,7 @@ fn behind_a_failing_waldir(
         waldir.clone().into(),
         pgdata.clone().into(),
     ]);
-    let outcome = testkit::run(tool, &argv).expect("run initdb");
+    let outcome = testkit::run_in(tool, &argv, &[], env).expect("run initdb");
     let (pgdata, waldir) = (pgdata.display(), waldir.display());
     let tail = format!(
         "initdb: error: directory \"{waldir}\" exists but is not empty\n\
@@ -415,12 +416,18 @@ fn a_failing_waldir_behind_a_refusal_that_keeps_lc_ctype_c_still_warns_first() {
         &["-E", "UTF8", "--locale", NON_C_LOCALE, "--lc-ctype", "C"],
     ] {
         let tempdir = TempDir::new("expanded-tsearch-refusal");
-        let (ours, tail) = behind_a_failing_waldir(Path::new(RINITDB), &tempdir, extra);
+        let (ours, tail) = behind_a_failing_waldir(
+            Path::new(RINITDB),
+            &tempdir,
+            extra,
+            &Environment::inherited(),
+        );
         assert_eq!(ours.status, Some(1), "{extra:?}: {}", ours.stderr_text());
         let expected = simple_might_not_match("C") + &tail;
         assert_eq!(ours.stderr_text(), expected, "{extra:?}");
         if let Some(initdb) = &reference {
-            let (theirs, _) = behind_a_failing_waldir(initdb, &tempdir, extra);
+            let (theirs, _) =
+                behind_a_failing_waldir(initdb, &tempdir, extra, &Environment::inherited());
             assert_eq!(theirs.status, ours.status, "{extra:?}");
             assert_eq!(theirs.stderr_text(), ours.stderr_text(), "{extra:?}");
         }
@@ -440,17 +447,124 @@ fn a_failing_waldir_behind_an_lc_ctype_refusal_leaves_the_warning_out() {
         &["-E", "UTF8", "--locale", NON_C_LOCALE],
     ] {
         let tempdir = TempDir::new("expanded-tsearch-lc-ctype");
-        let (ours, tail) = behind_a_failing_waldir(Path::new(RINITDB), &tempdir, extra);
+        let (ours, tail) = behind_a_failing_waldir(
+            Path::new(RINITDB),
+            &tempdir,
+            extra,
+            &Environment::inherited(),
+        );
         assert_eq!(ours.status, Some(1), "{extra:?}: {}", ours.stderr_text());
         assert_eq!(ours.stderr_text(), tail, "{extra:?}");
         if let Some(initdb) = &reference {
-            let (theirs, _) = behind_a_failing_waldir(initdb, &tempdir, extra);
+            let (theirs, _) =
+                behind_a_failing_waldir(initdb, &tempdir, extra, &Environment::inherited());
             assert_eq!(theirs.status, ours.status, "{extra:?}");
             assert_eq!(
                 theirs.stderr_text(),
                 simple_might_not_match(NON_C_LOCALE) + &tail,
                 "{extra:?}"
             );
+        }
+    }
+}
+
+/// With no `--lc-ctype` or `--locale`, or an empty one, C's `lc_ctype` is the
+/// environment's (`check_locale_name`, `initdb.c:2202`) and its warning names
+/// it — on musl `C.UTF-8` even with no locale variable set. This port takes
+/// the environment to be C and names `C` (`docs/divergences.md`). Under
+/// `LC_ALL` naming a non-C locale, against the reference initdb: its stderr
+/// is ours with that locale's name in place of `C`.
+#[test]
+fn a_failing_waldir_with_no_lc_ctype_given_warns_for_c_not_the_environment() {
+    let reference = reference::find_or_skip("initdb");
+    let env = Environment::inherited().with("LC_ALL", NON_C_LOCALE);
+    for extra in [
+        &["-E", "UTF8"][..],
+        &["-E", "UTF8", "--locale", ""],
+        &["-E", "UTF8", "--lc-ctype", ""],
+    ] {
+        let tempdir = TempDir::new("expanded-tsearch-environment");
+        let (ours, tail) = behind_a_failing_waldir(Path::new(RINITDB), &tempdir, extra, &env);
+        assert_eq!(ours.status, Some(1), "{extra:?}: {}", ours.stderr_text());
+        assert_eq!(
+            ours.stderr_text(),
+            simple_might_not_match("C") + &tail,
+            "{extra:?}"
+        );
+        if let Some(initdb) = &reference {
+            let (theirs, _) = behind_a_failing_waldir(initdb, &tempdir, extra, &env);
+            assert_eq!(theirs.status, ours.status, "{extra:?}");
+            assert_eq!(
+                theirs.stderr_text(),
+                simple_might_not_match(NON_C_LOCALE) + &tail,
+                "{extra:?}"
+            );
+        }
+    }
+}
+
+/// The variables `setlocale(category, "")` reads.
+const LOCALE_VARIABLES: [&str; 8] = [
+    "LANG",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+];
+
+/// The `lc_*` lines of `<pgdata>/postgresql.conf`.
+fn conf_locale_lines(pgdata: &Path) -> Vec<String> {
+    std::fs::read_to_string(pgdata.join("postgresql.conf"))
+        .expect("postgresql.conf")
+        .lines()
+        .filter(|line| line.starts_with("lc_"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// An empty `--locale`, `--lc-collate` or `--lc-ctype` is kept by
+/// `setlocales` (`initdb.c:2432`-`:2443`) and read by `check_locale_name`
+/// (`:2202`) as the environment's, like no switch at all: C accepts it, so
+/// it is not refused. With no locale variable set, against the reference
+/// initdb: both exit 0 and write the same four `postgresql.conf` locale
+/// lines, which are those of no switch.
+#[test]
+fn an_empty_locale_is_the_environments_like_no_switch() {
+    let reference = reference::find_or_skip("initdb");
+    let env = Environment::inherited().without_all(LOCALE_VARIABLES);
+    let tempdir = TempDir::new("expanded-empty-locale");
+    let no_switch = tempdir.join("no-switch");
+    rinitdb_ok(&["-U", "postgres", "--no-sync"], &no_switch, &env);
+    let expected = conf_locale_lines(&no_switch);
+    assert_eq!(expected.len(), 4, "{expected:?}");
+    for extra in [
+        &["--locale", ""][..],
+        &["--lc-collate", ""],
+        &["--lc-ctype", ""],
+        &["--locale", "C", "--lc-collate", ""],
+    ] {
+        let mut before = vec!["-U", "postgres", "--no-sync"];
+        before.extend(extra);
+        let ours = tempdir.join("ours");
+        rinitdb_ok(&before, &ours, &env);
+        assert_eq!(conf_locale_lines(&ours), expected, "{extra:?}");
+        std::fs::remove_dir_all(&ours).expect("remove the cluster");
+        if let Some(initdb) = &reference {
+            let theirs = tempdir.join("theirs");
+            let mut argv = args(&before);
+            argv.push(theirs.clone().into());
+            let outcome = testkit::run_in(initdb, &argv, &[], &env).expect("run initdb");
+            assert_eq!(
+                outcome.status,
+                Some(0),
+                "{extra:?}: {}",
+                outcome.stderr_text()
+            );
+            assert_eq!(conf_locale_lines(&theirs), expected, "{extra:?}");
+            std::fs::remove_dir_all(&theirs).expect("remove the cluster");
         }
     }
 }

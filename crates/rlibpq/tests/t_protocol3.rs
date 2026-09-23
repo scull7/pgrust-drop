@@ -11,7 +11,13 @@
 //! no simple-query test, and the authentication suite
 //! (`src/test/authentication/t/001_password.pl`) is outside the sparse
 //! checkout this port reads from. The cases below are therefore named for what
-//! they pin rather than after an upstream test name.
+//! they pin rather than after an upstream test name — except
+//! `test_prepared_outside_pipeline_mode`, which carries the name of the
+//! upstream `libpq_pipeline` test whose blocking assertions it runs.
+//!
+//! The extended-query gates (NAT-390) compare against C psql's `\bind`,
+//! `\parse` and `\bind_named`, which drive `PQsendQueryParams` and
+//! `PQsendQueryPrepared` in C libpq.
 
 #![allow(clippy::doc_markdown)]
 
@@ -19,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rlibpq::conninfo::{Env, parse_conninfo};
-use rlibpq::{Connection, ContextVisibility, ExecStatus, Verbosity};
+use rlibpq::{Connection, ContextVisibility, ExecStatus, Params, QueryResult, Verbosity};
 use testkit::reference;
 
 /// The three C tools a live gate needs.
@@ -150,6 +156,54 @@ impl Cluster {
             .expect("reference psql runs");
         (out.stdout, out.stderr, out.status.code().unwrap_or(-1))
     }
+
+    /// `psql -tAqX` reading `script` from a pipe, at `VERBOSITY terse`. A
+    /// piped stdin is not an input *file*, so psql prefixes no
+    /// `psql:<file>:<line>:` to its errors, and the extended-query
+    /// meta-commands (`\bind`, `\parse`, `\bind_named`, `\close_prepared`),
+    /// which `-c` cannot mix with SQL, are available.
+    fn psql_script(&self, script: &str) -> (Vec<u8>, Vec<u8>, i32) {
+        use std::io::Write as _;
+        let mut child = Command::new(self.bin.join("psql"))
+            .args(["-tAqX", "-v", "VERBOSITY=terse", "-d", &self.conninfo()])
+            .env("LC_ALL", "C")
+            .env("PGPASSWORD", "gatepassword")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("reference psql runs");
+        child
+            .stdin
+            .take()
+            .expect("a stdin pipe")
+            .write_all(script.as_bytes())
+            .expect("the script is written");
+        let out = child.wait_with_output().expect("reference psql exits");
+        (out.stdout, out.stderr, out.status.code().unwrap_or(-1))
+    }
+}
+
+/// Calculation: a result as `psql -tA` prints it — each row's values joined
+/// by `|`, one row per line, NULL as the empty string.
+fn unaligned(result: &QueryResult) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in 0..result.ntuples() {
+        for column in 0..result.nfields() {
+            if column > 0 {
+                out.push(b'|');
+            }
+            out.extend_from_slice(result.value(row, column).unwrap_or_default());
+        }
+        out.push(b'\n');
+    }
+    out
+}
+
+/// The one result an extended-query command must produce.
+fn only(results: Vec<QueryResult>) -> QueryResult {
+    assert_eq!(results.len(), 1, "one result: {results:?}");
+    results.into_iter().next().expect("one result")
 }
 
 impl Drop for Cluster {
@@ -283,4 +337,168 @@ fn an_installation_missing_any_one_tool_is_refused_by_name() {
         });
         assert_eq!(found, Err(absent), "a bin directory without {absent}");
     }
+}
+
+/// `PQexecParams` through this crate prints what C psql's `\bind … \g`
+/// prints — and psql's `\bind` *is* `PQsendQueryParams` with text
+/// parameters and no types (`src/bin/psql/common.c:1616`, in `ExecQueryAndProcessResults`),
+/// so both sides send the same Parse/Bind/Describe/Execute/Sync.
+#[test]
+fn exec_params_matches_the_reference_psql_bind() {
+    let Some(cluster) = Cluster::start("trust", 55_450) else {
+        return;
+    };
+    let mut conn = cluster.connect();
+    let query = "select $1::int4 + 1, $2::text, upper($2)";
+    let result = only(
+        conn.exec_params(
+            query.as_bytes(),
+            &[],
+            &Params::text(&[Some(b"41"), Some(b"a b|c")]),
+        )
+        .expect("the exchange completes"),
+    );
+    assert_eq!(result.status(), ExecStatus::TuplesOk);
+    assert_eq!(
+        result.ntuples(),
+        1,
+        "a row to compare, not two empty outputs"
+    );
+    assert_eq!(result.ftype(0), Some(23), "int4");
+
+    let (stdout, stderr, code) = cluster.psql_script(&format!("{query} \\bind 41 'a b|c' \\g\n"));
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(unaligned(&result), stdout, "the row must be byte-identical");
+}
+
+/// `PQprepare` then `PQexecPrepared` print what `\parse` then
+/// `\bind_named … \g` print, and a statement that does not exist fails
+/// with the same terse error line on both sides.
+#[test]
+fn prepare_and_exec_prepared_match_the_reference_psql() {
+    let Some(cluster) = Cluster::start("trust", 55_451) else {
+        return;
+    };
+    let mut conn = cluster.connect();
+    let prepared = only(
+        conn.prepare(b"s1", b"select $1::int8 * 2, $1::text", &[])
+            .expect("the exchange completes"),
+    );
+    assert_eq!(prepared.status(), ExecStatus::CommandOk);
+    let result = only(
+        conn.exec_prepared(b"s1", &Params::text(&[Some(b"21")]))
+            .expect("the exchange completes"),
+    );
+    assert_eq!(result.status(), ExecStatus::TuplesOk);
+    assert_eq!(
+        result.ntuples(),
+        1,
+        "a row to compare, not two empty outputs"
+    );
+
+    let (stdout, stderr, code) =
+        cluster.psql_script("select $1::int8 * 2, $1::text \\parse s1\n\\bind_named s1 21 \\g\n");
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(unaligned(&result), stdout, "the row must be byte-identical");
+
+    let missing = only(
+        conn.exec_prepared(b"nope", &Params::text(&[]))
+            .expect("the exchange completes"),
+    );
+    assert_eq!(missing.status(), ExecStatus::FatalError);
+    let (_, stderr, _) = cluster.psql_script("\\bind_named nope \\g\n");
+    assert_eq!(
+        missing.error().expect("an error result").message(
+            ExecStatus::FatalError,
+            Verbosity::Terse,
+            ContextVisibility::Errors
+        ),
+        stderr,
+        "the terse error must be psql's, byte for byte"
+    );
+}
+
+/// The blocking half of upstream's `test_prepared`
+/// (`src/test/modules/libpq_pipeline/libpq_pipeline.c:1253`): its
+/// assertions on `PQdescribePrepared`, `PQclosePrepared`,
+/// `PQdescribePortal` and `PQclosePortal` (`:1333`-`:1344`, `:1394`-`:1405`),
+/// plus the column and parameter types its pipelined half checks
+/// (`:1292`-`:1301`, `:1360`-`:1363`), made here with the blocking calls
+/// because pipeline mode is not ported yet. The whole test, trace and all,
+/// is NAT-390's pipeline work.
+#[test]
+fn test_prepared_outside_pipeline_mode() {
+    const INT4OID: u32 = 23;
+    const TEXTOID: u32 = 25;
+    const NUMERICOID: u32 = 1700;
+    const INTERVALOID: u32 = 1186;
+
+    let Some(cluster) = Cluster::start("trust", 55_452) else {
+        return;
+    };
+    let mut conn = cluster.connect();
+
+    let prepared = only(
+        conn.prepare(
+            b"select_one",
+            b"SELECT $1, '42', $1::numeric, interval '1 sec'",
+            &[INT4OID],
+        )
+        .expect("runs"),
+    );
+    assert_eq!(prepared.status(), ExecStatus::CommandOk);
+
+    let described = only(conn.describe_prepared(b"select_one").expect("runs"));
+    assert_eq!(described.status(), ExecStatus::CommandOk);
+    assert_eq!(described.nparams(), 1);
+    assert_eq!(described.paramtype(0), Some(INT4OID));
+    let types: Vec<Option<u32>> = (0..described.nfields())
+        .map(|i| described.ftype(i))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            Some(INT4OID),
+            Some(TEXTOID),
+            Some(NUMERICOID),
+            Some(INTERVALOID)
+        ]
+    );
+
+    let closed = only(conn.close_prepared(b"select_one").expect("runs"));
+    assert_eq!(closed.status(), ExecStatus::CommandOk);
+
+    // :1333 — "Now that it's closed we should get an error when describing".
+    let gone = only(conn.describe_prepared(b"select_one").expect("runs"));
+    assert_eq!(gone.status(), ExecStatus::FatalError);
+    assert_eq!(
+        gone.error().and_then(rlibpq::ResultError::sqlstate),
+        Some(&b"26000"[..])
+    );
+    // :1339 — closing a statement that does not exist is a no-op.
+    let again = only(conn.close_prepared(b"select_one").expect("runs"));
+    assert_eq!(again.status(), ExecStatus::CommandOk);
+
+    // :1347 — a portal made by DECLARE CURSOR.
+    only(conn.exec(b"BEGIN").expect("runs"));
+    only(
+        conn.exec(b"DECLARE cursor_one CURSOR FOR SELECT 1")
+            .expect("runs"),
+    );
+    let portal = only(conn.describe_portal(b"cursor_one").expect("runs"));
+    assert_eq!(portal.status(), ExecStatus::CommandOk);
+    assert_eq!(portal.ftype(0), Some(INT4OID));
+    assert_eq!(portal.nparams(), 0);
+
+    let closed = only(conn.close_portal(b"cursor_one").expect("runs"));
+    assert_eq!(closed.status(), ExecStatus::CommandOk);
+    // :1394 and :1400.
+    let gone = only(conn.describe_portal(b"cursor_one").expect("runs"));
+    assert_eq!(gone.status(), ExecStatus::FatalError);
+    assert_eq!(
+        gone.error().and_then(rlibpq::ResultError::sqlstate),
+        Some(&b"34000"[..])
+    );
+    let again = only(conn.close_portal(b"cursor_one").expect("runs"));
+    assert_eq!(again.status(), ExecStatus::CommandOk);
 }

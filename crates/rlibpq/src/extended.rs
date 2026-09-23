@@ -355,6 +355,19 @@ mod tests {
         );
     }
 
+    /// A text value is sent as the bytes given, a NUL included: C's
+    /// `strlen` (`fe-exec.c:1870`) cannot see past a NUL because a C string
+    /// cannot hold one, and a Rust slice can. The divergence is recorded in
+    /// `docs/divergences.md`.
+    #[test]
+    fn a_text_parameter_is_sent_whole_even_with_a_nul_in_it() {
+        let plan = query_params(b"SELECT $1", &[], &Params::text(&[Some(b"a\0b")])).unwrap();
+        let Frontend::Bind { params, .. } = &plan.messages[1] else {
+            panic!("not a Bind");
+        };
+        assert_eq!(params, &[Some(b"a\0b".to_vec())]);
+    }
+
     /// `PQsendQueryPrepared` sends no Parse; the Bind names the statement.
     #[test]
     fn query_prepared_binds_the_named_statement() {

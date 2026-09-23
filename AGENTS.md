@@ -113,8 +113,12 @@ container does not change that.
   far: `usage-rs` (all CLIs), `thiserror` (typed errors), `rustls` (rlibpq TLS,
   ADR-0006), `redox_liner` (rpsql line editing, ADR-0005) — owner, 2026-09-16;
   `ring` (rustls crypto provider) and `webpki-roots` (root store) — owner,
-  2026-09-17. `anyhow` is not approved. `ring` needs a musl C toolchain:
-  `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`.
+  2026-09-17; pgrust (`main_main`, rev-pinned git dependency, ADR-0001) and
+  its whole transitive dependency tree, **in `pgdrop` only** — owner,
+  2026-09-23. `anyhow` is not approved. `ring` needs a musl C toolchain:
+  `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`. pgrust's tree
+  needs a C compiler, `perl` and `make` (vendored OpenSSL), and for a release
+  build libre2 plus a C++ compiler; see ADR-0001's 2026-09-23 amendment.
 - **`thiserror` is deliberately not universal.** It is used where an error's
   text is a Rust string: `rinitdb` (`error.rs`, `control.rs`) and `testkit`
   (`gate.rs`, `pattern.rs`). `rlibpq` and `rpsql` depend on it not at all and
@@ -129,6 +133,8 @@ container does not change that.
 - Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rpsql` are MIT and are
   ported from PostgreSQL's C sources only. **Never copy code, comments or test
   corpora from pgrust into them.** `pgdrop` is AGPL-3.0 because it links pgrust.
+  No MIT crate may depend on a pgrust crate through any edge, direct or
+  transitive; `scripts/check-license-wall.sh` checks it and CI runs it.
 - Separate Data / Calculations / Actions. Parsing, planning, rendering are pure
   functions with unit tests; process spawning, filesystem, sockets live at the
   edge in thin functions.

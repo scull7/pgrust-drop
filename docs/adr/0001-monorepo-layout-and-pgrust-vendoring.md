@@ -3,7 +3,9 @@
 Status: accepted (owner decision 2026-09-16): pgrust is a rev-pinned Cargo git
 dependency; amended 2026-09-16 — the six auth primitives are ported from
 PostgreSQL C into `rlibpq` instead of linked, because ADR-0003 makes `rlibpq`
-MIT (see Amendment below).
+MIT (see Amendment below); amended 2026-09-23 — pinned to a scull7 fork
+carrying musl build fixes pending upstream, and pgrust's dependency tree
+approved for `pgdrop` only (see the second Amendment).
 
 ## Context
 
@@ -64,3 +66,61 @@ rev-pinned git dependency of `pgdrop`, which is why `pgdrop` is AGPL-3.0-only
 (ADR-0003). It is not in any manifest yet — vendoring pgrust is NAT-376 — so
 the first consequence above describes the build `pgdrop` will have, not the one
 it has today.
+
+## Amendment 2026-09-23: pinned to a scull7 fork until upstream builds on musl
+
+Made by the owner while landing NAT-376, which is where the Decision's git
+dependency first entered a manifest.
+
+**What broke.** At the rev we meant to pin, malisper/pgrust `79ad992` (`main`,
+"v0.3", the first rev carrying the collation-import port ADR-0002 needs),
+pgrust does not compile for `x86_64-unknown-linux-musl`, the product's primary
+target (ADR-0007). Two call sites use items the `libc` crate binds for glibc
+only: `libc::getentropy` in `pg_strong_random` and the `libc::LC_*_MASK`
+constants in `pg_locale`. With those two fixed, the whole tree builds on musl.
+Nothing else in pgrust needed a change.
+
+**Decision.** The pin is a fork, `github.com/scull7/pgrust`, branch
+`musl-build`: `79ad992` plus one commit carrying the two fixes (both behind
+`cfg(target_env = "musl")`). The same commit is prepared as a pull request to
+malisper/pgrust. Once upstream has the fixes, we switch back to malisper/pgrust
+at the first upstream rev that contains them
+(`scripts/pgrust-rev.sh --repo malisper/pgrust`) and delete the fork branch.
+It is still a Cargo git dependency pinned by `rev`. The Decision named a git
+submodule as the fallback for local patches; a fork keeps the manifest shape and
+the lock file honest, and a submodule would add nothing.
+
+**The squash risk, and why the fork branch matters.** pgrust squashes `main`
+to one commit per release and keeps each previous release only on an
+`archive/v0.x-main-*` branch. A rev pin stays fetchable only while some ref
+reaches the commit. On the fork, the `musl-build` branch is that ref. Do not
+delete or force-push it while the pin points at it. When the pin moves back to
+malisper/pgrust, the pinned upstream rev has the same exposure, so a bump
+should record which upstream branch reaches it.
+
+**Dependencies (owner, 2026-09-23).** pgrust's whole transitive dependency
+tree (about 870 pgrust crates plus third-party crates such as `openssl` with
+`vendored`, `zstd-sys` and `mimalloc`) is approved **in `pgdrop` only**. It must
+never reach the MIT crates (`testkit`, `rinitdb`, `rlibpq`, `rpsql`), through
+any edge. `scripts/check-license-wall.sh` fails if one of them can reach a
+pgrust crate, and every CI lane runs it.
+
+**Build requirements.** pgrust's tree needs a C compiler; `perl` and `make`
+(`openssl-src` builds OpenSSL from source); and, for release-family profiles,
+libre2 plus a C++ compiler. pgrust's `regexp_alt` build script refuses to build
+a release without RE2, and a dev build without it falls back to the
+Spencer-only engine. CI builds dev profiles with `PGRUST_FORCE_NO_RE2=1`, so
+every lane takes that fallback on purpose rather than depending on whether a
+runner image happens to have libre2. A release `pgdrop` with RE2, including a
+static musl build (Alpine packages no static libre2), is later work.
+
+**Cost.** A debug build of `pgdrop` with the pgrust tree takes about 3 minutes
+on 4 cores, cold. With full debuginfo the tree made an 11 GB `target/`, so
+`[profile.dev.package."*"]` keeps line tables only for dependencies (1.3 GB).
+The fork is a 727 MB git repository. CI caches `~/.cargo/git`, the registry
+and `target/` per lane (`Swatinem/rust-cache`), so a warm run fetches and
+compiles none of pgrust.
+
+**Linking.** `pgdrop` now links `main_main`. It reads only pgrust's
+`PG_BACKEND_VERSIONSTR`, for `pgdrop postgres --version`. Running the server
+in-process is NAT-407.

@@ -592,8 +592,15 @@ impl PipelineState {
             // fe-protocol3.c:446 — PortalSuspended has no case of its own,
             // and neither has NegotiateProtocolVersion: it is read only by
             // the startup loop (`fe-connect.c:4148`), never mid-query.
+            // The COPY messages are decoded, but this state machine has no
+            // COPY states yet: they are still the error they were.
             other @ (Backend::PortalSuspended
             | Backend::NegotiateProtocolVersion { .. }
+            | Backend::CopyInResponse(_)
+            | Backend::CopyOutResponse(_)
+            | Backend::CopyBothResponse(_)
+            | Backend::CopyData(_)
+            | Backend::CopyDone
             | Backend::Other { .. }) => {
                 return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
             }
@@ -886,6 +893,11 @@ pub fn message_id(message: &Backend) -> u8 {
         Backend::NoData => b'n',
         Backend::PortalSuspended => b's',
         Backend::ParameterDescription(_) => b't',
+        Backend::CopyInResponse(_) => b'G',
+        Backend::CopyOutResponse(_) => b'H',
+        Backend::CopyBothResponse(_) => b'W',
+        Backend::CopyData(_) => b'd',
+        Backend::CopyDone => b'c',
         Backend::Other { id, .. } => *id,
     }
 }

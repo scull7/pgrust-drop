@@ -252,6 +252,33 @@ pub fn next_frame(buf: &[u8]) -> Frame {
     }
 }
 
+/// `getCopyDataMessage`'s header handling, `fe-protocol3.c:1808`-`:1838`:
+/// the same as [`next_frame`] but without the long-message check, which
+/// `pqParseInput3` makes (`:102`) and `getCopyDataMessage` does not — only a
+/// length below 4 is lost synchronization there (`:1813`).
+#[must_use]
+pub fn next_copy_frame(buf: &[u8]) -> Frame {
+    if buf.len() < 5 {
+        return Frame::Incomplete;
+    }
+    let id = buf[0];
+    let length = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    if length < 4 {
+        return Frame::SyncLoss { id, length };
+    }
+    // `length >= 4` was checked just above, so this cannot fail.
+    let Ok(body_len) = usize::try_from(length - 4) else {
+        return Frame::SyncLoss { id, length };
+    };
+    if buf.len() - 5 < body_len {
+        return Frame::Incomplete;
+    }
+    Frame::Message {
+        id,
+        body: 5..5 + body_len,
+    }
+}
+
 /// `PQtransactionStatus`, set by `getReadyForQuery` (`fe-protocol3.c:1763`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
@@ -314,9 +341,34 @@ pub enum Backend {
     /// `PqMsg_ParameterDescription` (`getParamDescriptions`,
     /// `fe-protocol3.c:690`): one type OID per parameter.
     ParameterDescription(Vec<u32>),
-    /// The COPY messages and anything else this port does not interpret yet:
-    /// parsed as far as their type.
+    /// `PqMsg_CopyInResponse`, `protocol.h:45` (`getCopyStart`,
+    /// `fe-protocol3.c:1707`).
+    CopyInResponse(CopyFormat),
+    /// `PqMsg_CopyOutResponse`, `protocol.h:46`.
+    CopyOutResponse(CopyFormat),
+    /// `PqMsg_CopyBothResponse`, `protocol.h:54`.
+    CopyBothResponse(CopyFormat),
+    /// `PqMsg_CopyData`, `protocol.h:65`: one row, or any other chunk, of
+    /// COPY data, as the server framed it.
+    CopyData(Vec<u8>),
+    /// `PqMsg_CopyDone`, `protocol.h:64`.
+    CopyDone,
+    /// Anything else this port does not interpret yet (FunctionCallResponse):
+    /// parsed as far as its type.
     Other { id: u8, body: Vec<u8> },
+}
+
+/// The body of a CopyInResponse, CopyOutResponse or CopyBothResponse, as
+/// `getCopyStart` reads it (`fe-protocol3.c:1707`): the overall format, then
+/// one format code per column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFormat {
+    /// `conn->copy_is_binary`, the byte `pqGetc` read (`:1717`): 0 for text,
+    /// 1 for binary.
+    pub overall: u8,
+    /// `attDescs[i].format`, each read unsigned and coerced to signed
+    /// (`:1739`-`:1747`).
+    pub column_formats: Vec<i16>,
 }
 
 impl Backend {
@@ -410,18 +462,13 @@ impl Backend {
             b'3' => Backend::CloseComplete,
             b'n' => Backend::NoData,
             b's' => Backend::PortalSuspended,
-            b't' => {
-                // fe-protocol3.c:703 — a two-byte count, read unsigned, then
-                // one four-byte OID per parameter (`:719`). Nothing reserves
-                // capacity from the count, so a lying one costs only the
-                // bytes that are actually there.
-                let nparams = r.u16()?;
-                let mut types = Vec::new();
-                for _ in 0..nparams {
-                    types.push(r.u32()?);
-                }
-                Backend::ParameterDescription(types)
-            }
+            b't' => decode_parameter_description(&mut r)?,
+            b'G' => Backend::CopyInResponse(decode_copy_format(&mut r)?),
+            b'H' => Backend::CopyOutResponse(decode_copy_format(&mut r)?),
+            b'W' => Backend::CopyBothResponse(decode_copy_format(&mut r)?),
+            // pqGetCopyData3, fe-protocol3.c:1946 — the whole body is data.
+            b'd' => Backend::CopyData(r.take(body.len())?.to_vec()),
+            b'c' => Backend::CopyDone,
             _ => Backend::Other {
                 id,
                 body: body.to_vec(),
@@ -465,6 +512,36 @@ fn decode_negotiate_protocol_version(r: &mut Reader<'_>) -> Result<Backend, Prot
     Ok(Backend::NegotiateProtocolVersion {
         newest,
         unrecognized,
+    })
+}
+
+/// `getParamDescriptions`, `fe-protocol3.c:690`: a two-byte count, read
+/// unsigned (`:703`), then one four-byte OID per parameter (`:719`). Nothing
+/// reserves capacity from the count, so a lying one costs only the bytes
+/// that are actually there.
+fn decode_parameter_description(r: &mut Reader<'_>) -> Result<Backend, ProtocolError> {
+    let nparams = r.u16()?;
+    let mut types = Vec::new();
+    for _ in 0..nparams {
+        types.push(r.u32()?);
+    }
+    Ok(Backend::ParameterDescription(types))
+}
+
+/// `getCopyStart`, `fe-protocol3.c:1707`: the overall format byte, a
+/// two-byte column count read unsigned (`:1721`), then one two-byte format
+/// per column. Nothing reserves capacity from the count, so a lying one
+/// costs only the bytes that are actually there.
+fn decode_copy_format(r: &mut Reader<'_>) -> Result<CopyFormat, ProtocolError> {
+    let overall = r.u8()?;
+    let nfields = r.u16()?;
+    let mut column_formats = Vec::new();
+    for _ in 0..nfields {
+        column_formats.push(r.i16()?);
+    }
+    Ok(CopyFormat {
+        overall,
+        column_formats,
     })
 }
 
@@ -537,6 +614,14 @@ pub enum Frontend {
     Sync,
     /// `PqMsg_Flush`, `protocol.h:24`.
     Flush,
+    /// `PqMsg_CopyData`, `protocol.h:65`, as `PQputCopyData` sends it
+    /// (`fe-exec.c:2750`): the bytes, unframed.
+    CopyData(Vec<u8>),
+    /// `PqMsg_CopyDone`, `protocol.h:64` (`PQputCopyEnd`, `fe-exec.c:2792`).
+    CopyDone,
+    /// `PqMsg_CopyFail`, `protocol.h:29` (`PQputCopyEnd`, `fe-exec.c:2784`):
+    /// the error message, sent with `pqPuts`, so NUL-terminated.
+    CopyFail(Vec<u8>),
 }
 
 /// What a Describe or Close names: the `type` byte of `PQsendTypedCommand`
@@ -659,6 +744,9 @@ impl Frontend {
             }
             Frontend::Sync => packet(b'S', b""),
             Frontend::Flush => packet(b'H', b""),
+            Frontend::CopyData(data) => packet(b'd', data),
+            Frontend::CopyDone => packet(b'c', b""),
+            Frontend::CopyFail(message) => packet(b'f', &cstring(message)),
         }
     }
 }
@@ -1163,21 +1251,124 @@ mod tests {
         );
     }
 
-    /// A message this port does not interpret yet (CopyDone here) keeps its
-    /// bytes rather than failing to decode; refusing it is the caller's decision
-    /// (`fe-protocol3.c:447`).
+    /// A message this port does not interpret yet (FunctionCallResponse
+    /// here) keeps its bytes rather than failing to decode; refusing it is
+    /// the caller's decision (`fe-protocol3.c:447`).
     #[test]
     fn an_unhandled_message_type_keeps_its_body() {
         assert_eq!(
-            Backend::decode(b'c', b"").unwrap(),
+            Backend::decode(b'V', b"\xff\xff\xff\xff").unwrap(),
             Backend::Other {
-                id: b'c',
-                body: Vec::new()
+                id: b'V',
+                body: vec![0xff; 4]
             }
         );
         assert_eq!(
-            ProtocolError::UnexpectedResponse(b'c').message(),
-            b"unexpected response from server; first received character was \"c\"".to_vec()
+            ProtocolError::UnexpectedResponse(b'V').message(),
+            b"unexpected response from server; first received character was \"V\"".to_vec()
+        );
+    }
+
+    /// `getCopyStart`, `fe-protocol3.c:1707`: the overall format, then the
+    /// column formats, each two-byte one coerced to signed (`:1746`).
+    #[test]
+    fn a_copy_response_carries_its_formats() {
+        let body = [0u8, 0, 2, 0, 0, 0xff, 0xff];
+        let format = CopyFormat {
+            overall: 0,
+            column_formats: vec![0, -1],
+        };
+        assert_eq!(
+            Backend::decode(b'G', &body).unwrap(),
+            Backend::CopyInResponse(format.clone())
+        );
+        assert_eq!(
+            Backend::decode(b'H', &body).unwrap(),
+            Backend::CopyOutResponse(format.clone())
+        );
+        assert_eq!(
+            Backend::decode(b'W', &body).unwrap(),
+            Backend::CopyBothResponse(format)
+        );
+        assert_eq!(
+            Backend::decode(b'H', &[1, 0, 2, 0, 1]),
+            Err(ProtocolError::InsufficientData(b'H')),
+            "a column count the body cannot back"
+        );
+        assert_eq!(
+            Backend::decode(b'G', &[0, 0, 0, 7]),
+            Err(ProtocolError::ContentsDoNotAgree(b'G'))
+        );
+    }
+
+    /// `getCopyDataMessage` believes any length of 4 or more
+    /// (`fe-protocol3.c:1813`), where `pqParseInput3` doubts a long one of
+    /// most types (`:102`).
+    #[test]
+    fn a_copy_frame_is_not_held_to_the_long_message_threshold() {
+        let mut long = vec![b'S'];
+        long.extend_from_slice(&40_000i32.to_be_bytes());
+        assert_eq!(
+            next_frame(&long),
+            Frame::SyncLoss {
+                id: b'S',
+                length: 40_000
+            }
+        );
+        assert_eq!(next_copy_frame(&long), Frame::Incomplete);
+        long.resize(1 + 40_000, 0);
+        assert_eq!(
+            next_copy_frame(&long),
+            Frame::Message {
+                id: b'S',
+                body: 5..40_001
+            }
+        );
+        let mut broken = vec![b'd'];
+        broken.extend_from_slice(&3i32.to_be_bytes());
+        assert_eq!(
+            next_copy_frame(&broken),
+            Frame::SyncLoss {
+                id: b'd',
+                length: 3
+            }
+        );
+        broken[1..5].copy_from_slice(&i32::MIN.to_be_bytes());
+        assert_eq!(
+            next_copy_frame(&broken),
+            Frame::SyncLoss {
+                id: b'd',
+                length: i32::MIN
+            }
+        );
+    }
+
+    /// CopyData's body is the data, whole; CopyDone has none.
+    #[test]
+    fn copy_data_is_its_body() {
+        assert_eq!(
+            Backend::decode(b'd', b"1\tone\n").unwrap(),
+            Backend::CopyData(b"1\tone\n".to_vec())
+        );
+        assert_eq!(Backend::decode(b'c', b"").unwrap(), Backend::CopyDone);
+        assert_eq!(
+            Backend::decode(b'c', b"x"),
+            Err(ProtocolError::ContentsDoNotAgree(b'c'))
+        );
+    }
+
+    /// `PQputCopyData`, `PQputCopyEnd` (`fe-exec.c:2750`, `:2784`, `:2792`):
+    /// CopyFail's message goes out with its NUL (`pqPuts`).
+    #[test]
+    fn the_copy_messages_a_client_sends() {
+        assert_eq!(
+            Frontend::CopyData(b"a\n".to_vec()).encode(),
+            b"d\0\0\0\x06a\n".to_vec()
+        );
+        assert_eq!(Frontend::CopyDone.encode(), b"c\0\0\0\x04".to_vec());
+        assert_eq!(
+            Frontend::CopyFail(b"no".to_vec()).encode(),
+            b"f\0\0\0\x07no\0".to_vec()
         );
     }
 

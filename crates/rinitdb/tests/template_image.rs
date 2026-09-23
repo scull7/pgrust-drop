@@ -86,7 +86,10 @@ fn a_reference_cluster_round_trips_through_the_image() {
         "PG_VERSION",
         "postgresql.conf",
         "pg_hba.conf",
+        "pg_ident.conf",
+        "postgresql.auto.conf",
         "global/pg_control",
+        "pg_stat/pgstat.stat",
     ] {
         assert!(minted.join(gone).is_file(), "C initdb wrote {gone}");
         assert!(!paths.contains(&gone), "{gone} is stripped");

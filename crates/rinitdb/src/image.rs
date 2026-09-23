@@ -219,7 +219,10 @@ pub enum ImageError {
 /// - `postgresql.conf`, `pg_hba.conf`, `pg_ident.conf` are rendered from the
 ///   vendored samples (`crate::conf`); `postgresql.auto.conf` is written
 ///   fresh, as `initdb.c` writes it.
-/// - `postmaster.opts` records the mint host's server command line.
+/// - `postmaster.opts` is on NAT-381's list, but `initdb` alone never writes
+///   one: it is the postmaster's (`CreateOptsFile`,
+///   `src/backend/postmaster/postmaster.c:4063`), and a mint runs only
+///   `--single` backends. This entry guards a mint that started a server.
 /// - `global/pg_control` carries the mint's system identifier and timestamps;
 ///   a fresh one is written (`crate::control`).
 /// - `PG_VERSION` at the top level is written by `crate::layout`

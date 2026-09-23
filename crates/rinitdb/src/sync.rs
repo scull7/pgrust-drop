@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::InitdbError;
 
-/// `MINIMUM_VERSION_FOR_PG_WAL` (`file_utils.c:45`) is 100000 and this port
+/// `MINIMUM_VERSION_FOR_PG_WAL` (`file_utils.c:46`) is 100000 and this port
 /// only ever syncs its own clusters, so the WAL directory is always `pg_wal`.
 const PG_WAL_DIR: &str = "pg_wal";
 
@@ -79,7 +79,7 @@ pub fn parse_sync_method(arg: Option<&str>) -> Result<SyncMethod, InitdbError> {
 }
 
 /// What `stat`/`lstat` says an entry is, as far as `walkdir` cares
-/// (`PGFileType`, `src/include/common/file_utils.h:19`).
+/// (`PGFileType`, `src/include/common/file_utils.h:18`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     /// `PGFILETYPE_REG`.
@@ -99,7 +99,7 @@ pub enum FileKind {
 /// [`SyncProbe::read_dir`], which makes `walkdir` give up on the directory
 /// entirely (`file_utils.c:304`); `readdir` failing part-way through is
 /// [`DirListing::read_error`], which C reports *after* acting on everything it
-/// did manage to read and then still fsyncs the directory (`:337`, `:347`).
+/// did manage to read and then still fsyncs the directory (`:337`, `:348`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirListing {
     /// The entry names the loop read, in directory order, without `.` and
@@ -165,7 +165,7 @@ pub fn plan(
     let pg_tblspc = pgdata.join(PG_TBLSPC_DIR);
     let mut ops = Vec::new();
 
-    // file_utils.c:113 — "If pg_wal is a symlink, we'll need to recurse into
+    // file_utils.c:114 — "If pg_wal is a symlink, we'll need to recurse into
     // it separately, because the first walkdir below will ignore it."
     let xlog_is_symlink = match fs.lstat(&pg_wal) {
         Ok(kind) => kind == FileKind::Symlink,
@@ -179,7 +179,7 @@ pub fn plan(
         }
     };
 
-    // file_utils.c:188 is a switch on the method, and both arms plan the same
+    // file_utils.c:128 is a switch on the method, and both arms plan the same
     // `DATA_DIR_SYNC_METHOD_FSYNC` walk here, because `syncfs(2)` is not
     // reachable from the standard library; see the `--sync-method=syncfs` row
     // in docs/divergences.md and `syncfs_plans_the_same_walk_as_fsync`. This
@@ -192,7 +192,7 @@ pub fn plan(
 
     let exclude_dir = (!sync_data_files).then(|| pgdata.join(BASE_DIR));
 
-    // file_utils.c:206 — "The main call ignores symlinks, so in addition to
+    // file_utils.c:210 — "The main call ignores symlinks, so in addition to
     // specially processing pg_wal if it's a symlink, pg_tblspc has to be
     // visited separately with process_symlinks = true."
     //
@@ -228,7 +228,7 @@ fn walkdir(
         Err(reason) => {
             // file_utils.c:304 — reported, and the caller carries on. Note
             // that `path` itself is *not* fsync'd in this case: C returns
-            // before the trailing action at `:347`.
+            // before the trailing action at `:348`.
             ops.push(SyncOp::Warn(InitdbError::CouldNotOpenDirectory {
                 path: display(path),
                 reason,
@@ -244,7 +244,7 @@ fn walkdir(
                 path: subpath,
                 isdir: false,
             }),
-            // file_utils.c:324 — "we intentionally don't pass down the
+            // file_utils.c:279 — "we intentionally don't pass down the
             // process_symlinks flag to recursive calls".
             Some(FileKind::Directory) => walkdir(&subpath, exclude_dir, false, fs, ops),
             // file_utils.c:326 — remaining symlinks, unknown types and the
@@ -263,7 +263,7 @@ fn walkdir(
         }));
     }
 
-    // file_utils.c:347 — "It's important to fsync the destination directory
+    // file_utils.c:343 — "It's important to fsync the destination directory
     // itself as individual file fsyncs don't guarantee that the directory
     // entry for the file is synced."
     ops.push(SyncOp::Fsync {
@@ -273,7 +273,7 @@ fn walkdir(
 }
 
 /// `get_dirent_type(path, de, look_through_symlinks, PG_LOG_ERROR)`
-/// (`src/common/file_utils.c:566`).
+/// (`src/common/file_utils.c:547`).
 ///
 /// `d_type` is not reachable from `std::fs::DirEntry`, so this always takes
 /// the `PGFILETYPE_UNKNOWN` path C takes on a filesystem that does not fill it
@@ -337,7 +337,7 @@ pub fn apply(ops: &[SyncOp], stderr: &mut impl Write) -> Result<(), InitdbError>
     Ok(())
 }
 
-/// The `errno` values `fsync_fname` (`file_utils.c:424`, `:437`) tests by
+/// The `errno` values `fsync_fname` (`file_utils.c:426`, `:438`) tests by
 /// name. They have no `std::io::ErrorKind` spelling that covers all four, and
 /// `libc` is not an approved dependency, so they are the POSIX numbers Linux
 /// uses in `<asm-generic/errno-base.h>`.
@@ -353,7 +353,7 @@ mod errno {
 /// `Ok(None)` is C's `return 0`, `Ok(Some(err))` its `return -1` after a
 /// non-fatal `pg_log_error`, and `Err` its `exit(EXIT_FAILURE)`.
 fn fsync_fname(path: &Path, isdir: bool) -> Result<Option<InitdbError>, InitdbError> {
-    // file_utils.c:412 — "Some OSs require directories to be opened read-only
+    // file_utils.c:407 — "Some OSs require directories to be opened read-only
     // whereas other systems don't allow us to fsync files opened read-only;
     // so we need both cases here."
     let mut open = std::fs::OpenOptions::new();
@@ -379,7 +379,7 @@ fn fsync_fname(path: &Path, isdir: bool) -> Result<Option<InitdbError>, InitdbEr
 
     match file.sync_all() {
         Ok(()) => Ok(None),
-        // file_utils.c:437 — "Some OSes don't allow us to fsync directories at
+        // file_utils.c:435 — "Some OSes don't allow us to fsync directories at
         // all, so we can ignore those errors."
         Err(err) if isdir && (is(&err, errno::EBADF) || is(&err, errno::EINVAL)) => Ok(None),
         Err(err) => Err(InitdbError::CouldNotFsyncFile {
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn syncfs_is_accepted_exactly_where_the_build_has_it() {
-        // option_utils.c:93 and the #else at :99; 001_initdb.pl:19 picks the
+        // option_utils.c:96 and the #else at :98; 001_initdb.pl:19 picks the
         // same two branches from the same define.
         let parsed = parse_sync_method(Some("syncfs"));
         if HAVE_SYNCFS {
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_fsynced_after_everything_in_it() {
-        // file_utils.c:347.
+        // file_utils.c:348.
         let fs = cluster();
         let ops = plan(Path::new("/d"), SyncMethod::Fsync, true, &fs);
         assert_eq!(warnings(&ops), Vec::<String>::new());
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn no_sync_data_files_excludes_base_and_skips_pg_tblspc() {
-        // file_utils.c:190 (exclude_dir) and :219 (the pg_tblspc guard).
+        // file_utils.c:190 (exclude_dir) and :220 (the pg_tblspc guard).
         let fs = cluster();
         let ops = plan(Path::new("/d"), SyncMethod::Fsync, false, &fs);
         assert_eq!(warnings(&ops), Vec::<String>::new());
@@ -657,8 +657,8 @@ mod tests {
 
     #[test]
     fn a_symlinked_pg_wal_is_walked_separately() {
-        // file_utils.c:113: the first walkdir ignores the symlink, so the
-        // contents only get synced by the second call at :218.
+        // file_utils.c:114: the first walkdir ignores the symlink, so the
+        // contents only get synced by the second call at :219.
         // `cluster()` already gives /d/pg_wal its one segment; `link` only
         // changes what `lstat` says the entry itself is.
         let fs = cluster().link("/d/pg_wal", FileKind::Directory);
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_directory_is_reported_and_not_fsynced() {
-        // file_utils.c:304 returns before the trailing action at :347.
+        // file_utils.c:304 returns before the trailing action at :348.
         let mut fs = cluster();
         fs.entries.remove(Path::new("/d/global"));
         let ops = plan(Path::new("/d"), SyncMethod::Fsync, true, &fs);
@@ -746,7 +746,7 @@ mod tests {
         // different places. opendir failing means the directory is skipped
         // whole (tested above); readdir failing part-way means C acts on the
         // names it did read, reports `could not read directory`, and *still*
-        // fsyncs the directory at :347.
+        // fsyncs the directory at :348.
         let fs = cluster().unreadable_after("/d/global", &["pg_control"], "Stale file handle");
         let ops = plan(Path::new("/d"), SyncMethod::Fsync, true, &fs);
 

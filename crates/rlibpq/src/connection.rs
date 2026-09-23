@@ -2,7 +2,7 @@
 //!
 //! Ported from `src/interfaces/libpq/fe-connect.c` (`pqConnectDBComplete`'s
 //! blocking loop, `:2782`, and `PQconnectPoll`'s `CONNECTION_AWAITING_RESPONSE`
-//! state, `:4200`) and `fe-exec.c` (`PQexec`, `:2279`, which sends one Query and
+//! state, `:3982`) and `fe-exec.c` (`PQexec`, `:2279`, which sends one Query and
 //! collects results until ReadyForQuery).
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]

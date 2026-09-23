@@ -48,7 +48,7 @@ pub mod uri;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
 pub use connection::{
-    Address, Connection, ConnectionError, QueryClass, QueryRunner, Stream, socket_address,
+    Address, Connection, ConnectionError, QueryClass, QueryRunner, Stream, Tracer, socket_address,
 };
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,

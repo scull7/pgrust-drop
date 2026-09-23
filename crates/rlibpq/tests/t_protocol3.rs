@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rlibpq::conninfo::{Env, parse_conninfo};
-use rlibpq::{Connection, ContextVisibility, ExecStatus, Params, QueryResult, Verbosity};
+use rlibpq::{
+    Connection, ContextVisibility, ExecStatus, Params, QueryResult, TraceFlags, Verbosity,
+};
 use testkit::reference;
 
 /// The three C tools a live gate needs.
@@ -501,4 +503,134 @@ fn test_prepared_outside_pipeline_mode() {
     );
     let again = only(conn.close_portal(b"cursor_one").expect("runs"));
     assert_eq!(again.status(), ExecStatus::CommandOk);
+}
+
+/// A trace sink the gate reads back after `PQuntrace` hands it over.
+#[derive(Clone, Default)]
+struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("sink lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Lines `first..=last` (1-based) of an upstream trace vendored in
+/// `tests/traces/`, each with its newline — `None` for `last` means to the
+/// end of the file.
+fn upstream_trace(name: &str, first: usize, last: Option<usize>) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/traces")
+        .join(name);
+    let text = std::fs::read(&path).expect("the vendored trace is readable");
+    let lines: Vec<&[u8]> = text.split_inclusive(|b| *b == b'\n').collect();
+    let last = last.unwrap_or(lines.len());
+    lines[first - 1..last].concat()
+}
+
+/// A connection set up the way `libpq_pipeline.c`'s `main` sets one up
+/// before it turns tracing on (`:2332`-`:2337`, `:2352`-`:2354`).
+fn traced_like_libpq_pipeline(cluster: &Cluster) -> (Connection, SharedSink) {
+    let mut conn = cluster.connect();
+    for setup in [
+        &b"SET lc_messages TO \"C\""[..],
+        b"SET debug_parallel_query = off",
+    ] {
+        let result = only(conn.exec(setup).expect("runs"));
+        assert_eq!(result.status(), ExecStatus::CommandOk);
+    }
+    let sink = SharedSink::default();
+    conn.trace(Box::new(sink.clone()));
+    conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS | TraceFlags::REGRESS_MODE);
+    (conn, sink)
+}
+
+/// `001_libpq_pipeline.pl:72`, "prepared trace match", for every line of
+/// `traces/prepared.trace` this port can produce yet: lines 8 to 42.
+///
+/// Lines 1-7 are one pipeline (Parse, Describe, one Sync) and wait for
+/// pipeline mode; here the statement is prepared before tracing starts. From
+/// line 8 on, `test_prepared` (`libpq_pipeline.c:1312`-`:1405`) sends each
+/// command alone, pipelined or not — a single `PQsendClosePrepared` or
+/// `PQsendDescribePortal` followed by `PQpipelineSync` puts the same two
+/// messages on the wire as the blocking call — so the blocking calls below
+/// must reproduce the file byte for byte, `Terminate` from `PQfinish`
+/// included.
+#[test]
+fn prepared_trace_match_from_line_8() {
+    let Some(cluster) = Cluster::start("trust", 55_453) else {
+        return;
+    };
+    let (mut conn, sink) = traced_like_libpq_pipeline(&cluster);
+    // Lines 1-7 stand-in: the statement exists before line 8, as it does
+    // upstream, but its Parse is not part of the comparison.
+    let prepared = only(
+        conn.prepare(
+            b"select_one",
+            b"SELECT $1, '42', $1::numeric, interval '1 sec'",
+            &[23],
+        )
+        .expect("runs"),
+    );
+    assert_eq!(prepared.status(), ExecStatus::CommandOk);
+    sink.0.lock().expect("sink lock").clear();
+
+    // :1312 — lines 8-11; :1334 and :1342 — lines 12-19.
+    only(conn.close_prepared(b"select_one").expect("runs"));
+    only(conn.describe_prepared(b"select_one").expect("runs"));
+    only(conn.close_prepared(b"select_one").expect("runs"));
+    // :1347-:1348 — lines 20-25.
+    only(conn.exec(b"BEGIN").expect("runs"));
+    only(
+        conn.exec(b"DECLARE cursor_one CURSOR FOR SELECT 1")
+            .expect("runs"),
+    );
+    // :1350, :1373, :1395 and :1403 — lines 26-41.
+    only(conn.describe_portal(b"cursor_one").expect("runs"));
+    only(conn.close_portal(b"cursor_one").expect("runs"));
+    only(conn.describe_portal(b"cursor_one").expect("runs"));
+    only(conn.close_portal(b"cursor_one").expect("runs"));
+    // PQfinish, :2390 — line 42.
+    conn.terminate().expect("Terminate is sent");
+    assert!(conn.untrace().is_some());
+
+    let ours = sink.0.lock().expect("sink lock").clone();
+    let expected = upstream_trace("prepared.trace", 8, None);
+    assert_eq!(
+        String::from_utf8_lossy(&ours),
+        String::from_utf8_lossy(&expected),
+        "prepared.trace lines 8-42 must match byte for byte"
+    );
+    assert_eq!(ours, expected);
+}
+
+/// `001_libpq_pipeline.pl:72`, "transaction trace match", for its first
+/// five lines: the simple query `test_transaction` sends before it enters
+/// pipeline mode (`libpq_pipeline.c:1882`), with its NOTICE. The rest of
+/// `traces/transaction.trace` is a pipeline.
+#[test]
+fn transaction_trace_match_up_to_the_pipeline() {
+    let Some(cluster) = Cluster::start("trust", 55_454) else {
+        return;
+    };
+    let (mut conn, sink) = traced_like_libpq_pipeline(&cluster);
+    let results = conn
+        .exec(b"DROP TABLE IF EXISTS pq_pipeline_tst;CREATE TABLE pq_pipeline_tst (id int)")
+        .expect("runs");
+    assert_eq!(results.len(), 2);
+    assert!(conn.untrace().is_some());
+
+    let ours = sink.0.lock().expect("sink lock").clone();
+    let expected = upstream_trace("transaction.trace", 1, Some(5));
+    assert_eq!(
+        String::from_utf8_lossy(&ours),
+        String::from_utf8_lossy(&expected),
+        "transaction.trace lines 1-5 must match byte for byte"
+    );
+    assert_eq!(ours, expected);
 }

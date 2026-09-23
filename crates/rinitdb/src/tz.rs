@@ -11,10 +11,10 @@
 //! the file image rather than a path, so the only action involved is the read
 //! that [`crate::findtimezone`] performs.
 
-/// `TZ_STRLEN_MAX` (`include/pgtime.h:52`): the longest zone name, sans NUL.
+/// `TZ_STRLEN_MAX` (`include/pgtime.h:54`): the longest zone name, sans NUL.
 pub const TZ_STRLEN_MAX: usize = 255;
 
-/// `tzfile.h:96`-`:106`.
+/// `tzfile.h:100`-`:108`.
 const TZ_MAX_TIMES: usize = 2000;
 const TZ_MAX_TYPES: usize = 256;
 const TZ_MAX_CHARS: usize = 50;
@@ -51,7 +51,7 @@ const TZ_DEFRULESTRING: &str = ",M3.2.0,M11.1.0";
 /// (`pgtz.h:52`), and `tzparse` refuses a name pair that would not fit.
 const CHARS_CAP: usize = 2 * (TZ_STRLEN_MAX + 1);
 
-/// The fixed part of a TZif file: `struct tzhead` (`tzfile.h:38`).
+/// The fixed part of a TZif file: `struct tzhead` (`tzfile.h:39`).
 const TZHEADSIZE: usize = 44;
 
 /// `localtime.c:626`.
@@ -151,10 +151,10 @@ impl Default for State {
     }
 }
 
-/// `struct pg_tm` (`include/pgtime.h:33`).
+/// `struct pg_tm` (`include/pgtime.h:34`).
 ///
 /// The field names keep upstream's `tm_` meanings: `mon` counts from 0 and
-/// `year` is relative to 1900 (`pgtime.h:27`). `zone` borrows out of the
+/// `year` is relative to 1900 (`pgtime.h:29`). `zone` borrows out of the
 /// [`State`] it was computed from, as upstream's `tm_zone` points into
 /// `sp->chars` (`localtime.c:1337`), and it is bytes because that is what
 /// `strcmp` compares there.
@@ -181,8 +181,8 @@ impl PgTm<'_> {
         self.year + TM_YEAR_BASE
     }
 
-    /// `compare_tm` (`findtimezone.c:206`), plus the zone-abbreviation check
-    /// `score_timezone` makes right after it (`:294`).
+    /// `compare_tm` (`findtimezone.c:207`), plus the zone-abbreviation check
+    /// `score_timezone` makes right after it (`:292`).
     ///
     /// Upstream compares a system `struct tm` against a `struct pg_tm`; here
     /// both sides are `pg_tm`, so the two comparisons fold into one.
@@ -283,11 +283,11 @@ fn increment_overflow(ip: &mut i32, j: i32) -> bool {
 }
 
 /// `tzload` (`localtime.c:586`) over the file image rather than a file
-/// descriptor: the `open`/`read` upstream does at `:230`-`:236` is the caller's
+/// descriptor: the `open`/`read` upstream does at `:233`-`:237` is the caller's
 /// action. `None` is upstream's nonzero return.
 ///
 /// `doextend` is upstream's: read the v2+ footer's POSIX TZ string and splice
-/// its transitions on (`:417`).
+/// its transitions on (`:415`).
 #[must_use]
 pub fn load(image: &[u8], doextend: bool) -> Option<State> {
     let mut sp = State::default();
@@ -516,7 +516,7 @@ fn load_body(image: &[u8], doextend: bool, sp: &mut State) -> Option<()> {
     Some(())
 }
 
-/// `tzloadbody`'s extension block (`localtime.c:415`-`:485`), split out.
+/// `tzloadbody`'s extension block (`localtime.c:415`-`:493`), split out.
 fn extend(sp: &mut State, footer: &[u8]) {
     if sp.ttis.len() + 2 > TZ_MAX_TYPES {
         return;
@@ -816,7 +816,7 @@ fn transtime(year: i32, rule: &Rule, offset: i64) -> i64 {
 /// `tzparse` (`localtime.c:936`): a POSIX section 8-style TZ string.
 ///
 /// `lastditch` is upstream's: take the whole string as the standard-zone name
-/// at offset zero, which is how `"GMT"` is loaded (`pgtz.c` via `gmtload`).
+/// at offset zero, which is how `"GMT"` is loaded (`pg_tzset`, `pgtz.c:275`).
 #[must_use]
 #[allow(clippy::too_many_lines)] // One upstream function, kept in one piece.
 pub fn parse(name: &str, lastditch: bool) -> Option<State> {
@@ -927,7 +927,7 @@ pub fn parse(name: &str, lastditch: bool) -> Option<State> {
             return None;
         }
 
-        // Two transitions per year, from EPOCH_YEAR forward (`:1044`).
+        // Two transitions per year, from EPOCH_YEAR forward (`:1051`).
         sp.ttis = vec![
             init_ttinfo(clamp_offset(-stdoffset), false, 0),
             init_ttinfo(clamp_offset(-dstoffset), true, stdlen + 1),
@@ -1197,7 +1197,7 @@ pub fn acceptable(sp: &State) -> bool {
     matches!(localtime(sp, TIME_2000), Some(tm) if tm.sec == 0)
 }
 
-/// `mktime` as `build_time_t` (`findtimezone.c:189`) uses it: the instant at
+/// `mktime` as `build_time_t` (`findtimezone.c:190`) uses it: the instant at
 /// which this zone's wall clock reads `year-month-day 00:00:00`.
 ///
 /// Upstream calls the C library's `mktime`, which resolves `tm_isdst == -1` by
@@ -1238,7 +1238,7 @@ pub(crate) mod tests {
     /// One local time type for [`tzif`]: UT offset, `isdst`, index into `chars`.
     pub(crate) type Type = (i32, bool, u8);
 
-    /// Build a TZif image (RFC 8536, the layout `tzfile.h:38` describes).
+    /// Build a TZif image (RFC 8536, the layout `tzfile.h:39` describes).
     ///
     /// `version` 0 writes the 32-bit block alone, as a version 1 file; 2 writes
     /// it, then the 64-bit block, then the `\n`-wrapped POSIX TZ footer. Test
@@ -1327,7 +1327,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_fixed_offset_shifts_the_wall_clock_and_the_day() {
-        // Etc/GMT+5 is five hours *west* of Greenwich (`findtimezone.c:499`).
+        // Etc/GMT+5 is five hours *west* of Greenwich (`findtimezone.c:507`).
         let state = load(&fixed("-05", -5 * 3600), true).expect("load");
         let tm = at(&state, Y2K);
         assert_eq!(
@@ -1360,7 +1360,7 @@ pub(crate) mod tests {
     #[test]
     fn the_footer_rules_govern_instants_after_the_last_transition() {
         // zic's "slim" output: one stored transition, and a POSIX TZ string for
-        // everything after it. Without the `doextend` splice (`localtime.c:417`)
+        // everything after it. Without the `doextend` splice (`localtime.c:415`)
         // the zone would freeze at the last stored type.
         let image = tzif(
             2,
@@ -1564,7 +1564,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_instant_before_the_first_transition_takes_the_default_type() {
-        // localtime.c:521 — type 0 is used in a transition here, and the first
+        // localtime.c:537 — type 0 is used in a transition here, and the first
         // transition is to daylight, so early times take the standard type
         // below it rather than type 0.
         let image = tzif(

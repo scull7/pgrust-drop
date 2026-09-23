@@ -1,8 +1,8 @@
 //! The actions: a socket, the startup exchange, and `PQexec` over it.
 //!
-//! Ported from `src/interfaces/libpq/fe-connect.c` (`connectDBComplete`'s
-//! blocking loop and `PQconnectPoll`'s `CONNECTION_AWAITING_RESPONSE` state,
-//! `:4200`) and `fe-exec.c` (`PQexec`, `:2296`, which sends one Query and
+//! Ported from `src/interfaces/libpq/fe-connect.c` (`pqConnectDBComplete`'s
+//! blocking loop, `:2782`, and `PQconnectPoll`'s `CONNECTION_AWAITING_RESPONSE`
+//! state, `:4200`) and `fe-exec.c` (`PQexec`, `:2279`, which sends one Query and
 //! collects results until ReadyForQuery).
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]
@@ -354,7 +354,7 @@ pub struct QueryRunner {
     parameters: Vec<(Vec<u8>, Vec<u8>)>,
     transaction_status: Option<TransactionStatus>,
     /// Once an error result is set up, later DataRows are ignored
-    /// (`fe-protocol3.c:881`).
+    /// (`fe-protocol3.c:882`).
     saw_error: bool,
 }
 
@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     /// After an error result, later DataRows are ignored rather than
-    /// misfiled (`fe-protocol3.c:881`).
+    /// misfiled (`fe-protocol3.c:882`).
     #[test]
     fn data_rows_after_an_error_are_ignored() {
         let mut runner = QueryRunner::new();

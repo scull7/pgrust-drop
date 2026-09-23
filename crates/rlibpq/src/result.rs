@@ -441,7 +441,7 @@ mod tests {
         );
 
         // PQERRORS_TERSE has no QUERY line to carry the statement, so there
-        // the position does go in the text (`fe-protocol3.c:1118`).
+        // the position does go in the text (`fe-protocol3.c:1121`).
         assert_eq!(
             String::from_utf8(error.message(
                 ExecStatus::FatalError,

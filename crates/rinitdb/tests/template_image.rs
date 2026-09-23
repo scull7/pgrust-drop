@@ -207,3 +207,25 @@ fn the_image_expands_over_rinitdbs_layout() {
         &[],
     );
 }
+
+/// The mint tool's libc check (`rinitdb::image::mint::check_musl`) accepts
+/// the musl lane's real reference binaries, not only a synthetic ELF header:
+/// otherwise `scripts/mint-template-image.sh` could not run on the lane the
+/// owner chose to mint on (NAT-381). Only the musl lane's references are
+/// musl, so only that lane asks.
+#[cfg(target_env = "musl")]
+#[test]
+fn the_musl_reference_binaries_may_mint_the_image() {
+    for tool in ["initdb", "postgres"] {
+        let Some(path) = reference::find_or_skip(tool) else {
+            return;
+        };
+        let elf = std::fs::read(&path).expect("read the reference binary");
+        assert_eq!(
+            image::mint::check_musl(tool, &elf),
+            Ok(()),
+            "{}",
+            path.display()
+        );
+    }
+}

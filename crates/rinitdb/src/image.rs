@@ -5,8 +5,13 @@
 //! `postgres --boot`: C `initdb` runs once, offline, and every later cluster
 //! starts as a copy of its catalogs. This module is the format and the two
 //! ends of it — [`read_tree`] and [`strip`] on the mint side, [`pack`] in the
-//! middle, [`parse`] and [`expand`] on the run side. Where the minted image
-//! lives and how it is embedded are separate steps (NAT-381 follow-ups).
+//! middle, [`parse`] and [`expand`] on the run side.
+//!
+//! The minted image itself is committed at `crates/rinitdb/image/` and
+//! embedded as [`TEMPLATE`], with its provenance [`TEMPLATE_MANIFEST`]
+//! ([`manifest`]); `scripts/mint-template-image.sh` makes both, and [`mint`]
+//! holds what it refuses to mint with. The README beside the image records
+//! where it came from and its licence.
 //!
 //! Data / Calculations / Actions: [`ImagePath`], [`Entry`] and [`Node`] are
 //! the data; [`strip`], [`pack`] and [`parse`] are pure; [`read_tree`] and
@@ -47,6 +52,16 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use crate::crc32c::crc32c;
+
+/// The committed template image: a PostgreSQL 18.6 cluster minted on the
+/// musl lane with [`MINT_ARGS`], stripped and packed (NAT-381). Output of
+/// PostgreSQL's `initdb`, under the PostgreSQL licence; see
+/// `crates/rinitdb/image/README.md`.
+pub static TEMPLATE: &[u8] = include_bytes!("../image/template.img");
+
+/// [`TEMPLATE`]'s provenance: the `initdb` that minted it, its options, its
+/// length and SHA-256 ([`manifest::Manifest`]).
+pub const TEMPLATE_MANIFEST: &str = include_str!("../image/template.manifest");
 
 /// `"RINITDB"` followed by the format version.
 pub const MAGIC: [u8; 8] = *b"RINITDB\x01";
@@ -627,6 +642,49 @@ mod tests {
             Entry::file(path("base/1/1259"), vec![0; 8192]),
             Entry::file(path("empty"), Vec::new()),
         ]
+    }
+
+    /// The committed image is the one its manifest records, and the manifest
+    /// records the recipe this crate mints with. Recompute the digest with
+    /// `sha256sum crates/rinitdb/image/template.img`.
+    #[test]
+    fn the_embedded_image_is_the_one_the_manifest_records() {
+        let manifest = manifest::Manifest::parse(TEMPLATE_MANIFEST).unwrap();
+        assert_eq!(manifest.bytes, TEMPLATE.len() as u64, "length");
+        assert_eq!(
+            manifest.sha256,
+            crate::sha256::digest_hex(TEMPLATE),
+            "digest; re-mint with scripts/mint-template-image.sh and commit the image and \
+             manifest together"
+        );
+        assert_eq!(manifest.format, MAGIC[MAGIC.len() - 1], "format version");
+        assert_eq!(manifest.initdb, manifest::MINT_INITDB_VERSION);
+        assert_eq!(manifest.libc, manifest::MINT_LIBC);
+        assert_eq!(manifest.options, MINT_ARGS.join(" "));
+    }
+
+    /// The committed image is a well-formed, stripped PostgreSQL 18 cluster.
+    #[test]
+    fn the_embedded_image_is_a_stripped_postgresql_18_cluster() {
+        let entries = parse(TEMPLATE).unwrap();
+        assert!(entries.iter().all(keeps), "nothing strip drops is embedded");
+        let file = |name: &str| {
+            entries.iter().find_map(|entry| match entry.node {
+                Node::File(contents) if entry.path.as_str() == name => Some(contents),
+                _ => None,
+            })
+        };
+        // template1, template0 and postgres, each at the catalog version.
+        for db in ["base/1", "base/4", "base/5"] {
+            assert_eq!(
+                file(&format!("{db}/PG_VERSION")),
+                Some(b"18\n".as_slice()),
+                "{db}"
+            );
+        }
+        for name in ["global/pg_filenode.map", "global/1262", "pg_xact/0000"] {
+            assert!(file(name).is_some(), "{name}");
+        }
     }
 
     #[test]

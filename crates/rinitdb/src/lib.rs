@@ -104,8 +104,8 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
     }
 }
 
-/// `initialize_data_directory` (`initdb.c:3049`) as far as this port has it,
-/// with `cleanup_directories_atexit` (`:761`) behind it.
+/// `initialize_data_directory` (`initdb.c:3044`) as far as this port has it,
+/// with `cleanup_directories_atexit` (`:762`) behind it.
 ///
 /// Action, and the reason the two are one function: C's exit handler reports
 /// the directories the creation sequence had already made, so every failure
@@ -129,8 +129,8 @@ fn create_cluster(plan: &CreatePlan, no_clean: bool, stderr: &mut impl Write) ->
     ExitCode::from(EXIT_FAILURE)
 }
 
-/// Action: `create_data_directory` (`initdb.c:3060`) and then the head of
-/// `create_xlog_or_symlink` (`:3062`), in C's order.
+/// Action: `create_data_directory` (`initdb.c:2890`) and then the head of
+/// `create_xlog_or_symlink` (`:2948`), in C's order.
 ///
 /// The order is the whole point. C judges `--waldir` only once PGDATA exists,
 /// which is why both of its `--waldir` refusals are followed by `removing data
@@ -140,7 +140,7 @@ fn create_directories(plan: &CreatePlan, progress: &mut Progress) -> Result<(), 
     layout::apply(std::slice::from_ref(&layout::data_directory_op(plan)))?;
     progress.pgdata = Some((plan.pgdata.clone(), plan.pgdata_action));
 
-    // initdb.c:2955-:3010. Its mkdir half, and the subdirs loop after it, are
+    // initdb.c:2955-:3012. Its mkdir half, and the subdirs loop after it, are
     // NAT-381 … NAT-387; nothing beyond this point touches the filesystem yet,
     // so `progress.waldir` stays None.
     classify_waldir(plan.waldir.as_deref(), &RealFs)?;
@@ -161,7 +161,7 @@ fn sync_only(plan: &SyncPlan, stdout: &mut impl Write, stderr: &mut impl Write) 
         &sync::RealFs,
     );
     match sync::apply(&ops, stderr) {
-        // check_ok(), initdb.c:2127.
+        // check_ok(), initdb.c:2109.
         Ok(()) => {
             let _ = stdout.write_all(sync::CHECK_OK.as_bytes());
             ExitCode::SUCCESS

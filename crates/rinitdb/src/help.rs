@@ -6,7 +6,7 @@ pub const PG_VERSION: &str = "18.6";
 
 /// `PG_MAJORVERSION` from the same header: everything in [`PG_VERSION`] before
 /// the first dot. It is the whole content of a `PG_VERSION` *file*
-/// (`write_version_file`, `initdb.c:1036`), so the two must not drift apart —
+/// (`write_version_file`, `initdb.c:1024`), so the two must not drift apart —
 /// `the_major_version_is_the_leading_component_of_pg_version` pins them.
 pub const PG_MAJORVERSION: &str = "18";
 
@@ -98,8 +98,8 @@ pub fn version_line(progname: &str) -> String {
 /// progname)`, without the `progname: hint: ` that `src/common/logging.c`
 /// prefixes.
 ///
-/// `initdb.c` emits this from four sites (`:3274`, `:3400`, `:3420` and the
-/// `getopt_long` `default:` arm), two of which are reached through
+/// `initdb.c` emits this from four sites (`:2736`, `:3274`, `:3400` — the
+/// `getopt_long` `default:` arm — and `:3420`), two of which are reached through
 /// [`crate::error::InitdbError`] and two directly, so the string itself lives
 /// here — in the module that holds the text C prints — and nowhere else.
 #[must_use]

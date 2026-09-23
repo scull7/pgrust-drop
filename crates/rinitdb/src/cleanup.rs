@@ -1,7 +1,7 @@
-//! `cleanup_directories_atexit` (`initdb.c:761`): what initdb takes back when
+//! `cleanup_directories_atexit` (`initdb.c:762`): what initdb takes back when
 //! it fails after it has already made a directory.
 //!
-//! C registers this with `atexit` (`initdb.c:3465`) and it runs on every exit
+//! C registers this with `atexit` (`initdb.c:3436`) and it runs on every exit
 //! where `success` is still false. It is why
 //!
 //! ```text
@@ -23,7 +23,7 @@
 //!   filesystem, so every branch is unit-tested from a value.
 //! - [`apply`] is the action: it announces each step and carries it out.
 //!
-//! One thing `rmtree` (`src/common/rmtree.c:44`) does that [`apply`] does not:
+//! One thing `rmtree` (`src/common/rmtree.c:50`) does that [`apply`] does not:
 //! log a `pg_log_warning` per entry it could not remove. Only the summary
 //! `pg_log_error` is reproduced. Reaching either needs a directory initdb
 //! created and can no longer delete, which no stolen case provokes.
@@ -88,7 +88,7 @@ impl Step {
         }
     }
 
-    /// The `pg_log_error` line when the removal fails (`initdb.c:773`, `:779`,
+    /// The `pg_log_error` line when the removal fails (`initdb.c:773`, `:780`,
     /// `:787`, `:793`); `None` for a step that removes nothing.
     #[must_use]
     pub fn failure(&self) -> Option<String> {
@@ -108,7 +108,7 @@ impl Step {
 /// made it" and "it was there and empty" differently for each — four messages,
 /// or two more under `--no-clean`. Nothing here decides *whether* the run
 /// failed: the caller only reaches this on the `success == false` path
-/// (`initdb.c:763`).
+/// (`initdb.c:764`).
 #[must_use]
 pub fn plan(progress: &Progress, no_clean: bool) -> Vec<Step> {
     [
@@ -137,7 +137,7 @@ fn step(role: DirRole, path: PathBuf, action: DirAction, no_clean: bool) -> Step
 ///
 /// Nothing is returned. The handler runs after initdb has already decided to
 /// fail and reported why, so a removal that itself fails adds its own
-/// `pg_log_error` line and changes nothing else (`initdb.c:772`).
+/// `pg_log_error` line and changes nothing else (`initdb.c:773`).
 pub fn apply(steps: &[Step], stderr: &mut impl Write) {
     for step in steps {
         // Writes to a closed stream are not worth a second error message.
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn the_announcement_carries_the_pg_log_info_prefix_and_no_level() {
         // pg_log_info prints "<progname>: " and no level word, unlike
-        // pg_log_error's "<progname>: error: " (src/common/logging.c:99).
+        // pg_log_error's "<progname>: error: " (src/common/logging.c:279).
         let mut out = Vec::new();
         apply(
             &[Step::Keep {

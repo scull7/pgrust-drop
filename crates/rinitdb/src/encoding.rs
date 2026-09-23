@@ -3,14 +3,14 @@
 //!
 //! `initdb` needs three things from that file and nothing else: turn the
 //! `-E`/`--encoding` string into an encoding (`pg_char_to_encoding`,
-//! `encnames.c:559`), reject the ones that cannot be a *server* encoding
+//! `encnames.c:552`), reject the ones that cannot be a *server* encoding
 //! (`PG_VALID_BE_ENCODING`, `pg_wchar.h:297`), and recognize UTF-8 for the
 //! builtin-provider rule at `initdb.c:2781`.
 //!
 //! All of it is a pure calculation over a static table, so it is unit-tested
 //! without a filesystem or a server.
 
-/// `enum pg_enc` (`src/include/mb/pg_wchar.h:249`), in declaration order.
+/// `enum pg_enc` (`src/include/mb/pg_wchar.h:240`), in declaration order.
 ///
 /// The order is load-bearing: `PG_VALID_BE_ENCODING` is a range check against
 /// `PG_ENCODING_BE_LAST` (`PG_KOI8U`), so everything declared after it is
@@ -71,7 +71,7 @@ impl Encoding {
     }
 }
 
-/// `pg_encname_tbl[]` (`encnames.c:44`): every accepted spelling, already
+/// `pg_encname_tbl[]` (`encnames.c:39`): every accepted spelling, already
 /// cleaned, sorted as upstream sorts it for its binary search.
 ///
 /// Copied entry for entry; the aliases matter, because `--encoding UTF-8`,
@@ -164,7 +164,7 @@ const ENCNAME_TBL: &[(&str, Encoding)] = &[
 /// rejects anything this long or longer before it even cleans the name.
 const NAMEDATALEN: usize = 64;
 
-/// `clean_encoding_name` (`encnames.c:540`): drop every non-alphanumeric byte
+/// `clean_encoding_name` (`encnames.c:527`): drop every non-alphanumeric byte
 /// and lowercase the ASCII letters.
 ///
 /// Upstream works on bytes with `isalnum()` in the C locale, so only ASCII
@@ -178,7 +178,7 @@ pub fn clean_encoding_name(key: &str) -> String {
         .collect()
 }
 
-/// `pg_char_to_encoding` (`encnames.c:559`): the encoding a spelling names.
+/// `pg_char_to_encoding` (`encnames.c:552`): the encoding a spelling names.
 #[must_use]
 pub fn char_to_encoding(name: &str) -> Option<Encoding> {
     if name.is_empty() || name.len() >= NAMEDATALEN {
@@ -191,7 +191,7 @@ pub fn char_to_encoding(name: &str) -> Option<Encoding> {
         .map(|index| ENCNAME_TBL[index].1)
 }
 
-/// `pg_valid_server_encoding` (`encnames.c:596`): the encoding a spelling
+/// `pg_valid_server_encoding` (`encnames.c:502`): the encoding a spelling
 /// names, if it may be used as a server encoding.
 #[must_use]
 pub fn valid_server_encoding(name: &str) -> Option<Encoding> {
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn the_table_is_sorted_and_has_no_duplicates() {
-        // Upstream binary-searches it (encnames.c:566), so the order is part
+        // Upstream binary-searches it (encnames.c:570), so the order is part
         // of the port, not an accident of transcription.
         for pair in ENCNAME_TBL.windows(2) {
             assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn the_enum_ordinals_match_pg_enc() {
-        // pg_wchar.h:249. Only the boundaries need pinning; the rest follow.
+        // pg_wchar.h:240. Only the boundaries need pinning; the rest follow.
         assert_eq!(Encoding::SqlAscii as u8, 0);
         assert_eq!(Encoding::Utf8 as u8, 6);
         assert_eq!(Encoding::Koi8U as u8, 34);

@@ -423,7 +423,8 @@ impl QueryRunner {
     /// # Errors
     /// The message cannot appear here at all — a DataRow with no preceding
     /// RowDescription, a field count that disagrees with it, or a message type
-    /// the simple-query path does not handle.
+    /// this port does not handle yet (the COPY messages) or that libpq never
+    /// provokes (PortalSuspended, `fe-protocol3.c:446`).
     pub fn push(&mut self, message: Backend) -> Result<Flow, ProtocolError> {
         match message {
             // getRowDescriptions, fe-protocol3.c:527 — a Describe fills the
@@ -539,12 +540,12 @@ impl QueryRunner {
     /// ParseComplete, CloseComplete and NoData (`fe-protocol3.c:271`), then
     /// `PGASYNC_READY`: the pending result is handed over, or a fresh
     /// COMMAND_OK one when there is none. An error result already handed over
-    /// counts as pending (`pgHavePendingResult`, `libpq-int.h:936`), so it is
-    /// not followed by a spurious success.
+    /// does not count as pending: `PQgetResult` took it through
+    /// `pqPrepareAsyncResult`, which empties `conn->result` and clears
+    /// `error_result` (`fe-exec.c:927-928`), so C would follow it with a
+    /// COMMAND_OK here too. The server never sends that sequence (it discards
+    /// until Sync after an error), and this fold does not pretend otherwise.
     fn command_ok_ready(&mut self) {
-        if self.saw_error {
-            return;
-        }
         let result = self
             .current
             .take()
@@ -1616,10 +1617,9 @@ mod tests {
         assert_eq!(results[0].command_status(), b"SELECT 1");
     }
 
-    /// `traces/prepared.trace` lines 11-14: a Describe of a statement that
-    /// does not exist is the error alone, and an error already handed over
-    /// is not followed by a COMMAND_OK for a completion message
-    /// (`pgHavePendingResult`, `libpq-int.h:936`).
+    /// `traces/prepared.trace` lines 12-15: a Describe of a statement that
+    /// does not exist gets ErrorResponse and ReadyForQuery back, and its one
+    /// result is the error.
     #[test]
     fn an_error_is_the_only_result_of_its_command() {
         let error = ResultError::new(vec![
@@ -1634,7 +1634,6 @@ mod tests {
             QueryClass::Describe,
             vec![
                 Backend::ErrorResponse(error.clone()),
-                Backend::NoData,
                 Backend::ReadyForQuery(TransactionStatus::Idle),
             ],
         );

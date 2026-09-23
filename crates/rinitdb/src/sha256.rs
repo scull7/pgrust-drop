@@ -1,4 +1,8 @@
-//! SHA-256 (FIPS 180-4), for the vendoring gate in [`super`] and nothing else.
+//! SHA-256 (FIPS 180-4), for two provenance records and nothing else: the
+//! vendoring gate in `crate::conf`, and the template image manifest
+//! (`crate::image::manifest`) — the digest the mint tool writes into it
+//! (`examples/mint_template.rs`, which includes this file by path) and the
+//! test that pins the embedded image to it.
 //!
 //! The gate has to state each template's digest in the form upstream publishes
 //! it — `postgresql-18.6.tar.bz2.sha256` and `sha256sum` both speak SHA-256 —
@@ -16,9 +20,10 @@
 //! approval"). The honest cost is ~80 duplicated lines of a stable, fully
 //! specified algorithm; the alternative cost was a permanent inter-crate edge
 //! from the config renderer to the wire-protocol client, which is the more
-//! expensive of the two to live with. This copy is `#[cfg(test)]`, so it is
-//! not in the shipped binary, and it is written from FIPS 180-4 rather than
-//! copied from anywhere.
+//! expensive of the two to live with. This copy is `#[cfg(test)]` in the
+//! library and compiled into the mint tool by path, so it is not in the
+//! shipped binary, and it is written from FIPS 180-4 rather than copied from
+//! anywhere.
 //!
 //! Everything here is a calculation over immutable input: same bytes in, same
 //! digest out, no state that outlives a call. `digest_hex` is checked against
@@ -118,7 +123,7 @@ const MANDATORY_PADDING_BYTES: usize = 9;
 
 /// The SHA-256 of `message`, lowercase hex — byte for byte what `sha256sum`
 /// prints.
-pub(super) fn digest_hex(message: &[u8]) -> String {
+pub(crate) fn digest_hex(message: &[u8]) -> String {
     final_state(message)
         .iter()
         .fold(String::with_capacity(64), |mut hex, word| {

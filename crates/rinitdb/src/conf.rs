@@ -20,12 +20,6 @@ use crate::cli::Options;
 use crate::file_perm::{DataDirPerm, PG_DIR_MODE_GROUP};
 use crate::pg_config;
 
-/// SHA-256, used only by the provenance gate in `tests` and therefore not
-/// compiled into the binary. See that module's header for why this crate
-/// carries its own instead of borrowing `rlibpq`'s.
-#[cfg(test)]
-mod sha256;
-
 /// `src/backend/utils/misc/postgresql.conf.sample`, vendored byte for byte.
 pub const POSTGRESQL_CONF_SAMPLE: &str = include_str!("../share/postgresql.conf.sample");
 
@@ -703,6 +697,7 @@ pub fn render_all_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sha256;
 
     /// None of the four `@…@` placeholders may reach a written file. A bare
     /// `@` may: the template's own prose explains the `@file` include syntax.

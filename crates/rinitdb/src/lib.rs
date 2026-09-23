@@ -40,6 +40,10 @@ pub mod help;
 pub mod image;
 pub mod layout;
 pub mod pg_config;
+/// SHA-256 for the provenance tests only; see the module header for why this
+/// crate carries its own and why it is not compiled into the binary.
+#[cfg(test)]
+mod sha256;
 pub mod strerror;
 pub mod sync;
 pub mod tz;

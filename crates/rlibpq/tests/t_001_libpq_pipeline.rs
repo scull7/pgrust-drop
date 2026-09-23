@@ -10,10 +10,10 @@
 //! `main` sets it up before tracing (`libpq_pipeline.c:2332`-`:2354`), and
 //! ends as `PQfinish` ends it, whose Terminate is each trace's last line.
 //!
-//! Not here yet: `test_singlerowmode` (`singlerow.trace`, which also needs
-//! `PQsetChunkedRowsMode` checked end to end), `test_pipelined_insert`,
-//! `test_uniqviol`, `test_cancel` and `test_protocol_version`, which have no
-//! trace to compare or need cancellation and protocol 3.2 (NAT-391).
+//! All nine traces upstream ships are compared here. Not here yet:
+//! `test_pipelined_insert` and `test_uniqviol`, which have no trace to compare,
+//! and `test_cancel` and `test_protocol_version`, which need cancellation and
+//! protocol 3.2 (NAT-391).
 //!
 //! Without the reference tools every test prints `SKIP (flagged, not silent)`
 //! and passes; with `PGDROP_REQUIRE_REF=1` a missing reference fails instead.
@@ -747,6 +747,191 @@ fn test_simple_pipeline() {
     );
 
     finish_and_compare_trace(conn, &sink, "simple_pipeline.trace");
+}
+
+/// `test_singlerowmode`, `libpq_pipeline.c:1680`.
+#[test]
+fn test_singlerowmode() {
+    let Some(cluster) = Cluster::start("trust", 55_468) else {
+        return;
+    };
+    let (mut conn, sink) = traced_like_libpq_pipeline(&cluster);
+    let no_params = Params::text(&[]);
+    let mut pipeline_ended = false;
+
+    conn.enter_pipeline_mode()
+        .expect("failed to enter pipeline mode");
+
+    // :1690 — one series of three commands, using single-row mode for the
+    // first two.
+    for i in 0..3 {
+        let param = format!("{}", 44 + i);
+        let values: [Option<&[u8]>; 1] = [Some(param.as_bytes())];
+        conn.send_query_params(b"SELECT generate_series(42, $1)", &[], &Params::text(&values))
+            .expect("failed to send query");
+    }
+    conn.pipeline_sync().expect("pipeline sync failed");
+
+    // :1712
+    let mut i = 0;
+    while !pipeline_ended {
+        let mut first = true;
+        let mut is_single_tuple = false;
+
+        // Set single row mode for only first 2 SELECT queries.
+        if i < 2 {
+            assert!(
+                conn.set_single_row_mode(),
+                "PQsetSingleRowMode() failed for i={i}"
+            );
+        }
+
+        // :1725 — consume rows for this query.
+        let mut saw_ending_tuplesok = false;
+        while let Some(res) = get(&mut conn) {
+            let est = res.status();
+            if est == ExecStatus::PipelineSync {
+                eprintln!("end of pipeline reached");
+                pipeline_ended = true;
+                assert_eq!(i, 3, "Expected three results, got {i}");
+                break;
+            }
+
+            // :1741 — expect SINGLE_TUPLE for queries 0 and 1, TUPLES_OK
+            // for 2.
+            if first {
+                if i <= 1 {
+                    assert_eq!(
+                        est,
+                        ExecStatus::SingleTuple,
+                        "Expected PGRES_SINGLE_TUPLE for query {i}, got {}",
+                        est.as_str()
+                    );
+                }
+                if i >= 2 {
+                    assert_eq!(
+                        est,
+                        ExecStatus::TuplesOk,
+                        "Expected PGRES_TUPLES_OK for query {i}, got {}",
+                        est.as_str()
+                    );
+                }
+                first = false;
+            }
+
+            // :1753
+            eprint!("Result status {} for query {i}", est.as_str());
+            match est {
+                ExecStatus::TuplesOk => {
+                    eprintln!(", tuples: {}", res.ntuples());
+                    saw_ending_tuplesok = true;
+                    if is_single_tuple {
+                        assert_eq!(
+                            res.ntuples(),
+                            0,
+                            "Expected to follow PGRES_SINGLE_TUPLE, but received PGRES_TUPLES_OK directly instead"
+                        );
+                        eprintln!("all tuples received in query {i}");
+                    }
+                }
+                ExecStatus::SingleTuple => {
+                    is_single_tuple = true;
+                    eprintln!(
+                        ", {} tuple: {}",
+                        res.ntuples(),
+                        String::from_utf8_lossy(res.value(0, 0).unwrap_or_default())
+                    );
+                }
+                _ => panic!("unexpected"),
+            }
+        }
+        assert!(
+            pipeline_ended || saw_ending_tuplesok,
+            "didn't get expected terminating TUPLES_OK"
+        );
+        i += 1;
+    }
+
+    // :1782 — now issue one command, get its results in with single-row
+    // mode, then issue another command, and get its results in normal mode;
+    // make sure the single-row mode flag is reset as expected.
+    conn.send_query_params(b"SELECT generate_series(0, 0)", &[], &no_params)
+        .expect("failed to send query");
+    conn.send_flush_request()
+        .expect("failed to send flush request");
+    assert!(conn.set_single_row_mode(), "PQsetSingleRowMode() failed");
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::SingleTuple,
+        "Expected PGRES_SINGLE_TUPLE, got {}",
+        res.status().as_str()
+    );
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::TuplesOk,
+        "Expected PGRES_TUPLES_OK, got {}",
+        res.status().as_str()
+    );
+    assert!(get(&mut conn).is_none(), "expected NULL result");
+
+    // :1810
+    conn.send_query_params(b"SELECT 1", &[], &no_params)
+        .expect("failed to send query");
+    conn.send_flush_request()
+        .expect("failed to send flush request");
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::TuplesOk,
+        "Expected PGRES_TUPLES_OK, got {}",
+        res.status().as_str()
+    );
+    assert!(get(&mut conn).is_none(), "expected NULL result");
+
+    // :1825 — try chunked mode as well; make sure that it correctly
+    // delivers a partial final chunk.
+    conn.send_query_params(b"SELECT generate_series(1, 5)", &[], &no_params)
+        .expect("failed to send query");
+    conn.send_flush_request()
+        .expect("failed to send flush request");
+    assert!(
+        conn.set_chunked_rows_mode(3),
+        "PQsetChunkedRowsMode() failed"
+    );
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::TuplesChunk,
+        "Expected PGRES_TUPLES_CHUNK, got {}",
+        res.status().as_str()
+    );
+    assert_eq!(res.ntuples(), 3, "Expected 3 rows, got {}", res.ntuples());
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::TuplesChunk,
+        "Expected PGRES_TUPLES_CHUNK, got {}",
+        res.status().as_str()
+    );
+    assert_eq!(res.ntuples(), 2, "Expected 2 rows, got {}", res.ntuples());
+    let res = get(&mut conn).expect("unexpected NULL");
+    assert_eq!(
+        res.status(),
+        ExecStatus::TuplesOk,
+        "Expected PGRES_TUPLES_OK, got {}",
+        res.status().as_str()
+    );
+    assert_eq!(res.ntuples(), 0, "Expected 0 rows, got {}", res.ntuples());
+    assert!(get(&mut conn).is_none(), "expected NULL result");
+
+    conn.exit_pipeline_mode()
+        .expect("failed to end pipeline mode");
+
+    eprintln!("ok");
+
+    finish_and_compare_trace(conn, &sink, "singlerow.trace");
 }
 
 /// `test_transaction`, `libpq_pipeline.c:1876`.

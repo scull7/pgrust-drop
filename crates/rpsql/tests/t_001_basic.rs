@@ -139,7 +139,7 @@ fn version_matches_c_psql() {
 }
 
 /// Without a server, `-c` still reports a connection failure and exits 2
-/// (`EXIT_BADCONN`, `settings.h:199`) rather than succeeding or hanging.
+/// (`EXIT_BADCONN`, `settings.h:200`) rather than succeeding or hanging.
 #[test]
 fn a_connection_failure_exits_badconn() {
     let outcome = testkit::run(

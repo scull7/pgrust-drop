@@ -1,14 +1,14 @@
 //! The psql command line: `src/bin/psql/startup.c`.
 //!
-//! [`Options`] is `long_options[]` (`startup.c:466`-`:503`) one row at a time,
+//! [`Options`] is `long_options[]` (`startup.c:490`-`:529`) one row at a time,
 //! parsed by usage-rs (ADR-0004). [`actions`] is the other half of
 //! `parse_psql_options`: `-c` and `-f` build a `SimpleActionList` *in argv
-//! order* (`startup.c:640`), which a declarative option table cannot express,
+//! order* (`startup.c:550`-`:573`), which a declarative option table cannot express,
 //! so it is its own pure walk over argv driven by [`SHORT_OPTIONS`] — the
 //! getopt string upstream passes on the same line.
 //!
 //! `--help`, `--help=…` and `--version` are NAT-399's; the `argv[1]` fast path
-//! at `startup.c:139` is here because it decides what an invocation *is*.
+//! at `startup.c:138` is here because it decides what an invocation *is*.
 
 use std::ffi::{OsStr, OsString};
 
@@ -17,7 +17,7 @@ use usage::Cli;
 use crate::settings::{PrintFormat, PsqlSettings, Trivalue};
 use crate::variables::{AssignError, VariableSpace};
 
-/// `getopt_long`'s option string (`startup.c:506`). A `:` means the option
+/// `getopt_long`'s option string (`startup.c:536`). A `:` means the option
 /// takes a value.
 pub const SHORT_OPTIONS: &str = "aAbc:d:eEf:F:h:HlL:no:p:P:qR:sStT:U:v:VwWxXz?01";
 
@@ -146,13 +146,13 @@ pub struct Options {
     pub positional: Vec<String>,
 }
 
-/// One entry of `SimpleActionList` (`startup.c:52`-`:63`).
+/// One entry of `SimpleActionList` (`startup.c:53`-`:58`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// `ACT_SINGLE_QUERY`: `-c` with SQL.
     SingleQuery(String),
     /// `ACT_SINGLE_SLASH`: `-c` whose argument starts with a backslash; the
-    /// backslash itself is not part of the value (`startup.c:544`).
+    /// backslash itself is not part of the value (`startup.c:554`).
     SingleSlash(String),
     /// `ACT_FILE`: `-f`, or the implied `-f -` for a non-tty with no action.
     File(Option<String>),
@@ -163,7 +163,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
     /// `usage(NOPAGER)` — `-?`, or `--help` as the only argument
-    /// (`startup.c:141`).
+    /// (`startup.c:140`).
     PrintHelp(HelpTopic),
     /// `showVersion()` — `--version`/`-V` as `argv[1]` (`startup.c:145`).
     PrintVersion,
@@ -184,7 +184,7 @@ pub enum HelpTopic {
     Variables,
 }
 
-/// `struct adhoc_opts` (`startup.c:65`) plus everything the option loop wrote
+/// `struct adhoc_opts` (`startup.c:66`) plus everything the option loop wrote
 /// straight into `pset`.
 // One field per `struct adhoc_opts` member, and upstream's are `bool`.
 #[allow(clippy::struct_excessive_bools)]
@@ -216,11 +216,11 @@ pub struct Session {
     pub vars: VariableSpace,
     /// `-o FILENAME`: where query output goes (`setQFout`).
     pub output: Option<String>,
-    /// Extra bare words the loop warned about (`startup.c:669`).
+    /// Extra bare words the loop warned about (`startup.c:740`).
     pub warnings: Vec<String>,
 }
 
-/// `main()`'s `argv[1]`-only fast path (`startup.c:139`-`:150`).
+/// `main()`'s `argv[1]`-only fast path (`startup.c:138`-`:150`).
 ///
 /// `-?` is a help request wherever it appears, but `--help` only when it is
 /// the *sole* argument; `--version`/`-V` only as `argv[1]`.
@@ -236,7 +236,7 @@ pub fn fast_path(args: &[OsString]) -> Option<Invocation> {
     None
 }
 
-/// The ordered `-c`/`-f` action list (`startup.c:540`-`:560`).
+/// The ordered `-c`/`-f` action list (`startup.c:550`-`:573`).
 ///
 /// Walks argv the way getopt does, using [`SHORT_OPTIONS`] to know which short
 /// options swallow the next word. It answers one question — in what order did
@@ -314,12 +314,12 @@ fn push_action(actions: &mut Vec<Action>, is_file: bool, value: Option<String>) 
     }
 }
 
-/// `parse_psql_options()` (`startup.c:460`): turn a parsed [`Options`] into the
+/// `parse_psql_options()` (`startup.c:488`): turn a parsed [`Options`] into the
 /// settings and variables the rest of psql reads.
 ///
 /// # Errors
 /// The message `-v NAME=VALUE`'s `SetVariable` would have logged before
-/// `exit(EXIT_FAILURE)` (`startup.c:657`).
+/// `exit(EXIT_FAILURE)` (`startup.c:659`).
 // The body is one table, one `if` per row of upstream's `long_options[]` and
 // in its order; splitting it would only move the rows somewhere else.
 #[allow(clippy::too_many_lines)]
@@ -328,7 +328,7 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
     let mut pset = PsqlSettings::default();
     let mut warnings = Vec::new();
 
-    // `main()` seeds these before the option loop (`startup.c:195`-`:210`).
+    // `main()` seeds these before the option loop (`startup.c:202`-`:206`).
     for (name, value) in crate::variables::default_prompts() {
         vars.set(name, Some(value))?;
     }
@@ -377,7 +377,7 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
     if let Some(attr) = &options.table_attr {
         pset.popt.topt.table_attr = Some(attr.clone());
     }
-    // `-v NAME=VALUE`, or `-v NAME` to delete (`startup.c:645`).
+    // `-v NAME=VALUE`, or `-v NAME` to delete (`startup.c:644`).
     for assignment in &options.set {
         match assignment.split_once('=') {
             Some((name, value)) => vars.set(name, Some(value))?,
@@ -404,7 +404,7 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
     }
 
     // The remaining bare words are the database name and the user name
-    // (`startup.c:663`).
+    // (`startup.c:733`).
     let mut dbname = options.dbname.clone();
     let mut username = options.username.clone();
     for word in &options.positional {
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn version_and_help_use_the_argv_one_fast_path() {
-        // `startup.c:139`: -? anywhere, --help only alone, --version as argv[1].
+        // `startup.c:138`: -? anywhere, --help only alone, --version as argv[1].
         assert_eq!(plan(&args(&["--version"])), Invocation::PrintVersion);
         assert_eq!(plan(&args(&["-V"])), Invocation::PrintVersion);
         assert_eq!(
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn actions_keep_argv_order() {
-        // `simple_action_list_append` (`startup.c:684`) appends to the tail.
+        // `simple_action_list_append` (`startup.c:753`) appends to the tail.
         let session = session(&["-c", "one", "-f", "a.sql", "-c", "two"]);
         assert_eq!(
             session.actions,
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn a_backslash_command_becomes_a_slash_action_without_its_backslash() {
-        // `startup.c:544`: optarg + 1.
+        // `startup.c:554`: optarg + 1.
         let session = session(&["-c", "\\echo hi"]);
         assert_eq!(session.actions, vec![Action::SingleSlash("echo hi".into())]);
     }
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn the_short_option_string_and_the_table_agree() {
-        // Every short option in the getopt string (`startup.c:506`) must be a
+        // Every short option in the getopt string (`startup.c:536`) must be a
         // row of the table, and vice versa; the two are upstream's own
         // duplication and this is what keeps them from drifting apart here.
         let mut from_string: Vec<char> = SHORT_OPTIONS
@@ -595,8 +595,8 @@ mod tests {
 
     #[test]
     fn no_psqlrc_is_recorded_but_the_startup_file_is_never_read() {
-        // `-X` sets `options->no_psqlrc` (`startup.c:634`), which upstream
-        // then consults at `startup.c:441` to decide whether to call
+        // `-X` sets `options->no_psqlrc` (`startup.c:679`), which upstream
+        // then consults at `startup.c:352` to decide whether to call
         // `process_psqlrc`. This port records the flag and has no
         // `process_psqlrc` to call, so *every* invocation behaves as if `-X`
         // had been given — the divergence `docs/divergences.md` records.
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn dash_v_sets_and_unsets_variables() {
         assert!(session(&["-v", "ON_ERROR_STOP=1"]).pset.on_error_stop);
-        // `-v NAME` with no `=` deletes (`startup.c:650`).
+        // `-v NAME` with no `=` deletes (`startup.c:651`).
         assert_eq!(
             session(&["-v", "AUTOCOMMIT"]).vars.get("AUTOCOMMIT"),
             Some("off")
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn bare_words_are_the_database_then_the_user() {
-        // `startup.c:663`.
+        // `startup.c:733`.
         let session = session(&["mydb", "myuser", "extra"]);
         assert_eq!(session.dbname.as_deref(), Some("mydb"));
         assert_eq!(session.username.as_deref(), Some("myuser"));

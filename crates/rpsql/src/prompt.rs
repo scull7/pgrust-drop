@@ -1,6 +1,6 @@
 //! The prompt renderer: `src/bin/psql/prompt.c`.
 //!
-//! `get_prompt()` (`prompt.c:63`) walks the prompt string expanding `%`
+//! `get_prompt()` (`prompt.c:68`) walks the prompt string expanding `%`
 //! escapes. This port keeps it pure by taking a [`PromptFacts`] instead of
 //! reaching into `pset.db`: the escapes that need a live connection read it,
 //! and the ones that run a shell (`` %` ``) are refused rather than executed,
@@ -29,7 +29,7 @@ pub struct PromptFacts {
     pub transaction: TransactionMark,
 }
 
-/// What `%x` prints for each transaction status (`prompt.c:250`).
+/// What `%x` prints for each transaction status (`prompt.c:251`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionMark {
     /// `PQTRANS_IDLE`: nothing.
@@ -43,7 +43,7 @@ pub enum TransactionMark {
     Unknown,
 }
 
-/// `get_prompt()` (`prompt.c:63`).
+/// `get_prompt()` (`prompt.c:68`).
 ///
 /// `conditional_active` is `\if` state, which NAT-402 owns; `true` here is the
 /// "not inside an inactive branch" case.
@@ -108,7 +108,7 @@ pub fn get_prompt(
             // `%%` is a literal percent; `%?` is "not here yet" upstream too.
             '%' => out.push('%'),
             '?' => {}
-            // `` %` `` runs a shell command (`prompt.c:277`), which is an
+            // `` %` `` runs a shell command (`prompt.c:289`), which is an
             // action; it renders as nothing here and NAT-405 owns it.
             '`' => {
                 for c in chars.by_ref() {
@@ -126,7 +126,7 @@ pub fn get_prompt(
     out
 }
 
-/// The `%M`/`%m` host rendering (`prompt.c:130`).
+/// The `%M`/`%m` host rendering (`prompt.c:135`).
 fn host_mark(host: Option<&str>, short: bool) -> String {
     match host {
         Some(host) if !host.is_empty() && !host.starts_with('/') => {
@@ -142,7 +142,7 @@ fn host_mark(host: Option<&str>, short: bool) -> String {
     }
 }
 
-/// The `%R` escape (`prompt.c:216`).
+/// The `%R` escape (`prompt.c:214`).
 fn render_r(
     status: PromptStatus,
     facts: &PromptFacts,

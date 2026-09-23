@@ -1,6 +1,6 @@
 //! The input loop: `src/bin/psql/mainloop.c`.
 //!
-//! `MainLoop()` (`mainloop.c:32`) reads lines, feeds them to the lexer, and
+//! `MainLoop()` (`mainloop.c:33`) reads lines, feeds them to the lexer, and
 //! sends a statement whenever the lexer finds a semicolon. This port keeps the
 //! same shape with two substitutions: lines come from a [`LineSource`] rather
 //! than a `FILE *`, and queries go to a [`crate::common::Executor`]. Readline
@@ -18,7 +18,7 @@ use crate::variables::{VarView, VariableSpace};
 /// Where `MainLoop` gets its lines. `None` is end of input.
 pub trait LineSource {
     /// One line, with its terminator already stripped (`gets_fromFile`,
-    /// `input.c:150`).
+    /// `input.c:186`).
     fn next_line(&mut self) -> Option<Vec<u8>>;
 }
 
@@ -57,7 +57,7 @@ pub struct Session<'a> {
     pub vars: &'a mut VariableSpace,
 }
 
-/// `MainLoop()` (`mainloop.c:32`). Returns the process exit status.
+/// `MainLoop()` (`mainloop.c:33`). Returns the process exit status.
 // The body is one `for (;;)` of upstream's, statement for statement; cutting
 // it up would hide that correspondence without removing a single branch.
 #[allow(clippy::too_many_lines)]
@@ -85,7 +85,7 @@ pub fn main_loop(
         };
         session.pset.lineno += 1;
 
-        // Detect attempts to run custom-format dumps as SQL (`mainloop.c:200`).
+        // Detect attempts to run custom-format dumps as SQL (`mainloop.c:209`).
         if session.pset.lineno == 1
             && !session.pset.cur_cmd_interactive
             && line.starts_with(b"PGDMP")
@@ -103,7 +103,7 @@ pub fn main_loop(
             continue;
         }
 
-        // ECHO=all echoes the input line, unless interactive (`mainloop.c:355`).
+        // ECHO=all echoes the input line, unless interactive (`mainloop.c:360`).
         if session.pset.echo == crate::settings::Echo::All && !session.pset.cur_cmd_interactive {
             let _ = stdout.write_all(&line);
             let _ = stdout.write_all(b"\n");
@@ -187,7 +187,7 @@ pub fn main_loop(
     }
 
     // A non-semicolon-terminated query at end of file is still processed
-    // (`mainloop.c:600`).
+    // (`mainloop.c:598`).
     if !query_buf.is_empty() && !session.pset.cur_cmd_interactive && success_result == EXIT_SUCCESS
     {
         let ok = send_query(executor, &query_buf, session.pset, stdout, stderr);
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_trailing_statement_without_a_semicolon_is_still_sent() {
-        // `mainloop.c:600`.
+        // `mainloop.c:598`.
         let out = run("select 1", PsqlSettings::default());
         assert_eq!(out.seen, ["select 1"]);
     }
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn a_custom_format_dump_is_detected_on_the_first_line() {
-        // `mainloop.c:200`.
+        // `mainloop.c:209`.
         let out = run("PGDMP\x01\x02\n", PsqlSettings::default());
         assert_eq!(out.code, crate::settings::EXIT_FAILURE);
         assert!(

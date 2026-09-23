@@ -1,0 +1,3 @@
+# The packed template cluster (NAT-381): never diffed as text, never
+# normalised. See crates/rinitdb/image/README.md.
+crates/rinitdb/image/template.img binary

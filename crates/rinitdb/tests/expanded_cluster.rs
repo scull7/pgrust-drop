@@ -525,46 +525,89 @@ fn conf_locale_lines(pgdata: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The `lc_*` lines the reference initdb writes for `before`, under `env`.
+fn reference_conf_locale_lines(
+    initdb: &Path,
+    before: &[&str],
+    pgdata: &Path,
+    env: &Environment,
+) -> Vec<String> {
+    let mut argv = args(before);
+    argv.push(pgdata.into());
+    let outcome = testkit::run_in(initdb, &argv, &[], env).expect("run initdb");
+    assert_eq!(
+        outcome.status,
+        Some(0),
+        "{before:?}: {}",
+        outcome.stderr_text()
+    );
+    let lines = conf_locale_lines(pgdata);
+    std::fs::remove_dir_all(pgdata).expect("remove the cluster");
+    lines
+}
+
 /// An empty `--locale`, `--lc-collate` or `--lc-ctype` is kept by
 /// `setlocales` (`initdb.c:2432`-`:2443`) and read by `check_locale_name`
 /// (`:2202`) as the environment's, like no switch at all: C accepts it, so
-/// it is not refused. With no locale variable set, against the reference
-/// initdb: both exit 0 and write the same four `postgresql.conf` locale
-/// lines, which are those of no switch.
+/// it is not refused. In two environments — no locale variable set, and
+/// `LC_ALL=C` alone — each initdb writes, for a command line with an empty
+/// switch, the four `postgresql.conf` locale lines it writes for the same
+/// command line without it, and ours are the reference's.
+///
+/// Except on macOS with no locale variable set: there the reference takes
+/// the system's preferred locale (`en_US` on the CI runner, run
+/// 35837072908), where glibc and musl take C — the Homebrew build's
+/// `setlocale` being, it appears, gettext's `libintl_setlocale`, whose `""`
+/// falls back to the user's preferences. This port writes `C` for the
+/// environment everywhere (`docs/divergences.md`), so there only the
+/// reference's own empty-equals-no-switch is compared; under `LC_ALL=C` the
+/// cross comparison holds on every lane.
 #[test]
 fn an_empty_locale_is_the_environments_like_no_switch() {
     let reference = reference::find_or_skip("initdb");
-    let env = Environment::inherited().without_all(LOCALE_VARIABLES);
-    let tempdir = TempDir::new("expanded-empty-locale");
-    let no_switch = tempdir.join("no-switch");
-    rinitdb_ok(&["-U", "postgres", "--no-sync"], &no_switch, &env);
-    let expected = conf_locale_lines(&no_switch);
-    assert_eq!(expected.len(), 4, "{expected:?}");
-    for extra in [
-        &["--locale", ""][..],
-        &["--lc-collate", ""],
-        &["--lc-ctype", ""],
-        &["--locale", "C", "--lc-collate", ""],
-    ] {
-        let mut before = vec!["-U", "postgres", "--no-sync"];
-        before.extend(extra);
+    let scrubbed = Environment::inherited().without_all(LOCALE_VARIABLES);
+    let lc_all_c = Environment::inherited()
+        .without_all(LOCALE_VARIABLES)
+        .with("LC_ALL", "C");
+    let base = ["-U", "postgres", "--no-sync"];
+    // Each empty switch, and the command line it is the same as: the one
+    // without it.
+    let cases: [(&[&str], &[&str]); 4] = [
+        (&["--locale", ""], &[]),
+        (&["--lc-collate", ""], &[]),
+        (&["--lc-ctype", ""], &[]),
+        (&["--locale", "C", "--lc-collate", ""], &["--locale", "C"]),
+    ];
+    for (env, the_reference_is_c) in [(&scrubbed, !cfg!(target_os = "macos")), (&lc_all_c, true)] {
+        let tempdir = TempDir::new("expanded-empty-locale");
         let ours = tempdir.join("ours");
-        rinitdb_ok(&before, &ours, &env);
-        assert_eq!(conf_locale_lines(&ours), expected, "{extra:?}");
-        std::fs::remove_dir_all(&ours).expect("remove the cluster");
-        if let Some(initdb) = &reference {
-            let theirs = tempdir.join("theirs");
-            let mut argv = args(&before);
-            argv.push(theirs.clone().into());
-            let outcome = testkit::run_in(initdb, &argv, &[], &env).expect("run initdb");
-            assert_eq!(
-                outcome.status,
-                Some(0),
-                "{extra:?}: {}",
-                outcome.stderr_text()
-            );
-            assert_eq!(conf_locale_lines(&theirs), expected, "{extra:?}");
-            std::fs::remove_dir_all(&theirs).expect("remove the cluster");
+        let theirs = tempdir.join("theirs");
+        for (extra, without) in cases {
+            let mut before = base.to_vec();
+            before.extend(extra);
+            let mut same_as = base.to_vec();
+            same_as.extend(without);
+
+            rinitdb_ok(&same_as, &ours, env);
+            let expected = conf_locale_lines(&ours);
+            assert_eq!(expected.len(), 4, "{expected:?}");
+            std::fs::remove_dir_all(&ours).expect("remove the cluster");
+            rinitdb_ok(&before, &ours, env);
+            assert_eq!(conf_locale_lines(&ours), expected, "{extra:?}, {env:?}");
+            std::fs::remove_dir_all(&ours).expect("remove the cluster");
+
+            if let Some(initdb) = &reference {
+                let reference_expected =
+                    reference_conf_locale_lines(initdb, &same_as, &theirs, env);
+                assert_eq!(
+                    reference_conf_locale_lines(initdb, &before, &theirs, env),
+                    reference_expected,
+                    "{extra:?}, {env:?}"
+                );
+                if the_reference_is_c {
+                    assert_eq!(reference_expected, expected, "{extra:?}, {env:?}");
+                }
+            }
         }
     }
 }

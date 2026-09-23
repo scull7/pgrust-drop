@@ -4,8 +4,8 @@
 # pgrust is AGPL-3.0. Only the AGPL crate `pgdrop` may depend on it, directly or
 # transitively; the MIT crates (testkit, rinitdb, rlibpq, rpsql) must not
 # reach a single pgrust crate through any normal, build or dev edge, on any
-# target. The owner's approval of pgrust's dependency tree (2026-09-23) is for
-# pgdrop only.
+# target, under any feature. The owner's approval of pgrust's dependency tree
+# (2026-09-23) is for pgdrop only.
 #
 # A pgrust crate is recognised by its source: a git URL whose repository is
 # named `pgrust` (malisper's or scull7's fork). As a guard against this check
@@ -21,7 +21,7 @@ readonly PGRUST_SOURCE='github\.com/[^/]*/pgrust[?#]'
 # Capture first, so a failing `cargo tree` fails the script instead of feeding
 # an empty tree to grep.
 tree_of() {
-  cargo tree --locked -p "$1" -e normal,build,dev --target all \
+  cargo tree --locked --all-features -p "$1" -e normal,build,dev --target all \
     --prefix none --format '{p}'
 }
 

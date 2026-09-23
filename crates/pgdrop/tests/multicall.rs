@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use testkit::normalize::EXTRA_VERSION;
+
 const PGDROP: &str = env!("CARGO_BIN_EXE_pgdrop");
 
 fn symlinked_as(name: &str) -> PathBuf {
@@ -79,13 +81,22 @@ fn postgres_subcommand_reports_pgrusts_version() {
 
 /// Through a `postgres` symlink, pgrust's version line is C's byte for byte
 /// (`main.c:170`, `PG_BACKEND_VERSIONSTR`).
+///
+/// Normalized by `normalize::EXTRA_VERSION`, as `version_matches_c_psql` and
+/// the `initdb` version gate are: PGDG and Homebrew build the reference with
+/// `--with-extra-version`, which appends a parenthetical such as
+/// `(Ubuntu 18.6-1.pgdg24.04+2)` or `(Homebrew)` to that one line. The
+/// normalizer strips only a trailing parenthetical from that line shape; the
+/// version number itself is still compared, so 18.6 and 18.5 still differ.
 #[test]
 fn postgres_symlink_version_matches_the_c_server() {
     let link = symlinked_as("postgres");
     let Some(gate) = testkit::Gate::for_tool_or_skip("postgres", link) else {
         return; // The flagged skip is already on stderr.
     };
-    gate.arg("--version").assert_clean();
+    gate.arg("--version")
+        .normalizer(EXTRA_VERSION)
+        .assert_clean();
 }
 
 #[test]

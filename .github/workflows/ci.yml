@@ -88,6 +88,8 @@ jobs:
       # target/. It runs as root, so the next step hands the restored trees to
       # the unprivileged user.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # The container's steps run as root, and C initdb and postgres refuse to
       # run as root ("cannot be run as root"), so every gate that creates a
       # cluster would compare two refusals. The checks run as an ordinary user;
@@ -129,6 +131,8 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Install the PostgreSQL 18 reference (Homebrew)
         run: brew install postgresql@18
       - name: verify the reference binaries are where the gates look
@@ -159,6 +163,8 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # postgresql-18 + postgresql-client-18 put these under
       # /usr/lib/postgresql/18/bin (PGDG's Debian/Ubuntu layout -- versioned
       # bindir, with /usr/bin holding only pg_wrapper symlinks):

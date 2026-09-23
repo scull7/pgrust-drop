@@ -14,7 +14,8 @@
 //! again, [`conf`] renders the configuration files from the vendored templates
 //! over [`pg_config`]'s build-time constants, [`sync`] plans and performs
 //! `sync_pgdata`, [`control`] parses and rewrites `pg_control` over
-//! [`crc32c`], [`tz`] reads the timezone database and [`findtimezone`] picks
+//! [`crc32c`], [`image`] packs and expands the template cluster ADR-0002
+//! builds on, [`tz`] reads the timezone database and [`findtimezone`] picks
 //! the default zone over it, [`help`] is the upstream text, and [`run`] is the
 //! only function that writes to a stream.
 
@@ -36,6 +37,7 @@ pub mod error;
 pub mod file_perm;
 pub mod findtimezone;
 pub mod help;
+pub mod image;
 pub mod layout;
 pub mod pg_config;
 pub mod strerror;

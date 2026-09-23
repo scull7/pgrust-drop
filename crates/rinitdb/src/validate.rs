@@ -23,7 +23,7 @@
 //!   through [`FsProbe`], so every case below is unit-tested against a map of
 //!   fake directories, with no temporary files at all.
 //! - [`RealFs`] is the single action, a port of `pg_check_dir`
-//!   (`src/port/pgcheckdir.c:32`).
+//!   (`src/port/pgcheckdir.c:33`).
 //!
 //! Order is the whole point: several of these conditions can hold at once and
 //! C reports exactly one of them, so a check in the wrong place is a wrong
@@ -37,7 +37,7 @@ use crate::error::{DirRole, InitdbError, LocaleProvider, NotEmpty};
 use crate::file_perm::DataDirPerm;
 use crate::sync::{self, SyncMethod};
 
-/// What `pg_check_dir` (`src/port/pgcheckdir.c:32`) reports about a directory.
+/// What `pg_check_dir` (`src/port/pgcheckdir.c:33`) reports about a directory.
 ///
 /// The upstream return codes are 0, 1, 2, 3, 4 and -1; the two that carry an
 /// `errno` carry the text `%m` would print with them, because the caller
@@ -143,10 +143,10 @@ pub fn strerror(err: &std::io::Error) -> String {
 /// What the process was told, outside its arguments.
 ///
 /// `PGDATA` is `setup_pgdata`'s fallback (`initdb.c:2615`). `effective_user`
-/// stands in for `get_id()` (`initdb.c:817`); see the note on [`validate`].
+/// stands in for `get_id()` (`initdb.c:815`); see the note on [`validate`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Environment {
-    /// `getenv("PGDATA")`, `None` when unset or empty (`initdb.c:2616`).
+    /// `getenv("PGDATA")`, `None` when unset or empty (`initdb.c:2617`).
     pub pgdata: Option<String>,
     /// The name `get_id()` would report, when it can be determined.
     pub effective_user: Option<String>,
@@ -172,7 +172,7 @@ impl Environment {
 }
 
 /// What `create_data_directory` / `create_xlog_or_symlink` will do with a
-/// directory that passed validation (`initdb.c:2896` and `:2909`).
+/// directory that passed validation (`initdb.c:2896` and `:2910`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirAction {
     /// `pg_check_dir` == 0: make it.
@@ -203,7 +203,7 @@ pub struct CreatePlan {
     /// What `-g` left `pg_dir_create_mode` and friends at (`initdb.c:3360`).
     pub perm: DataDirPerm,
     pub locale_provider: LocaleProvider,
-    /// The canonical `datlocale` (`initdb.c:2483`), `None` for `libc`.
+    /// The canonical `datlocale` (`initdb.c:2488`), `None` for `libc`.
     pub datlocale: Option<String>,
     /// `None` when `-E` was not given: C derives it from `LC_CTYPE`, which
     /// needs `setlocale`/`nl_langinfo` and lands with the locale work.
@@ -211,7 +211,7 @@ pub struct CreatePlan {
     /// The superuser name, `None` when neither `--username` nor the
     /// environment settled it.
     pub username: Option<String>,
-    /// `-c NAME=VALUE`, split and kept in command-line order (`initdb.c:3277`).
+    /// `-c NAME=VALUE`, split and kept in command-line order (`initdb.c:3278`).
     pub gucs: Vec<(String, String)>,
     /// `do_sync` (`initdb.c:164`): false under `--no-sync`, which prints the
     /// note at `:3516` instead of syncing.
@@ -242,7 +242,7 @@ pub fn validate(
     // --- the getopt_long switch arms that can fail, in command-line order ---
     let gucs = split_gucs(&options.set)?;
     let locale_provider = parse_locale_provider(options.locale_provider.as_deref())?;
-    // initdb.c:3389, the `case 19:` arm.
+    // initdb.c:3388, the `case 19:` arm.
     let sync_method = sync::parse_sync_method(options.sync_method.as_deref())?;
 
     // --- immediately after the loop (initdb.c:3416) ---
@@ -277,7 +277,7 @@ pub fn validate(
 
     let pgdata = require_datadir(datadir, env)?;
 
-    // initdb.c:3477 — after setup_bin_paths and get_id().
+    // initdb.c:3478 — after setup_bin_paths and get_id().
     let username = options
         .username
         .clone()
@@ -288,7 +288,7 @@ pub fn validate(
         return Err(InitdbError::SuperuserNameDisallowed { name: name.clone() });
     }
 
-    // initdb.c:2420 (setlocales) and :2687 (setup_locale_encoding).
+    // initdb.c:2424 (setlocales) and :2685 (setup_locale_encoding).
     let datlocale = resolve_datlocale(options, locale_provider)?;
     let encoding = resolve_encoding(options.encoding.as_deref())?;
     check_builtin_locale_encoding(locale_provider, datlocale.as_deref(), encoding)?;
@@ -313,7 +313,7 @@ pub fn validate(
     }))
 }
 
-/// The head of `create_xlog_or_symlink` (`initdb.c:2955`-`:3010`): `--waldir`
+/// The head of `create_xlog_or_symlink` (`initdb.c:2955`-`:3012`): `--waldir`
 /// must be absolute and usable, and what will be done to it.
 ///
 /// Pure, like [`validate`], and over the same [`FsProbe`] — but deliberately
@@ -325,7 +325,7 @@ pub fn validate(
 ///
 /// # Errors
 /// [`InitdbError::WalDirectoryNotAbsolute`] (`initdb.c:2962`), or whatever
-/// `pg_check_dir` makes of the directory (`:2966`).
+/// `pg_check_dir` makes of the directory (`:2965`).
 pub fn classify_waldir(
     waldir: Option<&Path>,
     fs: &dyn FsProbe,
@@ -340,7 +340,7 @@ pub fn classify_waldir(
     Ok(Some((path.to_path_buf(), action)))
 }
 
-/// `initdb.c:3268`: every `-c` argument must contain an `=`.
+/// `initdb.c:3271`: every `-c` argument must contain an `=`.
 fn split_gucs(set: &[String]) -> Result<Vec<(String, String)>, InitdbError> {
     set.iter()
         .map(|item| match item.split_once('=') {
@@ -353,7 +353,7 @@ fn split_gucs(set: &[String]) -> Result<Vec<(String, String)>, InitdbError> {
 /// `initdb.c:3367`: the `--locale-provider` switch arm.
 fn parse_locale_provider(name: Option<&str>) -> Result<LocaleProvider, InitdbError> {
     match name {
-        // No --locale-provider leaves the initdb.c:139 default in place.
+        // No --locale-provider leaves the initdb.c:147 default in place.
         None | Some("libc") => Ok(LocaleProvider::Libc),
         Some("builtin") => Ok(LocaleProvider::Builtin),
         Some("icu") => Ok(LocaleProvider::Icu),
@@ -396,7 +396,7 @@ fn check_provider_specific_options(
     Ok(())
 }
 
-/// `setup_pgdata` (`initdb.c:2612`): `-D`, else the positional argument, else
+/// `setup_pgdata` (`initdb.c:2611`): `-D`, else the positional argument, else
 /// `PGDATA`, else a fatal.
 fn require_datadir(from_args: Option<&str>, env: &Environment) -> Result<PathBuf, InitdbError> {
     from_args
@@ -406,7 +406,7 @@ fn require_datadir(from_args: Option<&str>, env: &Environment) -> Result<PathBuf
         .ok_or(InitdbError::NoDataDirectory)
 }
 
-/// `setlocales` (`initdb.c:2420`) and the builtin canonicalization at `:2474`.
+/// `setlocales` (`initdb.c:2424`) and the builtin canonicalization at `:2475`.
 fn resolve_datlocale(
     options: &Options,
     provider: LocaleProvider,
@@ -418,7 +418,7 @@ fn resolve_datlocale(
         .builtin_locale
         .clone()
         .or_else(|| options.icu_locale.clone());
-    // --no-locale is `locale = "C"` (initdb.c:3336).
+    // --no-locale is `locale = "C"` (initdb.c:3338).
     let locale = options
         .locale
         .clone()
@@ -431,7 +431,7 @@ fn resolve_datlocale(
         (None, _) => locale,
     };
 
-    // libc is the only provider that may leave datlocale unset (initdb.c:2470).
+    // libc is the only provider that may leave datlocale unset (initdb.c:2471).
     if provider == LocaleProvider::Libc {
         return Ok(datlocale);
     }
@@ -440,11 +440,11 @@ fn resolve_datlocale(
         return Err(InitdbError::LocaleRequiredForProvider { provider });
     };
     if provider == LocaleProvider::Icu {
-        // initdb.c:2490 calls icu_language_tag(), which is the #else branch at
+        // initdb.c:2495 calls icu_language_tag(), which is the #else branch at
         // :2362 in a build without ICU. rinitdb has no ICU dependency.
         return Err(InitdbError::IcuNotSupported);
     }
-    // initdb.c:2474: C, C.UTF-8 (either spelling) and PG_UNICODE_FAST only.
+    // initdb.c:2475: C, C.UTF-8 (either spelling) and PG_UNICODE_FAST only.
     match name.as_str() {
         "C" => Ok(Some("C".to_owned())),
         "C.UTF-8" | "C.UTF8" => Ok(Some("C.UTF-8".to_owned())),
@@ -453,7 +453,7 @@ fn resolve_datlocale(
     }
 }
 
-/// `get_encoding_id` (`initdb.c:845`), or `None` when `-E` was not given.
+/// `get_encoding_id` (`initdb.c:846`), or `None` when `-E` was not given.
 fn resolve_encoding(name: Option<&str>) -> Result<Option<Encoding>, InitdbError> {
     match name {
         None => Ok(None),
@@ -465,7 +465,7 @@ fn resolve_encoding(name: Option<&str>) -> Result<Option<Encoding>, InitdbError>
     }
 }
 
-/// `initdb.c:2777`: the builtin provider's UTF-8-only locales.
+/// `initdb.c:2778`: the builtin provider's UTF-8-only locales.
 fn check_builtin_locale_encoding(
     provider: LocaleProvider,
     datlocale: Option<&str>,
@@ -487,7 +487,7 @@ fn check_builtin_locale_encoding(
 }
 
 /// The shared `switch (pg_check_dir(...))` of `create_data_directory`
-/// (`initdb.c:2894`) and `create_xlog_or_symlink` (`initdb.c:2966`).
+/// (`initdb.c:2894`) and `create_xlog_or_symlink` (`initdb.c:2965`).
 fn classify_dir(state: DirState, path: &Path, role: DirRole) -> Result<DirAction, InitdbError> {
     match state {
         DirState::Nonexistent { .. } => Ok(DirAction::Create),
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn a_set_argument_without_an_equals_sign_is_rejected() {
-        // initdb.c:3268.
+        // initdb.c:3271.
         assert_eq!(
             failure(&["-c", "work_mem", "dd"], &FakeFs::empty()),
             InitdbError::SetRequiresValue {
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn a_set_value_may_itself_contain_an_equals_sign() {
-        // *equals++ = '\0' splits at the first '=' only (initdb.c:3277).
+        // *equals++ = '\0' splits at the first '=' only (initdb.c:3278).
         let plan = created(&["-c", "search_path=a=b", "dd"], &FakeFs::empty());
         assert_eq!(
             plan.gucs,
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn a_password_prompt_with_a_password_file_beats_the_missing_data_directory() {
-        // initdb.c:3454 runs before setup_pgdata() at :3468.
+        // initdb.c:3454 runs before setup_pgdata() at :3470.
         assert_eq!(
             failure(&["--pwprompt", "--pwfile", "/tmp/pw"], &FakeFs::empty()),
             InitdbError::PasswordPromptAndFile
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn the_effective_user_is_the_default_superuser_name_and_is_checked_too() {
-        // initdb.c:3477: `if (!username) username = effective_user;`.
+        // initdb.c:3475: `if (!username) username = effective_user;`.
         let banned = Environment {
             effective_user: Some("pg_robot".to_owned()),
             ..env()
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn the_superuser_name_is_checked_before_the_locale_provider() {
-        // initdb.c:3479 precedes setup_locale_encoding() at :3491.
+        // initdb.c:3479 precedes setup_locale_encoding() at :3490.
         assert_eq!(
             failure(
                 &[
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn no_locale_stands_in_for_locale_c() {
-        // initdb.c:3336 sets locale = "C" for --no-locale.
+        // initdb.c:3338 sets locale = "C" for --no-locale.
         let plan = created(
             &["--locale-provider", "builtin", "--no-locale", "/tmp/data"],
             &FakeFs::empty(),
@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn the_builtin_provider_canonicalizes_its_three_locales_and_rejects_the_rest() {
-        // initdb.c:2474.
+        // initdb.c:2475.
         let cases = [
             ("C", "C"),
             ("C.UTF-8", "C.UTF-8"),
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn an_explicit_locale_wins_over_no_locale_whatever_the_order() {
-        // C's getopt applies case 8 (--no-locale, initdb.c:3336) and case 1
+        // C's getopt applies case 8 (--no-locale, initdb.c:3337) and case 1
         // (--locale) in command-line order, so the last one wins. usage-rs
         // reports flags, not positions, so --locale always wins here.
         for order in [
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn a_data_directory_path_is_reported_as_it_was_typed() {
-        // C runs canonicalize_path() (initdb.c:2646) before pg_check_dir and
+        // C runs canonicalize_path() (initdb.c:2634) before pg_check_dir and
         // before every message, so it would print "/tmp/x/nonexistent" here.
         let err = failure(&["--sync-only", "/tmp/x//nonexistent/"], &FakeFs::empty());
         assert_eq!(

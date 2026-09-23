@@ -26,6 +26,10 @@ rpsql = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }
+# Workspace-internal, test-only: tests/pg_config_agreement.rs compares
+# rinitdb's pg_config constants with rlibpq's (NAT-428). rlibpq is already in
+# the build through rpsql; this edge only makes it nameable from a test.
+rlibpq = { workspace = true }
 
 [lints]
 workspace = true

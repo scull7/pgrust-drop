@@ -343,3 +343,114 @@ fn a_failing_waldir_behind_a_superuser_refusal_still_warns_first() {
         )
     );
 }
+
+/// A locale every lane's libc knows by this name, for the command lines the
+/// reference initdb must get past `setlocales` (`initdb.c:2424`) with: musl
+/// keeps any name, glibc has `C.UTF-8` built in, Darwin has no `C.UTF-8`.
+const NON_C_LOCALE: &str = if cfg!(target_os = "macos") {
+    "en_US.UTF-8"
+} else {
+    "C.UTF-8"
+};
+
+/// `<tool> --no-sync -T simple -U postgres <extra> --waldir=<non-empty> <pgdata>`
+/// in `tempdir`, and the stderr it is expected to end with: C's `--waldir`
+/// error, its hint and the removal of the data directory it made.
+fn behind_a_failing_waldir(
+    tool: &Path,
+    tempdir: &TempDir,
+    extra: &[&str],
+) -> (testkit::CommandOutcome, String) {
+    let pgdata = tempdir.join("data");
+    let waldir = tempdir.join("wal");
+    let _ = std::fs::create_dir(&waldir);
+    std::fs::write(waldir.join("occupied"), b"").expect("make the WAL directory non-empty");
+    let mut argv = args(&["--no-sync", "-T", "simple", "-U", "postgres"]);
+    argv.extend(extra.iter().map(OsString::from));
+    argv.extend([
+        OsString::from("--waldir"),
+        waldir.clone().into(),
+        pgdata.clone().into(),
+    ]);
+    let outcome = testkit::run(tool, &argv).expect("run initdb");
+    let (pgdata, waldir) = (pgdata.display(), waldir.display());
+    let tail = format!(
+        "initdb: error: directory \"{waldir}\" exists but is not empty\n\
+         initdb: hint: If you want to store the WAL there, either remove or empty the \
+         directory \"{waldir}\".\n\
+         initdb: removing data directory \"{pgdata}\"\n"
+    );
+    (outcome, tail)
+}
+
+/// `setup_text_search`'s line (`initdb.c:2859`) for `-T simple` and `lc_ctype`.
+fn simple_might_not_match(lc_ctype: &str) -> String {
+    format!(
+        "initdb: warning: specified text search configuration \"simple\" might not match \
+         locale \"{lc_ctype}\"\n"
+    )
+}
+
+/// `setup_text_search` (`initdb.c:3492`) runs before `create_data_directory`
+/// (`:3060`) and names `lc_ctype` (`:2859`), which only `--lc-ctype` and
+/// `--locale` set (`:2432`). So behind a failing `--waldir`, a refusal that
+/// leaves `lc_ctype` at C — `-E`, `--locale-provider`, `--lc-collate`, or a
+/// `--locale` that `--lc-ctype=C` overrides — still gets C's warning first.
+/// Byte for byte against the reference initdb's stderr and exit status.
+#[test]
+fn a_failing_waldir_behind_a_refusal_that_keeps_lc_ctype_c_still_warns_first() {
+    let reference = reference::find_or_skip("initdb");
+    for extra in [
+        &["--no-locale", "-E", "UTF8", "--lc-collate", NON_C_LOCALE][..],
+        &["--no-locale", "-E", "LATIN1"],
+        &[
+            "--no-locale",
+            "-E",
+            "UTF8",
+            "--locale-provider",
+            "builtin",
+            "--builtin-locale",
+            "C",
+        ],
+        &["-E", "UTF8", "--locale", NON_C_LOCALE, "--lc-ctype", "C"],
+    ] {
+        let tempdir = TempDir::new("expanded-tsearch-refusal");
+        let (ours, tail) = behind_a_failing_waldir(Path::new(RINITDB), &tempdir, extra);
+        assert_eq!(ours.status, Some(1), "{extra:?}: {}", ours.stderr_text());
+        let expected = simple_might_not_match("C") + &tail;
+        assert_eq!(ours.stderr_text(), expected, "{extra:?}");
+        if let Some(initdb) = &reference {
+            let (theirs, _) = behind_a_failing_waldir(initdb, &tempdir, extra);
+            assert_eq!(theirs.status, ours.status, "{extra:?}");
+            assert_eq!(theirs.stderr_text(), ours.stderr_text(), "{extra:?}");
+        }
+    }
+}
+
+/// When `--lc-ctype` or `--locale` is what is refused, `lc_ctype` is not C
+/// and C's warning names it as `setlocale` canonicalizes it, which this port
+/// does not reach: the line is left out rather than misstated, and the rest
+/// of stderr is C's (`docs/divergences.md`). Against the reference initdb:
+/// its stderr is exactly that one line followed by ours.
+#[test]
+fn a_failing_waldir_behind_an_lc_ctype_refusal_leaves_the_warning_out() {
+    let reference = reference::find_or_skip("initdb");
+    for extra in [
+        &["--no-locale", "-E", "UTF8", "--lc-ctype", NON_C_LOCALE][..],
+        &["-E", "UTF8", "--locale", NON_C_LOCALE],
+    ] {
+        let tempdir = TempDir::new("expanded-tsearch-lc-ctype");
+        let (ours, tail) = behind_a_failing_waldir(Path::new(RINITDB), &tempdir, extra);
+        assert_eq!(ours.status, Some(1), "{extra:?}: {}", ours.stderr_text());
+        assert_eq!(ours.stderr_text(), tail, "{extra:?}");
+        if let Some(initdb) = &reference {
+            let (theirs, _) = behind_a_failing_waldir(initdb, &tempdir, extra);
+            assert_eq!(theirs.status, ours.status, "{extra:?}");
+            assert_eq!(
+                theirs.stderr_text(),
+                simple_might_not_match(NON_C_LOCALE) + &tail,
+                "{extra:?}"
+            );
+        }
+    }
+}

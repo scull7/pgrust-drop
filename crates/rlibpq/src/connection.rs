@@ -24,6 +24,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
+use crate::cancel::Peer;
 use crate::conninfo::ConnInfo;
 use crate::error::ConnError;
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
@@ -352,6 +353,22 @@ impl Stream {
         }
     }
 
+    /// `conn->raddr`: the address this socket is connected to, which a
+    /// cancel request must reach (`fe-cancel.c:170`, `:406`). `None` when
+    /// the socket has no peer any more, or a Unix peer has no path — C's
+    /// `conn->sock == PGINVALID_SOCKET` (`fe-cancel.c:83`, `:377`).
+    #[must_use]
+    pub fn peer(&self) -> Option<Peer> {
+        match self {
+            Stream::Tcp(s) => s.peer_addr().ok().map(Peer::Tcp),
+            Stream::Unix(s) => s
+                .peer_addr()
+                .ok()?
+                .as_pathname()
+                .map(|path| Peer::Unix(path.to_path_buf())),
+        }
+    }
+
     /// Switch the socket between blocking and non-blocking reads.
     ///
     /// # Errors
@@ -489,6 +506,12 @@ impl Connection<Stream> {
         let stream = Stream::connect(&address)?;
         let nonce = strong_random(RAW_NONCE_LEN)?;
         Connection::start_up(stream, conninfo, &nonce)
+    }
+
+    /// Where the socket is connected: see [`Stream::peer`].
+    #[must_use]
+    pub fn peer(&self) -> Option<Peer> {
+        self.stream.peer()
     }
 
     /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
@@ -1284,7 +1307,9 @@ impl<S: Read + Write> Connection<S> {
         self.backend_pid
     }
 
-    /// The cancel key, kept for the cancel request NAT-394 will send.
+    /// The cancel key BackendKeyData carried (`conn->be_cancel_key`), which
+    /// [`Connection::get_cancel`] and [`Connection::cancel_create`] copy.
+    /// Empty when the server sent none.
     #[must_use]
     pub fn cancel_key(&self) -> &[u8] {
         &self.cancel_key

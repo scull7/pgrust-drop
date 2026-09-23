@@ -2,7 +2,7 @@
 //!
 //! Upstream stores a name-ordered linked list of `struct _variable`, each with
 //! an optional substitute hook and an optional assign hook
-//! (`variables.h:57`-`:69`). The assign hooks there are C function pointers
+//! (`variables.h:62`-`:69`). The assign hooks there are C function pointers
 //! that write into the `pset` global; here they are *data* — [`Assign`] says
 //! which setting a variable controls — and [`VariableSpace::settings`] is the
 //! pure calculation that derives those settings from the current values. Same
@@ -17,16 +17,16 @@ use crate::settings::{
 };
 
 /// What a variable's substitute hook does to a proposed value
-/// (`variables.h:41`-`:55`).
+/// (`variables.h:34`-`:54`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Substitute {
-    /// `bool_substitute_hook` (`startup.c:718`): `\unset FOO` becomes
+    /// `bool_substitute_hook` (`startup.c:863`): `\unset FOO` becomes
     /// `\set FOO off`, and `\set FOO` becomes `\set FOO on`.
     Bool,
     /// The several `*_substitute_hook`s that only supply a default for an
     /// unset variable: `fetch_count`, `histsize`, `echo`, `verbosity`, ….
     Default(&'static str),
-    /// `ignoreeof_substitute_hook` (`startup.c:806`): unset is `0`, and a
+    /// `ignoreeof_substitute_hook` (`startup.c:963`): unset is `0`, and a
     /// non-integer value becomes `10`, as bash does.
     IgnoreEof,
 }
@@ -45,12 +45,12 @@ pub enum Assign {
     Enum(EnumField),
     /// A prompt string; any value is accepted.
     Prompt(PromptField),
-    /// `histfile_hook` (`startup.c:781`): a placeholder that accepts anything,
+    /// `histfile_hook` (`startup.c:924`): a placeholder that accepts anything,
     /// so HISTFILE stays known to tab completion.
     Accept,
 }
 
-/// The boolean `pset` fields (`settings.h:163`-`:169`).
+/// The boolean `pset` fields (`settings.h:165`-`:171`, `:185`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolField {
     /// `pset.autocommit`
@@ -71,7 +71,7 @@ pub enum BoolField {
     HideTableam,
 }
 
-/// The integer `pset` fields (`settings.h:170`-`:173`).
+/// The integer `pset` fields (`settings.h:172`-`:174`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumField {
     /// `pset.fetch_count`
@@ -82,7 +82,7 @@ pub enum NumField {
     Ignoreeof,
 }
 
-/// The enum-valued `pset` fields (`settings.h:175`-`:186`).
+/// The enum-valued `pset` fields (`settings.h:176`-`:180`, `:184`, `:186`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnumField {
     /// `pset.echo`
@@ -112,12 +112,12 @@ pub enum PromptField {
     Prompt3,
 }
 
-/// One entry of the repository (`variables.h:63`-`:69`).
+/// One entry of the repository (`variables.h:62`-`:69`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Variable {
     name: String,
     /// `None` means the variable is logically unset, but the entry stays so
-    /// its hooks are not forgotten (`variables.h:60`).
+    /// its hooks are not forgotten (`variables.h:59`-`:60`).
     value: Option<String>,
     substitute: Option<Substitute>,
     assign: Option<Assign>,
@@ -133,15 +133,15 @@ pub struct AssignError {
 /// The variable space (`variables.h:72`).
 ///
 /// Entries are kept in name order (`strcmp`), which is what makes
-/// [`VariableSpace::print`] read nicely (`variables.c:48`).
+/// [`VariableSpace::print`] read nicely (`variables.c:49`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VariableSpace {
     entries: Vec<Variable>,
 }
 
 impl VariableSpace {
-    /// `CreateVariableSpace()` (`variables.c:52`) followed by
-    /// `EstablishVariableSpace()` (`startup.c:1101`): the hook table, in
+    /// `CreateVariableSpace()` (`variables.c:53`) followed by
+    /// `EstablishVariableSpace()` (`startup.c:1218`): the hook table, in
     /// upstream's order.
     #[must_use]
     // The body is one table, one row per `SetVariableHooks` call upstream makes;
@@ -256,7 +256,7 @@ impl VariableSpace {
         space
     }
 
-    /// `SetVariableHooks()` (`variables.c:341`): install the hooks and apply
+    /// `SetVariableHooks()` (`variables.c:385`): install the hooks and apply
     /// them to the variable's current value.
     fn set_hooks(&mut self, name: &str, substitute: Option<Substitute>, assign: Option<Assign>) {
         let value = self.get(name).map(str::to_string);
@@ -280,7 +280,7 @@ impl VariableSpace {
         self.entries.binary_search_by(|v| v.name.as_str().cmp(name))
     }
 
-    /// `GetVariable()` (`variables.c:70`): the value, or `None` when unset.
+    /// `GetVariable()` (`variables.c:73`): the value, or `None` when unset.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.position(name)
@@ -297,7 +297,7 @@ impl VariableSpace {
         result
     }
 
-    /// `SetVariable()` (`variables.c:252`). `value == None` is `\unset`.
+    /// `SetVariable()` (`variables.c:282`). `value == None` is `\unset`.
     ///
     /// # Errors
     /// Returns the message upstream's `pg_log_error` would print when the name
@@ -325,7 +325,7 @@ impl VariableSpace {
                 let entry = &mut self.entries[i];
                 entry.value = new_value;
                 // If the value is gone and there are no hooks to remember, the
-                // entry can go too (`variables.c:299`).
+                // entry can go too (`variables.c:333`).
                 if entry.value.is_none() && entry.substitute.is_none() && entry.assign.is_none() {
                     self.entries.remove(i);
                 }
@@ -349,7 +349,7 @@ impl VariableSpace {
         }
     }
 
-    /// `SetVariableBool()` (`variables.c:335`): `\set NAME on`.
+    /// `SetVariableBool()` (`variables.c:463`): `\set NAME on`.
     ///
     /// # Errors
     /// As [`VariableSpace::set`].
@@ -357,7 +357,7 @@ impl VariableSpace {
         self.set(name, Some("on"))
     }
 
-    /// `DeleteVariable()` (`variables.c:330`).
+    /// `DeleteVariable()` (`variables.c:475`).
     ///
     /// # Errors
     /// As [`VariableSpace::set`].
@@ -365,7 +365,7 @@ impl VariableSpace {
         self.set(name, None)
     }
 
-    /// `PrintVariables()` (`variables.c:229`): `name = value`, one per line,
+    /// `PrintVariables()` (`variables.c:257`): `name = value`, one per line,
     /// in name order, skipping the unset ones.
     #[must_use]
     pub fn print(&self) -> String {
@@ -382,7 +382,7 @@ impl VariableSpace {
     /// derive every hook-owned field of [`PsqlSettings`] from the current
     /// values.
     ///
-    /// Only the fields listed under "set by assign hooks" in `settings.h:159`
+    /// Only the fields listed under "set by assign hooks" in `settings.h:161`
     /// are touched; everything else on `base` is left alone.
     #[must_use]
     // One arm per assign hook `startup.c` installs, which is the same table
@@ -478,7 +478,7 @@ impl VariableSpace {
 
 /// A read-only view of the variable space for the lexer's `:name` callback.
 ///
-/// This is upstream's `psql_get_variable()` (`startup.c:1127`), the one
+/// This is upstream's `psql_get_variable()` (`common.c:190`), the one
 /// `PsqlScanCallbacks.get_variable` psql installs: it reads `pset.vars` and
 /// quotes the value the way the caller asked. It borrows because the lexer
 /// only ever reads; a caller that needs the snapshot to outlive a concurrent
@@ -494,7 +494,7 @@ impl VariableSource for VarView<'_> {
             QuoteType::SqlIdent => escape_identifier(&value),
             // `PQUOTE_SHELL_ARG` is upstream's fourth case, and exactly one
             // lexer rule asks for it: `:'{variable_char}+'` at
-            // `psqlscanslash.l:397`, which sits inside the
+            // `psqlscanslash.l:396`, which sits inside the
             // `<xslashbackquote>` start condition opened at `:355`. So
             // `:'var'` means SQL-literal quoting in ordinary context and
             // shell-arg quoting inside backticks.
@@ -562,7 +562,7 @@ fn apply_substitute(hook: Substitute, newval: Option<String>) -> Option<String> 
 /// The validation half of an assign hook: does it accept this value?
 fn check_assign(hook: Assign, name: &str, value: Option<&str>) -> Result<(), AssignError> {
     let enum_error = |value: &str, suggestions: &str| AssignError {
-        // `PsqlVarEnumError` (`variables.c:474`).
+        // `PsqlVarEnumError` (`variables.c:487`).
         message: format!(
             "unrecognized value \"{value}\" for \"{name}\"\nAvailable values are: {suggestions}."
         ),
@@ -634,7 +634,7 @@ fn check_assign(hook: Assign, name: &str, value: Option<&str>) -> Result<(), Ass
     }
 }
 
-/// The `Available values are:` list each enum hook prints (`startup.c:866`…).
+/// The `Available values are:` list each enum hook prints (`startup.c:1011`…).
 const fn enum_suggestions(field: EnumField) -> &'static str {
     match field {
         EnumField::Echo => "none, errors, queries, all",
@@ -646,7 +646,7 @@ const fn enum_suggestions(field: EnumField) -> &'static str {
     }
 }
 
-/// `ParseVariableBool()` (`variables.c:104`).
+/// `ParseVariableBool()` (`variables.c:109`).
 ///
 /// Valid values are true, false, yes, no, on, off, 1, 0 and unique prefixes
 /// thereof; `on`/`off` need two characters because `o` is not unique.
@@ -681,7 +681,7 @@ pub fn parse_variable_bool(value: Option<&str>, _name: Option<&str>, result: &mu
     true
 }
 
-/// `ParseVariableNum()` (`variables.c:155`). `strtol` with base 0, so `0x10`
+/// `ParseVariableNum()` (`variables.c:158`). `strtol` with base 0, so `0x10`
 /// and `010` are read the way C reads them.
 pub fn parse_variable_num(value: Option<&str>, _name: Option<&str>, result: &mut i32) -> bool {
     let value = value.unwrap_or("").trim_start();
@@ -711,7 +711,7 @@ pub fn parse_variable_num(value: Option<&str>, _name: Option<&str>, result: &mut
     }
 }
 
-/// `ParseVariableDouble()` (`variables.c:186`), range-checked into
+/// `ParseVariableDouble()` (`variables.c:195`), range-checked into
 /// `[min, max]`.
 pub fn parse_variable_double(
     value: Option<&str>,
@@ -803,7 +803,7 @@ fn parse_show_context(value: &str) -> Option<rlibpq::ContextVisibility> {
     }
 }
 
-/// `PQescapeLiteral`'s output shape (`fe-exec.c:3960`) for a value that needs
+/// `PQescapeLiteral`'s output shape (`fe-exec.c:4413`) for a value that needs
 /// no `E''` prefix: single quotes doubled.
 #[must_use]
 pub fn escape_literal(value: &str) -> String {
@@ -819,7 +819,7 @@ pub fn escape_literal(value: &str) -> String {
     out
 }
 
-/// `PQescapeIdentifier` (`fe-exec.c:4046`): always double-quoted, embedded
+/// `PQescapeIdentifier` (`fe-exec.c:4419`): always double-quoted, embedded
 /// double quotes doubled.
 #[must_use]
 pub fn escape_identifier(value: &str) -> String {
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn unique_prefixes_of_booleans_are_accepted() {
-        // `variables.c:96`: true, false, yes, no, on, off, 1, 0 and unique
+        // `variables.c:100`: true, false, yes, no, on, off, 1, 0 and unique
         // prefixes; 'o' is not unique enough.
         let mut result = false;
         for (text, want) in [
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn unset_of_a_bool_variable_becomes_off() {
-        // `bool_substitute_hook` (`startup.c:718`).
+        // `bool_substitute_hook` (`startup.c:863`).
         let mut vars = VariableSpace::new();
         vars.set("AUTOCOMMIT", None).unwrap();
         assert_eq!(vars.get("AUTOCOMMIT"), Some("off"));
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn a_hooked_variable_survives_unset_so_its_hooks_are_remembered() {
-        // `variables.c:299`: the struct stays when there are hooks.
+        // `variables.c:333`: the struct stays when there are hooks.
         let mut vars = VariableSpace::new();
         vars.set("QUIET", None).unwrap();
         assert_eq!(vars.get("QUIET"), Some("off"));
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn ignoreeof_mimics_bash() {
-        // `ignoreeof_substitute_hook` (`startup.c:806`).
+        // `ignoreeof_substitute_hook` (`startup.c:963`).
         let mut vars = VariableSpace::new();
         assert_eq!(vars.get("IGNOREEOF"), Some("0"));
         vars.set("IGNOREEOF", Some("banana")).unwrap();

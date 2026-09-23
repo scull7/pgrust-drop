@@ -10,11 +10,11 @@
 
 use rlibpq::{ContextVisibility, Verbosity};
 
-/// `DEFAULT_CSV_FIELD_SEP` (`settings.h:13`).
+/// `DEFAULT_CSV_FIELD_SEP` (`settings.h:14`).
 pub const DEFAULT_CSV_FIELD_SEP: char = ',';
-/// `DEFAULT_FIELD_SEP` (`settings.h:14`).
+/// `DEFAULT_FIELD_SEP` (`settings.h:15`).
 pub const DEFAULT_FIELD_SEP: &str = "|";
-/// `DEFAULT_RECORD_SEP` (`settings.h:15`).
+/// `DEFAULT_RECORD_SEP` (`settings.h:16`).
 pub const DEFAULT_RECORD_SEP: &str = "\n";
 /// `DEFAULT_PROMPT1` (`settings.h:26`).
 pub const DEFAULT_PROMPT1: &str = "%/%R%x%# ";
@@ -27,16 +27,16 @@ pub const DEFAULT_WATCH_INTERVAL: &str = "2";
 /// `DEFAULT_WATCH_INTERVAL_MAX` (`settings.h:35`).
 pub const DEFAULT_WATCH_INTERVAL_MAX: f64 = 1_000_000.0;
 
-/// `EXIT_SUCCESS` (`settings.h:192`).
+/// `EXIT_SUCCESS` (`settings.h:193`).
 pub const EXIT_SUCCESS: u8 = 0;
-/// `EXIT_FAILURE` (`settings.h:196`).
+/// `EXIT_FAILURE` (`settings.h:197`).
 pub const EXIT_FAILURE: u8 = 1;
-/// `EXIT_BADCONN` (`settings.h:199`).
+/// `EXIT_BADCONN` (`settings.h:200`).
 pub const EXIT_BADCONN: u8 = 2;
-/// `EXIT_USER` (`settings.h:201`).
+/// `EXIT_USER` (`settings.h:202`).
 pub const EXIT_USER: u8 = 3;
 
-/// `PSQL_ECHO` (`settings.h:40`).
+/// `PSQL_ECHO` (`settings.h:41`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Echo {
     /// `PSQL_ECHO_NONE`
@@ -50,7 +50,7 @@ pub enum Echo {
     All,
 }
 
-/// `PSQL_ECHO_HIDDEN` (`settings.h:48`).
+/// `PSQL_ECHO_HIDDEN` (`settings.h:49`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EchoHidden {
     /// `PSQL_ECHO_HIDDEN_OFF`
@@ -62,7 +62,7 @@ pub enum EchoHidden {
     NoExec,
 }
 
-/// `PSQL_ERROR_ROLLBACK` (`settings.h:55`).
+/// `PSQL_ERROR_ROLLBACK` (`settings.h:56`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorRollback {
     /// `PSQL_ERROR_ROLLBACK_OFF`
@@ -74,7 +74,7 @@ pub enum ErrorRollback {
     On,
 }
 
-/// `PSQL_COMP_CASE` (`settings.h:62`).
+/// `PSQL_COMP_CASE` (`settings.h:63`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompCase {
     /// `PSQL_COMP_CASE_PRESERVE_UPPER`
@@ -88,7 +88,7 @@ pub enum CompCase {
     Lower,
 }
 
-/// `HistControl` (`settings.h:84`).
+/// `HistControl` (`settings.h:86`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistControl {
     /// `hctl_none`
@@ -102,7 +102,7 @@ pub enum HistControl {
     IgnoreBoth,
 }
 
-/// `enum trivalue` (`settings.h:92`).
+/// `enum trivalue` (`settings.h:94`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Trivalue {
     /// `TRI_DEFAULT`
@@ -114,7 +114,7 @@ pub enum Trivalue {
     Yes,
 }
 
-/// `printFormat` (`fe_utils/print.h:29`), as far as this issue reaches.
+/// `printFormat` (`fe_utils/print.h:28`), as far as this issue reaches.
 ///
 /// NAT-400 owns the rest of the matrix; the variants are declared here so the
 /// option table can record what `-A`, `-H` and `--csv` asked for, and
@@ -142,7 +142,7 @@ pub enum PrintFormat {
 }
 
 /// A field or record separator: a string, or the zero byte
-/// (`fe_utils/print.h:74`).
+/// (`fe_utils/print.h:105`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Separator {
     /// `separator`
@@ -163,7 +163,7 @@ impl Separator {
     }
 }
 
-/// `printTableOpt` (`fe_utils/print.h:92`), the fields `main()` initializes.
+/// `printTableOpt` (`fe_utils/print.h:111`), the fields `main()` initializes.
 // One field per C struct member, and upstream's are `bool`; grouping them into
 // an enum here would put this struct out of step with the header it tracks.
 #[allow(clippy::struct_excessive_bools)]
@@ -196,7 +196,7 @@ pub struct TableOpt {
 }
 
 impl Default for TableOpt {
-    /// The block at `startup.c:164`-`:180`, which relies on the unmentioned
+    /// The block at `startup.c:165`-`:184`, which relies on the unmentioned
     /// fields starting out 0/false/NULL.
     fn default() -> Self {
         Self {
@@ -222,7 +222,7 @@ impl Default for TableOpt {
     }
 }
 
-/// `printQueryOpt` (`fe_utils/print.h:172`).
+/// `printQueryOpt` (`fe_utils/print.h:183`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrintQueryOpt {
     /// `topt`
@@ -233,7 +233,7 @@ pub struct PrintQueryOpt {
     pub title: Option<String>,
 }
 
-/// `PsqlSettings` (`settings.h:99`), minus the fields this port has not
+/// `PsqlSettings` (`settings.h:101`), minus the fields this port has not
 /// reached and minus the ones that are C file handles.
 // As `TableOpt`: these are upstream's `bool` members, one for one.
 #[allow(clippy::struct_excessive_bools)]
@@ -260,7 +260,7 @@ pub struct PsqlSettings {
     /// `timing`
     pub timing: bool,
 
-    // The remaining fields are the ones `settings.h:159` says are set by the
+    // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
     // derives every one of them.
     /// `autocommit`
@@ -311,7 +311,7 @@ pub struct PsqlSettings {
 
 impl Default for PsqlSettings {
     /// What `main()` sets before `parse_psql_options` runs
-    /// (`startup.c:152`-`:212`).
+    /// (`startup.c:152`-`:211`).
     fn default() -> Self {
         Self {
             popt: PrintQueryOpt::default(),
@@ -324,7 +324,7 @@ impl Default for PsqlSettings {
             lineno: 0,
             stmt_lineno: 1,
             timing: false,
-            // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:201`.
+            // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,
             quiet: false,
@@ -346,7 +346,7 @@ impl Default for PsqlSettings {
             prompt3: DEFAULT_PROMPT3.to_string(),
             verbosity: Verbosity::Default,
             // `SetVariableBool(pset.vars, "SHOW_ALL_RESULTS")` at
-            // `startup.c:205`.
+            // `startup.c:206`.
             show_all_results: true,
             show_context: ContextVisibility::Errors,
         }
@@ -355,7 +355,7 @@ impl Default for PsqlSettings {
 
 impl PsqlSettings {
     /// The separator defaults `main()` supplies after option parsing, once it
-    /// knows `-F`/`-R`/`-z`/`-0` did not (`startup.c:228`-`:238`).
+    /// knows `-F`/`-R`/`-z`/`-0` did not (`startup.c:227`-`:238`).
     pub fn apply_separator_defaults(&mut self) {
         let topt = &mut self.popt.topt;
         if topt.field_sep.separator.is_none() && !topt.field_sep.separator_zero {

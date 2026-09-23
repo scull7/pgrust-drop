@@ -77,7 +77,7 @@ pub const FLUSH_AFTER_DEFAULTS: [(&str, u32); 3] = [
     ("checkpoint_flush_after", DEFAULT_CHECKPOINT_FLUSH_AFTER),
 ];
 
-/// `#ifdef WIN32` at `initdb.c:1396`: Windows gets `update_process_title = off`.
+/// `#ifdef WIN32` at `initdb.c:1397`: Windows gets `update_process_title = off`.
 pub const UPDATE_PROCESS_TITLE_OFF: bool = cfg!(windows);
 
 #[cfg(test)]

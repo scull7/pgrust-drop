@@ -16,7 +16,7 @@
 //!
 //! `ControlFileData` is written to disk as raw memory — `WriteControlFile`
 //! `memcpy`s the struct into a zeroed `PG_CONTROL_FILE_SIZE` buffer
-//! (`xlog.c:4333`) — so the file *is* the C ABI's layout: native byte order,
+//! (`xlog.c:4304`) — so the file *is* the C ABI's layout: native byte order,
 //! natural alignment, and the compiler's interior padding. [`offset`] holds
 //! every field's byte offset for a 64-bit build with `MAXIMUM_ALIGNOF` 8
 //! (x86-64, aarch64, the platforms this crate targets), and [`PADDING`] holds
@@ -26,7 +26,7 @@
 //!
 //! A 32-bit or `MAXIMUM_ALIGNOF 4` build lays the struct out differently;
 //! upstream cannot read such a file either (`maxAlign` is one of the
-//! compatibility fields `ReadControlFile` rejects on, `xlog.c:4425`), so there
+//! compatibility fields `ReadControlFile` rejects on, `xlog.c:4434`), so there
 //! is one layout here and a build that does not match it is a build whose
 //! clusters upstream would refuse too.
 
@@ -44,30 +44,30 @@ pub const CATALOG_VERSION_NO: u32 = 202_506_291;
 /// `MOCK_AUTH_NONCE_LEN` (`src/include/catalog/pg_control.h:28`).
 pub const MOCK_AUTH_NONCE_LEN: usize = 32;
 
-/// `PG_CONTROL_FILE_SIZE` (`src/include/catalog/pg_control.h:252`): the
+/// `PG_CONTROL_FILE_SIZE` (`src/include/catalog/pg_control.h:256`): the
 /// physical size of the file, constant across format changes.
 pub const PG_CONTROL_FILE_SIZE: usize = 8192;
 
-/// `PG_CONTROL_MAX_SAFE_SIZE` (`src/include/catalog/pg_control.h:243`): the
+/// `PG_CONTROL_MAX_SAFE_SIZE` (`src/include/catalog/pg_control.h:247`): the
 /// struct must fit in one disk sector so the write is atomic.
 pub const PG_CONTROL_MAX_SAFE_SIZE: usize = 512;
 
 /// `sizeof(ControlFileData)` for a 64-bit build — the number of bytes
-/// `get_controlfile_by_exact_path` reads (`src/common/controldata_utils.c:99`)
-/// and `WriteControlFile` copies (`xlog.c:4334`).
+/// `get_controlfile_by_exact_path` reads (`src/common/controldata_utils.c:101`)
+/// and `WriteControlFile` copies (`xlog.c:4304`).
 pub const SIZEOF_CONTROL_FILE_DATA: usize = 296;
 
 /// `PG_DATA_CHECKSUM_VERSION` (`src/include/storage/bufpage.h:208`).
 pub const PG_DATA_CHECKSUM_VERSION: u32 = 1;
 
-/// `FLOATFORMAT_VALUE` (`src/include/catalog/pg_control.h:195`).
+/// `FLOATFORMAT_VALUE` (`src/include/catalog/pg_control.h:201`).
 pub const FLOATFORMAT_VALUE: f64 = 1_234_567.0;
 
 /// Byte offset of every `ControlFileData` field, in declaration order.
 ///
-/// Taken from `src/include/catalog/pg_control.h:101` onwards under the C ABI
+/// Taken from `src/include/catalog/pg_control.h:104` onwards under the C ABI
 /// rules for a 64-bit build; the `checkPointCopy` group is the embedded
-/// `CheckPoint` struct (`pg_control.h:36`) and its offsets are absolute, not
+/// `CheckPoint` struct (`pg_control.h:35`) and its offsets are absolute, not
 /// relative to the group.
 pub mod offset {
     /// `uint64 system_identifier`.
@@ -200,7 +200,7 @@ pub const PADDING: [(usize, usize); 10] = [
     (289, 3), // after the nonce, aligning `crc`
 ];
 
-/// `DBState` (`src/include/catalog/pg_control.h:88`).
+/// `DBState` (`src/include/catalog/pg_control.h:89`).
 ///
 /// `Unrecognized` keeps a value upstream would not write, so parsing and
 /// writing an image back stays byte-identical whatever is in the file.
@@ -393,7 +393,7 @@ impl SystemIdentifier {
     /// expansions never share an identifier. Each result is therefore forced
     /// past the previous one: when the clock has moved on, that is upstream's
     /// value unchanged; when it has not, it is the previous value plus one,
-    /// which spends the low bits `xlog.c:5090` calls "a little extra
+    /// which spends the low bits `xlog.c:5094` calls "a little extra
     /// uniqueness" and leaves the second and microsecond — the part upstream
     /// documents as readable — intact.
     #[must_use]
@@ -416,7 +416,7 @@ impl SystemIdentifier {
     }
 }
 
-/// A `CheckPoint` (`src/include/catalog/pg_control.h:36`), the copy of the last
+/// A `CheckPoint` (`src/include/catalog/pg_control.h:35`), the copy of the last
 /// checkpoint record `pg_control` keeps for disaster recovery.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CheckPoint {
@@ -456,7 +456,7 @@ pub struct CheckPoint {
     pub oldest_active_xid: u32,
 }
 
-/// `ControlFileData` (`src/include/catalog/pg_control.h:101`), field for field.
+/// `ControlFileData` (`src/include/catalog/pg_control.h:104`), field for field.
 ///
 /// `crc` is the value that was in the file; [`ControlFile::to_bytes`] always
 /// recomputes it, exactly as `WriteControlFile` does, so the field is what
@@ -545,7 +545,7 @@ pub enum ControlFileError {
     /// Fewer than `sizeof(ControlFileData)` bytes.
     ///
     /// The shape of `get_controlfile_by_exact_path`'s short read
-    /// (`src/common/controldata_utils.c:113`); the message it prints names the
+    /// (`src/common/controldata_utils.c:119`); the message it prints names the
     /// path, which is the caller's to add.
     #[error("read {found} of {SIZEOF_CONTROL_FILE_DATA}")]
     ShortRead {
@@ -556,7 +556,7 @@ pub enum ControlFileError {
 
 // Readers. `pg_control` is raw struct memory, so every scalar is in the
 // machine's own byte order — upstream relies on exactly that
-// (`pg_control.h:176`: a file from a different-endian machine is caught by
+// (`pg_control.h:189`: a file from a different-endian machine is caught by
 // `pg_control_version` looking wrong, not by an endianness field).
 fn u32_at(image: &[u8], at: usize) -> u32 {
     let mut bytes = [0u8; 4];
@@ -649,7 +649,7 @@ fn put_check_point(image: &mut [u8], cp: &CheckPoint) {
 impl ControlFile {
     /// Read a `pg_control` image.
     ///
-    /// `get_controlfile_by_exact_path` (`src/common/controldata_utils.c:99`)
+    /// `get_controlfile_by_exact_path` (`src/common/controldata_utils.c:101`)
     /// reads `sizeof(ControlFileData)` bytes and ignores the rest of the file,
     /// so anything past [`SIZEOF_CONTROL_FILE_DATA`] is ignored here too. The
     /// CRC is *checked*, never enforced: upstream hands the verdict back
@@ -729,7 +729,7 @@ impl ControlFile {
 
     /// The `PG_CONTROL_FILE_SIZE` bytes `WriteControlFile` would write.
     ///
-    /// `xlog.c:4333` zeroes the whole buffer and copies the struct into its
+    /// `xlog.c:4303` zeroes the whole buffer and copies the struct into its
     /// front, so every byte past `sizeof(ControlFileData)` — and every interior
     /// padding byte, which `InitControlFile`'s `memset` already zeroed — is
     /// zero. The CRC over `offsetof(ControlFileData, crc)` bytes is recomputed
@@ -845,7 +845,7 @@ impl ControlFile {
         self.crc == crc32c::crc32c(&self.to_bytes()[..offset::CRC])
     }
 
-    /// `DataChecksumsEnabled()` (`xlog.c:4614`).
+    /// `DataChecksumsEnabled()` (`xlog.c:4611`).
     #[must_use]
     pub const fn data_checksums(&self) -> DataChecksums {
         DataChecksums::from_version(self.data_checksum_version)
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn the_struct_fits_in_one_sector_and_in_the_file() {
-        // `StaticAssertDecl`, pg_control.h:255 and :257 — static there, so
+        // `StaticAssertDecl`, pg_control.h:261 and :263 — static there, so
         // static here too.
         const {
             assert!(SIZEOF_CONTROL_FILE_DATA <= PG_CONTROL_MAX_SAFE_SIZE);
@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(sysid.get() & 0xFFF, 0x765);
     }
 
-    /// Upstream's comment at `xlog.c:5087` says the microsecond "must fit in 20
+    /// Upstream's comment at `xlog.c:5093` says the microsecond "must fit in 20
     /// bits"; the largest one does, and it does not reach the seconds half.
     #[test]
     fn the_largest_microsecond_stays_clear_of_the_seconds() {

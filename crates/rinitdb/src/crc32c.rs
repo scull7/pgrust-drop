@@ -6,8 +6,8 @@
 //! ```text
 //! INIT_CRC32C(crc)          (crc) = 0xFFFFFFFF          pg_crc32c.h:41
 //! EQ_CRC32C(c1, c2)         (c1) == (c2)                pg_crc32c.h:42
-//! COMP_CRC32C(crc, d, len)  accumulate bytes            pg_crc32c.h:106
-//! FIN_CRC32C(crc)           (crc) ^= 0xFFFFFFFF         pg_crc32c.h:108
+//! COMP_CRC32C(crc, d, len)  accumulate bytes            pg_crc32c.h:157
+//! FIN_CRC32C(crc)           (crc) ^= 0xFFFFFFFF         pg_crc32c.h:162
 //! ```
 //!
 //! Upstream picks between an SSE 4.2 / AVX-512 implementation, an ARMv8 one, a
@@ -36,7 +36,7 @@ const POLYNOMIAL: u32 = 0x82F6_3B78;
 /// `INIT_CRC32C` (`src/include/port/pg_crc32c.h:41`).
 pub const INIT: u32 = 0xFFFF_FFFF;
 
-/// `FIN_CRC32C` (`src/include/port/pg_crc32c.h:108`) xors with this.
+/// `FIN_CRC32C` (`src/include/port/pg_crc32c.h:162`) xors with this.
 const FINAL_XOR: u32 = 0xFFFF_FFFF;
 
 /// `pg_crc32c_table[0]` (`src/port/pg_crc32c_sb8.c:109`).
@@ -79,7 +79,7 @@ pub fn comp(crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-/// `FIN_CRC32C(crc)` (`src/include/port/pg_crc32c.h:108`).
+/// `FIN_CRC32C(crc)` (`src/include/port/pg_crc32c.h:162`).
 #[must_use]
 pub const fn fin(crc: u32) -> u32 {
     crc ^ FINAL_XOR

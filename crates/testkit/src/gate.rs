@@ -17,9 +17,8 @@
 //!
 //! When the reference binary is absent, [`Gate::for_tool_or_skip`] yields
 //! `None` having *already* announced `SKIP (flagged, not silent)`, so the
-//! caller cannot reach that arm with the skip unannounced. The older
-//! [`Gate::for_tool`] leaves the announcement to the caller and is superseded
-//! by it: a skip is flagged, never silent.
+//! caller cannot reach that arm with the skip unannounced: a skip is flagged,
+//! never silent.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -163,8 +162,8 @@ impl Gate {
     /// is not installed here **and** [`crate::reference::skip`] has already
     /// put `SKIP (flagged, not silent)` on the process's own stderr, so the
     /// caller has nothing left to do but return. There is no way to reach the
-    /// `None` arm with the skip unannounced, which is the difference between a
-    /// guarantee and the call-site convention [`Gate::for_tool`] relies on.
+    /// `None` arm with the skip unannounced: the announcement is a guarantee,
+    /// not a call-site convention.
     ///
     /// ```no_run
     /// # use testkit::Gate;
@@ -176,23 +175,6 @@ impl Gate {
     #[must_use]
     pub fn for_tool_or_skip(tool: &str, candidate: impl Into<PathBuf>) -> Option<Self> {
         Self::for_located_tool(tool, candidate, reference::find, reference::skip)
-    }
-
-    /// Locate the reference `tool` (see [`crate::reference::find`]) and gate
-    /// `candidate` against it.
-    ///
-    /// `None` means the reference is not installed here; the caller must print
-    /// [`crate::reference::skip_message`] and pass, so the skip is visible in
-    /// the test output rather than a silently narrowed assertion.
-    ///
-    /// Superseded by [`Gate::for_tool_or_skip`], which makes that announcement
-    /// itself instead of trusting each call site to remember it. It is kept
-    /// only so the call sites not yet migrated keep compiling; they move over
-    /// as their owning review chunks land, and this goes away with the last of
-    /// them.
-    #[must_use]
-    pub fn for_tool(tool: &str, candidate: impl Into<PathBuf>) -> Option<Self> {
-        Self::for_located_tool(tool, candidate, reference::find, |_| {})
     }
 
     /// The lookup and the announcement it owes, with both actions injected.
@@ -699,11 +681,6 @@ mod tests {
         assert!(shown.contains("--help"), "{shown}");
         assert!(shown.contains("stdin: 3 bytes"), "{shown}");
         assert!(shown.contains("timing"), "{shown}");
-    }
-
-    #[test]
-    fn for_tool_is_none_when_the_reference_is_absent() {
-        assert!(Gate::for_tool("no-such-postgres-tool", "target/debug/rinitdb").is_none());
     }
 
     #[test]

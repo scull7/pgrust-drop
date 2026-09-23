@@ -58,8 +58,7 @@ fn program_options_handling_ok() {
 /// otherwise.
 #[test]
 fn select_one_matches_c_psql() {
-    let Some(gate) = Gate::for_tool("psql", RPSQL) else {
-        reference::skip("psql");
+    let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
         return;
     };
     if std::env::var_os("PGDROP_TEST_CLUSTER").is_none() {
@@ -85,8 +84,7 @@ fn select_one_matches_c_psql() {
 /// fails the test.
 #[test]
 fn a_small_sql_corpus_matches_c_psql() {
-    let Some(gate) = Gate::for_tool("psql", RPSQL) else {
-        reference::skip("psql");
+    let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
         return;
     };
     if std::env::var_os("PGDROP_TEST_CLUSTER").is_none() {
@@ -129,8 +127,7 @@ fn a_small_sql_corpus_matches_c_psql() {
 /// compared, so 18.6 and 19.1 still differ.
 #[test]
 fn version_matches_c_psql() {
-    let Some(gate) = Gate::for_tool("psql", RPSQL) else {
-        reference::skip("psql");
+    let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
         return;
     };
     gate.arg("--version")

@@ -120,8 +120,7 @@ fn sync_argv(before: &[&str], datadir: &Path, after: &[&str]) -> Vec<OsString> {
 /// The byte-diff gate for an invocation where C prints nothing on stdout
 /// either, so nothing is out of scope.
 fn gate_strictly(argv: &[OsString]) {
-    let Some(gate) = Gate::for_tool("initdb", RINITDB) else {
-        reference::skip("initdb");
+    let Some(gate) = Gate::for_tool_or_skip("initdb", RINITDB) else {
         return;
     };
     gate.with_args(argv).assert_clean();
@@ -131,8 +130,7 @@ fn gate_strictly(argv: &[OsString]) {
 /// progress rinitdb does not produce yet; stderr and the exit status are gated
 /// in full and the stdout difference is flagged.
 fn gate_diagnostics(argv: &[OsString]) {
-    let Some(gate) = Gate::for_tool("initdb", RINITDB) else {
-        reference::skip("initdb");
+    let Some(gate) = Gate::for_tool_or_skip("initdb", RINITDB) else {
         return;
     };
     gate.with_args(argv)
@@ -174,8 +172,7 @@ fn program_options_handling_ok() {
 /// wherever PostgreSQL 18 is installed or `PGDROP_REF_BIN` points at it.
 #[test]
 fn help_and_version_match_reference_initdb() {
-    let Some(gate) = Gate::for_tool("initdb", RINITDB) else {
-        reference::skip("initdb");
+    let Some(gate) = Gate::for_tool_or_skip("initdb", RINITDB) else {
         return;
     };
     gate.clone().arg("--help").assert_clean();
@@ -1161,7 +1158,8 @@ fn the_two_control_file_readers_agree() {
 ///
 /// The real file comes from `PGDROP_REF_PGDATA` if that names a PostgreSQL 18
 /// data directory, otherwise from running the reference `initdb` into a
-/// temporary one. With neither, `SKIP (flagged, not silent)`.
+/// temporary one. With neither, `SKIP (flagged, not silent)`, or a failure
+/// under `PGDROP_REQUIRE_REF`.
 #[test]
 fn a_real_control_file_round_trips_byte_for_byte() {
     let tempdir = TempDir::new("real-control");
@@ -1169,11 +1167,9 @@ fn a_real_control_file_round_trips_byte_for_byte() {
         PathBuf::from(existing)
     } else {
         let Some(initdb) = reference::find("initdb") else {
-            reference::announce_skip(&format!(
-                "{}: no reference `initdb` and {REF_PGDATA_ENV} is unset; \
-                 no real pg_control to round-trip",
-                reference::SKIP_FLAG
-            ));
+            // Through `skip`, not `announce_skip`, so PGDROP_REQUIRE_REF
+            // turns a missing reference into a failure here as in every gate.
+            reference::skip("initdb");
             return;
         };
         let datadir = tempdir.join("data");

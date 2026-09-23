@@ -32,7 +32,7 @@ pub enum ConnectionError {
     /// A socket, DNS or `/dev/urandom` failure.
     Io(io::Error),
     /// The server closed the connection mid-message — `pqReadData`'s
-    /// "server closed the connection unexpectedly" (`fe-misc.c:698`).
+    /// "server closed the connection unexpectedly" (`fe-misc.c:833`).
     ServerClosedConnection,
     /// A message that did not parse.
     Protocol(ProtocolError),
@@ -200,8 +200,8 @@ pub fn parse_port(raw: Option<&[u8]>) -> Result<u16, ConnError> {
     }
 }
 
-/// Which socket a `ConnInfo` names — `parse_connection_string`'s host
-/// classification at `fe-connect.c:1310`-`:1350` over the port
+/// Which socket a `ConnInfo` names — `pqConnectOptions2`'s host
+/// classification at `fe-connect.c:1315`-`:1352` over the port
 /// [`parse_port`] settles, as a pure function.
 ///
 /// # Errors
@@ -588,7 +588,7 @@ impl<S: Read + Write> Connection<S> {
         }
     }
 
-    /// `PQexec`, `fe-exec.c:2296`: one Query message, then every result up to
+    /// `PQexec`, `fe-exec.c:2279`: one Query message, then every result up to
     /// ReadyForQuery.
     ///
     /// # Errors
@@ -614,7 +614,7 @@ impl<S: Read + Write> Connection<S> {
         Ok(runner.into_results())
     }
 
-    /// `PQfinish`'s Terminate, `fe-connect.c:5203`.
+    /// `PQfinish`'s Terminate, `fe-connect.c:5239`.
     ///
     /// # Errors
     /// The message could not be written to the socket.
@@ -659,7 +659,7 @@ impl<S: Read + Write> Connection<S> {
         }
     }
 
-    /// `PQparameterStatus`, `fe-connect.c:7570` — the last value the server
+    /// `PQparameterStatus`, `fe-connect.c:7593` — the last value the server
     /// reported for a GUC.
     #[must_use]
     pub fn parameter_status(&self, name: &[u8]) -> Option<&[u8]> {
@@ -670,7 +670,7 @@ impl<S: Read + Write> Connection<S> {
             .map(|(_, v)| v.as_slice())
     }
 
-    /// `PQbackendPID`, `fe-connect.c:7620`.
+    /// `PQbackendPID`, `fe-connect.c:7674`.
     #[must_use]
     pub fn backend_pid(&self) -> i32 {
         self.backend_pid
@@ -682,7 +682,7 @@ impl<S: Read + Write> Connection<S> {
         &self.cancel_key
     }
 
-    /// `PQtransactionStatus`, `fe-connect.c:7546`.
+    /// `PQtransactionStatus`, `fe-connect.c:7583`.
     #[must_use]
     pub fn transaction_status(&self) -> TransactionStatus {
         self.transaction_status

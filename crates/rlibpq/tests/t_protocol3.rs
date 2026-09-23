@@ -201,11 +201,11 @@ fn an_error_carries_the_fields_the_reference_reports() {
     // syntax-cursor display over the query it kept (`res->errQuery`,
     // `fe-protocol3.c:966`, filled for a simple query at `fe-exec.c:1484`),
     // printing `LINE 1: selct 1` and a caret line that `reportErrorPosition`
-    // (`:1202`) draws and this port does not — the divergence
+    // (`fe-protocol3.c:1202`) draws and this port does not — the divergence
     // `docs/divergences.md` records. Terse is the one verbosity where upstream
-    // renders the position as text (`:1099`), which is exactly what this port
-    // renders, so this is a real byte-for-byte gate over the same fields
-    // rather than a comparison the port is documented to fail.
+    // renders the position as text (`fe-protocol3.c:1102`), which is exactly
+    // what this port renders, so this is a real byte-for-byte gate over the
+    // same fields rather than a comparison the port is documented to fail.
     let (_, stderr, code) = cluster.psql("selct 1", "terse");
     assert_ne!(code, 0);
     let rendered = error.message(

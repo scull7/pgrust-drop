@@ -25,7 +25,7 @@ pub enum ExecStatus {
 }
 
 impl ExecStatus {
-    /// `pgresStatus[]`, `fe-exec.c:44` — what `PQresStatus` returns.
+    /// `pgresStatus[]`, `fe-exec.c:33` — what `PQresStatus` returns.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -88,7 +88,7 @@ pub enum ContextVisibility {
 }
 
 /// The broken-down fields of an ErrorResponse or NoticeResponse, in the order
-/// the server sent them (`pqSaveMessageField`, `fe-exec.c:848`).
+/// the server sent them (`pqSaveMessageField`, `fe-exec.c:1066`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultError {
     fields: Vec<(u8, Vec<u8>)>,
@@ -100,7 +100,7 @@ impl ResultError {
         Self { fields }
     }
 
-    /// `PQresultErrorField`, `fe-exec.c:3282`.
+    /// `PQresultErrorField`, `fe-exec.c:3497`.
     #[must_use]
     pub fn field(&self, code: u8) -> Option<&[u8]> {
         self.fields
@@ -125,7 +125,7 @@ impl ResultError {
     ///
     /// The syntax-cursor display (`reportErrorPosition`, `fe-protocol3.c:1202`)
     /// is not ported: this result never carries the query text, which is the
-    /// case upstream renders as " at character %s" (`:1099`). See
+    /// case upstream renders as " at character %s" (`:1102`). See
     /// `docs/divergences.md`.
     #[must_use]
     // `valf` / `vall` below are upstream's own names for the source file and
@@ -223,7 +223,7 @@ impl ResultError {
                 }
             }
 
-            // fe-protocol3.c:1171 — LOCATION, from up to three fields. The
+            // fe-protocol3.c:1174 — LOCATION, from up to three fields. The
             // names are upstream's `valf` (file) and `vall` (line).
             let valf = self.field(diag::SOURCE_FILE);
             let vall = self.field(diag::SOURCE_LINE);
@@ -247,7 +247,7 @@ impl ResultError {
     }
 }
 
-/// One column of a `RowDescription` — `PGresAttDesc`, `libpq-fe.h:249`, as
+/// One column of a `RowDescription` — `PGresAttDesc`, `libpq-fe.h:305`, as
 /// filled by `getRowDescriptions` (`fe-protocol3.c:519`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescription {
@@ -271,7 +271,7 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    /// `PQmakeEmptyPGresult`, `fe-exec.c:156`.
+    /// `PQmakeEmptyPGresult`, `fe-exec.c:160`.
     #[must_use]
     pub fn new(status: ExecStatus) -> Self {
         Self {
@@ -294,19 +294,19 @@ impl QueryResult {
         }
     }
 
-    /// `PQresultStatus`, `fe-exec.c:3219`.
+    /// `PQresultStatus`, `fe-exec.c:3442`.
     #[must_use]
     pub fn status(&self) -> ExecStatus {
         self.status
     }
 
-    /// `PQnfields`, `fe-exec.c:3441`.
+    /// `PQnfields`, `fe-exec.c:3520`.
     #[must_use]
     pub fn nfields(&self) -> usize {
         self.fields.len()
     }
 
-    /// `PQntuples`, `fe-exec.c:3432`.
+    /// `PQntuples`, `fe-exec.c:3512`.
     #[must_use]
     pub fn ntuples(&self) -> usize {
         self.rows.len()
@@ -325,13 +325,13 @@ impl QueryResult {
         self.rows.push(row);
     }
 
-    /// `PQfname`, `fe-exec.c:3390`.
+    /// `PQfname`, `fe-exec.c:3598`.
     #[must_use]
     pub fn fname(&self, column: usize) -> Option<&[u8]> {
         self.fields.get(column).map(|f| f.name.as_slice())
     }
 
-    /// `PQgetvalue`, `fe-exec.c:3566`. A NULL field is an empty string there
+    /// `PQgetvalue`, `fe-exec.c:3907`. A NULL field is an empty string there
     /// and `None` here; `PQgetisnull` is the only way to tell them apart in C,
     /// so the distinction is kept rather than flattened.
     #[must_use]
@@ -339,7 +339,7 @@ impl QueryResult {
         self.rows.get(row)?.get(column)?.as_ref().map(Vec::as_slice)
     }
 
-    /// `PQgetisnull`, `fe-exec.c:3594`.
+    /// `PQgetisnull`, `fe-exec.c:3932`.
     #[must_use]
     pub fn is_null(&self, row: usize, column: usize) -> bool {
         self.rows
@@ -348,7 +348,7 @@ impl QueryResult {
             .is_none_or(Option::is_none)
     }
 
-    /// `PQcmdStatus`, `fe-exec.c:3672` — the CommandComplete tag.
+    /// `PQcmdStatus`, `fe-exec.c:3783` — the CommandComplete tag.
     #[must_use]
     pub fn command_status(&self) -> &[u8] {
         &self.command_status
@@ -364,7 +364,7 @@ impl QueryResult {
         self.error.as_ref()
     }
 
-    /// `PQresultErrorMessage`, `fe-exec.c:3234`.
+    /// `PQresultErrorMessage`, `fe-exec.c:3458`.
     #[must_use]
     pub fn error_message(&self) -> Vec<u8> {
         match &self.error {
@@ -547,7 +547,7 @@ mod tests {
 
     /// `PQSHOW_CONTEXT_ERRORS` shows CONTEXT for an error and not for a
     /// notice; `PQSHOW_CONTEXT_ALWAYS` shows it for both
-    /// (`fe-protocol3.c:1130`).
+    /// (`fe-protocol3.c:1141`).
     #[test]
     fn context_follows_the_show_context_setting() {
         let notice = ResultError::new(vec![

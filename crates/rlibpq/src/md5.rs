@@ -91,7 +91,7 @@ pub const BLOCK_SIZE: usize = 64;
 /// `md5.h:20` — `MD5_DIGEST_LENGTH`.
 pub const DIGEST_LENGTH: usize = 16;
 
-/// `pg_md5_ctx` (`md5.h` in `src/include/md5_int.h`), with `pg_md5_init`
+/// `pg_md5_ctx` (`src/common/md5_int.h:54`), with `pg_md5_init`
 /// (`md5.c:382`), `pg_md5_update` (`:400`) and `pg_md5_final` (`:432`).
 #[derive(Debug, Clone)]
 pub struct Md5 {

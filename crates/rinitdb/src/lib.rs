@@ -58,6 +58,8 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
+use error::Unsupported;
+
 pub use cleanup::Progress;
 pub use cli::{Invocation, Options};
 pub use conf::{AuthMethods, DateOrder, Settings};
@@ -133,7 +135,9 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
 /// sequence below fails where C's does. The refusal is evaluated again once
 /// the directories exist, so a `--waldir` that fails here and passes there
 /// cannot skip it. `setup_text_search`'s warning (`initdb.c:3492`) comes
-/// next, before the first `mkdir` as in C. Progress output and the closing
+/// next, before the first `mkdir` as in C — also ahead of a waiting refusal,
+/// unless that refusal is the locale's, whose "C" the warning would misstate.
+/// Progress output and the closing
 /// instructions are C's stdout and are not printed yet (NAT-387).
 fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write) -> ExitCode {
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
@@ -143,13 +147,18 @@ fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write)
             let _ = writeln!(stderr, "{}", err.render());
             return ExitCode::from(EXIT_FAILURE);
         }
-        // Its locale "C" is only true of a cluster the template can make.
-        Ok(()) => {
+        // Its locale "C" is untrue only when the refusal is the locale's;
+        // `-U`, `-W`, `--pwfile` and `--wal-segsize` leave `lc_ctype` at C,
+        // so behind a failing `--waldir` C writes the warning first.
+        Err(InitdbError::NotSupportedYet {
+            why: Unsupported::EncodingOrLocale,
+            ..
+        }) => {}
+        Ok(()) | Err(_) => {
             if let Some(warning) = cluster::text_search_warning(options) {
                 let _ = writeln!(stderr, "{warning}");
             }
         }
-        Err(_) => {}
     }
     let mut progress = Progress::default();
     let created = initialize_data_directory(plan, options, &mut progress)

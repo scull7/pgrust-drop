@@ -303,3 +303,43 @@ fn a_text_search_config_that_does_not_match_locale_c_warns() {
             .any(|line| line == "default_text_search_config = 'pg_catalog.simple'")
     );
 }
+
+/// A `--waldir` that fails keeps precedence over this port's refusal
+/// (`docs/divergences.md`), and a refusal that leaves `lc_ctype` at C does
+/// not take the warning with it: the reference initdb writes these four
+/// stderr lines, in this order, for this command line with `-U alice`.
+#[test]
+fn a_failing_waldir_behind_a_superuser_refusal_still_warns_first() {
+    let tempdir = TempDir::new("expanded-tsearch-waldir");
+    let pgdata = tempdir.join("data");
+    let waldir = tempdir.join("wal");
+    std::fs::create_dir(&waldir).expect("create the WAL directory");
+    std::fs::write(waldir.join("occupied"), b"").expect("make the WAL directory non-empty");
+    let argv = args(&[
+        "--no-sync",
+        "--no-locale",
+        "-E",
+        "UTF8",
+        "-T",
+        "simple",
+        "-U",
+        "alice",
+        "--waldir",
+        &waldir.to_string_lossy(),
+        &pgdata.to_string_lossy(),
+    ]);
+    let outcome = testkit::run(Path::new(RINITDB), &argv).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(1), "{}", outcome.stderr_text());
+    let (pgdata, waldir) = (pgdata.display(), waldir.display());
+    assert_eq!(
+        outcome.stderr_text(),
+        format!(
+            "initdb: warning: specified text search configuration \"simple\" might not match \
+             locale \"C\"\n\
+             initdb: error: directory \"{waldir}\" exists but is not empty\n\
+             initdb: hint: If you want to store the WAL there, either remove or empty the \
+             directory \"{waldir}\".\n\
+             initdb: removing data directory \"{pgdata}\"\n"
+        )
+    );
+}

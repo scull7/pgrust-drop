@@ -19,9 +19,19 @@ pub const BLCKSZ: u32 = 8192;
 ///
 /// Upstream writes it into the file verbatim (`DEF_PGPORT_STR`), so it is a
 /// string here too and never a number that has been formatted back.
+///
+/// Must equal `crates/rlibpq/src/pg_config.rs`'s `DEF_PGPORT_STR`: a cluster
+/// `pgdrop initdb` writes and the server `pgdrop psql` dials by default are
+/// the same configure-time number. Pinned by this module's tests and by
+/// `crates/pgdrop/tests/pg_config_agreement.rs`.
 pub const DEF_PGPORT_STR: &str = "5432";
 
 /// `src/include/pg_config_manual.h:193` — where AF_UNIX sockets go by default.
+///
+/// Must equal `crates/rlibpq/src/pg_config.rs`'s `DEFAULT_PGSOCKET_DIR`, arm
+/// for arm, or a cluster `pgdrop initdb` creates puts its socket somewhere
+/// `pgdrop psql` does not look. Pinned by this module's tests and by
+/// `crates/pgdrop/tests/pg_config_agreement.rs`.
 #[cfg(not(windows))]
 pub const DEFAULT_PGSOCKET_DIR: &str = "/tmp";
 /// `src/include/pg_config_manual.h:195` — Windows has no standard location.
@@ -87,6 +97,25 @@ mod tests {
     fn the_wal_defaults_are_the_sizes_the_sample_file_documents() {
         assert_eq!(DEFAULT_WAL_SEGMENT_SIZE_MB * DEFAULT_MAX_WAL_SEGS, 1024);
         assert_eq!(DEFAULT_WAL_SEGMENT_SIZE_MB * DEFAULT_MIN_WAL_SEGS, 80);
+    }
+
+    /// This crate's half of the cross-crate agreement: the two values
+    /// `rlibpq` also defines, pinned to the stock build's literals
+    /// (`src/include/pg_config.h.in:43`, `src/include/pg_config_manual.h:193`
+    /// / `:195`). The other half is `rlibpq`'s
+    /// `the_constants_rinitdb_also_defines_are_the_stock_build_values`
+    /// (`crates/rlibpq/src/pg_config.rs`); `crates/pgdrop/tests/pg_config_agreement.rs`
+    /// compares the two directly.
+    ///
+    /// If one of these ever legitimately stops being the stock value, change
+    /// both halves together; the `pgdrop` test is the one that must survive.
+    #[test]
+    fn the_constants_rlibpq_also_defines_are_the_stock_build_values() {
+        assert_eq!(DEF_PGPORT_STR, "5432");
+        #[cfg(not(windows))]
+        assert_eq!(DEFAULT_PGSOCKET_DIR, "/tmp");
+        #[cfg(windows)]
+        assert_eq!(DEFAULT_PGSOCKET_DIR, "");
     }
 
     /// The table is the three `#if` blocks, in `setup_config` order.

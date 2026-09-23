@@ -13,7 +13,9 @@
 /// `--with-pgport` feeds both `initdb.c` and `fe-connect.c`, so a cluster
 /// `pgdrop initdb` writes and the server `pgdrop psql` dials are the same
 /// configure-time number. The two modules stay separate because they mirror
-/// different headers' consumers, so nothing but this note ties them together.
+/// different headers' consumers (NAT-424); what ties them together is each
+/// crate's pin to the stock value and `crates/pgdrop/tests/pg_config_agreement.rs`,
+/// which compares the two directly.
 pub const DEF_PGPORT_STR: &str = "5432";
 
 /// `src/include/pg_config.h.in:609`, whose default is `postgres`
@@ -68,8 +70,9 @@ pub const DEFAULT_GSS_MODE: &str = if ENABLE_GSS { "prefer" } else { "disable" }
 /// for arm: it is one C constant, and if the two disagree a cluster `pgdrop
 /// initdb` creates puts its socket somewhere `pgdrop psql` does not look. The
 /// two modules stay deliberately separate — they mirror `initdb.c`'s and
-/// `fe-connect.c`'s own headers — so this note and the tests below are what
-/// hold the shared value still.
+/// `fe-connect.c`'s own headers — so the tests below, `rinitdb`'s mirror of
+/// them, and `crates/pgdrop/tests/pg_config_agreement.rs` are what hold the
+/// shared value still.
 #[cfg(not(windows))]
 pub const DEFAULT_PGSOCKET_DIR: &str = "/tmp";
 /// `src/include/pg_config_manual.h:195` — Windows has no standard location, so
@@ -101,8 +104,11 @@ mod tests {
 
     /// Half of the cross-crate agreement: this crate's side of the two values
     /// `rinitdb` also defines, pinned to the header they both come from.
-    /// `rinitdb`'s half is pinned in its own module, because neither crate
-    /// depends on the other and nothing may make one.
+    /// `rinitdb`'s half is pinned in its own module
+    /// (`the_constants_rlibpq_also_defines_are_the_stock_build_values`),
+    /// because neither crate depends on the other and nothing may make one;
+    /// `pgdrop`, which links both, compares them in
+    /// `crates/pgdrop/tests/pg_config_agreement.rs`.
     #[test]
     fn the_constants_rinitdb_also_defines_are_the_stock_build_values() {
         assert_eq!(DEF_PGPORT_STR, "5432");

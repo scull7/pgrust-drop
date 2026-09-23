@@ -20,12 +20,16 @@
 //! a server, and what makes the order of a trace — which messages are
 //! parsed before which are sent — a property of this module alone.
 //!
-//! The COPY states (`PGASYNC_COPY_*`) are not here: COPY is not ported, and
-//! a COPY response is still the protocol error it was.
+//! The COPY states (`PGASYNC_COPY_*`) are here too: a COPY response parks
+//! the connection in one (`fe-protocol3.c:411`-`:427`), and the decisions of
+//! `PQputCopyData`, `PQputCopyEnd` (`fe-exec.c:2712`, `:2766`) and
+//! `getCopyDataMessage` (`fe-protocol3.c:1795`) are
+//! [`PipelineState::begin_put_copy`], [`PipelineState::put_copy_end`] and
+//! [`PipelineState::copy_message`].
 
 use std::collections::VecDeque;
 
-use crate::message::{Backend, ProtocolError, TransactionStatus};
+use crate::message::{Backend, CopyFormat, ProtocolError, TransactionStatus};
 use crate::result::{ExecStatus, QueryResult, ResultError, diag};
 
 /// `PGQueryClass`, `libpq-int.h:318`: what the command at the head of the
@@ -63,7 +67,7 @@ pub enum PipelineStatus {
     Aborted,
 }
 
-/// `PGAsyncStatusType`, `libpq-int.h:213`, without the COPY states.
+/// `PGAsyncStatusType`, `libpq-int.h:213`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AsyncStatus {
     /// `PGASYNC_IDLE`: nothing is expected from the server.
@@ -80,6 +84,34 @@ pub enum AsyncStatus {
     /// `PGASYNC_PIPELINE_IDLE`: between two commands of a pipeline — the
     /// state in which `PQgetResult` returns the NULL that ends a command.
     PipelineIdle,
+    /// `PGASYNC_COPY_IN`: the server waits for COPY data.
+    CopyIn,
+    /// `PGASYNC_COPY_OUT`: the server is sending COPY data.
+    CopyOut,
+    /// `PGASYNC_COPY_BOTH`: both at once (replication).
+    CopyBoth,
+}
+
+impl AsyncStatus {
+    /// One of the three COPY states.
+    #[must_use]
+    pub fn is_copy(self) -> bool {
+        matches!(
+            self,
+            AsyncStatus::CopyIn | AsyncStatus::CopyOut | AsyncStatus::CopyBoth
+        )
+    }
+
+    /// The `PGRES_COPY_*` a COPY state's `PQgetResult` reports
+    /// (`getCopyResult`, `fe-exec.c:2211`-`:2220`).
+    fn copy_status(self) -> Option<ExecStatus> {
+        match self {
+            AsyncStatus::CopyIn => Some(ExecStatus::CopyIn),
+            AsyncStatus::CopyOut => Some(ExecStatus::CopyOut),
+            AsyncStatus::CopyBoth => Some(ExecStatus::CopyBoth),
+            _ => None,
+        }
+    }
 }
 
 /// `partialResMode`, `singleRowMode` and `maxChunkSize` (`libpq-int.h:468`)
@@ -126,6 +158,20 @@ pub enum PipelineError {
     NotAllowedInPipelineMode(&'static str),
     /// `fe-exec.c:2378`: `PQexec` and its blocking siblings.
     SynchronousInPipelineMode,
+    /// `fe-exec.c:1744`: a command queued in pipeline mode while a COPY runs.
+    QueueDuringCopy,
+    /// `fe-exec.c:2719`, `:2773`, `:2841`: a COPY call with no COPY running.
+    NoCopyInProgress,
+    /// `fe-exec.c:2411`: `PQexec` (via `PQexecStart`) while COPY BOTH runs.
+    ExecDuringCopyBoth,
+    /// `fe-exec.c:3135`: leaving pipeline mode during a COPY. The C `case`
+    /// appends its message and falls out of the `switch` with no `return`,
+    /// into the queue check (`:3139`); the COPY command is still queued, so
+    /// that check refuses as well and both messages are left.
+    ExitDuringCopy,
+    /// `fe-exec.c:3345`: a pipeline Sync while a COPY runs, which upstream
+    /// calls unreachable.
+    SyncDuringCopy,
 }
 
 impl PipelineError {
@@ -147,6 +193,15 @@ impl PipelineError {
             }
             PipelineError::SynchronousInPipelineMode => {
                 b"synchronous command execution functions are not allowed in pipeline mode".to_vec()
+            }
+            PipelineError::QueueDuringCopy => b"cannot queue commands during COPY".to_vec(),
+            PipelineError::NoCopyInProgress => b"no COPY in progress".to_vec(),
+            PipelineError::ExecDuringCopyBoth => b"PQexec not allowed during COPY BOTH".to_vec(),
+            PipelineError::ExitDuringCopy => b"cannot exit pipeline mode while in COPY\ncannot exit pipeline mode with uncollected results".to_vec(),
+            // appendPQExpBufferStr, not libpq_append_conn_error: the newline
+            // is upstream's own and is left off here like every other.
+            PipelineError::SyncDuringCopy => {
+                b"internal error: cannot send pipeline while in COPY".to_vec()
             }
         }
     }
@@ -190,6 +245,21 @@ pub enum Event {
     /// A ReadyForQuery's transaction status (`getReadyForQuery`,
     /// `fe-protocol3.c:1763`).
     ReadyForQuery(TransactionStatus),
+}
+
+/// What `getCopyDataMessage` does with the next whole message during COPY
+/// OUT or COPY BOTH (`fe-protocol3.c:1846`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyStep {
+    /// A NotificationResponse, NoticeResponse or ParameterStatus: process it
+    /// as usual, consume it, and look at the next one.
+    Async,
+    /// CopyData: hand its body to the caller.
+    Data,
+    /// The end of the COPY (`return -1`): leave the message in the buffer —
+    /// the state has already moved on — and let `PQgetResult` read the
+    /// command's result.
+    End,
 }
 
 /// What `PQgetResult` does next.
@@ -261,11 +331,15 @@ impl PipelineState {
     /// `class` be sent now?
     ///
     /// # Errors
-    /// Another command is running outside pipeline mode, or a simple query
-    /// is asked for in pipeline mode.
+    /// Another command is running outside pipeline mode, a COPY is running
+    /// in it, or a simple query is asked for in pipeline mode.
     pub fn begin_send(&mut self, class: QueryClass) -> Result<(), PipelineError> {
         if self.status != AsyncStatus::Idle && self.pipeline == PipelineStatus::Off {
             return Err(PipelineError::CommandInProgress);
+        }
+        // fe-exec.c:1741 — nothing can be queued behind a COPY.
+        if self.pipeline != PipelineStatus::Off && self.status.is_copy() {
+            return Err(PipelineError::QueueDuringCopy);
         }
         if self.pipeline == PipelineStatus::Off {
             // fe-exec.c:1756 — this command's results come in immediately.
@@ -357,6 +431,13 @@ impl PipelineState {
             }
             AsyncStatus::Busy => return Err(PipelineError::Busy),
             AsyncStatus::Idle | AsyncStatus::PipelineIdle => {}
+            // fe-exec.c:3132 — see `ExitDuringCopy`: the COPY command is
+            // still at the head of the queue, so the queue check refuses too.
+            AsyncStatus::CopyIn | AsyncStatus::CopyOut | AsyncStatus::CopyBoth => {
+                if !self.queue.is_empty() {
+                    return Err(PipelineError::ExitDuringCopy);
+                }
+            }
         }
         if !self.queue.is_empty() {
             return Err(PipelineError::UncollectedResults);
@@ -374,6 +455,9 @@ impl PipelineState {
     pub fn begin_pipeline_sync(&self) -> Result<(), PipelineError> {
         if self.pipeline == PipelineStatus::Off {
             Err(PipelineError::NotInPipelineMode)
+        } else if self.status.is_copy() {
+            // fe-exec.c:3340.
+            Err(PipelineError::SyncDuringCopy)
         } else {
             Ok(())
         }
@@ -442,7 +526,15 @@ impl PipelineState {
                     Admit::Process
                 }
             }
-            AsyncStatus::Ready | AsyncStatus::ReadyMore | AsyncStatus::PipelineIdle => Admit::Wait,
+            // fe-protocol3.c:166 — any other state waits, the COPY states
+            // included: their data is read by `getCopyDataMessage` (see
+            // `copy_message`), not here.
+            AsyncStatus::Ready
+            | AsyncStatus::ReadyMore
+            | AsyncStatus::PipelineIdle
+            | AsyncStatus::CopyIn
+            | AsyncStatus::CopyOut
+            | AsyncStatus::CopyBoth => Admit::Wait,
         }
     }
 
@@ -544,10 +636,17 @@ impl PipelineState {
             Backend::ParseComplete if head == Some(QueryClass::Prepare) => self.command_ok_ready(),
             Backend::CloseComplete if head == Some(QueryClass::Close) => self.command_ok_ready(),
             Backend::NoData if head == Some(QueryClass::Describe) => self.command_ok_ready(),
+            // The same three otherwise, and BindComplete always, are nothing
+            // to the result; so are data left over from a COPY OUT the caller
+            // stopped reading early and the CopyDone `getCopyDataMessage`
+            // leaves in the buffer, which are dropped (fe-protocol3.c:428,
+            // :437).
             Backend::ParseComplete
             | Backend::CloseComplete
             | Backend::NoData
-            | Backend::BindComplete => {}
+            | Backend::BindComplete
+            | Backend::CopyData(_)
+            | Backend::CopyDone => {}
             Backend::ParameterStatus { name, value } => {
                 return Ok(Some(Event::ParameterStatus { name, value }));
             }
@@ -582,6 +681,11 @@ impl PipelineState {
                 self.result = Some(result);
             }
             Backend::DataRow(values) => self.data_row(values)?,
+            // fe-protocol3.c:411-:427 — getCopyStart makes the COPY result,
+            // and the connection waits in the COPY state for the caller.
+            Backend::CopyInResponse(format) => self.copy_start(ExecStatus::CopyIn, &format),
+            Backend::CopyOutResponse(format) => self.copy_start(ExecStatus::CopyOut, &format),
+            Backend::CopyBothResponse(format) => self.copy_start(ExecStatus::CopyBoth, &format),
             // Both belong to the startup exchange; naming the byte that
             // actually arrived is the whole point of upstream's message
             // (`fe-protocol3.c:447`).
@@ -592,15 +696,8 @@ impl PipelineState {
             // fe-protocol3.c:446 — PortalSuspended has no case of its own,
             // and neither has NegotiateProtocolVersion: it is read only by
             // the startup loop (`fe-connect.c:4148`), never mid-query.
-            // The COPY messages are decoded, but this state machine has no
-            // COPY states yet: they are still the error they were.
             other @ (Backend::PortalSuspended
             | Backend::NegotiateProtocolVersion { .. }
-            | Backend::CopyInResponse(_)
-            | Backend::CopyOutResponse(_)
-            | Backend::CopyBothResponse(_)
-            | Backend::CopyData(_)
-            | Backend::CopyDone
             | Backend::Other { .. }) => {
                 return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
             }
@@ -609,6 +706,107 @@ impl PipelineState {
             }
         }
         Ok(None)
+    }
+
+    /// `getCopyStart`, `fe-protocol3.c:1707`, and the state it leaves
+    /// (`:414`, `:419`, `:425`). The COPY result replaces whatever was being
+    /// built, as `conn->result = result` does (`:1751`).
+    fn copy_start(&mut self, status: ExecStatus, format: &CopyFormat) {
+        self.result = Some(QueryResult::copy(status, format));
+        self.status = match status {
+            ExecStatus::CopyIn => AsyncStatus::CopyIn,
+            ExecStatus::CopyOut => AsyncStatus::CopyOut,
+            _ => AsyncStatus::CopyBoth,
+        };
+    }
+
+    /// `PQputCopyData`'s check, `fe-exec.c:2716`: sending COPY data needs
+    /// COPY IN or COPY BOTH.
+    ///
+    /// # Errors
+    /// No COPY is taking data.
+    pub fn begin_put_copy(&self) -> Result<(), PipelineError> {
+        if matches!(self.status, AsyncStatus::CopyIn | AsyncStatus::CopyBoth) {
+            Ok(())
+        } else {
+            Err(PipelineError::NoCopyInProgress)
+        }
+    }
+
+    /// `PQputCopyEnd`, `fe-exec.c:2766`, less the sending: `Ok(true)` when
+    /// a Sync must follow the CopyDone or CopyFail, because the COPY came
+    /// from an extended-query command (`:2801`). Afterwards the connection is
+    /// back to waiting for the command's result, or, from COPY BOTH, to
+    /// reading COPY OUT (`:2810`).
+    ///
+    /// # Errors
+    /// No COPY is taking data.
+    pub fn put_copy_end(&mut self) -> Result<bool, PipelineError> {
+        self.begin_put_copy()?;
+        let sync = self
+            .queue
+            .front()
+            .is_some_and(|class| *class != QueryClass::Simple);
+        self.status = if self.status == AsyncStatus::CopyBoth {
+            AsyncStatus::CopyOut
+        } else {
+            AsyncStatus::Busy
+        };
+        Ok(sync)
+    }
+
+    /// `PQgetCopyData`'s check, `fe-exec.c:2838`: reading COPY data needs
+    /// COPY OUT or COPY BOTH.
+    ///
+    /// # Errors
+    /// No COPY is sending data.
+    pub fn begin_get_copy(&self) -> Result<(), PipelineError> {
+        if matches!(self.status, AsyncStatus::CopyOut | AsyncStatus::CopyBoth) {
+            Ok(())
+        } else {
+            Err(PipelineError::NoCopyInProgress)
+        }
+    }
+
+    /// `getCopyDataMessage`'s switch, `fe-protocol3.c:1846`-`:1882`, for a
+    /// whole message of type `id` at the head of the buffer during COPY OUT
+    /// or COPY BOTH. The end of the COPY moves the state on here, and leaves
+    /// the message where it is for `pqParseInput3` to read.
+    pub fn copy_message(&mut self, id: u8) -> CopyStep {
+        match id {
+            b'A' | b'N' | b'S' => CopyStep::Async,
+            b'd' => CopyStep::Data,
+            // fe-protocol3.c:1862 — CopyDone ends COPY OUT, and turns COPY
+            // BOTH into COPY IN.
+            b'c' => {
+                self.status = if self.status == AsyncStatus::CopyBoth {
+                    AsyncStatus::CopyIn
+                } else {
+                    AsyncStatus::Busy
+                };
+                CopyStep::End
+            }
+            // fe-protocol3.c:1874 — anything else ends the COPY too.
+            _ => {
+                self.status = AsyncStatus::Busy;
+                CopyStep::End
+            }
+        }
+    }
+
+    /// Whether a result is waiting to be handed over — `conn->result`.
+    #[must_use]
+    pub fn has_pending_result(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// `PQexecStart` leaving a COPY OUT it was handed (`fe-exec.c:2399`):
+    /// "we just switch back to BUSY and allow the remaining COPY data to be
+    /// dropped on the floor".
+    pub fn abandon_copy_out(&mut self) {
+        if self.status == AsyncStatus::CopyOut {
+            self.status = AsyncStatus::Busy;
+        }
     }
 
     /// `fe-protocol3.c:383` and `pqRowProcessor`, `fe-exec.c:1223`.
@@ -706,7 +904,24 @@ impl PipelineState {
                 self.status = AsyncStatus::Busy;
                 Next::Result(result)
             }
+            AsyncStatus::CopyIn | AsyncStatus::CopyOut | AsyncStatus::CopyBoth => {
+                Next::Result(self.copy_result())
+            }
         }
+    }
+
+    /// `getCopyResult`, `fe-exec.c:2241`: the COPY result getCopyStart made,
+    /// the first time; a fresh one of the same status every time after. The
+    /// state does not change — the caller is to move the data.
+    fn copy_result(&mut self) -> QueryResult {
+        let status = self
+            .status
+            .copy_status()
+            .expect("called in a COPY state only");
+        if self.result.as_ref().map(QueryResult::status) == Some(status) {
+            return self.prepare_async_result();
+        }
+        QueryResult::new(status)
     }
 
     /// `pqCommandQueueAdvance`, `fe-exec.c:3173`.
@@ -725,7 +940,12 @@ impl PipelineState {
     /// command.
     fn process_queue(&mut self) {
         match self.status {
-            AsyncStatus::Ready | AsyncStatus::ReadyMore | AsyncStatus::Busy => return,
+            AsyncStatus::Ready
+            | AsyncStatus::ReadyMore
+            | AsyncStatus::Busy
+            | AsyncStatus::CopyIn
+            | AsyncStatus::CopyOut
+            | AsyncStatus::CopyBoth => return,
             AsyncStatus::Idle if self.queue.is_empty() => return,
             AsyncStatus::Idle | AsyncStatus::PipelineIdle => {}
         }
@@ -788,12 +1008,17 @@ impl QueryRunner {
         }
     }
 
-    /// One message in.
+    /// One message in. A COPY result ends the fold as it ends `PQexecFinish`
+    /// (`fe-exec.c:2448`): the data transfer is the caller's, so the runner
+    /// is [`Flow::Done`] from then on and takes nothing more.
     ///
     /// # Errors
     /// The message cannot appear here at all; see [`PipelineState::apply`].
     pub fn push(&mut self, message: Backend) -> Result<Flow, ProtocolError> {
         while self.state.admit(message_id(&message)) == Admit::Wait {
+            if self.state.async_status().is_copy() {
+                return Ok(Flow::Done);
+            }
             self.collect();
         }
         match self.state.apply(message)? {
@@ -808,14 +1033,16 @@ impl QueryRunner {
             Some(Event::ReadyForQuery(status)) => self.transaction_status = Some(status),
         }
         self.collect();
-        Ok(if self.state.async_status() == AsyncStatus::Idle {
+        let status = self.state.async_status();
+        Ok(if status == AsyncStatus::Idle || status.is_copy() {
             Flow::Done
         } else {
             Flow::Continue
         })
     }
 
-    /// Take every result that is ready, as `PQgetResult` would.
+    /// Take every result that is ready, as `PQgetResult` would — and the
+    /// COPY result once, where `PQexecFinish` stops.
     fn collect(&mut self) {
         while matches!(
             self.state.async_status(),
@@ -824,6 +1051,12 @@ impl QueryRunner {
             if let Next::Result(result) = self.state.next_result() {
                 self.results.push(result);
             }
+        }
+        if self.state.async_status().is_copy()
+            && self.state.has_pending_result()
+            && let Next::Result(result) = self.state.next_result()
+        {
+            self.results.push(result);
         }
     }
 
@@ -1865,5 +2098,270 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].value(0, 0), Some(&b"x"[..]));
         assert_eq!(results[1].fname(0), Some(&b"b"[..]));
+    }
+
+    fn copy_format(columns: &[i16]) -> CopyFormat {
+        CopyFormat {
+            overall: 0,
+            column_formats: columns.to_vec(),
+        }
+    }
+
+    /// A simple `COPY … TO STDOUT` sent and its CopyOutResponse parsed.
+    fn copying_out() -> PipelineState {
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Simple).unwrap();
+        state.append(QueryClass::Simple);
+        let mut input = VecDeque::from([Backend::CopyOutResponse(copy_format(&[0, 0]))]);
+        assert!(parse(&mut state, &mut input).is_empty());
+        state
+    }
+
+    /// `fe-protocol3.c:416` and `getCopyResult`, `fe-exec.c:2241`: the COPY
+    /// result getCopyStart made comes first, then a fresh one on every call,
+    /// and the state stays put until the data has been moved.
+    #[test]
+    fn a_copy_response_is_a_copy_result_on_every_call() {
+        let mut state = copying_out();
+        assert_eq!(state.async_status(), AsyncStatus::CopyOut);
+        assert!(!state.is_busy(), "PQisBusy is false during COPY");
+        let Next::Result(first) = state.next_result() else {
+            panic!("a COPY result")
+        };
+        assert_eq!(first.status(), ExecStatus::CopyOut);
+        assert_eq!(first.nfields(), 2, "one column per format code");
+        assert_eq!(first.fformat(1), Some(0));
+        assert_eq!(
+            first.fname(0),
+            Some(&b""[..]),
+            "zeroed attDescs: an empty name, where C's PQfname is NULL"
+        );
+        assert!(!first.binary_tuples());
+        let Next::Result(again) = state.next_result() else {
+            panic!("a COPY result again")
+        };
+        assert_eq!(again.status(), ExecStatus::CopyOut);
+        assert_eq!(again.nfields(), 0, "PQmakeEmptyPGresult, the second time");
+        assert_eq!(state.async_status(), AsyncStatus::CopyOut);
+
+        // fe-protocol3.c:166 — nothing but NOTIFY and NOTICE is parsed by
+        // pqParseInput3 during COPY.
+        assert_eq!(state.admit(b'd'), Admit::Wait);
+        assert_eq!(state.admit(b'C'), Admit::Wait);
+        assert_eq!(state.admit(b'N'), Admit::Process);
+    }
+
+    /// `getCopyStart`'s `binary` (`fe-protocol3.c:1719`) is
+    /// `PQbinaryTuples`.
+    #[test]
+    fn a_binary_copy_result_says_so() {
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Simple).unwrap();
+        state.append(QueryClass::Simple);
+        let mut input = VecDeque::from([Backend::CopyInResponse(CopyFormat {
+            overall: 1,
+            column_formats: vec![1],
+        })]);
+        parse(&mut state, &mut input);
+        let Next::Result(result) = state.next_result() else {
+            panic!("a COPY result")
+        };
+        assert_eq!(result.status(), ExecStatus::CopyIn);
+        assert!(result.binary_tuples());
+        assert_eq!(result.fformat(0), Some(1));
+    }
+
+    /// `getCopyDataMessage`'s switch, `fe-protocol3.c:1846`-`:1882`.
+    #[test]
+    fn get_copy_data_message_ends_the_copy_at_anything_but_data() {
+        let mut state = copying_out();
+        for id in [b'A', b'N', b'S'] {
+            assert_eq!(state.copy_message(id), CopyStep::Async);
+        }
+        assert_eq!(state.copy_message(b'd'), CopyStep::Data);
+        assert_eq!(state.async_status(), AsyncStatus::CopyOut);
+        assert_eq!(state.copy_message(b'c'), CopyStep::End);
+        assert_eq!(state.async_status(), AsyncStatus::Busy);
+
+        let mut state = copying_out();
+        assert_eq!(state.copy_message(b'E'), CopyStep::End, "an error ends it");
+        assert_eq!(state.async_status(), AsyncStatus::Busy);
+
+        // fe-protocol3.c:1869 — CopyDone during COPY BOTH leaves COPY IN.
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Simple).unwrap();
+        state.append(QueryClass::Simple);
+        let mut input = VecDeque::from([Backend::CopyBothResponse(copy_format(&[]))]);
+        parse(&mut state, &mut input);
+        assert_eq!(state.copy_message(b'c'), CopyStep::End);
+        assert_eq!(state.async_status(), AsyncStatus::CopyIn);
+    }
+
+    /// Once the COPY is over, what `getCopyDataMessage` left behind is read
+    /// by pqParseInput3: the CopyDone and stray CopyData are dropped
+    /// (`fe-protocol3.c:428`, `:437`), and the command ends as usual.
+    #[test]
+    fn a_finished_copy_out_ends_like_any_command() {
+        let mut state = copying_out();
+        let Next::Result(_) = state.next_result() else {
+            panic!("the COPY result")
+        };
+        assert_eq!(state.copy_message(b'c'), CopyStep::End);
+        let mut input = VecDeque::from([
+            Backend::CopyData(b"late\n".to_vec()),
+            Backend::CopyDone,
+            Backend::CommandComplete(b"COPY 2".to_vec()),
+            ready(TransactionStatus::Idle),
+        ]);
+        parse(&mut state, &mut input);
+        let Next::Result(done) = state.next_result() else {
+            panic!("the command's result")
+        };
+        assert_eq!(done.status(), ExecStatus::CommandOk);
+        assert_eq!(done.command_status(), b"COPY 2");
+        parse(&mut state, &mut input);
+        assert_eq!(state.next_result(), Next::Null);
+        assert!(state.queue().is_empty());
+    }
+
+    /// `PQputCopyEnd`, `fe-exec.c:2766`: a Sync follows only a COPY that an
+    /// extended-query command started (`:2801`), and COPY BOTH goes on as
+    /// COPY OUT (`:2810`).
+    #[test]
+    fn put_copy_end_syncs_only_an_extended_query_copy() {
+        for (class, sync) in [(QueryClass::Simple, false), (QueryClass::Extended, true)] {
+            let mut state = PipelineState::new();
+            state.begin_send(class).unwrap();
+            state.append(class);
+            let mut input = VecDeque::from([Backend::CopyInResponse(copy_format(&[0]))]);
+            parse(&mut state, &mut input);
+            assert_eq!(state.begin_put_copy(), Ok(()));
+            assert_eq!(
+                state.begin_get_copy(),
+                Err(PipelineError::NoCopyInProgress),
+                "COPY IN sends, it does not receive"
+            );
+            assert_eq!(state.put_copy_end(), Ok(sync), "{class:?}");
+            assert_eq!(state.async_status(), AsyncStatus::Busy);
+            assert_eq!(
+                state.put_copy_end(),
+                Err(PipelineError::NoCopyInProgress),
+                "only once"
+            );
+        }
+
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Simple).unwrap();
+        state.append(QueryClass::Simple);
+        let mut input = VecDeque::from([Backend::CopyBothResponse(copy_format(&[]))]);
+        parse(&mut state, &mut input);
+        assert_eq!(state.begin_get_copy(), Ok(()));
+        assert_eq!(state.put_copy_end(), Ok(false));
+        assert_eq!(state.async_status(), AsyncStatus::CopyOut);
+    }
+
+    /// `fe-exec.c:2719`, `:2773`, `:2841` — no COPY, no COPY calls.
+    #[test]
+    fn copy_calls_need_a_copy() {
+        let mut state = PipelineState::new();
+        assert_eq!(state.begin_put_copy(), Err(PipelineError::NoCopyInProgress));
+        assert_eq!(state.put_copy_end(), Err(PipelineError::NoCopyInProgress));
+        assert_eq!(state.begin_get_copy(), Err(PipelineError::NoCopyInProgress));
+        assert_eq!(
+            PipelineError::NoCopyInProgress.message(),
+            b"no COPY in progress"
+        );
+    }
+
+    /// A COPY in pipeline mode blocks the queue (`fe-exec.c:1744`), a Sync
+    /// (`:3345`) and leaving the mode (`:3135`, and `:3141` after it).
+    #[test]
+    fn nothing_is_queued_behind_a_copy_in_a_pipeline() {
+        let mut state = PipelineState::new();
+        state.enter_pipeline_mode().unwrap();
+        state.begin_send(QueryClass::Extended).unwrap();
+        state.append(QueryClass::Extended);
+        let mut input = VecDeque::from([
+            Backend::ParseComplete,
+            Backend::BindComplete,
+            Backend::CopyInResponse(copy_format(&[0])),
+        ]);
+        parse(&mut state, &mut input);
+        assert_eq!(state.async_status(), AsyncStatus::CopyIn);
+        assert_eq!(
+            state.begin_send(QueryClass::Extended),
+            Err(PipelineError::QueueDuringCopy)
+        );
+        assert_eq!(
+            state.begin_pipeline_sync(),
+            Err(PipelineError::SyncDuringCopy)
+        );
+        assert_eq!(
+            state.exit_pipeline_mode(),
+            Err(PipelineError::ExitDuringCopy)
+        );
+        assert_eq!(
+            PipelineError::ExitDuringCopy.message(),
+            b"cannot exit pipeline mode while in COPY\ncannot exit pipeline mode with uncollected results"
+        );
+        assert_eq!(
+            PipelineError::QueueDuringCopy.message(),
+            b"cannot queue commands during COPY"
+        );
+        assert_eq!(
+            PipelineError::SyncDuringCopy.message(),
+            b"internal error: cannot send pipeline while in COPY"
+        );
+    }
+
+    /// `PQexecStart` leaves a COPY OUT by going back to BUSY (`fe-exec.c:2399`)
+    /// — and nothing else is left that way.
+    #[test]
+    fn abandoning_a_copy_out_drops_its_data() {
+        let mut state = copying_out();
+        state.abandon_copy_out();
+        assert_eq!(state.async_status(), AsyncStatus::Busy);
+        let mut input = VecDeque::from([
+            Backend::CopyData(b"1\n".to_vec()),
+            Backend::CopyDone,
+            Backend::CommandComplete(b"COPY 1".to_vec()),
+        ]);
+        parse(&mut state, &mut input);
+        let Next::Result(result) = state.next_result() else {
+            panic!("the command's result")
+        };
+        assert_eq!(result.command_status(), b"COPY 1");
+
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Simple).unwrap();
+        state.append(QueryClass::Simple);
+        let mut input = VecDeque::from([Backend::CopyInResponse(copy_format(&[0]))]);
+        parse(&mut state, &mut input);
+        state.abandon_copy_out();
+        assert_eq!(state.async_status(), AsyncStatus::CopyIn, "COPY IN stays");
+        assert_eq!(
+            PipelineError::ExecDuringCopyBoth.message(),
+            b"PQexec not allowed during COPY BOTH"
+        );
+    }
+
+    /// `PQexecFinish` stops at a COPY result (`fe-exec.c:2448`), and so
+    /// does the runner, however much follows.
+    #[test]
+    fn a_query_runner_stops_at_a_copy_result() {
+        let mut runner = QueryRunner::new();
+        assert_eq!(
+            runner
+                .push(Backend::CopyOutResponse(copy_format(&[0])))
+                .unwrap(),
+            Flow::Done
+        );
+        assert_eq!(
+            runner.push(Backend::CopyData(b"1\n".to_vec())).unwrap(),
+            Flow::Done
+        );
+        let results = runner.into_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::CopyOut);
     }
 }

@@ -7,7 +7,10 @@
 //! `PQisBusy` (`:2048`), `PQconsumeInput` (`:2001`), and pipeline mode from
 //! `PQenterPipelineMode` (`:3073`) to `PQsendFlushRequest` (`:3402`) — and
 //! the blocking ones built on them, `PQexec` (`:2279`) to `PQclosePortal`
-//! (`:2556`), which are `PQexecStart`, one send, and `PQexecFinish`.
+//! (`:2556`), which are `PQexecStart`, one send, and `PQexecFinish` — and
+//! the COPY data transfer, `PQputCopyData` (`:2712`), `PQputCopyEnd`
+//! (`:2766`) and `PQgetCopyData` (`:2833`, with `fe-protocol3.c`'s
+//! `pqGetCopyData3`, `:1907`).
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]
 //! and [`socket_address`] are functions of the `ConnInfo` alone, and
@@ -26,11 +29,12 @@ use crate::error::ConnError;
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
-    next_frame,
+    next_copy_frame, next_frame,
 };
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::pipeline::{
-    Admit, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass, message_id,
+    Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
+    message_id,
 };
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
@@ -421,6 +425,24 @@ fn auth_response(message: &Frontend) -> AuthResponse {
     }
 }
 
+/// What `PQgetCopyData` returned (`fe-exec.c:2823`), less its `-2`, which is
+/// an `Err` here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyRead {
+    /// One CopyData message's bytes — a row, for a text or CSV COPY (`> 0`).
+    Row(Vec<u8>),
+    /// No whole message is buffered yet, and the call was asked not to wait
+    /// (`0`, `async` only).
+    WouldBlock,
+    /// The COPY is over (`-1`): collect its result with
+    /// [`Connection::get_result`].
+    End,
+}
+
+/// `pqPutMsgEnd`, `fe-misc.c:559`: output is pushed once this much is
+/// buffered, "the typical size of a pipe buffer on Unix systems".
+const PUT_MSG_PUSH_THRESHOLD: usize = 8192;
+
 /// A live connection: `PGconn`, minus everything the query paths do not
 /// need yet.
 #[derive(Debug)]
@@ -685,20 +707,138 @@ impl<S: Read + Write> Connection<S> {
     /// `PQexecStart`, `fe-exec.c:2361`: refused in pipeline mode; otherwise
     /// "silently discard any prior query result that application didn't
     /// eat" (`:2386`).
+    ///
+    /// A COPY left running is ended the way `PQexecStart` ends it
+    /// (`:2391`-`:2412`): COPY IN with a CopyFail, COPY OUT by dropping the
+    /// rest of its data; COPY BOTH is refused.
     fn exec_start(&mut self) -> Result<(), ConnectionError> {
         self.state.begin_exec()?;
-        while self.get_result()?.is_some() {}
+        while let Some(result) = self.get_result()? {
+            match result.status() {
+                ExecStatus::CopyIn => {
+                    self.put_copy_end(Some(b"COPY terminated by new PQexec"))?;
+                }
+                ExecStatus::CopyOut => self.state.abandon_copy_out(),
+                ExecStatus::CopyBoth => {
+                    return Err(PipelineError::ExecDuringCopyBoth.into());
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
     /// `PQexecFinish`, `fe-exec.c:2427`, keeping every result rather than
-    /// the last.
+    /// the last. It stops at a COPY result (`:2448`): the data transfer is
+    /// the caller's, through [`Connection::put_copy_data`] or
+    /// [`Connection::get_copy_data`].
     fn exec_finish(&mut self) -> Result<Vec<QueryResult>, ConnectionError> {
         let mut results = Vec::new();
         while let Some(result) = self.get_result()? {
+            let copy = matches!(
+                result.status(),
+                ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::CopyBoth
+            );
             results.push(result);
+            if copy {
+                break;
+            }
         }
         Ok(results)
+    }
+
+    /// `PQputCopyData`, `fe-exec.c:2712`: send `data` as one CopyData
+    /// message during COPY IN or COPY BOTH. Nothing is sent for no data.
+    ///
+    /// The message is buffered, and the buffer pushed once it holds 8 kB,
+    /// as `pqPutMsgEnd` pushes it (`fe-misc.c:559`); [`Connection::flush`]
+    /// or [`Connection::put_copy_end`] sends the rest. The push is the
+    /// whole buffer, C's TCP case: over a Unix socket C holds the last
+    /// partial 8 kB back (`:577`) for tidier pipe writes, which changes when
+    /// bytes leave but not which bytes do.
+    ///
+    /// # Errors
+    /// No COPY is taking data (`fe-exec.c:2719`), or the write failed.
+    pub fn put_copy_data(&mut self, data: &[u8]) -> Result<(), ConnectionError> {
+        self.state.begin_put_copy()?;
+        // fe-exec.c:2731 — deal with notices and notifications already read,
+        // so a long COPY does not pile them up.
+        self.parse_input()?;
+        if !data.is_empty() {
+            self.put_message(&Frontend::CopyData(data.to_vec()));
+            if self.outbuf.len() >= PUT_MSG_PUSH_THRESHOLD {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `PQputCopyEnd`, `fe-exec.c:2766`: end COPY IN with a CopyDone, or
+    /// fail it with a CopyFail carrying `error`; a COPY started by an
+    /// extended-query command also gets its Sync (`:2801`). Everything
+    /// buffered is flushed. The COPY command's result then comes from
+    /// [`Connection::get_result`].
+    ///
+    /// # Errors
+    /// No COPY is taking data (`fe-exec.c:2773`), or the write failed.
+    pub fn put_copy_end(&mut self, error: Option<&[u8]>) -> Result<(), ConnectionError> {
+        self.state.begin_put_copy()?;
+        let end = match error {
+            Some(message) => Frontend::CopyFail(message.to_vec()),
+            None => Frontend::CopyDone,
+        };
+        self.put_message(&end);
+        if self.state.put_copy_end()? {
+            self.put_message(&Frontend::Sync);
+        }
+        self.flush()
+    }
+
+    /// `PQgetCopyData`, `fe-exec.c:2833`, and `pqGetCopyData3`,
+    /// `fe-protocol3.c:1907`: the next CopyData during COPY OUT or COPY
+    /// BOTH. Notices, notifications and ParameterStatus messages in between
+    /// are dealt with as they come (`getCopyDataMessage`, `:1795`); an empty
+    /// CopyData is skipped (`:1955`). With `nonblocking`, nothing is read
+    /// from the socket — as with `async`, the caller reads with
+    /// [`Connection::consume_input`].
+    ///
+    /// # Errors
+    /// No COPY is sending data (`fe-exec.c:2841`), the stream lost
+    /// synchronization, or the read failed — `PQgetCopyData`'s `-2`.
+    pub fn get_copy_data(&mut self, nonblocking: bool) -> Result<CopyRead, ConnectionError> {
+        self.state.begin_get_copy()?;
+        loop {
+            let (id, body) = match next_copy_frame(&self.inbuf[self.start..]) {
+                // fe-protocol3.c:1926 — "Need to load more data".
+                Frame::Incomplete => {
+                    if nonblocking {
+                        return Ok(CopyRead::WouldBlock);
+                    }
+                    self.read_more()?;
+                    continue;
+                }
+                Frame::SyncLoss { id, length } => {
+                    return Err(ProtocolError::LostSynchronization { id, length }.into());
+                }
+                Frame::Message { id, body } => (id, body),
+            };
+            match self.state.copy_message(id) {
+                CopyStep::End => return Ok(CopyRead::End),
+                CopyStep::Data => {
+                    let Backend::CopyData(data) = self.parse_frame(id, body)? else {
+                        unreachable!("a 'd' message decodes to CopyData");
+                    };
+                    if !data.is_empty() {
+                        return Ok(CopyRead::Row(data));
+                    }
+                }
+                CopyStep::Async => {
+                    let message = self.parse_frame(id, body)?;
+                    let event = self.state.apply(message)?;
+                    self.take_event(event);
+                }
+            }
+        }
     }
 
     /// `PQsendQuery`, `fe-exec.c:1433`: send one Query message and return;
@@ -980,19 +1120,25 @@ impl<S: Read + Write> Connection<S> {
                 return Ok(());
             }
             let message = self.parse_frame(id, body)?;
-            match self.state.apply(message)? {
-                None => {}
-                Some(Event::Notice(notice)) => self.notices.push(notice),
-                Some(Event::Notification {
-                    pid,
-                    channel,
-                    payload,
-                }) => self.notifications.push((pid, channel, payload)),
-                Some(Event::ParameterStatus { name, value }) => {
-                    self.parameters.push((name, value));
-                }
-                Some(Event::ReadyForQuery(status)) => self.transaction_status = status,
+            let event = self.state.apply(message)?;
+            self.take_event(event);
+        }
+    }
+
+    /// The connection-level side of a parsed message.
+    fn take_event(&mut self, event: Option<Event>) {
+        match event {
+            None => {}
+            Some(Event::Notice(notice)) => self.notices.push(notice),
+            Some(Event::Notification {
+                pid,
+                channel,
+                payload,
+            }) => self.notifications.push((pid, channel, payload)),
+            Some(Event::ParameterStatus { name, value }) => {
+                self.parameters.push((name, value));
             }
+            Some(Event::ReadyForQuery(status)) => self.transaction_status = status,
         }
     }
 
@@ -1038,8 +1184,14 @@ impl<S: Read + Write> Connection<S> {
         Ok(message)
     }
 
-    /// `pqReadData`, blocking: append what one read returns.
+    /// `pqReadData`, blocking: append what one read returns, after moving
+    /// what is left unparsed to the front of the buffer (`fe-misc.c:659`) —
+    /// without that, a long COPY OUT would keep every byte it ever read.
     fn read_more(&mut self) -> Result<(), ConnectionError> {
+        if self.start > 0 {
+            self.inbuf.drain(..self.start);
+            self.start = 0;
+        }
         let mut chunk = [0u8; 8192];
         let n = self.stream.read(&mut chunk)?;
         if n == 0 {
@@ -2045,5 +2197,288 @@ mod tests {
         );
         assert_eq!(conn.stream.to_server.len(), written);
         assert!(!conn.is_busy().unwrap());
+    }
+
+    /// A connected, idle session over `script`, whose first turn is the
+    /// startup exchange.
+    fn replayed(after_startup: &[u8]) -> Connection<Scripted> {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend_from_slice(after_startup);
+        Connection::start_up(
+            Scripted::new(script),
+            &conninfo("user=alice dbname=postgres"),
+            &[0; 18],
+        )
+        .unwrap()
+    }
+
+    /// `CopyOutResponse` with `n` text columns, as the server sends it.
+    fn copy_response(id: u8, columns: u16) -> Vec<u8> {
+        let mut body = vec![0];
+        body.extend_from_slice(&columns.to_be_bytes());
+        for _ in 0..columns {
+            body.extend_from_slice(&0i16.to_be_bytes());
+        }
+        message(id, &body)
+    }
+
+    /// A NoticeResponse carrying only a primary message.
+    fn notice(text: &[u8]) -> Vec<u8> {
+        let mut body = vec![b'M'];
+        body.extend_from_slice(text);
+        body.extend_from_slice(b"\0\0");
+        message(b'N', &body)
+    }
+
+    /// COPY OUT end to end: `PQexec` stops at the COPY result, each
+    /// `PQgetCopyData` returns one CopyData, a notice in between is taken
+    /// and an empty CopyData skipped (`fe-protocol3.c:1955`), CopyDone is -1,
+    /// and `PQgetResult` then reads the command's own result — with every
+    /// message traced once, as it is parsed.
+    #[test]
+    fn a_copy_out_hands_over_each_copy_data_then_the_result() {
+        let mut replies = copy_response(b'H', 2);
+        replies.extend(message(b'd', b"1\tone\n"));
+        replies.extend(notice(b"midway"));
+        replies.extend(message(b'd', b""));
+        replies.extend(message(b'd', b"2\t\\N\n"));
+        replies.extend(message(b'c', b""));
+        replies.extend(message(b'C', b"COPY 2\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        let sink = SharedSink::default();
+        conn.trace(Box::new(sink.clone()));
+        conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS);
+
+        let results = conn.exec(b"COPY t TO STDOUT").unwrap();
+        assert_eq!(results.len(), 1, "PQexecFinish stops at the COPY result");
+        assert_eq!(results[0].status(), ExecStatus::CopyOut);
+        assert_eq!(results[0].nfields(), 2);
+
+        assert_eq!(
+            conn.get_copy_data(false).unwrap(),
+            CopyRead::Row(b"1\tone\n".to_vec())
+        );
+        assert_eq!(
+            conn.get_copy_data(false).unwrap(),
+            CopyRead::Row(b"2\t\\N\n".to_vec())
+        );
+        assert_eq!(conn.notices().len(), 1, "the notice was taken on the way");
+        assert_eq!(conn.get_copy_data(false).unwrap(), CopyRead::End);
+        assert!(
+            matches!(
+                conn.get_copy_data(false),
+                Err(ConnectionError::Pipeline(PipelineError::NoCopyInProgress))
+            ),
+            "the COPY is over"
+        );
+
+        let done = conn.get_result().unwrap().expect("the COPY's result");
+        assert_eq!(done.status(), ExecStatus::CommandOk);
+        assert_eq!(done.command_status(), b"COPY 2");
+        assert!(conn.get_result().unwrap().is_none());
+
+        // fe-trace.c prints a printable byte as itself, a backslash
+        // included, and the rest as \xNN (`pqTraceOutputNchar`).
+        let expected: &[u8] = b"F\t21\tQuery\t \"COPY t TO STDOUT\"\n\
+              B\t11\tCopyOutResponse\t \\x00 2 0 0\n\
+              B\t10\tCopyData\t '1\\x09one\\x0a'\n\
+              B\t13\tNoticeResponse\t M \"midway\" \\x00\n\
+              B\t4\tCopyData\t ''\n\
+              B\t9\tCopyData\t '2\\x09\\N\\x0a'\n\
+              B\t4\tCopyDone\n\
+              B\t11\tCommandComplete\t \"COPY 2\"\n\
+              B\t5\tReadyForQuery\t I\n";
+        assert_eq!(
+            String::from_utf8_lossy(sink.0.lock().unwrap().as_slice()),
+            String::from_utf8_lossy(expected)
+        );
+    }
+
+    /// With `nonblocking`, `PQgetCopyData` reads nothing and says 0 until a
+    /// whole message is buffered (`fe-protocol3.c:1929`).
+    #[test]
+    fn a_nonblocking_get_copy_data_reads_nothing() {
+        let mut replies = copy_response(b'H', 1);
+        replies.extend(message(b'd', b"x\n"));
+        replies.extend(message(b'c', b""));
+        replies.extend(message(b'C', b"COPY 1\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        conn.send_query(b"COPY t TO STDOUT").unwrap();
+        // Only the first read's worth: cut the buffer after the response.
+        let copy_out = copy_response(b'H', 1).len();
+        conn.read_more().unwrap();
+        let buffered = conn.inbuf.split_off(copy_out);
+        let result = conn.get_result().unwrap().expect("the COPY result");
+        assert_eq!(result.status(), ExecStatus::CopyOut);
+        assert_eq!(conn.get_copy_data(true).unwrap(), CopyRead::WouldBlock);
+        conn.inbuf.extend(buffered);
+        assert_eq!(
+            conn.get_copy_data(true).unwrap(),
+            CopyRead::Row(b"x\n".to_vec())
+        );
+        assert_eq!(conn.get_copy_data(true).unwrap(), CopyRead::End);
+    }
+
+    /// COPY IN end to end: data goes out as CopyData, `PQputCopyEnd` sends
+    /// CopyDone — and, for a simple Query, no Sync (`fe-exec.c:2801`).
+    #[test]
+    fn a_copy_in_sends_copy_data_then_copy_done() {
+        let mut replies = copy_response(b'G', 1);
+        replies.extend(message(b'C', b"COPY 2\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        let results = conn.exec(b"COPY t FROM STDIN").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::CopyIn);
+        assert!(matches!(
+            conn.get_copy_data(false),
+            Err(ConnectionError::Pipeline(PipelineError::NoCopyInProgress))
+        ));
+        let before = conn.stream.to_server.len();
+
+        conn.put_copy_data(b"1\n").unwrap();
+        conn.put_copy_data(b"").unwrap();
+        conn.put_copy_data(b"2\n").unwrap();
+        assert_eq!(
+            conn.stream.to_server.len(),
+            before,
+            "under 8 kB, nothing is pushed yet"
+        );
+        conn.put_copy_end(None).unwrap();
+        let mut sent = Frontend::CopyData(b"1\n".to_vec()).encode();
+        sent.extend(Frontend::CopyData(b"2\n".to_vec()).encode());
+        sent.extend(Frontend::CopyDone.encode());
+        assert_eq!(&conn.stream.to_server[before..], &sent[..]);
+
+        let done = conn.get_result().unwrap().expect("the COPY's result");
+        assert_eq!(done.command_status(), b"COPY 2");
+        assert!(conn.get_result().unwrap().is_none());
+        assert!(matches!(
+            conn.put_copy_data(b"3\n"),
+            Err(ConnectionError::Pipeline(PipelineError::NoCopyInProgress))
+        ));
+    }
+
+    /// `pqPutMsgEnd` pushes the buffer once it holds 8 kB (`fe-misc.c:559`).
+    #[test]
+    fn copy_data_is_pushed_at_eight_kilobytes() {
+        let mut replies = copy_response(b'G', 1);
+        replies.extend(message(b'C', b"COPY 1\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        conn.exec(b"COPY t FROM STDIN").unwrap();
+        let before = conn.stream.to_server.len();
+        let row = vec![b'x'; 8192 - 5];
+        conn.put_copy_data(&row).unwrap();
+        assert_eq!(conn.stream.to_server.len() - before, 8192);
+        assert!(conn.outbuf.is_empty());
+    }
+
+    /// A COPY started through the extended protocol needs its Sync after
+    /// the CopyDone (`fe-exec.c:2801`).
+    #[test]
+    fn an_extended_query_copy_in_ends_with_a_sync() {
+        let mut replies = message(b'1', b"");
+        replies.extend(message(b'2', b""));
+        replies.extend(copy_response(b'G', 1));
+        replies.extend(message(b'C', b"COPY 0\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        let results = conn
+            .exec_params(b"COPY t FROM STDIN", &[], &Params::default())
+            .unwrap();
+        assert_eq!(results[0].status(), ExecStatus::CopyIn);
+        let before = conn.stream.to_server.len();
+        conn.put_copy_end(Some(b"stop")).unwrap();
+        let mut sent = Frontend::CopyFail(b"stop".to_vec()).encode();
+        sent.extend(Frontend::Sync.encode());
+        assert_eq!(&conn.stream.to_server[before..], &sent[..]);
+        assert_eq!(
+            conn.get_result().unwrap().unwrap().command_status(),
+            b"COPY 0"
+        );
+    }
+
+    /// `PQexecStart`, `fe-exec.c:2391`: a new `PQexec` fails a COPY IN that
+    /// was left open, swallows the error that earns, and runs.
+    #[test]
+    fn a_new_exec_fails_a_copy_in_left_open() {
+        let mut replies = copy_response(b'G', 1);
+        replies.extend(message(
+            b'E',
+            b"SERROR\0C57014\0MCOPY from stdin failed: COPY terminated by new PQexec\0\0",
+        ));
+        replies.extend(ready(b'I'));
+        replies.extend(message(b'I', b""));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        conn.exec(b"COPY t FROM STDIN").unwrap();
+        let before = conn.stream.to_server.len();
+        let results = conn.exec(b"").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::EmptyQuery);
+        let mut sent = Frontend::CopyFail(b"COPY terminated by new PQexec".to_vec()).encode();
+        sent.extend(Frontend::Query(Vec::new()).encode());
+        assert_eq!(&conn.stream.to_server[before..], &sent[..]);
+    }
+
+    /// `PQexecStart`, `fe-exec.c:2399`: a COPY OUT left open is drained by
+    /// the next `PQexec`, its data dropped.
+    #[test]
+    fn a_new_exec_drops_what_is_left_of_a_copy_out() {
+        let mut replies = copy_response(b'H', 1);
+        replies.extend(message(b'd', b"1\n"));
+        replies.extend(message(b'd', b"2\n"));
+        replies.extend(message(b'c', b""));
+        replies.extend(message(b'C', b"COPY 2\0"));
+        replies.extend(ready(b'I'));
+        replies.extend(message(b'I', b""));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        conn.exec(b"COPY t TO STDOUT").unwrap();
+        assert_eq!(
+            conn.get_copy_data(false).unwrap(),
+            CopyRead::Row(b"1\n".to_vec())
+        );
+        let results = conn.exec(b"").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::EmptyQuery);
+    }
+
+    /// `fe-exec.c:2411`: COPY BOTH is not something `PQexec` ends.
+    #[test]
+    fn a_new_exec_refuses_a_copy_both() {
+        let mut conn = replayed(&copy_response(b'W', 0));
+        let results = conn.exec(b"START_REPLICATION").unwrap();
+        assert_eq!(results[0].status(), ExecStatus::CopyBoth);
+        let error = conn.exec(b"SELECT 1").unwrap_err();
+        assert_eq!(error.message(), b"PQexec not allowed during COPY BOTH");
+    }
+
+    /// `pqReadData` moves the unparsed tail to the front before it reads
+    /// (`fe-misc.c:659`), so the buffer holds at most one read and a partial
+    /// message, however long the COPY.
+    #[test]
+    fn the_input_buffer_does_not_keep_what_was_parsed() {
+        let mut replies = copy_response(b'H', 1);
+        let row = message(b'd', &[b'r'; 99]);
+        for _ in 0..1000 {
+            replies.extend_from_slice(&row);
+        }
+        replies.extend(message(b'c', b""));
+        replies.extend(message(b'C', b"COPY 1000\0"));
+        replies.extend(ready(b'I'));
+        let mut conn = replayed(&replies);
+        conn.exec(b"COPY t TO STDOUT").unwrap();
+        let mut rows = 0;
+        while let CopyRead::Row(data) = conn.get_copy_data(false).unwrap() {
+            assert_eq!(data.len(), 99);
+            assert!(conn.inbuf.len() < 8192 + row.len());
+            rows += 1;
+        }
+        assert_eq!(rows, 1000);
     }
 }

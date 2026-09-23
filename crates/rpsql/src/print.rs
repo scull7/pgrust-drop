@@ -39,7 +39,7 @@ impl std::fmt::Display for PrintError {
 
 impl std::error::Error for PrintError {}
 
-/// Column alignment: `column_type_alignment()` (`print.c:3479`).
+/// Column alignment: `column_type_alignment()` (`print.c:3615`).
 ///
 /// The numeric-ish types right-align; everything else left-aligns.
 #[must_use]
@@ -54,7 +54,7 @@ pub fn column_type_alignment(typid: u32) -> Align {
     }
 }
 
-/// `cont->aligns[]`'s `'l'` and `'r'` (`print.h:151`).
+/// `cont->aligns[]`'s `'l'` and `'r'` (`print.h:178`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
     /// `'l'`
@@ -63,7 +63,7 @@ pub enum Align {
     Right,
 }
 
-/// `printQuery()` (`print.c:3529`): render one result.
+/// `printQuery()` (`print.c:3550`): render one result.
 ///
 /// # Errors
 /// [`PrintError::Unsupported`] for a format NAT-400 still owns.
@@ -100,7 +100,7 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
 
 /// Display width of one *line* in characters.
 ///
-/// `pg_wcssize()` (`mbprint.c:339`) measures display columns, counting a
+/// `pg_wcssize()` (`mbprint.c:211`) measures display columns, counting a
 /// double-width character as two. This port measures UTF-8 characters, which
 /// agrees for every ASCII result — the corpus this issue gates — and is a
 /// recorded divergence for the wide-character case that NAT-400 must close.
@@ -111,13 +111,13 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
 fn line_width(line: &[u8]) -> usize {
     match std::str::from_utf8(line) {
         Ok(text) => text.chars().count(),
-        // A non-UTF-8 cell is measured in bytes, as an unsafe encoding is
-        // measured upstream (`mbprint.c:349`).
+        // A non-UTF-8 cell is measured in bytes, one column per byte, as
+        // upstream measures a single-byte character (`mbprint.c:228`).
         Err(_) => line.len(),
     }
 }
 
-/// `pg_wcsformat()` (`mbprint.c:398`): a cell becomes one entry per embedded
+/// `pg_wcsformat()` (`mbprint.c:294`): a cell becomes one entry per embedded
 /// newline, which is what `print_aligned_text` walks with `curr_nl_line`.
 fn cell_lines(cell: &[u8]) -> Vec<&[u8]> {
     cell.split(|&c| c == b'\n').collect()
@@ -132,12 +132,12 @@ fn cell_width(cell: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// `print_aligned_text()` (`print.c:669`) for `border = 1` and no wrapping.
+/// `print_aligned_text()` (`print.c:635`) for `border = 1` and no wrapping.
 ///
 /// Wrapping (`PRINT_WRAPPED`) is NAT-400's, so the only reason a cell spans
 /// more than one output line here is an embedded newline; the continuation
 /// marks are `pg_asciiformat`'s `nl_left` `" "` and `nl_right` `"+"`
-/// (`print.c:56`), and the header's are `header_nl_left`/`header_nl_right`,
+/// (`print.c:68`-`:71`), and the header's are `header_nl_left`/`header_nl_right`,
 /// which for ascii are the same two strings.
 fn print_aligned_text(
     headers: &[Vec<u8>],
@@ -148,7 +148,7 @@ fn print_aligned_text(
     let col_count = headers.len();
     let mut out = Vec::new();
 
-    // Widest of the header and every cell, per column (`print.c:742`-`:779`).
+    // Widest of the header and every cell, per column (`print.c:710`-`:752`).
     let mut max_width: Vec<usize> = headers.iter().map(|h| cell_width(h)).collect();
     for row in cells {
         for (i, cell) in row.iter().enumerate() {
@@ -163,7 +163,7 @@ fn print_aligned_text(
         }
 
         // Headers, centered, one output line per embedded newline
-        // (`print.c:867`).
+        // (`print.c:971`-`:1015`).
         let header_lines: Vec<Vec<&[u8]>> = headers.iter().map(|h| cell_lines(h)).collect();
         let header_height = header_lines.iter().map(Vec::len).max().unwrap_or(1);
         for k in 0..header_height {
@@ -177,7 +177,7 @@ fn print_aligned_text(
                         out.extend(std::iter::repeat_n(b' ', nbspace.div_ceil(2)));
                     }
                     // A header that has run out of lines is blank-padded
-                    // (`print.c:369`).
+                    // (`print.c:1000`-`:1001`).
                     None => out.extend(std::iter::repeat_n(b' ', max_width[i])),
                 }
                 out.push(if lines.len() > k + 1 { b'+' } else { b' ' });
@@ -188,7 +188,7 @@ fn print_aligned_text(
             out.push(b'\n');
         }
 
-        // `_print_horizontal_line(PRINT_RULE_MIDDLE)` (`print.c:610`).
+        // `_print_horizontal_line(PRINT_RULE_MIDDLE)` (`print.c:1017`).
         for (i, width) in max_width.iter().enumerate() {
             out.extend(std::iter::repeat_n(b'-', width + 2));
             if i < col_count - 1 {
@@ -198,7 +198,7 @@ fn print_aligned_text(
         out.push(b'\n');
     }
 
-    // Cells, one output line per embedded newline (`print.c:890`).
+    // Cells, one output line per embedded newline (`print.c:1022`).
     for row in cells {
         let row_lines: Vec<Vec<&[u8]>> = row.iter().map(|cell| cell_lines(cell)).collect();
         let row_height = row_lines.iter().map(Vec::len).max().unwrap_or(1);
@@ -222,7 +222,7 @@ fn print_aligned_text(
                                 out.extend_from_slice(line);
                                 // Left-aligned cells pad when the column is
                                 // not the last *or* when a mark follows
-                                // (`print.c:1147`).
+                                // (`print.c:1138`).
                                 if finalspaces || continues {
                                     out.extend(std::iter::repeat_n(b' ', pad));
                                 }
@@ -230,7 +230,7 @@ fn print_aligned_text(
                         }
                     }
                     // Past this column's last line: pad for the others
-                    // (`print.c:1085`).
+                    // (`print.c:1078`).
                     None => {
                         if finalspaces {
                             out.extend(std::iter::repeat_n(b' ', max_width[j]));
@@ -251,7 +251,7 @@ fn print_aligned_text(
     }
 
     if opt.topt.stop_table {
-        // `footers_with_default()` (`print.c:389`).
+        // `footers_with_default()` (`print.c:398`).
         if opt.topt.default_footer && !opt.topt.tuples_only {
             let n = cells.len();
             let noun = if n == 1 { "row" } else { "rows" };
@@ -263,7 +263,7 @@ fn print_aligned_text(
     out
 }
 
-/// `print_unaligned_text()` (`print.c:180`).
+/// `print_unaligned_text()` (`print.c:422`).
 fn print_unaligned_text(
     headers: &[Vec<u8>],
     cells: &[Vec<Vec<u8>>],
@@ -436,7 +436,7 @@ mod tests {
         let out = String::from_utf8(print_query(&res, &opt).unwrap()).unwrap();
         // The header is still measured for the column width, and
         // `stop_table` still ends the table with a blank line
-        // (`print.c:1060`).
+        // (`print.c:1179`).
         assert_eq!(out, " 1\n\n");
     }
 
@@ -465,9 +465,9 @@ mod tests {
 
     #[test]
     fn a_newline_in_a_cell_splits_the_row_and_marks_it_with_a_plus() {
-        // `pg_wcsformat` (`mbprint.c:398`) splits on newlines and
+        // `pg_wcsformat` (`mbprint.c:294`) splits on newlines and
         // `print_aligned_text` marks each continued line with `nl_right`,
-        // which is "+" for ascii (`print.c:56`). Writing the newline into the
+        // which is "+" for ascii (`print.c:71`). Writing the newline into the
         // table raw would corrupt the frame.
         let res = result(vec![text_field("?column?")], vec![vec![Some("a\nb")]]);
         assert_eq!(
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_multi_line_cell_pads_its_neighbours_on_the_extra_lines() {
-        // `print.c:1085`: a column past its last line is blank-padded so the
+        // `print.c:1078`: a column past its last line is blank-padded so the
         // dividers stay aligned.
         let res = result(
             vec![text_field("a"), text_field("b")],
@@ -495,7 +495,7 @@ mod tests {
         );
         // The trailing space on the second line is upstream's: the left mark
         // is emitted for every column whenever `border != 0`, including for a
-        // column that has run out of lines (`print.c:1072`).
+        // column that has run out of lines (`print.c:1066`).
         assert_eq!(
             rendered(&res),
             " a | b \n---+---\n 1+| x\n 2 | \n(1 row)\n\n"

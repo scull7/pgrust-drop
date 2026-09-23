@@ -323,10 +323,23 @@ impl Scanner {
         self.stack.clear();
     }
 
-    /// `psql_scan_count_copy_from_stdin()` (`psqlscan.l:1422`): read and reset
-    /// the counter, as upstream does.
+    /// `psql_scan_count_copy_from_stdin()` (`psqlscan.l:1422`): the number of
+    /// `COPY ... FROM STDIN` commands in the input scanned so far.
+    ///
+    /// Only a semicolon counts a statement as it is lexed, so a `COPY ... FROM
+    /// STDIN` after the last one is counted here, once: clearing
+    /// `init_idents_count` is what makes a second call return the same
+    /// number (`:1424`-`:1430`). The counter itself is not reset; only
+    /// [`Scanner::reset`] does that, as only `psql_scan_reset` does upstream
+    /// (`:1390`).
     pub fn count_copy_from_stdin(&mut self) -> i32 {
-        std::mem::take(&mut self.state.copy_stdin_count)
+        if self.state.init_idents_count > 0 {
+            if self.is_copy_from_stdin() {
+                self.state.copy_stdin_count += 1;
+            }
+            self.state.init_idents_count = 0;
+        }
+        self.state.copy_stdin_count
     }
 
     /// `psql_scan_in_quote()` (`psqlscan.l:1443`).
@@ -1385,6 +1398,48 @@ mod tests {
         scanner.setup(b"copy t to stdout;", true);
         let mut out = Vec::new();
         scanner.scan(&mut out, &NoVariables);
+        assert_eq!(scanner.count_copy_from_stdin(), 0);
+    }
+
+    /// `psqlscan.l:1424`: a `COPY ... FROM STDIN` after the last semicolon
+    /// has not been counted by the `";"` rule, so the count picks it up.
+    #[test]
+    fn a_trailing_copy_from_stdin_without_a_semicolon_is_counted() {
+        let mut scanner = Scanner::new();
+        scanner.setup(b"copy t from stdin", true);
+        let mut out = Vec::new();
+        let (res, _) = scanner.scan(&mut out, &NoVariables);
+        assert_eq!(res, ScanResult::Eol);
+        assert_eq!(scanner.count_copy_from_stdin(), 1);
+
+        let mut scanner = Scanner::new();
+        scanner.setup(b"copy t from stdin; copy u from stdin", true);
+        let mut out = Vec::new();
+        while scanner.scan(&mut out, &NoVariables).0 == ScanResult::Semicolon {}
+        assert_eq!(scanner.count_copy_from_stdin(), 2);
+    }
+
+    /// `psqlscan.l:1429`, "... but do so only once": asking twice neither
+    /// counts the trailing statement again nor resets the counter.
+    #[test]
+    fn counting_copy_from_stdin_twice_gives_the_same_answer() {
+        let mut scanner = Scanner::new();
+        scanner.setup(b"copy t from stdin; copy u from stdin", true);
+        let mut out = Vec::new();
+        while scanner.scan(&mut out, &NoVariables).0 == ScanResult::Semicolon {}
+        assert_eq!(scanner.count_copy_from_stdin(), 2);
+        assert_eq!(scanner.count_copy_from_stdin(), 2);
+    }
+
+    /// `psqlscan.l:1390`: only `psql_scan_reset` clears the counter.
+    #[test]
+    fn a_reset_clears_the_copy_from_stdin_count() {
+        let mut scanner = Scanner::new();
+        scanner.setup(b"copy t from stdin;", true);
+        let mut out = Vec::new();
+        scanner.scan(&mut out, &NoVariables);
+        assert_eq!(scanner.count_copy_from_stdin(), 1);
+        scanner.reset();
         assert_eq!(scanner.count_copy_from_stdin(), 0);
     }
 

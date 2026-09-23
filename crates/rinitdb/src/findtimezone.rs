@@ -33,8 +33,17 @@ pub const TZDEFAULT: &str = "/etc/localtime";
 /// row for why a system directory is the fallback.
 pub const TZDIR_ENV: &str = "PGRUST_TZDIR";
 
-/// The directories a `--with-system-tzdata` build is pointed at, in the order
-/// `configure` documents them. The first that exists wins.
+/// Where to look for a system timezone database when `PGRUST_TZDIR` is unset.
+/// The first that exists wins.
+///
+/// This list and its order are this port's own choice, not upstream's.
+/// PostgreSQL has no list: a `--with-system-tzdata=DIRECTORY` build compiles
+/// the one directory it was given in as `SYSTEMTZDIR` (`findtimezone.c:44`),
+/// and neither `configure`, `configure.ac` nor `meson.build` names a default.
+/// The only mention of any of these paths at `REL_18_6` is the installation
+/// guide's "`/usr/share/zoneinfo` is a likely directory on some operating
+/// systems" (`doc/src/sgml/installation.sgml:1379`, and `:2866` for meson).
+/// See `docs/divergences.md`.
 const SYSTEM_TZDIRS: [&str; 4] = [
     "/usr/share/zoneinfo",
     "/usr/lib/zoneinfo",
@@ -881,5 +890,20 @@ mod tests {
         let (score, name) =
             scan_available_timezones(&[String::from("zone.tab")], &probe, |_| None::<State>);
         assert_eq!((score, name.as_str()), (-1, ""));
+    }
+
+    /// Pins the list `docs/divergences.md` records as this port's own, so a
+    /// change to it is a change to that row too.
+    #[test]
+    fn the_system_tzdir_fallbacks_are_this_ports_own_list_in_this_order() {
+        assert_eq!(
+            SYSTEM_TZDIRS,
+            [
+                "/usr/share/zoneinfo",
+                "/usr/lib/zoneinfo",
+                "/usr/share/lib/zoneinfo",
+                "/etc/zoneinfo",
+            ]
+        );
     }
 }

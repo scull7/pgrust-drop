@@ -12,16 +12,21 @@
 //! musl ([`rinitdb::image::mint`]), mints two clusters with
 //! [`rinitdb::image::MINT_ARGS`], strips and packs each, and refuses unless
 //! the two images are byte-identical — a mint that is not reproducible is not
-//! worth recording. Then it writes `<out-dir>/template.img` and
-//! `<out-dir>/template.manifest`.
+//! worth recording; the refusal names the first entry that differs. Between
+//! the two it measures what the host put into `pg_collation`, by running
+//! [`rinitdb::image::mint::HOST_QUERY`] through the same `postgres` in
+//! single-user mode on the first cluster, after it is packed (the query's
+//! shutdown checkpoint writes to the directory). Then it writes
+//! `<out-dir>/template.img` and `<out-dir>/template.manifest`.
 
 // Crate attributes are the only level that outranks CI's `-W clippy::pedantic`;
 // the library root says why this lint is off, and `sha256.rs` is included here.
 #![allow(clippy::doc_markdown)]
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use rinitdb::image::manifest::{MINT_LIBC, Manifest};
 use rinitdb::image::{self, MAGIC, MINT_ARGS, mint};
@@ -65,16 +70,23 @@ fn run(initdb: &Path, out_dir: &Path) -> Result<Manifest, String> {
     }
 
     let scratch = Scratch::new()?;
-    let first = mint_and_pack(initdb, &scratch.0.join("first"))?;
+    let first_dir = scratch.0.join("first");
+    let first = mint_and_pack(initdb, &first_dir)?;
+    let host = host_facts(&postgres, &first_dir)?;
     let second = mint_and_pack(initdb, &scratch.0.join("second"))?;
-    if first != second {
-        return Err("two mints packed to different images; the mint is not reproducible".into());
+    if let Some(difference) = mint::first_difference(&first, &second) {
+        return Err(format!(
+            "two mints packed to different images (first difference: {difference}); \
+             the mint is not reproducible"
+        ));
     }
 
     let manifest = Manifest {
         format: MAGIC[MAGIC.len() - 1],
         initdb: version.trim_end_matches('\n').to_owned(),
         libc: MINT_LIBC.to_owned(),
+        icu: host.icu,
+        collations: host.collations,
         options: MINT_ARGS.join(" "),
         bytes: first.len() as u64,
         sha256: sha256::digest_hex(&first),
@@ -107,6 +119,53 @@ fn mint_and_pack(initdb: &Path, dir: &Path) -> Result<Vec<u8>, String> {
     let entries = image::read_tree(dir)
         .map_err(|err| format!("could not read \"{}\": {err}", dir.display()))?;
     image::pack(&image::strip(entries)).map_err(|err| err.to_string())
+}
+
+/// What the minting host put into `pg_collation`.
+struct HostFacts {
+    icu: String,
+    collations: String,
+}
+
+/// `postgres --single -D <dir> postgres` with [`mint::HOST_QUERY`] on stdin,
+/// and the two values it prints.
+fn host_facts(postgres: &Path, dir: &Path) -> Result<HostFacts, String> {
+    let mut child = Command::new(postgres)
+        .arg("--single")
+        .arg("-D")
+        .arg(dir)
+        .arg("postgres")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("could not run \"{}\": {err}", postgres.display()))?;
+    // Dropping stdin after the write is the EOF that ends the session.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(mint::HOST_QUERY.as_bytes())
+        .map_err(|err| format!("could not write to \"{}\": {err}", postgres.display()))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("could not run \"{}\": {err}", postgres.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = |column: &str| {
+        mint::single_user_value(&stdout, column)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "postgres --single printed no \"{column}\" ({}):\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })
+    };
+    Ok(HostFacts {
+        icu: value("icu")?,
+        collations: value("collations")?,
+    })
 }
 
 /// A scratch directory, removed when the tool exits.

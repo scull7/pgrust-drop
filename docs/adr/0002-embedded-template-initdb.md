@@ -169,9 +169,10 @@ expanding host may not have.
 
 1. **The image is a committed blob.** It is minted once, committed at
    `crates/rinitdb/image/template.img` with a provenance manifest
-   (`template.manifest`: format, `initdb --version`, libc, options, length,
-   SHA-256), and embedded with `include_bytes!`. No build needs PostgreSQL. The
-   test `the_embedded_image_is_the_one_the_manifest_records`
+   (`template.manifest`: format, `initdb --version`, libc, the host's ICU
+   version and `pg_collation` rows per provider as measured on the first mint,
+   options, length, SHA-256), and embedded with `include_bytes!`. No build
+   needs PostgreSQL. The test `the_embedded_image_is_the_one_the_manifest_records`
    (`crates/rinitdb/src/image.rs`) pins the embedded bytes to the manifest and
    the manifest to `MINT_ARGS`. It is a plain commit, not Git LFS: about 24 MB
    raw and about 3 MB compressed in a git pack.

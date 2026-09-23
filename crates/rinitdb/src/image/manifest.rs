@@ -1,5 +1,6 @@
 //! The template image's provenance manifest: which `initdb` minted the image,
-//! on which C library, with which options, and the SHA-256 of the result.
+//! on which C library, what the host's ICU and locales put into
+//! `pg_collation`, with which options, and the SHA-256 of the result.
 //!
 //! The image is a committed blob (NAT-381, owner decision 2026-09-23), so a
 //! build never runs PostgreSQL; the manifest is what lets a reader check,
@@ -20,10 +21,18 @@
 //! format: 1                                  the image format version (MAGIC[7])
 //! initdb: initdb (PostgreSQL) 18.6           `initdb --version`, verbatim
 //! libc: musl                                 the C library initdb was linked against
+//! icu: 153.136                               the host's ICU collator version, or `none`
+//! collations: b=3 c=2 d=1 i=805              pg_collation rows per provider, measured
 //! options: --no-locale --encoding=UTF8 …     MINT_ARGS, space-separated, after `-D <dir>`
 //! bytes: 23633969                            the image's length
 //! sha256: 0123…                              the image's SHA-256, lowercase hex
 //! ```
+//!
+//! `icu` and `collations` are measured by the mint tool, not asserted: it
+//! runs [`super::mint::HOST_QUERY`] through the minting `postgres` in
+//! single-user mode on the first mint. They are the host inputs that move
+//! the digest (ADR-0002): libicu decides the `i` rows and their
+//! `collversion`, and `locale -a` the `c` rows beyond `C` and `POSIX`.
 
 use std::fmt::Write as _;
 
@@ -38,7 +47,16 @@ pub const MINT_LIBC: &str = "musl";
 
 /// The keys, in the order [`Manifest::render`] writes them and
 /// [`Manifest::parse`] requires them.
-const KEYS: [&str; 6] = ["format", "initdb", "libc", "options", "bytes", "sha256"];
+const KEYS: [&str; 8] = [
+    "format",
+    "initdb",
+    "libc",
+    "icu",
+    "collations",
+    "options",
+    "bytes",
+    "sha256",
+];
 
 /// What a template image records about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +67,12 @@ pub struct Manifest {
     pub initdb: String,
     /// The C library the minting binary was linked against.
     pub libc: String,
+    /// The minting host's ICU collator version, the `collversion` of the
+    /// `unicode` collation, or `none` without libicu.
+    pub icu: String,
+    /// `pg_collation` rows per `collprovider` in the minted cluster, as
+    /// `provider=count` sorted by provider.
+    pub collations: String,
     /// The options after `-D <dir>`, space-separated.
     pub options: String,
     /// The image's length in bytes.
@@ -89,6 +113,8 @@ impl Manifest {
             self.format.to_string(),
             self.initdb.clone(),
             self.libc.clone(),
+            self.icu.clone(),
+            self.collations.clone(),
             self.options.clone(),
             self.bytes.to_string(),
             self.sha256.clone(),
@@ -138,8 +164,23 @@ impl Manifest {
             value: value.to_owned(),
         };
         let format = values[0].parse().map_err(|_| bad("format", values[0]))?;
-        let bytes = values[4].parse().map_err(|_| bad("bytes", values[4]))?;
-        let sha256 = values[5];
+        let collations = values[4];
+        let is_count = |token: &str| {
+            token.split_once('=').is_some_and(|(provider, count)| {
+                provider.len() == 1
+                    && provider.bytes().all(|b| b.is_ascii_lowercase())
+                    && !count.is_empty()
+                    && count.bytes().all(|b| b.is_ascii_digit())
+            })
+        };
+        if collations.is_empty() || !collations.split(' ').all(is_count) {
+            return Err(bad("collations", collations));
+        }
+        if values[3].is_empty() {
+            return Err(bad("icu", values[3]));
+        }
+        let bytes = values[6].parse().map_err(|_| bad("bytes", values[6]))?;
+        let sha256 = values[7];
         if sha256.len() != 64
             || !sha256
                 .bytes()
@@ -151,7 +192,9 @@ impl Manifest {
             format,
             initdb: values[1].to_owned(),
             libc: values[2].to_owned(),
-            options: values[3].to_owned(),
+            icu: values[3].to_owned(),
+            collations: collations.to_owned(),
+            options: values[5].to_owned(),
             bytes,
             sha256: sha256.to_owned(),
         })
@@ -167,6 +210,8 @@ mod tests {
             format: 1,
             initdb: MINT_INITDB_VERSION.to_owned(),
             libc: MINT_LIBC.to_owned(),
+            icu: "153.136".to_owned(),
+            collations: "b=3 c=2 d=1 i=805".to_owned(),
             options: "--no-locale --encoding=UTF8".to_owned(),
             bytes: 42,
             sha256: "ab".repeat(32),
@@ -188,6 +233,8 @@ mod tests {
                 "format: 1",
                 "initdb: initdb (PostgreSQL) 18.6",
                 "libc: musl",
+                "icu: 153.136",
+                "collations: b=3 c=2 d=1 i=805",
                 "options: --no-locale --encoding=UTF8",
                 "bytes: 42",
                 &format!("sha256: {}", "ab".repeat(32)),
@@ -213,7 +260,7 @@ mod tests {
         assert_eq!(
             Manifest::parse(&format!("{good}extra: 1\n")),
             Err(ManifestError::ExtraKey {
-                line: 10,
+                line: 12,
                 found: "extra".to_owned()
             })
         );
@@ -227,6 +274,13 @@ mod tests {
             Err(ManifestError::BadValue {
                 key: "bytes",
                 value: "many".to_owned()
+            })
+        );
+        assert_eq!(
+            Manifest::parse(&good.replace("c=2 d=1", "c=2  d=1")),
+            Err(ManifestError::BadValue {
+                key: "collations",
+                value: "b=3 c=2  d=1 i=805".to_owned()
             })
         );
         let upper = "AB".repeat(32);

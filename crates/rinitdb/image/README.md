@@ -27,14 +27,16 @@ tool refuses any other release and any binary whose ELF dynamic loader is not
 musl's, and it mints twice and refuses unless both mints pack to the same
 bytes. What `template.manifest` records:
 
-| key       | value                                                              |
-| --------- | ------------------------------------------------------------------ |
-| `format`  | `1`                                                                |
-| `initdb`  | `initdb (PostgreSQL) 18.6`                                         |
-| `libc`    | `musl`                                                             |
-| `options` | `--no-locale --encoding=UTF8 -U postgres -A trust --no-sync`       |
-| `bytes`   | `23633969`                                                         |
-| `sha256`  | `c2f04ac2821873e38ec8b9c2e9fc5c4a5c7c704bf969c5fdbdf5c36b5fb261e4` |
+| key          | value                                                              |
+| ------------ | ------------------------------------------------------------------ |
+| `format`     | `1`                                                                |
+| `initdb`     | `initdb (PostgreSQL) 18.6`                                         |
+| `libc`       | `musl`                                                             |
+| `icu`        | `153.136`                                                          |
+| `collations` | `b=3 c=2 d=1 i=805`                                                |
+| `options`    | `--no-locale --encoding=UTF8 -U postgres -A trust --no-sync`       |
+| `bytes`      | `23633969`                                                         |
+| `sha256`     | `c2f04ac2821873e38ec8b9c2e9fc5c4a5c7c704bf969c5fdbdf5c36b5fb261e4` |
 
 The test `the_embedded_image_is_the_one_the_manifest_records` in
 `crates/rinitdb/src/image.rs` asserts the embedded bytes against the
@@ -60,6 +62,12 @@ offered:
   for them.
 - **builtin:** 3 rows, version `1` (PostgreSQL's own), and the 2 `c`-provider
   rows and `default`, as on every host.
+
+The manifest's `icu` and `collations` record this, measured rather than
+written by hand: after the first mint the tool runs
+`rinitdb::image::mint::HOST_QUERY` through the minting `postgres` in
+single-user mode and writes the `unicode` collation's `collversion` (`none`
+without libicu) and the `pg_collation` row count per provider.
 
 So re-minting on a host with a different libicu, or with `locale` on `PATH`,
 changes the image and its digest. Commit a re-mint's image and manifest

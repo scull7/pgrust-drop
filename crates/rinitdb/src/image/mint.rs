@@ -18,8 +18,89 @@
 //! The same check applies to the `postgres` next to `initdb`: it is the
 //! backend `initdb` runs (`setup_bin_paths`, `initdb.c:2652`), and the one
 //! that does the import.
+//!
+//! What the host contributes is measured, not assumed: after the first mint
+//! the tool runs [`HOST_QUERY`] through that `postgres` in single-user mode
+//! and reads the answer with [`single_user_value`], so the manifest records
+//! the ICU collator version and the `pg_collation` rows each provider added
+//! ([`super::manifest::Manifest::icu`], [`super::manifest::Manifest::collations`]).
+//! When two mints differ, [`first_difference`] names where.
 
 use super::manifest::{MINT_INITDB_VERSION, MINT_LIBC};
+use super::parse;
+
+/// The query the mint tool feeds `postgres --single -D <first mint>
+/// postgres` on stdin: the host inputs that move the image's digest, as two
+/// text columns.
+///
+/// - `icu`: the `collversion` of the `unicode` collation, the minting host's
+///   ICU collator version, or `none` when there is no such row or it is NULL
+///   (no libicu).
+/// - `collations`: `pg_collation` rows per `collprovider`, as
+///   `provider=count` sorted by provider (`b=3 c=2 d=1 i=805`): the `c` count
+///   is what `locale -a` added, the `i` count what libicu did.
+///
+/// One line: single-user mode reads a statement per line.
+pub const HOST_QUERY: &str = "SELECT coalesce((SELECT collversion FROM pg_collation \
+     WHERE collname = 'unicode'), 'none') AS icu, \
+     (SELECT string_agg(collprovider::text || '=' || n, ' ' ORDER BY collprovider) \
+     FROM (SELECT collprovider, count(*) AS n FROM pg_collation GROUP BY 1) AS s) \
+     AS collations\n";
+
+/// Pure: the value single-user mode printed for `column` in `output`, the
+/// backend's stdout.
+///
+/// Each non-NULL attribute of a result row is one line,
+/// `\t%2d: <name> = "<value>"\t(typeid = …)` (`printatt`, called by
+/// `debugtup`, `src/backend/access/common/printtup.c:423` and `:462` at
+/// `REL_18_6`). The value is not escaped, so this takes it up to the `"\t`
+/// that closes it. `None` when no such line is there: the column was NULL,
+/// or the statement failed (single-user mode still exits 0; the error went
+/// to stderr).
+#[must_use]
+pub fn single_user_value<'a>(output: &'a str, column: &str) -> Option<&'a str> {
+    let prefix = format!("{column} = \"");
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix('\t')?;
+        let (number, rest) = rest.trim_start().split_once(": ")?;
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (value, _) = rest.strip_prefix(prefix.as_str())?.split_once("\"\t")?;
+        Some(value)
+    })
+}
+
+/// Pure: where two packed images first differ, for the mint tool's
+/// "not reproducible" refusal — the first entry path whose node differs, or
+/// that only one image has — or `None` when they are the same bytes.
+#[must_use]
+pub fn first_difference(first: &[u8], second: &[u8]) -> Option<String> {
+    if first == second {
+        return None;
+    }
+    let (Ok(a), Ok(b)) = (parse(first), parse(second)) else {
+        return Some("an image that does not parse".to_owned());
+    };
+    let mut a = a.iter();
+    let mut b = b.iter();
+    loop {
+        match (a.next(), b.next()) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) if x.path == y.path => return Some(x.path.to_string()),
+            (Some(x), Some(y)) => {
+                // Entries are sorted by path; the smaller one is the one missing
+                // from the other image.
+                let only = if x.path < y.path { x } else { y };
+                return Some(format!("{} (in one image only)", only.path));
+            }
+            (Some(only), None) | (None, Some(only)) => {
+                return Some(format!("{} (in one image only)", only.path));
+            }
+            (None, None) => return Some("the image header".to_owned()),
+        }
+    }
+}
 
 /// Why a binary may not mint the committed image.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -184,6 +265,69 @@ mod tests {
             refusal.to_string(),
             "\"/opt/pg/bin/initdb\" is not linked against musl (dynamic loader: none found); \
              the image is minted on the musl lane (NAT-381)"
+        );
+    }
+
+    /// What `postgres --single` printed for [`HOST_QUERY`] on the minting
+    /// host (Alpine 3.24, PostgreSQL 18.6), captured verbatim.
+    const SINGLE_USER: &str = "\n\
+        PostgreSQL stand-alone backend 18.6\n\
+        backend> \t 1: icu\t(typeid = 25, len = -1, typmod = -1, byval = f)\n\
+        \t 2: collations\t(typeid = 25, len = -1, typmod = -1, byval = f)\n\
+        \t----\n\
+        \t 1: icu = \"153.136\"\t(typeid = 25, len = -1, typmod = -1, byval = f)\n\
+        \t 2: collations = \"b=3 c=2 d=1 i=805\"\t(typeid = 25, len = -1, typmod = -1, byval = f)\n\
+        \t----\n\
+        backend> ";
+
+    #[test]
+    fn single_user_values_are_read_from_debugtup_lines() {
+        assert_eq!(single_user_value(SINGLE_USER, "icu"), Some("153.136"));
+        assert_eq!(
+            single_user_value(SINGLE_USER, "collations"),
+            Some("b=3 c=2 d=1 i=805")
+        );
+        // The header line names the column but carries no value.
+        assert_eq!(single_user_value(SINGLE_USER, "nosuch"), None);
+        let failed = "PostgreSQL stand-alone backend 18.6\nbackend> \nbackend> ";
+        assert_eq!(single_user_value(failed, "icu"), None);
+    }
+
+    #[test]
+    fn a_non_reproducible_mint_names_the_first_difference() {
+        use super::super::{Entry, ImagePath, pack};
+        let path = |p: &str| ImagePath::new(p).unwrap();
+        let image = |entries: &[Entry<&[u8]>]| pack(entries).unwrap();
+        let base = [
+            Entry::dir(path("base")),
+            Entry::file(path("base/1"), b"one".as_slice()),
+            Entry::dir(path("pg_xact")),
+            Entry::file(path("pg_xact/0000"), b"xact".as_slice()),
+        ];
+        let first = image(&base);
+        assert_eq!(first_difference(&first, &first), None);
+
+        let mut changed = base.clone();
+        changed[3] = Entry::file(path("pg_xact/0000"), b"XACT".as_slice());
+        assert_eq!(
+            first_difference(&first, &image(&changed)).as_deref(),
+            Some("pg_xact/0000")
+        );
+
+        let fewer = &base[..3];
+        assert_eq!(
+            first_difference(&first, &image(fewer)).as_deref(),
+            Some("pg_xact/0000 (in one image only)")
+        );
+        let mut extra = base.to_vec();
+        extra.push(Entry::file(path("base/2"), b"two".as_slice()));
+        assert_eq!(
+            first_difference(&first, &image(&extra)).as_deref(),
+            Some("base/2 (in one image only)")
+        );
+        assert_eq!(
+            first_difference(&first, b"garbage").as_deref(),
+            Some("an image that does not parse")
         );
     }
 }

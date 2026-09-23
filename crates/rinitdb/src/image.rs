@@ -661,11 +661,10 @@ mod tests {
         assert_eq!(manifest.initdb, manifest::MINT_INITDB_VERSION);
         assert_eq!(manifest.libc, manifest::MINT_LIBC);
         assert_eq!(manifest.options, MINT_ARGS.join(" "));
-        // The measured host facts agree with each other: ICU rows exist
-        // exactly when the host had a libicu to report a version.
-        assert_eq!(
-            manifest.icu == "none",
-            !manifest.collations.split(' ').any(|c| c.starts_with("i=")),
+        // The measured host facts agree with each other: `icu` is `none`
+        // exactly when the bootstrap `unicode` row is the only `i` row.
+        assert!(
+            manifest.host_facts_agree(),
             "icu {:?} against collations {:?}",
             manifest.icu,
             manifest.collations

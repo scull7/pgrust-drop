@@ -12,8 +12,9 @@
 //! (trust, password, md5, SCRAM-SHA-256), and a blocking `Connection` that
 //! runs simple queries and the extended-query commands outside pipeline mode
 //! (`PQexecParams`, `PQprepare`, `PQexecPrepared`, `PQdescribePrepared`,
-//! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`). The rest is
-//! tracked in Linear NAT-390 … NAT-396.
+//! `PQdescribePortal`, `PQclosePrepared`, `PQclosePortal`), and the
+//! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
+//! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
 //! crate denies it until that layer exists as its own module.
@@ -42,6 +43,7 @@ pub mod result;
 pub mod scram;
 pub mod sha256;
 mod text;
+pub mod trace;
 pub mod uri;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
@@ -62,4 +64,5 @@ pub use result::{
 };
 pub use scram::{Mechanism, ScramClient, ScramError};
 pub use text::RawText;
+pub use trace::{AuthResponse, Origin, TraceFlags};
 pub use uri::{parse_uri, uri_decode};

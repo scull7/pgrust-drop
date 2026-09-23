@@ -875,6 +875,138 @@ pub fn rewrite(
     Ok(control.to_bytes())
 }
 
+/// `sizeof(CheckPoint)` on a 64-bit build (`pg_control.h:35`): the span of
+/// `checkPointCopy` inside `ControlFileData`, tail padding included.
+pub const SIZEOF_CHECK_POINT: usize = offset::UNLOGGED_LSN - offset::CP_REDO;
+
+impl CheckPoint {
+    /// The struct as raw memory: the bytes `WriteEmptyXLOG` `memcpy`s into
+    /// its checkpoint record (`src/bin/pg_resetwal/pg_resetwal.c:1154`).
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SIZEOF_CHECK_POINT] {
+        let mut image = [0u8; offset::UNLOGGED_LSN];
+        put_check_point(&mut image, self);
+        let mut bytes = [0u8; SIZEOF_CHECK_POINT];
+        bytes.copy_from_slice(&image[offset::CP_REDO..]);
+        bytes
+    }
+}
+
+/// `XLByteToSeg` (`src/include/access/xlog_internal.h:117`): the segment an
+/// LSN falls in.
+#[must_use]
+pub const fn segment_of(lsn: u64, wal_segsz_bytes: u32) -> u64 {
+    lsn / wal_segsz_bytes as u64
+}
+
+/// `XLogSegNoOffsetToRecPtr` (`src/include/access/xlog_internal.h:103`).
+#[must_use]
+pub const fn segment_offset_to_lsn(segno: u64, offset: u64, wal_segsz_bytes: u32) -> u64 {
+    segno * wal_segsz_bytes as u64 + offset
+}
+
+/// `SizeOfXLogLongPHD` (`src/include/access/xlog_internal.h:69`): the long
+/// page header that opens a segment, and so the offset of its first record.
+pub const SIZE_OF_XLOG_LONG_PHD: u64 = 40;
+
+impl ControlFile {
+    /// Pure: this `pg_control` with the fields no two clusters share zeroed —
+    /// the system identifier, both timestamps and the mock authentication
+    /// nonce — and everything else kept.
+    ///
+    /// This is the form the template's `pg_control` is committed in
+    /// (`crates/rinitdb/image/template.control`). What it zeroes is either a
+    /// fact about one cluster (`InitControlFile`, `xlog.c:4217`, `:4218`) or
+    /// a wall-clock time (`update_controlfile`,
+    /// `src/common/controldata_utils.c:197`, and the checkpoint's own), so
+    /// two mints of the same catalogs agree on what is left, and
+    /// [`for_new_cluster`] sets every field it zeroed.
+    #[must_use]
+    pub fn as_template(&self) -> Self {
+        let mut template = *self;
+        template.system_identifier = SystemIdentifier::from_raw(0);
+        template.time = 0;
+        template.check_point_copy.time = 0;
+        template.mock_authentication_nonce = [0; MOCK_AUTH_NONCE_LEN];
+        template
+    }
+}
+
+/// What a new cluster's `pg_control` gets that its template cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewCluster {
+    /// `InitControlFile`'s `sysidentifier` (`xlog.c:4217`).
+    pub system_identifier: SystemIdentifier,
+    /// `-k` / `--no-data-checksums` (`xlog.c:4231`).
+    pub checksums: DataChecksums,
+    /// `InitControlFile`'s `pg_strong_random` nonce (`xlog.c:4210`).
+    pub mock_authentication_nonce: [u8; MOCK_AUTH_NONCE_LEN],
+    /// `time(NULL)`, for the file and for its checkpoint.
+    pub now: i64,
+}
+
+/// Pure: the new cluster's `pg_control`, from the template's.
+///
+/// The template's `pg_wal` is not shipped (`crate::image::STRIPPED_FILES`),
+/// so its checkpoint record is gone. The cluster gets a new one, alone in a
+/// new first segment, the way `pg_resetwal` gives a cluster one:
+///
+/// - `FindEndOfXLOG` (`src/bin/pg_resetwal/pg_resetwal.c:940`) starts from
+///   the segment of the redo pointer and, with no segment file left to push
+///   it further, advances by exactly one. So every page LSN in the expanded
+///   catalogs is behind the new checkpoint.
+/// - `RewriteControlFile` (`:894`) puts redo and the checkpoint just past
+///   that segment's long page header, stamps the checkpoint time, marks the
+///   cluster shut down and clears the recovery and backup fields.
+///
+/// `RewriteControlFile` also forces `wal_level` and the `max_*` settings to
+/// their defaults (`:917`), because it cannot know which server wrote the
+/// file. This template's values are the ones C initdb's own server wrote
+/// under the settings `postgresql.conf` is rendered with, so they are kept.
+///
+/// Then the fields `InitControlFile` derives per cluster (`xlog.c:4217`,
+/// `:4218`, `:4231`) and `update_controlfile`'s timestamp
+/// (`src/common/controldata_utils.c:197`) are set. [`ControlFile::to_bytes`]
+/// takes the CRC.
+#[must_use]
+pub fn for_new_cluster(template: &ControlFile, new: &NewCluster) -> ControlFile {
+    let mut control = *template;
+    let seg_size = control.xlog_seg_size;
+    let segno = segment_of(control.check_point_copy.redo, seg_size) + 1;
+    let redo = segment_offset_to_lsn(segno, SIZE_OF_XLOG_LONG_PHD, seg_size);
+
+    control.check_point_copy.redo = redo;
+    control.check_point_copy.time = new.now;
+    control.state = DbState::Shutdowned;
+    control.check_point = redo;
+    control.min_recovery_point = 0;
+    control.min_recovery_point_tli = 0;
+    control.backup_start_point = 0;
+    control.backup_end_point = 0;
+    control.backup_end_required = false;
+
+    control.system_identifier = new.system_identifier;
+    control.mock_authentication_nonce = new.mock_authentication_nonce;
+    control.data_checksum_version = new.checksums.version();
+    control.time = new.now;
+    control
+}
+
+/// Action: `pg_strong_random` for the mock authentication nonce, in the
+/// variant upstream builds without OpenSSL: read `/dev/urandom`
+/// (`src/port/pg_strong_random.c:150`).
+///
+/// # Errors
+/// The `open` or `read` failure. Upstream's caller turns one into `could not
+/// generate secret authorization token` (`xlog.c:4213`).
+pub fn strong_random_nonce() -> std::io::Result<[u8; MOCK_AUTH_NONCE_LEN]> {
+    use std::io::Read as _;
+    let mut nonce = [0u8; MOCK_AUTH_NONCE_LEN];
+    // `read_exact` retries `EINTR` and short reads, as the C loop does.
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    Ok(nonce)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,5 +1339,114 @@ mod tests {
         }
         assert_eq!(DbState::from_u32(1), DbState::Shutdowned);
         assert_eq!(DbState::from_u32(7), DbState::Unrecognized(7));
+    }
+
+    #[test]
+    fn a_check_point_is_the_check_point_copy_bytes() {
+        let image = a_full_image();
+        let control = ControlFile::parse(&image).unwrap();
+        assert_eq!(SIZEOF_CHECK_POINT, 88);
+        assert_eq!(
+            control.check_point_copy.to_bytes().as_slice(),
+            &image[offset::CP_REDO..offset::UNLOGGED_LSN]
+        );
+    }
+
+    #[test]
+    fn the_template_form_zeroes_exactly_the_per_cluster_fields() {
+        let control = ControlFile::parse(&a_full_image()).unwrap();
+        let template = control.as_template();
+        assert_eq!(template.system_identifier.get(), 0);
+        assert_eq!(template.time, 0);
+        assert_eq!(template.check_point_copy.time, 0);
+        assert_eq!(template.mock_authentication_nonce, [0; MOCK_AUTH_NONCE_LEN]);
+
+        // Put the four back and nothing else differs.
+        let mut restored = template;
+        restored.system_identifier = control.system_identifier;
+        restored.time = control.time;
+        restored.check_point_copy.time = control.check_point_copy.time;
+        restored.mock_authentication_nonce = control.mock_authentication_nonce;
+        assert_eq!(restored.to_bytes(), control.to_bytes());
+    }
+
+    /// A template whose last checkpoint sits where C initdb's does, in the
+    /// first segment.
+    fn a_template() -> ControlFile {
+        let mut template = ControlFile::parse(&a_full_image()).unwrap().as_template();
+        template.xlog_seg_size = 16 * 1024 * 1024;
+        template.check_point_copy.redo = 0x0175_B1F0;
+        template.check_point = 0x0175_B1F0;
+        template.state = DbState::InProduction;
+        template.min_recovery_point = 7;
+        template.min_recovery_point_tli = 7;
+        template.backup_start_point = 7;
+        template.backup_end_point = 7;
+        template.backup_end_required = true;
+        template
+    }
+
+    #[test]
+    fn a_new_cluster_checkpoints_at_the_start_of_the_next_segment() {
+        let template = a_template();
+        let new = NewCluster {
+            system_identifier: SystemIdentifier::from_raw(0x1234),
+            checksums: DataChecksums::Disabled,
+            mock_authentication_nonce: [9; MOCK_AUTH_NONCE_LEN],
+            now: 1_790_000_000,
+        };
+        let control = for_new_cluster(&template, &new);
+
+        // pg_resetwal.c:940 and :894: segment 1 holds the old redo, so the
+        // new record opens segment 2, just past its long page header.
+        assert_eq!(control.check_point_copy.redo, 0x0200_0028);
+        assert_eq!(control.check_point, 0x0200_0028);
+        assert_eq!(control.check_point_copy.time, 1_790_000_000);
+        assert_eq!(control.time, 1_790_000_000);
+        assert_eq!(control.state, DbState::Shutdowned);
+        assert_eq!(control.min_recovery_point, 0);
+        assert_eq!(control.min_recovery_point_tli, 0);
+        assert_eq!(control.backup_start_point, 0);
+        assert_eq!(control.backup_end_point, 0);
+        assert!(!control.backup_end_required);
+
+        assert_eq!(control.system_identifier.get(), 0x1234);
+        assert_eq!(control.mock_authentication_nonce, [9; MOCK_AUTH_NONCE_LEN]);
+        assert_eq!(control.data_checksum_version, 0);
+
+        // Everything else is the template's.
+        assert_eq!(control.wal_level, template.wal_level);
+        assert_eq!(control.max_connections, template.max_connections);
+        assert_eq!(
+            control.check_point_copy.next_xid,
+            template.check_point_copy.next_xid
+        );
+        assert_eq!(
+            control.check_point_copy.next_oid,
+            template.check_point_copy.next_oid
+        );
+        assert_eq!(control.catalog_version_no, template.catalog_version_no);
+    }
+
+    #[test]
+    fn a_redo_on_a_segment_boundary_still_moves_one_segment_on() {
+        let mut template = a_template();
+        template.check_point_copy.redo = 0x0300_0000;
+        let new = NewCluster {
+            system_identifier: SystemIdentifier::from_raw(1),
+            checksums: DataChecksums::Enabled,
+            mock_authentication_nonce: [0; MOCK_AUTH_NONCE_LEN],
+            now: 0,
+        };
+        let control = for_new_cluster(&template, &new);
+        assert_eq!(control.check_point, 0x0400_0028);
+        assert_eq!(control.data_checksum_version, PG_DATA_CHECKSUM_VERSION);
+    }
+
+    #[test]
+    fn the_nonce_is_read_from_the_system() {
+        let first = strong_random_nonce().unwrap();
+        let second = strong_random_nonce().unwrap();
+        assert_ne!(first, second, "two 256-bit draws should not collide");
     }
 }

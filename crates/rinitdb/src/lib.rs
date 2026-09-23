@@ -48,6 +48,7 @@ pub mod strerror;
 pub mod sync;
 pub mod tz;
 pub mod validate;
+pub mod wal;
 
 use std::ffi::OsString;
 use std::io::Write;

@@ -35,6 +35,7 @@ use crate::cli::Options;
 use crate::encoding::{self, Encoding};
 use crate::error::{DirRole, InitdbError, LocaleProvider, NotEmpty};
 use crate::file_perm::DataDirPerm;
+use crate::strerror::strerror;
 use crate::sync::{self, SyncMethod};
 
 /// What `pg_check_dir` (`src/port/pgcheckdir.c:33`) reports about a directory.
@@ -120,23 +121,6 @@ impl FsProbe for RealFs {
         } else {
             DirState::Empty
         }
-    }
-}
-
-/// What `%m` expands to for this error: `strerror(errno)` and nothing else.
-///
-/// `std::io::Error`'s own `Display` appends ` (os error N)` to the same
-/// `strerror` text; C's `%m` does not, so the suffix is removed rather than a
-/// second error table being invented.
-#[must_use]
-pub fn strerror(err: &std::io::Error) -> String {
-    let text = err.to_string();
-    match err.raw_os_error() {
-        Some(code) => text
-            .strip_suffix(&format!(" (os error {code})"))
-            .unwrap_or(&text)
-            .to_owned(),
-        None => text,
     }
 }
 
@@ -1218,20 +1202,5 @@ mod tests {
                 reason: ENOENT.to_owned(),
             }
         );
-    }
-
-    // --- %m ---------------------------------------------------------------
-
-    #[test]
-    fn strerror_drops_the_os_error_suffix_rust_adds() {
-        let err = std::io::Error::from_raw_os_error(2);
-        assert!(err.to_string().contains("(os error 2)"));
-        assert_eq!(strerror(&err), ENOENT);
-    }
-
-    #[test]
-    fn strerror_leaves_an_error_without_an_errno_alone() {
-        let err = std::io::Error::other("something else");
-        assert_eq!(strerror(&err), "something else");
     }
 }

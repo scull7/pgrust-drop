@@ -276,7 +276,7 @@ mod unix {
 
     use super::FsOp;
     use crate::error::InitdbError;
-    use crate::validate::strerror;
+    use crate::strerror::strerror;
 
     /// Action: carry out `ops`, in order.
     ///

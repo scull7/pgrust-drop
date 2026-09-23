@@ -48,7 +48,7 @@ pub use conninfo::{
     uri_prefix_length,
 };
 pub use error::ConnError;
-pub use message::{Backend, Frame, Frontend, ProtocolError, TransactionStatus, next_frame};
+pub use message::{Backend, Frame, Frontend, ProtocolError, Target, TransactionStatus, next_frame};
 pub use regress::regress_report;
 pub use result::{
     ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,

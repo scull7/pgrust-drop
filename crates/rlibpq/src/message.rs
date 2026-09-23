@@ -2,9 +2,12 @@
 //!
 //! Ported from `src/interfaces/libpq/fe-protocol3.c` — `pqParseInput3`
 //! (`:71`) for the framing and the dispatch, `getRowDescriptions` (`:519`),
-//! `getAnotherTuple` (`:778`), `pqGetErrorNotice3` (`:899`) and
-//! `build_startup_packet` (`:2444`) for the bodies — with the message
-//! type codes of `src/include/libpq/protocol.h`.
+//! `getParamDescriptions` (`:690`), `getAnotherTuple` (`:778`),
+//! `pqGetErrorNotice3` (`:899`) and `build_startup_packet` (`:2444`) for the
+//! bodies — plus the extended-query messages `fe-exec.c` builds
+//! (`PQsendPrepare`, `:1553`; `PQsendQueryGuts`, `:1774`;
+//! `PQsendTypedCommand`, `:2606`), with the message type codes of
+//! `src/include/libpq/protocol.h`.
 //!
 //! Decoding is a pure function from bytes to a [`Backend`] and encoding a pure
 //! function from a [`Frontend`] to bytes, so both are fuzzable and neither
@@ -294,9 +297,25 @@ pub enum Backend {
         newest: u32,
         unrecognized: Vec<Vec<u8>>,
     },
-    /// `PqMsg_NoData`, `PqMsg_ParseComplete`, `PqMsg_BindComplete`,
-    /// `PqMsg_CloseComplete` and the COPY messages: parsed as far as their
-    /// type, since the simple-query path has nothing to do with them.
+    /// `PqMsg_ParseComplete`, `protocol.h:38`.
+    ParseComplete,
+    /// `PqMsg_BindComplete`, `protocol.h:39`.
+    BindComplete,
+    /// `PqMsg_CloseComplete`, `protocol.h:40`.
+    CloseComplete,
+    /// `PqMsg_NoData`, `protocol.h:56`: the statement or portal described
+    /// returns no rows.
+    NoData,
+    /// `PqMsg_PortalSuspended`, `protocol.h:57`. libpq never asks for it —
+    /// every Execute it sends has a row limit of 0 (`fe-exec.c:1899`) — so
+    /// `pqParseInput3` has no case for it and it lands in the "unexpected
+    /// response" default (`fe-protocol3.c:446`).
+    PortalSuspended,
+    /// `PqMsg_ParameterDescription` (`getParamDescriptions`,
+    /// `fe-protocol3.c:690`): one type OID per parameter.
+    ParameterDescription(Vec<u32>),
+    /// The COPY messages and anything else this port does not interpret yet:
+    /// parsed as far as their type.
     Other { id: u8, body: Vec<u8> },
 }
 
@@ -386,6 +405,23 @@ impl Backend {
                 }
             }
             b'v' => decode_negotiate_protocol_version(&mut r)?,
+            b'1' => Backend::ParseComplete,
+            b'2' => Backend::BindComplete,
+            b'3' => Backend::CloseComplete,
+            b'n' => Backend::NoData,
+            b's' => Backend::PortalSuspended,
+            b't' => {
+                // fe-protocol3.c:703 — a two-byte count, read unsigned, then
+                // one four-byte OID per parameter (`:719`). Nothing reserves
+                // capacity from the count, so a lying one costs only the
+                // bytes that are actually there.
+                let nparams = r.u16()?;
+                let mut types = Vec::new();
+                for _ in 0..nparams {
+                    types.push(r.u32()?);
+                }
+                Backend::ParameterDescription(types)
+            }
             _ => Backend::Other {
                 id,
                 body: body.to_vec(),
@@ -469,10 +505,69 @@ pub enum Frontend {
     SaslResponse(Vec<u8>),
     /// `PqMsg_Terminate`, `protocol.h:28`.
     Terminate,
+    /// `PqMsg_Parse`, `protocol.h:25`, as `PQsendPrepare` builds it
+    /// (`fe-exec.c:1584`): statement name, query, then a two-byte count and
+    /// one OID per declared parameter type.
+    Parse {
+        statement: Vec<u8>,
+        query: Vec<u8>,
+        param_types: Vec<u32>,
+    },
+    /// `PqMsg_Bind`, `protocol.h:19`, as `PQsendQueryGuts` builds it
+    /// (`fe-exec.c:1823`): portal, statement, the parameter format codes, the
+    /// parameter values (`None` is SQL NULL, sent as length -1), and the
+    /// result format codes.
+    Bind {
+        portal: Vec<u8>,
+        statement: Vec<u8>,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Vec<u8>>>,
+        result_formats: Vec<i16>,
+    },
+    /// `PqMsg_Describe`, `protocol.h:21` (`PQsendTypedCommand`,
+    /// `fe-exec.c:2606`).
+    Describe { target: Target, name: Vec<u8> },
+    /// `PqMsg_Execute`, `protocol.h:22`: the portal and a row limit, where 0
+    /// means all rows (`fe-exec.c:1896`).
+    Execute { portal: Vec<u8>, max_rows: i32 },
+    /// `PqMsg_Close`, `protocol.h:20` (`PQsendTypedCommand`,
+    /// `fe-exec.c:2606`).
+    Close { target: Target, name: Vec<u8> },
+    /// `PqMsg_Sync`, `protocol.h:27`.
+    Sync,
+    /// `PqMsg_Flush`, `protocol.h:24`.
+    Flush,
+}
+
+/// What a Describe or Close names: the `type` byte of `PQsendTypedCommand`
+/// (`fe-exec.c:2600`-`:2601`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// `'S'`, a prepared statement.
+    Statement,
+    /// `'P'`, a portal.
+    Portal,
+}
+
+impl Target {
+    /// The byte on the wire.
+    #[must_use]
+    pub fn byte(self) -> u8 {
+        match self {
+            Target::Statement => b'S',
+            Target::Portal => b'P',
+        }
+    }
 }
 
 impl Frontend {
     /// The bytes on the wire, length word included.
+    ///
+    /// # Panics
+    /// A message is longer than its four-byte length word can say, or a
+    /// Parse or Bind carries more than 65535 of something — neither of which
+    /// [`crate::Connection`] builds, because it refuses more than
+    /// `PQ_QUERY_PARAM_MAX_LIMIT` parameters first (`fe-exec.c:1527`).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -524,8 +619,100 @@ impl Frontend {
             }
             Frontend::SaslResponse(response) => packet(b'p', response),
             Frontend::Terminate => packet(b'X', b""),
+            Frontend::Parse {
+                statement,
+                query,
+                param_types,
+            } => {
+                let mut body = cstring(statement);
+                body.extend_from_slice(&cstring(query));
+                body.extend_from_slice(&count16(param_types.len()));
+                for oid in param_types {
+                    body.extend_from_slice(&oid.to_be_bytes());
+                }
+                packet(b'P', &body)
+            }
+            Frontend::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            } => packet(
+                b'B',
+                &bind_body(portal, statement, param_formats, params, result_formats),
+            ),
+            Frontend::Describe { target, name } => {
+                let mut body = vec![target.byte()];
+                body.extend_from_slice(&cstring(name));
+                packet(b'D', &body)
+            }
+            Frontend::Execute { portal, max_rows } => {
+                let mut body = cstring(portal);
+                body.extend_from_slice(&max_rows.to_be_bytes());
+                packet(b'E', &body)
+            }
+            Frontend::Close { target, name } => {
+                let mut body = vec![target.byte()];
+                body.extend_from_slice(&cstring(name));
+                packet(b'C', &body)
+            }
+            Frontend::Sync => packet(b'S', b""),
+            Frontend::Flush => packet(b'H', b""),
         }
     }
+}
+
+/// The body of a Bind, as `PQsendQueryGuts` lays it out (`fe-exec.c:1823`-`:1887`).
+fn bind_body(
+    portal: &[u8],
+    statement: &[u8],
+    param_formats: &[i16],
+    params: &[Option<Vec<u8>>],
+    result_formats: &[i16],
+) -> Vec<u8> {
+    let mut body = cstring(portal);
+    body.extend_from_slice(&cstring(statement));
+    body.extend_from_slice(&count16(param_formats.len()));
+    for format in param_formats {
+        body.extend_from_slice(&format.to_be_bytes());
+    }
+    body.extend_from_slice(&count16(params.len()));
+    for param in params {
+        match param {
+            // fe-exec.c:1878 — a NULL is a length of -1 and no
+            // bytes.
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(value) => {
+                let len =
+                    i32::try_from(value.len()).expect("a parameter value fits in its length word");
+                body.extend_from_slice(&len.to_be_bytes());
+                body.extend_from_slice(value);
+            }
+        }
+    }
+    body.extend_from_slice(&count16(result_formats.len()));
+    for format in result_formats {
+        body.extend_from_slice(&format.to_be_bytes());
+    }
+    body
+}
+
+/// `pqPuts`, `fe-misc.c:154`: the bytes and their NUL.
+fn cstring(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.extend_from_slice(bytes);
+    out.push(0);
+    out
+}
+
+/// `pqPutInt(n, 2, conn)` for a count. The callers refuse more than
+/// `PQ_QUERY_PARAM_MAX_LIMIT` (`libpq-fe.h:507`) before building a message,
+/// so every count that reaches here fits.
+fn count16(n: usize) -> [u8; 2] {
+    u16::try_from(n)
+        .expect("a count is checked against PQ_QUERY_PARAM_MAX_LIMIT before encoding")
+        .to_be_bytes()
 }
 
 /// `pqPacketSend`, `fe-connect.c:5409`: type byte, length including itself but
@@ -608,6 +795,171 @@ mod tests {
         }
         .encode();
         assert_eq!(without, b"p\0\0\0\x12SCRAM-SHA-256\0".to_vec());
+    }
+
+    /// The length word of a frontend message, as a trace prints it: the
+    /// message minus its type byte.
+    fn traced_length(encoded: &[u8]) -> u32 {
+        let length = u32::from_be_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]);
+        assert_eq!(
+            length as usize,
+            encoded.len() - 1,
+            "the length word is honest"
+        );
+        length
+    }
+
+    /// The five messages `PQsendQueryParams` sends, with the lengths the
+    /// upstream trace `src/test/modules/libpq_pipeline/traces/simple_pipeline.trace`
+    /// (lines 1-5) recorded for `SELECT $1` with one `int4` parameter `'1'`.
+    /// The lengths come from C libpq, not from this encoder, so they are an
+    /// oracle for the layout.
+    #[test]
+    fn the_extended_query_messages_have_the_lengths_upstream_traced() {
+        let parse = Frontend::Parse {
+            statement: Vec::new(),
+            query: b"SELECT $1".to_vec(),
+            param_types: vec![23],
+        }
+        .encode();
+        assert_eq!(traced_length(&parse), 21);
+        assert_eq!(parse, b"P\0\0\0\x15\0SELECT $1\0\0\x01\0\0\0\x17".to_vec());
+
+        let bind = Frontend::Bind {
+            portal: Vec::new(),
+            statement: Vec::new(),
+            param_formats: Vec::new(),
+            params: vec![Some(b"1".to_vec())],
+            result_formats: vec![0],
+        }
+        .encode();
+        assert_eq!(traced_length(&bind), 19);
+        assert_eq!(
+            bind,
+            b"B\0\0\0\x13\0\0\0\0\0\x01\0\0\0\x011\0\x01\0\0".to_vec()
+        );
+
+        let describe = Frontend::Describe {
+            target: Target::Portal,
+            name: Vec::new(),
+        }
+        .encode();
+        assert_eq!(traced_length(&describe), 6);
+        assert_eq!(describe, b"D\0\0\0\x06P\0".to_vec());
+
+        let execute = Frontend::Execute {
+            portal: Vec::new(),
+            max_rows: 0,
+        }
+        .encode();
+        assert_eq!(traced_length(&execute), 9);
+        assert_eq!(execute, b"E\0\0\0\x09\0\0\0\0\0".to_vec());
+
+        assert_eq!(Frontend::Sync.encode(), b"S\0\0\0\x04".to_vec());
+        assert_eq!(Frontend::Flush.encode(), b"H\0\0\0\x04".to_vec());
+    }
+
+    /// `PQsendPrepare`'s Parse and `PQsendTypedCommand`'s Describe and Close,
+    /// against `traces/prepared.trace` lines 1, 2 and 6 (lengths 68, 16, 16).
+    #[test]
+    fn a_named_parse_describe_and_close_have_the_lengths_upstream_traced() {
+        let parse = Frontend::Parse {
+            statement: b"select_one".to_vec(),
+            query: b"SELECT $1, '42', $1::numeric, interval '1 sec'".to_vec(),
+            param_types: vec![23],
+        }
+        .encode();
+        assert_eq!(traced_length(&parse), 68);
+        assert_eq!(&parse[5..16], b"select_one\0");
+
+        for target in [Target::Statement, Target::Portal] {
+            let describe = Frontend::Describe {
+                target,
+                name: b"select_one".to_vec(),
+            }
+            .encode();
+            assert_eq!(traced_length(&describe), 16);
+            assert_eq!(describe[0], b'D');
+            assert_eq!(describe[5], target.byte());
+            let close = Frontend::Close {
+                target,
+                name: b"select_one".to_vec(),
+            }
+            .encode();
+            assert_eq!(traced_length(&close), 16);
+            assert_eq!(close[0], b'C');
+            assert_eq!(&close[6..], b"select_one\0");
+        }
+        assert_eq!(Target::Statement.byte(), b'S');
+        assert_eq!(Target::Portal.byte(), b'P');
+    }
+
+    /// A Bind of a named statement with no parameters and a binary result
+    /// (`traces/transaction.trace:15`, length 22), and one whose only
+    /// parameter is NULL: a length of -1 and no bytes (`fe-exec.c:1878`).
+    #[test]
+    fn a_bind_carries_formats_and_nulls_as_upstream_sends_them() {
+        let bind = Frontend::Bind {
+            portal: Vec::new(),
+            statement: b"rollback".to_vec(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: vec![1],
+        }
+        .encode();
+        assert_eq!(traced_length(&bind), 22);
+        assert_eq!(&bind[bind.len() - 6..], b"\0\0\0\x01\0\x01");
+
+        let null = Frontend::Bind {
+            portal: Vec::new(),
+            statement: Vec::new(),
+            param_formats: vec![1],
+            params: vec![None],
+            result_formats: vec![0],
+        }
+        .encode();
+        assert_eq!(
+            &null[5..],
+            b"\0\0\0\x01\0\x01\0\x01\xff\xff\xff\xff\0\x01\0\0"
+        );
+    }
+
+    /// The small extended-protocol replies, and ParameterDescription against
+    /// `traces/prepared.trace:5` (`B 10 ParameterDescription 1 NNNN`: a
+    /// two-byte count and one OID).
+    #[test]
+    fn the_extended_query_replies_decode() {
+        assert_eq!(Backend::decode(b'1', b"").unwrap(), Backend::ParseComplete);
+        assert_eq!(Backend::decode(b'2', b"").unwrap(), Backend::BindComplete);
+        assert_eq!(Backend::decode(b'3', b"").unwrap(), Backend::CloseComplete);
+        assert_eq!(Backend::decode(b'n', b"").unwrap(), Backend::NoData);
+        assert_eq!(
+            Backend::decode(b's', b"").unwrap(),
+            Backend::PortalSuspended
+        );
+
+        let mut body = 1u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&23u32.to_be_bytes());
+        assert_eq!(body.len() + 4, 10, "the traced length");
+        assert_eq!(
+            Backend::decode(b't', &body).unwrap(),
+            Backend::ParameterDescription(vec![23])
+        );
+        assert_eq!(
+            Backend::decode(b't', &0u16.to_be_bytes()).unwrap(),
+            Backend::ParameterDescription(Vec::new())
+        );
+
+        // fe-protocol3.c:722 — too few OIDs for the count is "insufficient
+        // data", and a body for a message with none is a disagreement.
+        assert_eq!(
+            Backend::decode(b't', &2u16.to_be_bytes()),
+            Err(ProtocolError::InsufficientData(b't'))
+        );
+        assert_eq!(
+            Backend::decode(b'1', b"x"),
+            Err(ProtocolError::ContentsDoNotAgree(b'1'))
+        );
     }
 
     /// The framing rule of `pqParseInput3`, `fe-protocol3.c:97`-`:113`.
@@ -811,21 +1163,21 @@ mod tests {
         );
     }
 
-    /// A message the simple-query path does not handle keeps its bytes rather
-    /// than failing to decode; refusing it is the caller's decision
+    /// A message this port does not interpret yet (CopyDone here) keeps its
+    /// bytes rather than failing to decode; refusing it is the caller's decision
     /// (`fe-protocol3.c:447`).
     #[test]
     fn an_unhandled_message_type_keeps_its_body() {
         assert_eq!(
-            Backend::decode(b'1', b"").unwrap(),
+            Backend::decode(b'c', b"").unwrap(),
             Backend::Other {
-                id: b'1',
+                id: b'c',
                 body: Vec::new()
             }
         );
         assert_eq!(
-            ProtocolError::UnexpectedResponse(b'1').message(),
-            b"unexpected response from server; first received character was \"1\"".to_vec()
+            ProtocolError::UnexpectedResponse(b'c').message(),
+            b"unexpected response from server; first received character was \"c\"".to_vec()
         );
     }
 

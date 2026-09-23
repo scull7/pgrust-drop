@@ -26,7 +26,7 @@ const T_MONTH: i64 = 60 * 60 * 24 * 31;
 /// `MAX_TEST_TIMES` (`findtimezone.c:156`): 100 years of weekly probes.
 const MAX_TEST_TIMES: usize = 52 * 100;
 
-/// `TZDEFAULT` (`tzfile.h:26`).
+/// `TZDEFAULT` (`tzfile.h:27`).
 pub const TZDEFAULT: &str = "/etc/localtime";
 
 /// Where `PGRUST_TZDIR` is read from; see the crate's `docs/divergences.md`
@@ -53,8 +53,8 @@ const MAX_SCAN_DEPTH: usize = 16;
 
 /// Everything `findtimezone.c` reads from outside itself.
 pub trait TzSource {
-    /// `pg_open_tzfile` (`:65`) and the `read` that follows it: the bytes of
-    /// `TZDIR/name`, or `None` when there is no such file.
+    /// `pg_open_tzfile` (`findtimezone.c:65`) and the `read` that follows it:
+    /// the bytes of `TZDIR/name`, or `None` when there is no such file.
     fn read_tzfile(&self, name: &str) -> Option<Vec<u8>>;
 
     /// The zone names under `TZDIR`, as `scan_available_timezones` (`:657`)
@@ -62,14 +62,14 @@ pub trait TzSource {
     /// into. Order does not matter — the tie-break at `:709` is a total order.
     fn zone_names(&self) -> Vec<String>;
 
-    /// `readlink(linkname)` (`:557`).
+    /// `readlink(linkname)` (`:556`).
     fn read_link(&self, linkname: &str) -> Option<String>;
 
     /// The bytes of a plain path, for the file the C library's `localtime()`
     /// reads. Not an upstream call; see the module comment on [`system_state`].
     fn read_path(&self, path: &str) -> Option<Vec<u8>>;
 
-    /// `getenv("TZ")` (`:1770`).
+    /// `getenv("TZ")` (`:1767`).
     fn tz_env(&self) -> Option<String>;
 
     /// `time(NULL)` (`:368`).
@@ -83,7 +83,7 @@ pub struct RealTzSource {
 }
 
 impl RealTzSource {
-    /// `pg_TZDIR()` (`:36`). `PGRUST_TZDIR` stands in for `share_path/timezone`
+    /// `pg_TZDIR()` (`:37`). `PGRUST_TZDIR` stands in for `share_path/timezone`
     /// and a system directory for `SYSTEMTZDIR`; `None` when neither is there,
     /// which is upstream's "no timezone database" and lands on GMT.
     #[must_use]
@@ -106,24 +106,24 @@ impl RealTzSource {
     }
 }
 
-/// `scan_available_timezones`' recursive walk (`findtimezone.c:656`), as far as
+/// `scan_available_timezones`' recursive walk (`findtimezone.c:657`), as far as
 /// the names go: the scoring itself is [`scan_available_timezones`].
 fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return; // pgfnames returns NULL and the caller just returns (`:670`).
+        return; // pgfnames returns NULL and the caller just returns (`:665`).
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // Ignore . and .., plus any other "hidden" files (`:677`).
+        // Ignore . and .., plus any other "hidden" files (`:673`).
         if name.starts_with('.') {
             continue;
         }
         let path = entry.path();
-        // `stat`, so a symlink to a directory is recursed into (`:686`).
+        // `stat`, so a symlink to a directory is recursed into (`:680`).
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -142,7 +142,7 @@ fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
 
 impl TzSource for RealTzSource {
     fn read_tzfile(&self, name: &str) -> Option<Vec<u8>> {
-        // `strlen(fullname) + 1 + strlen(name) >= MAXPGPATH` (`:72`) is the only
+        // `strlen(fullname) + 1 + strlen(name) >= MAXPGPATH` (`:73`) is the only
         // check upstream makes; a name that escapes the directory would have
         // been rejected by `open` there and by `read` here just the same.
         std::fs::read(self.tzdir.join(name)).ok()
@@ -231,12 +231,12 @@ impl<'a> Probe<'a> {
         self.test_times.is_empty()
     }
 
-    /// `score_timezone` (`findtimezone.c:233`): how many test times, counted
+    /// `score_timezone` (`findtimezone.c:234`): how many test times, counted
     /// from the most recent, the candidate reproduces. `-1` for a zone that is
     /// unusable at all — upstream's "worse than zero".
     #[must_use]
     pub fn score(&self, candidate: &State) -> i32 {
-        // Reject if leap seconds involved (`:246`).
+        // Reject if leap seconds involved (`:248`).
         if !tz::acceptable(candidate) {
             return -1;
         }
@@ -254,14 +254,14 @@ impl<'a> Probe<'a> {
         i32::try_from(self.test_times.len()).unwrap_or(i32::MAX)
     }
 
-    /// `perfect_timezone_match` (`findtimezone.c:319`).
+    /// `perfect_timezone_match` (`findtimezone.c:320`).
     #[must_use]
     pub fn is_perfect_match(&self, candidate: &State) -> bool {
         self.score(candidate) == i32::try_from(self.test_times.len()).unwrap_or(i32::MAX)
     }
 }
 
-/// `zone_name_pref` (`findtimezone.c:614`): which of two equally good names to
+/// `zone_name_pref` (`findtimezone.c:615`): which of two equally good names to
 /// prefer. Larger is more preferred, 0 is neutral.
 #[must_use]
 pub fn zone_name_pref(zonename: &str) -> i32 {
@@ -287,7 +287,7 @@ pub fn breaks_tie(candidate: &str, best: &str) -> bool {
                 || (candidate.len() == best.len() && candidate < best)))
 }
 
-/// `pg_load_tz` (`findtimezone.c:90`).
+/// `pg_load_tz` (`findtimezone.c:91`).
 fn load_tz(src: &impl TzSource, name: &str) -> Option<State> {
     if name.len() > TZ_STRLEN_MAX {
         return None; // not going to fit
@@ -296,7 +296,7 @@ fn load_tz(src: &impl TzSource, name: &str) -> Option<State> {
     if name == "GMT" {
         return tz::parse(name, true);
     }
-    // tzload strips a leading ':' itself (`localtime.c:226`).
+    // tzload strips a leading ':' itself (`localtime.c:230`).
     let file = name.strip_prefix(':').unwrap_or(name);
     if let Some(state) = src
         .read_tzfile(file)
@@ -310,7 +310,7 @@ fn load_tz(src: &impl TzSource, name: &str) -> Option<State> {
     tz::parse(name, false)
 }
 
-/// `validate_zone` (`findtimezone.c:1727`).
+/// `validate_zone` (`findtimezone.c:1728`).
 fn validate_zone(src: &impl TzSource, name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -318,7 +318,7 @@ fn validate_zone(src: &impl TzSource, name: &str) -> bool {
     load_tz(src, name).is_some_and(|state| tz::acceptable(&state))
 }
 
-/// `check_system_link_file` (`findtimezone.c:543`): does the tail of the
+/// `check_system_link_file` (`findtimezone.c:544`): does the tail of the
 /// symlink's target name a zone whose behaviour matches the system's exactly?
 #[must_use]
 pub fn check_system_link_file(
@@ -359,7 +359,7 @@ pub fn check_system_link_file(
     None
 }
 
-/// `scan_available_timezones` (`findtimezone.c:656`), over the names the walk
+/// `scan_available_timezones` (`findtimezone.c:657`), over the names the walk
 /// produced. Returns the best score and the name that earned it.
 #[must_use]
 pub fn scan_available_timezones(
@@ -411,8 +411,8 @@ pub fn local_zone_abbrevs(system: &State, now: i64) -> (String, String, i64) {
     (std_zone_name, dst_zone_name, std_ofs)
 }
 
-/// `identify_system_timezone` (`findtimezone.c:330`), minus the `tzset()` at
-/// `:346`: the system's behaviour arrives as `system`.
+/// `identify_system_timezone` (`findtimezone.c:331`), minus the `tzset()` at
+/// `:347`: the system's behaviour arrives as `system`.
 fn identify_system_timezone(src: &impl TzSource, system: &State) -> Option<String> {
     let now = src.now();
     let probe = Probe::build(system, now)?;
@@ -496,7 +496,7 @@ pub fn system_state(src: &impl TzSource) -> Option<State> {
         .or_else(|| tz::parse("UTC0", false))
 }
 
-/// `select_default_timezone` (`findtimezone.c:1756`): `TZ` if it names a zone
+/// `select_default_timezone` (`findtimezone.c:1757`): `TZ` if it names a zone
 /// this database knows, else whatever best matches the system's behaviour.
 /// `None` means GMT, which is what `setup_config` leaves the two lines
 /// commented out for (`initdb.c:1348`).
@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(
             src.scans.get(),
             0,
-            "the shortcut exists to skip the brute-force scan (findtimezone.c:405)"
+            "the shortcut exists to skip the brute-force scan (findtimezone.c:406)"
         );
     }
 
@@ -656,7 +656,7 @@ mod tests {
                 "{target}"
             );
         }
-        // The first component is always skipped (`findtimezone.c:566`), so a
+        // The first component is always skipped (`findtimezone.c:569`), so a
         // link whose target *is* a zone name, with or without a leading slash,
         // finds nothing — which is why upstream only ever reaches the tail.
         for target in ["America/New_York", "/America/New_York"] {
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn the_factory_zone_is_ignored_in_favour_of_gmt() {
-        // findtimezone.c:415 — "Ignore IANA's rather silly Factory zone".
+        // findtimezone.c:418 — "Ignore IANA's rather silly Factory zone".
         let utc = fixed("UTC", 0);
         let src = FakeTz::new(&[("Factory", utc.clone())], &utc);
         assert_eq!(select_default_timezone(&src), None);
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn the_last_resort_is_an_etc_gmt_name_at_the_machines_offset() {
         // An abbreviation that is itself a signed number: no constructed name
-        // parses back to it, so upstream's final `Etc/GMT%s%d` (`:494`) lands.
+        // parses back to it, so upstream's final `Etc/GMT%s%d` (`:511`) lands.
         // The IANA names are POSIX style, so plus is west of Greenwich.
         let system = fixed("+04", 4 * 3600);
         let src = FakeTz::new(&[("Etc/UTC", fixed("UTC", 0))], &system);
@@ -830,8 +830,8 @@ mod tests {
 
     /// No timezone database and no `/etc/localtime`: the C library is on UTC,
     /// the scan has nothing to score, and the constructed-name stage
-    /// (`findtimezone.c:479`) tries `UTC` (no offset, so not a POSIX zone) and
-    /// then `UTC0`, which parses. That is the line C initdb writes on such a
+    /// (`findtimezone.c:494`-`:503`) tries `UTC` (no offset, so not a POSIX
+    /// zone) and then `UTC0`, which parses. That is the line C initdb writes on such a
     /// machine; `None`, `setup_config`'s commented-out pair (`initdb.c:1348`),
     /// is reserved for the `Factory` zone.
     #[test]
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn a_zone_that_only_matches_recently_loses_to_one_that_matches_further_back() {
-        // The whole point of the scoring (`findtimezone.c:228`): both zones
+        // The whole point of the scoring (`findtimezone.c:225`): both zones
         // agree about today, and only one agrees about 1990.
         let system = eastern();
         let state = tz::load(&system, true).expect("load");
@@ -877,7 +877,7 @@ mod tests {
     fn a_zone_the_reader_refuses_scores_worse_than_one_that_matches_nothing() {
         let system = tz::load(&fixed("UTC", 0), true).expect("load");
         let probe = Probe::build(&system, 1_789_128_000).expect("probe");
-        // findtimezone.c:243 — an unloadable name is -1, which never wins.
+        // findtimezone.c:246 — an unloadable name is -1, which never wins.
         let (score, name) =
             scan_available_timezones(&[String::from("zone.tab")], &probe, |_| None::<State>);
         assert_eq!((score, name.as_str()), (-1, ""));

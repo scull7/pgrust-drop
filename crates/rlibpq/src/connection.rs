@@ -439,7 +439,15 @@ impl QueryRunner {
                 return Err(ProtocolError::UnexpectedResponse(b'K'));
             }
             Backend::NegotiateProtocolVersion { .. } => {}
-            Backend::Other { id, .. } => return Err(ProtocolError::UnexpectedResponse(id)),
+            other @ (Backend::ParseComplete
+            | Backend::BindComplete
+            | Backend::CloseComplete
+            | Backend::NoData
+            | Backend::PortalSuspended
+            | Backend::ParameterDescription(_)
+            | Backend::Other { .. }) => {
+                return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
+            }
         }
         Ok(Flow::Continue)
     }
@@ -712,6 +720,12 @@ fn message_id(message: &Backend) -> u8 {
         Backend::NoticeResponse(_) => b'N',
         Backend::NotificationResponse { .. } => b'A',
         Backend::NegotiateProtocolVersion { .. } => b'v',
+        Backend::ParseComplete => b'1',
+        Backend::BindComplete => b'2',
+        Backend::CloseComplete => b'3',
+        Backend::NoData => b'n',
+        Backend::PortalSuspended => b's',
+        Backend::ParameterDescription(_) => b't',
         Backend::Other { id, .. } => *id,
     }
 }

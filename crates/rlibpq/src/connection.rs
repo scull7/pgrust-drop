@@ -353,10 +353,10 @@ impl Stream {
         }
     }
 
-    /// `conn->raddr`: the address this socket is connected to, which a
-    /// cancel request must reach (`fe-cancel.c:170`, `:406`). `None` when
-    /// the socket has no peer any more, or a Unix peer has no path — C's
-    /// `conn->sock == PGINVALID_SOCKET` (`fe-cancel.c:83`, `:377`).
+    /// The address this socket is connected to, as the kernel reports it
+    /// now: what [`Connection::connect`] records as `conn->raddr`. `None`
+    /// when the socket has no peer — a TCP peer that has reset it answers
+    /// `ENOTCONN` — or a Unix peer has no path.
     #[must_use]
     pub fn peer(&self) -> Option<Peer> {
         match self {
@@ -483,6 +483,10 @@ pub struct Connection<S = Stream> {
     /// `conn->notifyHead` … `notifyTail`: pid, channel, payload.
     notifications: Vec<(i32, Vec<u8>, Vec<u8>)>,
     trace: Option<Tracer>,
+    /// `conn->raddr`: where the socket was connected, copied once when it
+    /// was opened (`fe-connect.c:3249`), so nothing the peer does later
+    /// changes it. `None` for a stream [`Connection::start_up`] was handed.
+    raddr: Option<Peer>,
 }
 
 impl Connection<Stream> {
@@ -504,14 +508,11 @@ impl Connection<Stream> {
         // conninfo C would have rejected.
         let address = socket_address(conninfo)?;
         let stream = Stream::connect(&address)?;
+        let raddr = stream.peer();
         let nonce = strong_random(RAW_NONCE_LEN)?;
-        Connection::start_up(stream, conninfo, &nonce)
-    }
-
-    /// Where the socket is connected: see [`Stream::peer`].
-    #[must_use]
-    pub fn peer(&self) -> Option<Peer> {
-        self.stream.peer()
+        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
+        conn.raddr = raddr;
+        Ok(conn)
     }
 
     /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
@@ -575,6 +576,7 @@ impl<S: Read + Write> Connection<S> {
             notices: Vec::new(),
             notifications: Vec::new(),
             trace: None,
+            raddr: None,
         };
 
         loop {
@@ -1313,6 +1315,16 @@ impl<S: Read + Write> Connection<S> {
     #[must_use]
     pub fn cancel_key(&self) -> &[u8] {
         &self.cancel_key
+    }
+
+    /// `conn->raddr`, the address a cancel request must reach
+    /// (`fe-cancel.c:170`, `:406`): recorded once by
+    /// [`Connection::connect`], so a peer that has since reset the socket
+    /// does not lose it. `None` only when the stream was not opened there,
+    /// or a Unix peer has no path.
+    #[must_use]
+    pub fn peer(&self) -> Option<Peer> {
+        self.raddr.clone()
     }
 
     /// `PQtransactionStatus`, `fe-connect.c:7583`.

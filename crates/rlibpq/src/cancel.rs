@@ -21,7 +21,7 @@
 //! Both are plain data once built, so either can be moved to another thread
 //! and fired while the connection it came from is blocked in a query — which
 //! is what they are for. The decisions ([`CancelError::message`],
-//! [`judge_response`], the state checks of `PQcancelStart`) are pure; the
+//! `judge_response`, the state checks of `PQcancelStart`) are pure; the
 //! socket calls are thin and sit at the edge, generic over the stream so the
 //! unit tests below can script one.
 
@@ -353,10 +353,8 @@ fn exchange<S: Read + Write>(
 /// Calculation: what `PQcancelPoll` makes of its read in
 /// `CONNECTION_AWAITING_RESPONSE` (`fe-cancel.c:247`-`:293`). EOF is the
 /// answer it waits for; data is "unexpected"; an error is `pqReadData`'s.
-///
-/// # Errors
-/// The line to append to the error message.
-pub fn judge_response(read: io::Result<usize>) -> Result<(), Vec<u8>> {
+/// `Err` is the line to append to the error message.
+fn judge_response(read: io::Result<usize>) -> Result<(), Vec<u8>> {
     match read {
         Ok(0) => Ok(()),
         Ok(_) => Err(b"unexpected response from server\n".to_vec()),
@@ -367,7 +365,8 @@ pub fn judge_response(read: io::Result<usize>) -> Result<(), Vec<u8>> {
 
 impl Connection<Stream> {
     /// `PQgetCancel`, `fe-cancel.c:368`: a [`Cancel`] for this connection,
-    /// or `None` when it has no socket (`:377`). A connection that received
+    /// or `None` when it has no peer address to send one to — C's "no
+    /// socket" (`:377`). A connection that received
     /// no cancel key yields the dummy object (`:398`).
     #[must_use]
     pub fn get_cancel(&self) -> Option<Cancel> {
@@ -459,6 +458,53 @@ mod tests {
         let dummy = Cancel::new(peer(), 99, b"");
         assert_eq!(dummy.packet(), None);
         assert_eq!(dummy.cancel(), Err(CancelError::NoCancelKey));
+    }
+
+    /// `PQgetCancel` copies `conn->raddr` (`fe-cancel.c:406`), which C fixed
+    /// when it connected (`fe-connect.c:3249`), and checks only that the
+    /// socket is open (`:377`). A TCP peer that has since reset the socket —
+    /// after which `getpeername` answers `ENOTCONN` — does not change that:
+    /// the request still goes to the postmaster's address.
+    #[test]
+    fn get_cancel_survives_a_peer_that_reset_the_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected, wait_for_client) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            // AuthenticationOk, BackendKeyData (pid 99), ReadyForQuery.
+            socket
+                .write_all(b"R\0\0\0\x08\0\0\0\0K\0\0\0\x0c\0\0\0\x63\x01\x02\x03\x04Z\0\0\0\x05I")
+                .unwrap();
+            wait_for_client.recv().unwrap();
+            // The startup packet is still unread, so closing sends RST.
+            drop(socket);
+        });
+
+        let info = crate::conninfo::parse_conninfo(
+            format!("host=127.0.0.1 port={} user=u", addr.port()).as_bytes(),
+        )
+        .unwrap();
+        let mut conn = Connection::connect(&info).unwrap();
+        connected.send(()).unwrap();
+        server.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while conn.consume_input().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "no reset arrived");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let cancel = conn.get_cancel().expect("raddr outlives the peer");
+        assert_eq!(cancel.peer(), &Peer::Tcp(addr));
+        assert_eq!(cancel.packet(), Some(packet().as_slice()));
+        // Nobody listens there now: the connect fails, the socket was open.
+        assert!(matches!(
+            conn.request_cancel(),
+            Err(CancelError::Failed {
+                step: CancelStep::Connect,
+                ..
+            })
+        ));
     }
 
     /// The fixed strings of `fe-cancel.c`, byte for byte — including the

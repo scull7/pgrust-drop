@@ -84,7 +84,7 @@ impl Origin {
 
 /// `conn->current_auth_response`, `libpq-int.h:335`-`:338`: which of the four
 /// messages sharing type byte `p` is being sent. The byte alone cannot say,
-/// so C records it before sending and `fe-trace.c:731` reads it back.
+/// so C records it before sending and `fe-trace.c:723` reads it back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AuthResponse {
     /// `'\0'`: none recorded.
@@ -321,7 +321,7 @@ impl<'a> Line<'a> {
     }
 
     /// The `p` messages, told apart by what was recorded before sending
-    /// (`fe-trace.c:731`).
+    /// (`fe-trace.c:723`).
     fn auth_response(&mut self, auth: AuthResponse, length: i32, regress: bool) {
         match auth {
             AuthResponse::Gss => {

@@ -935,8 +935,11 @@ impl<S: Read + Write> Connection<S> {
     }
 
     /// `PQtrace`, `fe-trace.c:35`: from now on, write every message sent and
-    /// parsed to `sink`, with the flags reset. A previous sink is flushed and
-    /// dropped first, as `PQuntrace` does.
+    /// parsed to `sink`, with the flags reset. A sink still installed from an
+    /// earlier `trace` is flushed and then dropped (closing it, if it is a
+    /// `File`), where `PQtrace` only forgets the old `FILE *` (`fe-trace.c:53`).
+    /// To keep the old sink, call [`Connection::untrace`] first; it hands the
+    /// sink back.
     ///
     /// Tracing starts on a connected `Connection`, so the startup exchange is
     /// never traced — as with `PQconnectdb` followed by `PQtrace`.

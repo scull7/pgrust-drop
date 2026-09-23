@@ -661,6 +661,15 @@ mod tests {
         assert_eq!(manifest.initdb, manifest::MINT_INITDB_VERSION);
         assert_eq!(manifest.libc, manifest::MINT_LIBC);
         assert_eq!(manifest.options, MINT_ARGS.join(" "));
+        // The measured host facts agree with each other: ICU rows exist
+        // exactly when the host had a libicu to report a version.
+        assert_eq!(
+            manifest.icu == "none",
+            !manifest.collations.split(' ').any(|c| c.starts_with("i=")),
+            "icu {:?} against collations {:?}",
+            manifest.icu,
+            manifest.collations
+        );
     }
 
     /// The committed image is a well-formed, stripped PostgreSQL 18 cluster.

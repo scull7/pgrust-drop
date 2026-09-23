@@ -15,10 +15,11 @@
 # INITDB defaults to $PGDROP_REF_BIN_MUSL/initdb (on Alpine,
 # /usr/libexec/postgresql18/initdb from the postgresql18 package).
 #
-# Re-minting changes the image only if the catalogs changed. The host's
-# `locale -a` and libicu decide which collation rows initdb imports, so the
-# manifest's sha256 moves when those do too; commit the image and manifest
-# together, and say why on the Linear issue.
+# Re-minting changes the image when the catalogs change, and also when the
+# host does: `locale -a` and libicu decide which collation rows initdb
+# imports, so the manifest's sha256 moves with them. The manifest records the
+# host's ICU version and the rows per provider, measured on the first mint.
+# Commit the image and manifest together, and say why on the Linear issue.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

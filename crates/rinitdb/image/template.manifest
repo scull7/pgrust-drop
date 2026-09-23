@@ -4,6 +4,8 @@
 format: 1
 initdb: initdb (PostgreSQL) 18.6
 libc: musl
+icu: 153.136
+collations: b=3 c=2 d=1 i=805
 options: --no-locale --encoding=UTF8 -U postgres -A trust --no-sync
 bytes: 23633969
 sha256: c2f04ac2821873e38ec8b9c2e9fc5c4a5c7c704bf969c5fdbdf5c36b5fb261e4

@@ -3,7 +3,9 @@
 //! Ported from `src/interfaces/libpq/fe-connect.c` (`pqConnectDBComplete`'s
 //! blocking loop, `:2782`, and `PQconnectPoll`'s `CONNECTION_AWAITING_RESPONSE`
 //! state, `:3982`) and `fe-exec.c` (`PQexec`, `:2279`, which sends one Query and
-//! collects results until ReadyForQuery).
+//! collects results until ReadyForQuery, and its extended-query siblings from
+//! `PQexecParams`, `:2293`, to `PQclosePortal`, `:2556`, which send the plans
+//! `crate::extended` builds and collect the same way).
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]
 //! and [`socket_address`] are functions of the `ConnInfo` alone, and
@@ -19,8 +21,10 @@ use std::path::PathBuf;
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::conninfo::ConnInfo;
 use crate::error::ConnError;
+use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
 use crate::message::{
-    Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, TransactionStatus, next_frame,
+    Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
+    next_frame,
 };
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
@@ -46,6 +50,9 @@ pub enum ConnectionError {
     /// A conninfo value `PQconnectPoll` refuses before it opens anything —
     /// today the `port` alone (`fe-connect.c:3036`-`:3049`).
     Conninfo(ConnError),
+    /// An extended-query argument refused before anything was sent
+    /// (`PQsendQueryParams` and its siblings, `fe-exec.c:1509`).
+    Argument(ArgumentError),
 }
 
 impl ConnectionError {
@@ -69,6 +76,7 @@ impl ConnectionError {
                 ProtocolError::UnexpectedResponse(*id).message()
             }
             ConnectionError::Conninfo(err) => err.message(),
+            ConnectionError::Argument(err) => err.message(),
         }
     }
 }
@@ -96,6 +104,12 @@ impl From<ProtocolError> for ConnectionError {
 impl From<AuthError> for ConnectionError {
     fn from(err: AuthError) -> Self {
         ConnectionError::Auth(err)
+    }
+}
+
+impl From<ArgumentError> for ConnectionError {
+    fn from(err: ArgumentError) -> Self {
+        ConnectionError::Argument(err)
     }
 }
 
@@ -690,8 +704,117 @@ impl<S: Read + Write> Connection<S> {
     /// path cannot make a result of. A *failed query* is not an error here: it
     /// is a `PGRES_FATAL_ERROR` result, exactly as in libpq.
     pub fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
-        self.send(&Frontend::Query(query.to_vec()))?;
-        let mut runner = QueryRunner::new();
+        self.run(&Plan {
+            messages: vec![Frontend::Query(query.to_vec())],
+            class: QueryClass::Simple,
+        })
+    }
+
+    /// `PQexecParams`, `fe-exec.c:2293`: `command` through the unnamed
+    /// statement with out-of-line parameters.
+    ///
+    /// Every result is returned, as [`Connection::exec`] does; `PQexecParams`
+    /// itself returns the last of them (`PQexecFinish`, `fe-exec.c:2427`).
+    /// `param_types` is `paramTypes`, empty for NULL.
+    ///
+    /// # Errors
+    /// An argument `PQsendQueryParams` refuses (nothing is sent), or the
+    /// connection broke. A failed command is a `PGRES_FATAL_ERROR` result.
+    pub fn exec_params(
+        &mut self,
+        command: &[u8],
+        param_types: &[u32],
+        params: &Params<'_>,
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.run(&extended::query_params(command, param_types, params)?)
+    }
+
+    /// `PQprepare`, `fe-exec.c:2323`: Parse `query` as the statement
+    /// `statement`; the result is COMMAND_OK or the server's error.
+    ///
+    /// # Errors
+    /// More than 65535 parameter types (nothing is sent), or the connection
+    /// broke.
+    pub fn prepare(
+        &mut self,
+        statement: &[u8],
+        query: &[u8],
+        param_types: &[u32],
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.run(&extended::prepare(statement, query, param_types)?)
+    }
+
+    /// `PQexecPrepared`, `fe-exec.c:2340`: run a prepared statement.
+    ///
+    /// # Errors
+    /// An argument `PQsendQueryPrepared` refuses (nothing is sent), or the
+    /// connection broke.
+    pub fn exec_prepared(
+        &mut self,
+        statement: &[u8],
+        params: &Params<'_>,
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.run(&extended::query_prepared(statement, params)?)
+    }
+
+    /// `PQdescribePrepared`, `fe-exec.c:2472`: a COMMAND_OK result whose
+    /// `nparams`/`paramtype` and `nfields`/`ftype` describe the statement.
+    ///
+    /// # Errors
+    /// The connection broke.
+    pub fn describe_prepared(
+        &mut self,
+        statement: &[u8],
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.typed(TypedCommand::Describe, Target::Statement, statement)
+    }
+
+    /// `PQdescribePortal`, `fe-exec.c:2491`.
+    ///
+    /// # Errors
+    /// The connection broke.
+    pub fn describe_portal(&mut self, portal: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.typed(TypedCommand::Describe, Target::Portal, portal)
+    }
+
+    /// `PQclosePrepared`, `fe-exec.c:2538`. Closing a statement that does not
+    /// exist is not an error.
+    ///
+    /// # Errors
+    /// The connection broke.
+    pub fn close_prepared(
+        &mut self,
+        statement: &[u8],
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.typed(TypedCommand::Close, Target::Statement, statement)
+    }
+
+    /// `PQclosePortal`, `fe-exec.c:2556`.
+    ///
+    /// # Errors
+    /// The connection broke.
+    pub fn close_portal(&mut self, portal: &[u8]) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.typed(TypedCommand::Close, Target::Portal, portal)
+    }
+
+    fn typed(
+        &mut self,
+        command: TypedCommand,
+        target: Target,
+        name: &[u8],
+    ) -> Result<Vec<QueryResult>, ConnectionError> {
+        self.run(&extended::typed_command(command, target, name))
+    }
+
+    /// Send a plan's messages in one write — libpq buffers them and flushes
+    /// once (`pqPipelineFlush`, `fe-exec.c:4047`) — then fold every reply up
+    /// to ReadyForQuery as the plan's query class reads them.
+    fn run(&mut self, plan: &Plan) -> Result<Vec<QueryResult>, ConnectionError> {
+        let bytes: Vec<u8> = plan.messages.iter().flat_map(Frontend::encode).collect();
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()?;
+
+        let mut runner = QueryRunner::for_class(plan.class);
         loop {
             let message = self.read_message()?;
             if runner.push(message)? == Flow::Done {
@@ -1533,6 +1656,73 @@ mod tests {
             runner.push(Backend::PortalSuspended),
             Err(ProtocolError::UnexpectedResponse(b's'))
         );
+    }
+
+    /// `PQexecParams` over the wire: the client writes Parse, Bind,
+    /// Describe, Execute and Sync in one go, and the replies of
+    /// `traces/simple_pipeline.trace` lines 6-11 come back as one TUPLES_OK
+    /// result.
+    #[test]
+    fn exec_params_sends_the_extended_query_and_reads_its_result() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend(message(b'1', b""));
+        script.extend(message(b'2', b""));
+        let mut row_description = 1u16.to_be_bytes().to_vec();
+        row_description.extend_from_slice(b"?column?\0");
+        row_description.extend_from_slice(&0u32.to_be_bytes());
+        row_description.extend_from_slice(&0i16.to_be_bytes());
+        row_description.extend_from_slice(&23u32.to_be_bytes());
+        row_description.extend_from_slice(&4i16.to_be_bytes());
+        row_description.extend_from_slice(&(-1i32).to_be_bytes());
+        row_description.extend_from_slice(&0i16.to_be_bytes());
+        script.extend(message(b'T', &row_description));
+        let mut data_row = 1u16.to_be_bytes().to_vec();
+        data_row.extend_from_slice(&1u32.to_be_bytes());
+        data_row.push(b'1');
+        script.extend(message(b'D', &data_row));
+        script.extend(message(b'C', b"SELECT 1\0"));
+        script.extend(ready(b'I'));
+
+        let info = conninfo("user=alice");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        let written_before = conn.stream.to_server.len();
+        let results = conn
+            .exec_params(b"SELECT $1", &[23], &Params::text(&[Some(b"1")]))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status(), ExecStatus::TuplesOk);
+        assert_eq!(results[0].ftype(0), Some(23));
+        assert_eq!(results[0].value(0, 0), Some(&b"1"[..]));
+
+        let plan =
+            extended::query_params(b"SELECT $1", &[23], &Params::text(&[Some(b"1")])).unwrap();
+        let expected: Vec<u8> = plan.messages.iter().flat_map(Frontend::encode).collect();
+        assert_eq!(&conn.stream.to_server[written_before..], &expected[..]);
+    }
+
+    /// An argument C refuses is refused before a byte is written, with C's
+    /// message (`fe-exec.c:1527`).
+    #[test]
+    fn a_refused_argument_sends_nothing() {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        let info = conninfo("user=alice");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        let written_before = conn.stream.to_server.len();
+        let values = vec![None; extended::PQ_QUERY_PARAM_MAX_LIMIT + 1];
+        let error = conn
+            .exec_params(b"SELECT 1", &[], &Params::text(&values))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectionError::Argument(ArgumentError::TooManyParameters)
+        ));
+        assert_eq!(
+            error.message(),
+            b"number of parameters must be between 0 and 65535".to_vec()
+        );
+        assert_eq!(conn.stream.to_server.len(), written_before);
     }
 
     /// The two malformed-stream cases `pqParseInput3` names for "D".

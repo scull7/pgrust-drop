@@ -8,6 +8,8 @@ pgrust-drop is licensed per crate (see `docs/adr/0003-licensing.md`):
   Group. No code from pgrust is copied into them.
 - `crates/pgdrop`: GNU Affero General Public License v3.0
   (`crates/pgdrop/LICENSE`). It links pgrust (https://github.com/malisper/pgrust,
-  AGPL-3.0) and is therefore a derivative work of it.
+  AGPL-3.0) and is therefore a derivative work of it. The pinned source is
+  scull7's fork (https://github.com/scull7/pgrust, branch `musl-build`), which
+  carries a musl build fix pending upstream (ADR-0001).
 
 PostgreSQL is a trademark of the PostgreSQL Community Association of Canada.

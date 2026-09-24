@@ -52,8 +52,15 @@ pub struct Cluster {
 
 impl Cluster {
     /// Start a cluster whose `pg_hba.conf` uses `auth_method` for local
-    /// connections, or `None` when the reference tools are absent.
+    /// connections, or `None` when the reference tools are absent. It
+    /// listens on its Unix socket only.
     pub fn start(auth_method: &str, port: u16) -> Option<Self> {
+        Cluster::start_listening(auth_method, port, "")
+    }
+
+    /// [`Cluster::start`], also listening on TCP at `listen_addresses`
+    /// (`127.0.0.1` for a loopback gate).
+    pub fn start_listening(auth_method: &str, port: u16, listen_addresses: &str) -> Option<Self> {
         let Some(initdb) = reference::find(TOOLS[0]) else {
             reference::skip(TOOLS[0]);
             return None;
@@ -103,7 +110,7 @@ impl Cluster {
             .arg("-w")
             .arg("-o")
             .arg(format!(
-                "-p {port} -k {} -c listen_addresses=",
+                "-p {port} -k {} -c listen_addresses={listen_addresses}",
                 socket_dir.display()
             ))
             .args(["-l".as_ref(), dir.join("log").as_os_str()])
@@ -126,9 +133,16 @@ impl Cluster {
     }
 
     pub fn connect(&self) -> Connection {
-        let mut info = parse_conninfo(self.conninfo().as_bytes()).expect("conninfo parses");
-        info.add_defaults(&Env::empty());
-        Connection::connect(&info).expect("rlibpq connects")
+        connect_to(&self.conninfo())
+    }
+
+    /// A connection over TCP to `host`, for a cluster started with
+    /// [`Cluster::start_listening`].
+    pub fn connect_tcp(&self, host: &str) -> Connection {
+        connect_to(&format!(
+            "host={host} port={} user=gateuser dbname=postgres password=gatepassword",
+            self.port
+        ))
     }
 
     /// `psql -tAq -c query` — the reference rendering, unaligned and
@@ -170,6 +184,105 @@ impl Cluster {
         let out = child.wait_with_output().expect("reference psql exits");
         (out.stdout, out.stderr, out.status.code().unwrap_or(-1))
     }
+}
+
+/// `PQconnectdb(conninfo)`, with a failure a test failure.
+fn connect_to(conninfo: &str) -> Connection {
+    let mut info = parse_conninfo(conninfo.as_bytes()).expect("conninfo parses");
+    info.add_defaults(&Env::empty());
+    Connection::connect(&info).expect("rlibpq connects")
+}
+
+/// What [`wait_for_connection_state`] waits for: its `state` or its
+/// `event` argument — "only one of them can be given".
+pub enum WaitFor<'a> {
+    State(&'a str),
+    Event(&'a str),
+}
+
+/// `wait_for_connection_state`, `libpq_pipeline.c:120`: poll
+/// `pg_stat_activity` through `monitor` every 10 ms until backend `pid` is
+/// in the state, or waiting on the event, that `wait` names.
+pub fn wait_for_connection_state(monitor: &mut Connection, pid: i32, wait: &WaitFor<'_>) {
+    const INT4OID: u32 = 23;
+    const TEXTOID: u32 = 25;
+    let (query, value) = match wait {
+        WaitFor::State(state) => (
+            &b"SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = $2"[..],
+            *state,
+        ),
+        WaitFor::Event(event) => (
+            &b"SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event = $2"[..],
+            *event,
+        ),
+    };
+    let pid = pid.to_string();
+    let values = [Some(pid.as_bytes()), Some(value.as_bytes())];
+    loop {
+        let result = only(
+            monitor
+                .exec_params(query, &[INT4OID, TEXTOID], &rlibpq::Params::text(&values))
+                .expect("PQexecParams"),
+        );
+        assert_eq!(
+            result.status(),
+            ExecStatus::TuplesOk,
+            "could not query pg_stat_activity: {result:?}"
+        );
+        assert_eq!(result.ntuples(), 1, "unexpected number of rows received");
+        assert_eq!(result.nfields(), 1, "unexpected number of columns received");
+        if result.value(0, 0) != Some(&b"0"[..]) {
+            return;
+        }
+        // "wait 10ms before polling again".
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `send_cancellable_query`, `libpq_pipeline.c:172`: once `conn`'s backend
+/// is idle, send `SELECT pg_sleep($1)` for `PG_TEST_TIMEOUT_DEFAULT` seconds
+/// (180 when unset), and return once the sleep is running — "if the query is
+/// not running yet, the cancel request that we send won't have any effect".
+pub fn send_cancellable_query(conn: &mut Connection, monitor: &mut Connection) {
+    const INT4OID: u32 = 23;
+    let pid = conn.backend_pid();
+    wait_for_connection_state(monitor, pid, &WaitFor::State("idle"));
+    let env_wait = std::env::var("PG_TEST_TIMEOUT_DEFAULT").unwrap_or_else(|_| "180".into());
+    conn.send_query_params(
+        b"SELECT pg_sleep($1)",
+        &[INT4OID],
+        &rlibpq::Params::text(&[Some(env_wait.as_bytes())]),
+    )
+    .expect("failed to send query");
+    wait_for_connection_state(monitor, pid, &WaitFor::Event("PgSleep"));
+}
+
+/// `confirm_query_canceled`, `libpq_pipeline.c:95`: the next result is a
+/// failure with SQLSTATE 57014, and the rest of the input is consumed.
+pub fn confirm_query_canceled(conn: &mut Connection) {
+    let result = conn
+        .get_result()
+        .expect("PQgetResult")
+        .expect("PQgetResult returned null");
+    assert_query_canceled(&result);
+    while conn.is_busy().expect("PQisBusy") {
+        conn.consume_input().expect("PQconsumeInput");
+    }
+}
+
+/// The checks `confirm_query_canceled` makes of the result itself.
+pub fn assert_query_canceled(result: &QueryResult) {
+    assert_eq!(
+        result.status(),
+        ExecStatus::FatalError,
+        "query did not fail when it was expected"
+    );
+    let sqlstate = result.error().and_then(rlibpq::ResultError::sqlstate);
+    assert_eq!(
+        sqlstate,
+        Some(&b"57014"[..]),
+        "query failed with a different error than cancellation: {result:?}"
+    );
 }
 
 /// Calculation: a result as `psql -tA` prints it — each row's values joined

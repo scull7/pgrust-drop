@@ -24,6 +24,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
+use crate::cancel::Peer;
 use crate::conninfo::ConnInfo;
 use crate::error::ConnError;
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
@@ -352,6 +353,30 @@ impl Stream {
         }
     }
 
+    /// `conn->raddr` for a socket [`Stream::connect`] opened to `address`:
+    /// the address it was dialled at, as C copies the address it is about to
+    /// `connect()` to (`fe-connect.c:3249`) rather than asking the kernel
+    /// afterwards.
+    ///
+    /// A Unix peer is the path this side dialled. `getpeername` is no
+    /// substitute there: it answers with whatever the server bound — another
+    /// spelling of the path, through a symlink or relative to the server's
+    /// directory — and on Darwin with the whole `sun_path`, NUL padding
+    /// included, which `std` keeps as part of the path, so a cancel sent to
+    /// it cannot even be connected. A TCP peer is the resolved address the
+    /// connect succeeded on, which `std` chooses among the name's addresses
+    /// and reports only through `getpeername`; asked straight after the
+    /// connect, that is the connect target. `None` when the TCP peer has
+    /// already gone (`ENOTCONN`).
+    #[must_use]
+    pub fn raddr(&self, address: &Address) -> Option<Peer> {
+        match (self, address) {
+            (_, Address::Unix(path)) => Some(Peer::Unix(path.clone())),
+            (Stream::Tcp(s), Address::Tcp { .. }) => s.peer_addr().ok().map(Peer::Tcp),
+            (Stream::Unix(_), Address::Tcp { .. }) => None,
+        }
+    }
+
     /// Switch the socket between blocking and non-blocking reads.
     ///
     /// # Errors
@@ -466,6 +491,10 @@ pub struct Connection<S = Stream> {
     /// `conn->notifyHead` … `notifyTail`: pid, channel, payload.
     notifications: Vec<(i32, Vec<u8>, Vec<u8>)>,
     trace: Option<Tracer>,
+    /// `conn->raddr`: where the socket was connected, copied once when it
+    /// was opened (`fe-connect.c:3249`), so nothing the peer does later
+    /// changes it. `None` for a stream [`Connection::start_up`] was handed.
+    raddr: Option<Peer>,
 }
 
 impl Connection<Stream> {
@@ -487,8 +516,11 @@ impl Connection<Stream> {
         // conninfo C would have rejected.
         let address = socket_address(conninfo)?;
         let stream = Stream::connect(&address)?;
+        let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
-        Connection::start_up(stream, conninfo, &nonce)
+        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
+        conn.raddr = raddr;
+        Ok(conn)
     }
 
     /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
@@ -552,6 +584,7 @@ impl<S: Read + Write> Connection<S> {
             notices: Vec::new(),
             notifications: Vec::new(),
             trace: None,
+            raddr: None,
         };
 
         loop {
@@ -1284,10 +1317,22 @@ impl<S: Read + Write> Connection<S> {
         self.backend_pid
     }
 
-    /// The cancel key, kept for the cancel request NAT-394 will send.
+    /// The cancel key BackendKeyData carried (`conn->be_cancel_key`), which
+    /// [`Connection::get_cancel`] and [`Connection::cancel_create`] copy.
+    /// Empty when the server sent none.
     #[must_use]
     pub fn cancel_key(&self) -> &[u8] {
         &self.cancel_key
+    }
+
+    /// `conn->raddr`, the address a cancel request must reach
+    /// (`fe-cancel.c:170`, `:406`): recorded once by
+    /// [`Connection::connect`], so a peer that has since reset the socket
+    /// does not lose it. `None` only when the stream was not opened there,
+    /// or a TCP peer was gone before it could be recorded.
+    #[must_use]
+    pub fn peer(&self) -> Option<Peer> {
+        self.raddr.clone()
     }
 
     /// `PQtransactionStatus`, `fe-connect.c:7583`.

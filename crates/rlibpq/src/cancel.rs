@@ -84,6 +84,11 @@ pub enum CancelError {
     NoCancelKey,
     /// A socket call failed with this `errno` (`cancel_errReturn`, `:703`).
     Failed { step: CancelStep, errno: i32 },
+    /// A socket call failed without an `errno`: `std` refused it before any
+    /// system call (a socket path it cannot pass to `connect()`), or a send
+    /// wrote nothing. C has no such failure; `reason` is the `io::Error`
+    /// text, printed where C prints `error N`.
+    FailedWithoutErrno { step: CancelStep, reason: String },
     /// `PQrequestCancel` on a connection without a socket (`:761`).
     ConnectionNotOpen,
 }
@@ -102,16 +107,25 @@ impl CancelError {
             CancelError::Failed { step, errno } => {
                 format!("PQcancel() -- {}() failed: error {errno}\n", step.name()).into_bytes()
             }
+            CancelError::FailedWithoutErrno { step, reason } => {
+                format!("PQcancel() -- {}() failed: {reason}\n", step.name()).into_bytes()
+            }
             CancelError::ConnectionNotOpen => {
                 b"PQrequestCancel() -- connection is not open\n".to_vec()
             }
         }
     }
 
+    /// Calculation: the error for a failed `step`. An `io::Error` that
+    /// carries no `errno` is not reported as `error 0`, which would claim a
+    /// system call failed with no error.
     fn failed(step: CancelStep, err: &io::Error) -> Self {
-        CancelError::Failed {
-            step,
-            errno: err.raw_os_error().unwrap_or(0),
+        match err.raw_os_error() {
+            Some(errno) => CancelError::Failed { step, errno },
+            None => CancelError::FailedWithoutErrno {
+                step,
+                reason: err.to_string(),
+            },
         }
     }
 }
@@ -549,6 +563,80 @@ mod tests {
                 errno: 2
             })
         );
+    }
+
+    /// An `io::Error` with no `errno` — here the one `std` returns for a
+    /// socket path holding a NUL, before any `connect()` — is reported with
+    /// its text in C's `PQcancel() -- connect() failed: ` line, not as
+    /// `error 0`. The divergence `docs/divergences.md` records.
+    #[test]
+    fn pqcancel_reports_a_failure_without_an_errno_by_its_text() {
+        let cancel = Cancel::new(Peer::Unix(PathBuf::from("/tmp/nul\0padded")), 99, &KEY);
+        let err = cancel.cancel().unwrap_err();
+        let reason = UnixStream::connect("/tmp/nul\0padded")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            CancelError::FailedWithoutErrno {
+                step: CancelStep::Connect,
+                reason: reason.clone()
+            }
+        );
+        assert_eq!(
+            err.message(),
+            format!("PQcancel() -- connect() failed: {reason}\n").into_bytes()
+        );
+        assert!(!err.message().ends_with(b"error 0\n"));
+
+        let write_zero =
+            CancelError::failed(CancelStep::Send, &io::Error::from(io::ErrorKind::WriteZero));
+        assert_eq!(
+            write_zero.message(),
+            format!(
+                "PQcancel() -- send() failed: {}\n",
+                io::Error::from(io::ErrorKind::WriteZero)
+            )
+            .into_bytes()
+        );
+    }
+
+    /// `conn->raddr` for a Unix socket is the path libpq dialled
+    /// (`fe-connect.c:3249` copies the address before `connect()`), not
+    /// what `getpeername` says afterwards. Here the two differ: the server
+    /// binds under `real/` and the client dials through the symlink `link/`,
+    /// so `getpeername` would answer `real/…`. On Darwin it answers the
+    /// whole NUL-padded `sun_path`, which a cancel cannot connect to at all.
+    #[test]
+    fn a_unix_peer_is_the_path_dialled_not_the_one_the_server_bound() {
+        let dir = std::env::temp_dir().join(format!("rlibpq-raddr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(real.join(".s.PGSQL.5432")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            // AuthenticationOk, BackendKeyData (pid 99), ReadyForQuery.
+            socket
+                .write_all(b"R\0\0\0\x08\0\0\0\0K\0\0\0\x0c\0\0\0\x63\x01\x02\x03\x04Z\0\0\0\x05I")
+                .unwrap();
+            socket
+        });
+
+        let info = crate::conninfo::parse_conninfo(
+            format!("host={} port=5432 user=u", link.display()).as_bytes(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&info).unwrap();
+        let socket = server.join().unwrap();
+
+        let dialled = link.join(".s.PGSQL.5432");
+        assert_eq!(conn.peer(), Some(Peer::Unix(dialled.clone())));
+        assert_eq!(conn.get_cancel().unwrap().peer(), &Peer::Unix(dialled));
+        drop((conn, socket));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `retry4` … `retry5`: the packet goes out whole, then one read, whose

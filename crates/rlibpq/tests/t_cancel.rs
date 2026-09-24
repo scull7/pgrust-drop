@@ -116,10 +116,13 @@ fn a_sleep_is_cancelled_promptly_over_the_unix_socket() {
         return;
     };
     let conn = cluster.connect();
-    assert!(
-        matches!(conn.peer(), Some(Peer::Unix(_))),
-        "{:?}",
-        conn.peer()
+    // The socket path dialled, as C's `conn->raddr` (`fe-connect.c:3249`):
+    // not `getpeername`'s answer, which on Darwin is NUL-padded.
+    assert_eq!(
+        conn.peer(),
+        Some(Peer::Unix(
+            cluster.dir.join(format!(".s.PGSQL.{}", cluster.port))
+        ))
     );
     let mut monitor = cluster.connect();
     both_apis_cancel_promptly(conn, &mut monitor);

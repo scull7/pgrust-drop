@@ -353,19 +353,27 @@ impl Stream {
         }
     }
 
-    /// The address this socket is connected to, as the kernel reports it
-    /// now: what [`Connection::connect`] records as `conn->raddr`. `None`
-    /// when the socket has no peer — a TCP peer that has reset it answers
-    /// `ENOTCONN` — or a Unix peer has no path.
+    /// `conn->raddr` for a socket [`Stream::connect`] opened to `address`:
+    /// the address it was dialled at, as C copies the address it is about to
+    /// `connect()` to (`fe-connect.c:3249`) rather than asking the kernel
+    /// afterwards.
+    ///
+    /// A Unix peer is the path this side dialled. `getpeername` is no
+    /// substitute there: it answers with whatever the server bound — another
+    /// spelling of the path, through a symlink or relative to the server's
+    /// directory — and on Darwin with the whole `sun_path`, NUL padding
+    /// included, which `std` keeps as part of the path, so a cancel sent to
+    /// it cannot even be connected. A TCP peer is the resolved address the
+    /// connect succeeded on, which `std` chooses among the name's addresses
+    /// and reports only through `getpeername`; asked straight after the
+    /// connect, that is the connect target. `None` when the TCP peer has
+    /// already gone (`ENOTCONN`).
     #[must_use]
-    pub fn peer(&self) -> Option<Peer> {
-        match self {
-            Stream::Tcp(s) => s.peer_addr().ok().map(Peer::Tcp),
-            Stream::Unix(s) => s
-                .peer_addr()
-                .ok()?
-                .as_pathname()
-                .map(|path| Peer::Unix(path.to_path_buf())),
+    pub fn raddr(&self, address: &Address) -> Option<Peer> {
+        match (self, address) {
+            (_, Address::Unix(path)) => Some(Peer::Unix(path.clone())),
+            (Stream::Tcp(s), Address::Tcp { .. }) => s.peer_addr().ok().map(Peer::Tcp),
+            (Stream::Unix(_), Address::Tcp { .. }) => None,
         }
     }
 
@@ -508,7 +516,7 @@ impl Connection<Stream> {
         // conninfo C would have rejected.
         let address = socket_address(conninfo)?;
         let stream = Stream::connect(&address)?;
-        let raddr = stream.peer();
+        let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
         let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
         conn.raddr = raddr;
@@ -1321,7 +1329,7 @@ impl<S: Read + Write> Connection<S> {
     /// (`fe-cancel.c:170`, `:406`): recorded once by
     /// [`Connection::connect`], so a peer that has since reset the socket
     /// does not lose it. `None` only when the stream was not opened there,
-    /// or a Unix peer has no path.
+    /// or a TCP peer was gone before it could be recorded.
     #[must_use]
     pub fn peer(&self) -> Option<Peer> {
         self.raddr.clone()

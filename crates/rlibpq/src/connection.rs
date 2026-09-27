@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::cancel::Peer;
@@ -392,6 +393,17 @@ impl Stream {
             Stream::Unix(s) => s.set_nonblocking(nonblocking),
         }
     }
+
+    /// Bound a blocking read by `timeout`, or lift the bound with `None`.
+    ///
+    /// # Errors
+    /// The socket refused the change, or `timeout` is zero.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(timeout),
+            Stream::Unix(s) => s.set_read_timeout(timeout),
+        }
+    }
 }
 
 impl Read for Stream {
@@ -453,6 +465,18 @@ fn auth_response(message: &Frontend) -> AuthResponse {
         Frontend::SaslResponse(_) => AuthResponse::Sasl,
         _ => AuthResponse::None,
     }
+}
+
+/// `PGnotify`, `libpq-fe.h:228`: one notification, as
+/// [`Connection::notifies`] hands it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notify {
+    /// `relname`: the channel the notification was sent on.
+    pub relname: Vec<u8>,
+    /// `be_pid`: the server process that sent it.
+    pub be_pid: i32,
+    /// `extra`: its payload, empty when it had none.
+    pub extra: Vec<u8>,
 }
 
 /// What `PQgetCopyData` returned (`fe-exec.c:2823`), less its `-2`, which is
@@ -556,6 +580,51 @@ impl Connection<Stream> {
         match read {
             Err(ConnectionError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
             other => other,
+        }
+    }
+
+    /// Sleep until the server sends something or `end_time` passes, and
+    /// read what it sent: what a client does with `select(2)` on `PQsocket`
+    /// followed by `PQconsumeInput` (`testlibpq2.c:117`-`:132`), or with
+    /// `PQsocketPoll(PQsocket(conn), 1, 0, end_time)` (`fe-misc.c:1285`).
+    /// `None` waits for ever, `PQsocketPoll`'s `-1`; an `end_time` already
+    /// past does not wait at all. `false` means it passed with nothing read.
+    ///
+    /// `std` has no way to wait for a socket to become readable without
+    /// reading it, and this crate has no libc (AGENTS.md), so `PQsocket`'s
+    /// descriptor is not handed out to be polled. The bytes that end the
+    /// wait are read into the input buffer here, where `PQconsumeInput`
+    /// would have put them, and are not parsed: [`Connection::notifies`]
+    /// parses them.
+    ///
+    /// # Errors
+    /// The socket failed, or the server closed the connection.
+    pub fn wait_for_input(&mut self, end_time: Option<Instant>) -> Result<bool, ConnectionError> {
+        let timeout = end_time.map(|end| end.saturating_duration_since(Instant::now()));
+        let read = if timeout == Some(Duration::ZERO) {
+            // `set_read_timeout` refuses zero; a timeout already past is a
+            // read that does not block.
+            self.stream.set_nonblocking(true)?;
+            let read = self.read_more();
+            self.stream.set_nonblocking(false)?;
+            read
+        } else {
+            self.stream.set_read_timeout(timeout)?;
+            let read = self.read_more();
+            self.stream.set_read_timeout(None)?;
+            read
+        };
+        match read {
+            Ok(()) => Ok(true),
+            Err(ConnectionError::Io(err))
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err),
         }
     }
 }
@@ -1370,11 +1439,34 @@ impl<S: Read + Write> Connection<S> {
         &self.notices
     }
 
-    /// The notifications collected so far, oldest first — what `PQnotifies`
-    /// hands out one at a time: pid, channel, payload.
+    /// The notifications collected and not yet handed out by
+    /// [`Connection::notifies`], oldest first: pid, channel, payload.
     #[must_use]
     pub fn notifications(&self) -> &[(i32, Vec<u8>, Vec<u8>)] {
         &self.notifications
+    }
+
+    /// `PQnotifies`, `fe-exec.c:2684`: parse whatever has already been read,
+    /// then hand out the oldest notification not handed out yet, or `None`.
+    /// Each is handed out once. Nothing is read from the socket; that is
+    /// [`Connection::consume_input`]'s job, or any call that waits for a
+    /// reply.
+    ///
+    /// # Errors
+    /// What has been read does not parse.
+    pub fn notifies(&mut self) -> Result<Option<Notify>, ConnectionError> {
+        self.parse_input()?;
+        if self.notifications.is_empty() {
+            return Ok(None);
+        }
+        // The queue is `conn->notifyHead` … `notifyTail`, popped at the
+        // head (`fe-exec.c:2694`); it holds what arrived since the last call.
+        let (be_pid, relname, extra) = self.notifications.remove(0);
+        Ok(Some(Notify {
+            relname,
+            be_pid,
+            extra,
+        }))
     }
 
     /// `PQclientEncoding`, `fe-connect.c:7728`: `conn->client_encoding`,
@@ -2933,6 +3025,41 @@ mod tests {
             }
             .encode()
         );
+    }
+
+    fn notification(pid: i32, channel: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut body = pid.to_be_bytes().to_vec();
+        body.extend_from_slice(channel);
+        body.push(0);
+        body.extend_from_slice(payload);
+        body.push(0);
+        message(b'A', &body)
+    }
+
+    /// `PQnotifies` parses first (`fe-exec.c:2692`), so a notification read
+    /// while idle (`fe-protocol3.c:153`) and not yet parsed is handed out,
+    /// after the one a command's reply carried; the queue is popped at its
+    /// head (`:2694`), each once.
+    #[test]
+    fn notifies_hands_out_each_notification_once_oldest_first() {
+        let mut reply = notification(7, b"a", b"one");
+        reply.extend(message(b'C', b"NOTIFY\0"));
+        reply.extend(ready(b'I'));
+        let mut conn = replayed(&reply);
+        conn.exec(b"notify a, 'one'").unwrap();
+        // What PQconsumeInput reads while the connection is idle.
+        conn.inbuf.extend(notification(8, b"b", b""));
+        assert_eq!(conn.notifications().len(), 1);
+
+        let notify = |relname: &[u8], be_pid, extra: &[u8]| Notify {
+            relname: relname.to_vec(),
+            be_pid,
+            extra: extra.to_vec(),
+        };
+        assert_eq!(conn.notifies().unwrap(), Some(notify(b"a", 7, b"one")));
+        assert_eq!(conn.notifies().unwrap(), Some(notify(b"b", 8, b"")));
+        assert_eq!(conn.notifies().unwrap(), None);
+        assert!(conn.notifications().is_empty());
     }
 
     /// `fe-protocol3.c:2320` and `:2348`: an ErrorResponse is the result.

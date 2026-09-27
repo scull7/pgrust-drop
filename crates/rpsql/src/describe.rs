@@ -39,8 +39,9 @@
 //! [`list_ts_templates_query`], `\dFt`) and SQL/MED family
 //! ([`list_foreign_servers_query`], `\des`; [`list_user_mappings_query`],
 //! `\deu`; [`list_foreign_data_wrappers_query`], `\dew`;
-//! [`list_foreign_tables_query`], `\det`). Only `\d` with a pattern
-//! (`describeTableDetails`) is still refused by name until its slice lands.
+//! [`list_foreign_tables_query`], `\det`); and slice 8's `\d` with a
+//! pattern, `describeTableDetails` and `describeOneTableDetails`, in
+//! [`table`].
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -49,6 +50,8 @@
 //! mistaken for a quote, a dot or a wildcard (`docs/divergences.md`).
 
 use std::fmt::Write as _;
+
+pub mod table;
 
 /// One `\d…` command, as `exec_command_d()` (`command.c:1021`) dispatches it.
 #[derive(Debug, Clone, PartialEq, Eq)]

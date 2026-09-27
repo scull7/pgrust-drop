@@ -35,7 +35,7 @@ use testkit::reference;
 
 use regress::{
     Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, head, only, section, sections, split,
-    tail, without,
+    tail,
 };
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
@@ -336,6 +336,7 @@ const PUBLICATIONS_SUBSCRIPTIONS_EXTENSIONS_PORT: u16 = 55_504;
 const SINGLE_QUERY_LISTINGS_PORT: u16 = 55_505;
 const INVALID_MULTIPART_NAMES_PORT: u16 = 55_506;
 const TEXT_SEARCH_AND_SQL_MED_PORT: u16 = 55_507;
+const TABLE_DETAILS_PORT: u16 = 55_508;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -435,11 +436,8 @@ fn every_execute_q_block_matches_psql_out() {
 /// exp` and `\dfx exp` under `tuples_only` in aligned, unaligned and
 /// wrapped, normal and expanded, through rpsql against a server. They run as
 /// one script because each starts from the `\pset` state the one before
-/// leaves (wrapped, old-ascii, `\pset columns 20`).
-///
-/// The last section also prints `\d psql_serial_tab_id_seq` six times. That
-/// is `describeTableDetails`, a later NAT-401 slice, and nothing else reads
-/// what it prints, so those lines are cut from both files ([`without`]).
+/// leaves (wrapped, old-ascii, `\pset columns 20`). The last section's six
+/// `\d psql_serial_tab_id_seq` describe a sequence under its settings.
 #[test]
 fn the_output_format_sections_run_live() {
     let Some(cluster) = Cluster::start(OUTPUT_FORMAT_SECTIONS_PORT) else {
@@ -449,15 +447,14 @@ fn the_output_format_sections_run_live() {
         "-- test multi-line headers, wrapping, and newline indicators",
         "-- test header/footer/tuples_only behavior in aligned/unaligned/wrapped cases",
     );
-    let (sql, expected) = without(&run, &["\\d psql_serial_tab_id_seq"]);
     gate_text(
         &cluster,
         &format!(
-            "psql.sql:{} vs psql.out:{} ({} …, without \\d <sequence>)",
+            "psql.sql:{} vs psql.out:{} ({} …)",
             run.sql_line, run.out_line, run.header
         ),
-        &sql,
-        &expected,
+        run.sql,
+        run.expected,
         // The support table, so that C psql can make it again.
         Some("drop table psql_serial_tab;\n"),
     );
@@ -486,17 +483,24 @@ fn every_document_format_block_matches_psql_out() {
 
 /// The same six sections live, with `-- special cases` and `-- illegal csv
 /// separators` after csv's and then `-- check ambiguous format requests`
-/// (`psql.sql:879`), all against one cluster: each prints `\df exp` under
-/// `tuples_only`, normal and expanded, in its format, then `q`.
+/// (`psql.sql:879`), all against one cluster: each prints `\d
+/// psql_serial_tab_id_seq` and `\df exp` under `tuples_only`, normal and
+/// expanded, in its format, then `q`.
 ///
-/// Each section also prints `\d psql_serial_tab_id_seq` twice. That is
-/// `describeTableDetails`, a later NAT-401 slice, and nothing else reads what
-/// it prints, so those lines are cut from both files ([`without`]).
+/// The sequence is `-- support table for output-format tests`'s
+/// (`psql.sql:500`), which [`the_output_format_sections_run_live`] gates;
+/// here it is made once, ungated, for both psqls.
 #[test]
 fn the_document_format_sections_run_live() {
     let Some(cluster) = Cluster::start(DOCUMENT_FORMAT_SECTIONS_PORT) else {
         return;
     };
+    let out = cluster.run_script(
+        Path::new(RPSQL),
+        "create table psql_serial_tab (id serial);\n",
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
     for header in [
         "-- test asciidoc output format",
         "-- test csv output format",
@@ -510,15 +514,14 @@ fn the_document_format_sections_run_live() {
         } else {
             section(header)
         };
-        let (sql, expected) = without(&whole, &["\\d psql_serial_tab_id_seq"]);
         gate_text(
             &cluster,
             &format!(
-                "psql.sql:{} vs psql.out:{} ({}, without \\d <sequence>)",
+                "psql.sql:{} vs psql.out:{} ({})",
                 whole.sql_line, whole.out_line, whole.header
             ),
-            &sql,
-            &expected,
+            whole.sql,
+            whole.expected,
             None,
         );
     }
@@ -659,13 +662,10 @@ fn display_width_matches_c_psql() {
 
 /// `-- check conditional am display` (`psql.sql:548`), live: `\d+`, `\dt+`,
 /// `\dm+` and `\dv+` with and without `HIDE_TABLEAM`, and `\d+x`, over
-/// tables, a view and a materialized view in two table access methods.
-///
-/// The section also describes three tables one by one (`\d+ tbl_heap_psql`,
-/// `\d+ tbl_heap` twice each, and `\d+x tbl_heap`). That is
-/// `describeTableDetails`, a later NAT-401 slice, and nothing else in the
-/// section reads what it prints, so those five lines and their tables are
-/// cut from both files ([`without`]).
+/// tables, a view and a materialized view in two table access methods, and
+/// `\d+ tbl_heap_psql`, `\d+ tbl_heap` (twice each) and `\d+x tbl_heap`,
+/// which describe a table, its access method shown or not, and never
+/// expanded.
 ///
 /// The section's clean-up, from `RESET ROLE;` on, is cut too ([`head`]):
 /// its `DROP SCHEMA … CASCADE` makes the server send a NOTICE, and rpsql
@@ -684,19 +684,15 @@ fn the_conditional_am_display_section_runs_live() {
     };
     let full = section("-- check conditional am display");
     let whole = head(&full, "RESET ROLE;");
-    let (sql, expected) = without(
-        &whole,
-        &["\\d+ tbl_heap_psql", "\\d+ tbl_heap", "\\d+x tbl_heap"],
-    );
     let preamble = "\\pset format wrapped\n\\pset columns 40\n";
     gate_text(
         &cluster,
         &format!(
-            "psql.sql:{} vs psql.out:{} ({}, without \\d <table>)",
+            "psql.sql:{} vs psql.out:{} ({})",
             whole.sql_line, whole.out_line, whole.header
         ),
-        &format!("{preamble}{sql}"),
-        &format!("{preamble}{expected}"),
+        &format!("{preamble}{}", whole.sql),
+        &format!("{preamble}{}", whole.expected),
         // The section's own clean-up, so that C psql starts where rpsql did.
         Some(tail(&full, "RESET ROLE;").sql),
     );
@@ -772,6 +768,10 @@ fn the_relation_listings_match_c_psql() {
 /// and is the session's), so the gate starts at `create schema testpart;`,
 /// which sits at the end of the section before. The second section drops
 /// all of it again, role included, so C psql starts where rpsql did.
+///
+/// `-- \d on toast table` (`psql.sql:1328`), which follows them, runs on the
+/// same cluster: `\d pg_toast.pg_toast_2619`, a TOAST table's columns, its
+/// owning table and its index.
 #[test]
 fn the_partitioned_relations_sections_run_live() {
     let Some(cluster) = Cluster::start(PARTITIONED_RELATIONS_PORT) else {
@@ -782,6 +782,10 @@ fn the_partitioned_relations_sections_run_live() {
         "-- only partition related object should be displayed",
     );
     gate_section(&cluster, &tail(&run, "create schema testpart;"));
+    gate_section(
+        &cluster,
+        &section("-- \\d on toast table (use pg_statistic's toast table, which has a known name)"),
+    );
 }
 
 /// `-- check printing info about access methods` (`psql.sql:1331`), live:
@@ -1751,6 +1755,365 @@ fn the_text_search_and_sql_med_listings_match_c_psql() {
     diff_against_c_psql(&cluster, "text search and SQL/MED listings", &script);
 }
 
+/// One relation of every kind `describeOneTableDetails` tells apart, in
+/// schema `s8`, with at least one of each thing a footer reports: indexes of
+/// every label (primary key, unique, unique constraint, exclusion, `WITHOUT
+/// OVERLAPS`, deferrable, clustered, replica identity, nulls not distinct,
+/// partial, in a tablespace), check, foreign-key and not-null constraints
+/// (inherited, `NO INHERIT`, `NOT VALID`), references from a plain and a
+/// partitioned table, policies under every row-security setting, statistics
+/// objects with some, all and no kinds and a target, rules and triggers in
+/// every firing mode (an inherited and a disabled internal trigger too),
+/// publications (all tables, a schema, a column list with a row filter),
+/// inheritance, partitions (a default, a partitioned and a foreign one, and
+/// a partitioned table with none), a typed table, each replica identity,
+/// options, generated, identity and collated columns, column comments,
+/// storage, compression and statistics targets, and sequences owned by a
+/// column, by an identity column and by nothing. The tablespace is an
+/// in-place one (`allow_in_place_tablespaces`), so no directory is needed.
+const TABLE_DETAILS_SETUP: &str = "set client_min_messages = error;\n\
+    create role regress_s8_role;\n\
+    set allow_in_place_tablespaces = on;\n\
+    create tablespace regress_s8_spc location '';\n\
+    create schema s8;\n\
+    create schema s8pub;\n\
+    create function s8.trgf() returns trigger language plpgsql as $$begin return new; end$$;\n\
+    create table s8.t (a int primary key, b text collate \"C\" not null default 'x',\n\
+      c int unique deferrable initially deferred, d int check (d > 0),\n\
+      e int generated always as (a * 2) stored, f int generated always as (a + 1) virtual,\n\
+      g int generated always as identity, h numeric(10,2) default 1.5,\n\
+      constraint t_d_c unique (d), constraint t_h_chk check (h < 100) no inherit)\n\
+      with (fillfactor = 70, toast.autovacuum_enabled = false);\n\
+    comment on column s8.t.a is 'the key';\n\
+    alter table s8.t alter column b set statistics 50;\n\
+    alter table s8.t alter column b set storage external;\n\
+    alter table s8.t alter column b set compression pglz;\n\
+    create unique index t_nnd on s8.t (h) nulls not distinct;\n\
+    create index t_partial on s8.t (d) where d > 10;\n\
+    create index t_expr on s8.t ((a + d));\n\
+    alter index s8.t_expr alter column 1 set statistics 10;\n\
+    cluster s8.t using t_pkey;\n\
+    create table s8.ref (x int references s8.t, y int, z int,\n\
+      constraint ref_yz foreign key (y) references s8.t (d) on delete cascade);\n\
+    alter table s8.ref disable trigger all;\n\
+    create table s8.ex (r int4range, valid daterange, exclude using gist (r with &&),\n\
+      constraint ex_pk primary key (r, valid without overlaps));\n\
+    create table s8.ri (a int not null, b int);\n\
+    create unique index ri_a on s8.ri (a) tablespace regress_s8_spc;\n\
+    alter table s8.ri replica identity using index ri_a;\n\
+    create table s8.rif (a int) tablespace regress_s8_spc;\n\
+    alter table s8.rif replica identity full;\n\
+    create table s8.rin (a int);\n\
+    alter table s8.rin replica identity nothing;\n\
+    create table s8.nn (a int, b int not null no inherit, c int);\n\
+    alter table s8.nn add constraint nn_c not null c not valid;\n\
+    create table s8.parent1 (p int not null, q int check (q > 0));\n\
+    create table s8.parent2 (r int);\n\
+    create table s8.child (s int) inherits (s8.parent1, s8.parent2);\n\
+    create table s8.child2 () inherits (s8.parent1);\n\
+    create table s8.pol (a int, owner text);\n\
+    alter table s8.pol enable row level security;\n\
+    create policy p_all on s8.pol using (owner = current_user);\n\
+    create policy p_sel on s8.pol as restrictive for select to regress_s8_role\n\
+      using (a > 0);\n\
+    create policy p_ins on s8.pol for insert with check (a < 100);\n\
+    create table s8.polf (a int);\n\
+    alter table s8.polf enable row level security;\n\
+    alter table s8.polf force row level security;\n\
+    create table s8.polfp (a int);\n\
+    alter table s8.polfp enable row level security;\n\
+    alter table s8.polfp force row level security;\n\
+    create policy p_upd on s8.polfp for update using (true);\n\
+    create table s8.pole (a int);\n\
+    alter table s8.pole enable row level security;\n\
+    create table s8.pold (a int);\n\
+    create policy p_del on s8.pold for delete using (a = 1);\n\
+    create table s8.st (a int, b int, c int);\n\
+    create statistics s8.st_some (ndistinct, mcv) on a, b from s8.st;\n\
+    create statistics s8.st_all on a, c from s8.st;\n\
+    create statistics s8.st_expr on (a + b) from s8.st;\n\
+    alter statistics s8.st_all set statistics 100;\n\
+    create table s8.rl (a int);\n\
+    create rule rl_on as on insert to s8.rl do also notify rl;\n\
+    create rule rl_off as on update to s8.rl do instead nothing;\n\
+    create rule rl_always as on delete to s8.rl do also notify rl_d;\n\
+    create table s8.rl2 (a int);\n\
+    create rule rl_replica as on insert to s8.rl2 do also notify rl2;\n\
+    alter table s8.rl disable rule rl_off;\n\
+    alter table s8.rl enable always rule rl_always;\n\
+    alter table s8.rl2 enable replica rule rl_replica;\n\
+    create trigger tg_on before insert on s8.rl for each row execute function s8.trgf();\n\
+    create trigger tg_off after update on s8.rl for each row execute function s8.trgf();\n\
+    create trigger tg_always after delete on s8.rl for each statement execute function s8.trgf();\n\
+    create trigger tg_replica before insert on s8.rl2 for each row execute function s8.trgf();\n\
+    alter table s8.rl disable trigger tg_off;\n\
+    alter table s8.rl enable always trigger tg_always;\n\
+    alter table s8.rl2 enable replica trigger tg_replica;\n\
+    create table s8.pt (a int, b text, primary key (a)) partition by range (a);\n\
+    create table s8.pt1 partition of s8.pt for values from (0) to (10);\n\
+    create table s8.pt2 partition of s8.pt for values from (10) to (20) partition by list (a);\n\
+    create table s8.pt2a partition of s8.pt2 for values in (10, 11);\n\
+    create table s8.ptd partition of s8.pt default;\n\
+    create table s8.ptref (a int references s8.pt) partition by hash (a);\n\
+    create table s8.ptref0 partition of s8.ptref for values with (modulus 2, remainder 0);\n\
+    create trigger tg_pt after insert on s8.pt for each row execute function s8.trgf();\n\
+    create table s8.empty_pt (a int) partition by list (a);\n\
+    create foreign data wrapper s8_fdw;\n\
+    create server s8_srv foreign data wrapper s8_fdw;\n\
+    create foreign table s8.ft (a int options (column_name 'x', \"odd\" 'it''s') not null\n\
+      default 1, b text) server s8_srv options (schema_name 's', table_name 't');\n\
+    comment on column s8.ft.b is 'a foreign column';\n\
+    create table s8.pt3 (a int) partition by list (a);\n\
+    create foreign table s8.ptf partition of s8.pt3 for values in (1) server s8_srv;\n\
+    create foreign table s8.ft2 (a int) server s8_srv;\n\
+    create type s8.ct as (a int, b text collate \"C\");\n\
+    comment on column s8.ct.a is 'a field';\n\
+    create table s8.typed of s8.ct (a primary key);\n\
+    create unlogged table s8.ul (a serial);\n\
+    create unlogged sequence s8.useq;\n\
+    create sequence s8.oseq owned by s8.rin.a;\n\
+    create view s8.v as select a, b from s8.t where a > 0;\n\
+    comment on column s8.v.a is 'a view column';\n\
+    create rule v_ins as on insert to s8.v do instead insert into s8.t (a, b) values (new.a, new.b);\n\
+    create trigger tg_v instead of update on s8.v for each row execute function s8.trgf();\n\
+    create materialized view s8.mv as select a from s8.t;\n\
+    create index mv_a on s8.mv (a);\n\
+    create publication s8_all for all tables;\n\
+    create publication s8_cols for table s8.t (a, b) where (a > 5);\n\
+    create publication s8_schema for tables in schema s8pub;\n\
+    create table s8pub.pubt (a int);\n";
+
+/// Each relation of [`TABLE_DETAILS_SETUP`] with and without `+`, under
+/// `ECHO_HIDDEN` so every one of `describeOneTableDetails`'s queries is
+/// compared too; `HIDE_TABLEAM` and `HIDE_TOAST_COMPRESSION` both ways; a
+/// pattern naming several relations, one naming a system relation with and
+/// without `S`, a TOAST table found through its owner; `x`, which the
+/// description ignores except for a sequence; nothing found, loud and
+/// quiet; too many dots, and a database part; and `noexec`.
+const TABLE_DETAILS_COMMANDS: &str = "\\set QUIET off\n\
+    \\set ECHO_HIDDEN on\n\
+    \\d s8.t\n\
+    \\d+ s8.t\n\
+    \\set HIDE_TOAST_COMPRESSION off\n\
+    \\set HIDE_TABLEAM off\n\
+    \\d+ s8.t\n\
+    \\d+ s8.mv\n\
+    \\d+ s8.pt\n\
+    \\set HIDE_TOAST_COMPRESSION on\n\
+    \\set HIDE_TABLEAM on\n\
+    \\d s8.t_pkey\n\
+    \\d+ s8.t_nnd\n\
+    \\d s8.t_partial\n\
+    \\d+ s8.t_expr\n\
+    \\d s8.t_c_key\n\
+    \\d s8.ref\n\
+    \\d+ s8.ex\n\
+    \\d s8.ex_pk\n\
+    \\d s8.ri\n\
+    \\d s8.ri_a\n\
+    \\d+ s8.ri\n\
+    \\d+ s8.rif\n\
+    \\d+ s8.rin\n\
+    \\d+ s8.nn\n\
+    \\d s8.parent1\n\
+    \\d+ s8.parent1\n\
+    \\d+ s8.child\n\
+    \\d s8.pol\n\
+    \\d s8.polf\n\
+    \\d s8.polfp\n\
+    \\d s8.pole\n\
+    \\d s8.pold\n\
+    \\d s8.st\n\
+    \\d s8.rl\n\
+    \\d s8.rl2\n\
+    \\d s8.pt\n\
+    \\d+ s8.pt1\n\
+    \\d s8.pt2\n\
+    \\d+ s8.pt2\n\
+    \\d+ s8.ptd\n\
+    \\d s8.pt_pkey\n\
+    \\d+ s8.pt_pkey\n\
+    \\d s8.ptref\n\
+    \\d s8.ptref0\n\
+    \\d+ s8.empty_pt\n\
+    \\d s8.ft\n\
+    \\d+ s8.ft\n\
+    \\d+ s8.ptf\n\
+    \\d+ s8.pt3\n\
+    \\d s8.ct\n\
+    \\d+ s8.ct\n\
+    \\d+ s8.typed\n\
+    \\d s8.ul\n\
+    \\d s8.ul_a_seq\n\
+    \\d s8.useq\n\
+    \\d s8.oseq\n\
+    \\d s8.t_g_seq\n\
+    \\dSx s8.t_g_seq\n\
+    \\d s8.v\n\
+    \\d+ s8.v\n\
+    \\d s8.mv\n\
+    \\d+ s8pub.pubt\n\
+    \\d s8.p*\n\
+    \\d pg_am\n\
+    \\dS+ pg_am\n\
+    \\d+ pg_catalog.pg_am_oid_index\n\
+    \\d nonesuch\n\
+    \\d s8.nonesuch\n\
+    \\set ECHO_HIDDEN noexec\n\
+    \\d s8.t\n\
+    \\set ECHO_HIDDEN off\n\
+    \\d a.b.c.d\n\
+    \\d postgres.s8.t\n\
+    \\d other.s8.t\n\
+    \\set QUIET on\n\
+    \\d nonesuch\n\
+    \\set QUIET off\n";
+
+/// A TOAST table with `+`, and its index. A TOAST table's name has its
+/// owner's oid in it, and `\gset` is not ported yet, so these are
+/// `pg_statistic`'s, whose name `psql.sql:1329` relies on too.
+const TABLE_DETAILS_TOAST: &str = "\\d+ pg_toast.pg_toast_2619\n\\d pg_toast.pg_toast_2619_index\n";
+
+/// `\d s8.t`, `\d s8.pt`, `\d s8.useq` and `\d s8.t_pkey` (a table, a
+/// partitioned table, a sequence, an index), normal and with `x`, in every
+/// format at borders 0 and 2, with `tuples_only`, and with `\pset footer
+/// off`. A sequence alone is printed expanded by `x`. `wrapped` needs a
+/// target width this port does not take from the terminal, hence
+/// `\pset columns`.
+fn table_details_in_every_format() -> String {
+    let mut script = String::from("\\pset columns 60\n");
+    for format in [
+        "aligned",
+        "wrapped",
+        "unaligned",
+        "csv",
+        "html",
+        "asciidoc",
+        "latex",
+        "latex-longtable",
+        "troff-ms",
+    ] {
+        let _ = writeln!(script, "\\pset format {format}");
+        for settings in [
+            "\\pset border 0\n",
+            "\\pset border 2\n",
+            "\\pset tuples_only on\n",
+            "\\pset tuples_only off\n\\pset footer off\n",
+        ] {
+            script.push_str(settings);
+            script.push_str(
+                "\\d s8.t\n\\d+ s8.pt\n\\d s8.useq\n\\d+x s8.useq\n\\d s8.t_pkey\n\\dSx s8.t_pkey\n",
+            );
+        }
+        script.push_str("\\pset footer on\n\\pset border 1\n");
+    }
+    script
+}
+
+/// `describeTableDetails` and `describeOneTableDetails` beyond what
+/// `psql.sql` exercises (a sequence, a table's columns and access method, a
+/// TOAST table), against C psql, over [`TABLE_DETAILS_SETUP`]:
+/// [`TABLE_DETAILS_COMMANDS`], [`TABLE_DETAILS_TOAST`], then
+/// [`table_details_in_every_format`].
+///
+/// An index left invalid by a failed `create unique index concurrently` is
+/// made separately, since its setup must fail.
+#[test]
+fn the_table_details_match_c_psql() {
+    let Some(cluster) = Cluster::start(TABLE_DETAILS_PORT) else {
+        return;
+    };
+    let out = cluster.run_script(Path::new(RPSQL), TABLE_DETAILS_SETUP);
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+    cluster.run_script(
+        Path::new(RPSQL),
+        "create table s8.inv (a int);\n\
+         insert into s8.inv values (1), (1);\n\
+         create unique index concurrently inv_a on s8.inv (a);\n",
+    );
+    let script = format!(
+        "{TABLE_DETAILS_COMMANDS}\\d s8.inv\n\\d s8.inv_a\n{TABLE_DETAILS_TOAST}{}",
+        table_details_in_every_format()
+    );
+    let ours = diff_against_c_psql(&cluster, "table details", &script);
+    // Every footer the setup is there to reach, so that a setup statement
+    // that stops making one cannot narrow the gate unnoticed.
+    let text = String::from_utf8_lossy(&ours);
+    for footer in TABLE_DETAILS_FOOTERS {
+        assert!(text.contains(footer), "no {footer:?} in:\n{text}");
+    }
+}
+
+/// What [`the_table_details_match_c_psql`] must print at least once.
+const TABLE_DETAILS_FOOTERS: [&str; 65] = [
+    "\n    \"t_pkey\" PRIMARY KEY, btree (a) CLUSTER\n",
+    "UNIQUE CONSTRAINT, btree (c) DEFERRABLE INITIALLY DEFERRED\n",
+    "\"t_nnd\" UNIQUE, btree (h) NULLS NOT DISTINCT\n",
+    "\"ex_pk\" PRIMARY KEY (r, valid WITHOUT OVERLAPS)\n",
+    "\"ex_r_excl\" EXCLUDE USING gist (r WITH &&)\n",
+    "REPLICA IDENTITY, tablespace \"regress_s8_spc\"\n",
+    "\"inv_a\" UNIQUE, btree (a) INVALID\n",
+    "primary key, btree, for table \"s8.t\", clustered\n",
+    "unique nulls not distinct, btree, for table \"s8.t\"\n",
+    "btree, for table \"s8.t\", predicate (d > 10)\n",
+    "deferrable, initially deferred\n",
+    "for table \"s8.ri\", replica identity\n",
+    "for table \"s8.inv\", invalid\n",
+    "Tablespace: \"regress_s8_spc\"\n",
+    "Check constraints:\n",
+    "CHECK (h < 100::numeric) NO INHERIT\n",
+    "Foreign-key constraints:\n",
+    "Referenced by:\n",
+    "    TABLE \"s8.ptref\" CONSTRAINT \"ptref_a_fkey\" FOREIGN KEY (a) REFERENCES s8.pt(a)\n",
+    "Policies:\n",
+    "AS RESTRICTIVE FOR SELECT\n      TO regress_s8_role\n      USING ((a > 0))\n",
+    "Policies (forced row security enabled):\n",
+    "Policies (row security enabled): (none)\n",
+    "Policies (forced row security enabled): (none)\n",
+    "Policies (row security disabled):\n",
+    "Statistics objects:\n",
+    "\"s8.st_some\" (ndistinct, mcv) ON a, b FROM s8.st\n",
+    "\"s8.st_all\" ON a, c FROM s8.st; STATISTICS 100\n",
+    "Rules:\n",
+    "Disabled rules:\n",
+    "Rules firing always:\n",
+    "Rules firing on replica only:\n",
+    "Triggers:\n",
+    "Disabled user triggers:\n",
+    "Disabled internal triggers:\n",
+    "Triggers firing always:\n",
+    "Triggers firing on replica only:\n",
+    ", ON TABLE s8.pt\n",
+    "Publications:\n    \"s8_all\"\n    \"s8_cols\" (a, b) WHERE (a > 5)\n",
+    "    \"s8_schema\"\n",
+    "Not-null constraints:\n",
+    "NOT VALID\n",
+    "\" NO INHERIT\n",
+    "(inherited)\n",
+    "View definition:\n",
+    "Inherits: s8.parent1,\n          s8.parent2\n",
+    "Child tables: s8.child,\n",
+    "Partitions: s8.pt1 FOR VALUES FROM (0) TO (10),\n",
+    ", PARTITIONED,\n",
+    ", FOREIGN\n",
+    "Number of partitions: 0\n",
+    "Replica Identity: ???\n",
+    "Replica Identity: FULL\n",
+    "Typed table of type: s8.ct\n",
+    "Access method: heap\n",
+    "Options: fillfactor=70, toast.autovacuum_enabled=false\n",
+    "| pglz ",
+    "Server: s8_srv\nFDW options: (schema_name 's', table_name 't')\n",
+    "Partition key: RANGE (a)\n",
+    "Partition constraint: ",
+    "Owning table: \"pg_catalog.pg_statistic\"\n",
+    "Unlogged sequence \"s8.useq\"",
+    "Owned by: s8.rin.a\n",
+    "Sequence for identity column: s8.t.g\n",
+    "-[ RECORD 1 ]",
+];
+
 /// A script `psql.out` has no expected output for: rpsql must render all of
 /// it, and print what C psql prints when this lane has C psql.
 ///
@@ -1758,7 +2121,9 @@ fn the_text_search_and_sql_med_listings_match_c_psql() {
 /// `is not implemented yet`, and no server `ERROR`. Upstream's own "…are not
 /// implemented: <pattern>" (`describe.c:6380`) is output to diff, not a
 /// refusal.
-fn diff_against_c_psql(cluster: &Cluster, what: &str, script: &str) {
+///
+/// Returns rpsql's output, for a caller that checks what it covered.
+fn diff_against_c_psql(cluster: &Cluster, what: &str, script: &str) -> Vec<u8> {
     let ours = cluster.run_script(Path::new(RPSQL), script);
     let text = String::from_utf8_lossy(&ours);
     assert!(
@@ -1774,4 +2139,5 @@ fn diff_against_c_psql(cluster: &Cluster, what: &str, script: &str) {
         }
         None => reference::skip("psql"),
     }
+    ours
 }

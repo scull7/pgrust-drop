@@ -41,6 +41,8 @@ use crate::settings::{Expanded, PrintQueryOpt, PsqlSettings};
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
+mod table_details;
+
 /// `backslashResult` (`command.h:15`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandResult {
@@ -308,10 +310,15 @@ fn exec_command_d(
             stdout,
             stderr,
         ),
-        DescribeCommand::TableDetails => {
-            not_yet(&pset, cmd, "describeTableDetails", stderr);
-            false
-        }
+        DescribeCommand::TableDetails => table_details::describe_table_details(
+            pattern,
+            flags,
+            server,
+            &pset,
+            ctx.executor,
+            stdout,
+            stderr,
+        ),
         DescribeCommand::Roles => {
             describe_roles(pattern, flags, server, &pset, ctx.executor, stdout, stderr)
         }
@@ -568,16 +575,6 @@ fn arg_patterns(pattern: Option<&str>, options: &[SlashOption]) -> Vec<String> {
         .take(FUNC_MAX_ARGS)
         .map(SlashOption::without_trailing_semicolons)
         .collect()
-}
-
-/// Refuse a `\d` command whose `describe.c` function has not been ported,
-/// naming both, rather than print something that only looks right.
-fn not_yet(pset: &PsqlSettings, cmd: &str, function: &str, stderr: &mut dyn Write) {
-    let _ = writeln!(
-        stderr,
-        "{}\\{cmd}: {function} is not implemented yet (Linear NAT-401)",
-        log_prefix(pset, LogLevel::Error)
-    );
 }
 
 /// The shape most `describe.c` listings share: build the query, run it
@@ -2091,14 +2088,129 @@ mod tests {
     }
 
     #[test]
-    fn an_unported_d_command_is_refused_by_name_and_an_unknown_one_is_invalid() {
-        let details = run("\\d t");
-        assert_eq!(details.result, CommandResult::Error);
-        assert_eq!(
-            details.stderr,
-            "psql: error: \\d: describeTableDetails is not implemented yet (Linear NAT-401)\n"
-        );
+    fn an_unknown_d_command_is_invalid() {
         let unknown = run("\\dz");
         assert_eq!(unknown.stderr, "psql: error: invalid command \\dz\n");
+    }
+
+    /// `pg_class`'s row for `relkind`, as `describeOneTableDetails` asks for
+    /// it: no index, rule, trigger or check, permanent, default tablespace.
+    fn table_info(relkind: &str) -> Vec<QueryResult> {
+        relations(
+            &["relchecks"; 15],
+            &[&[
+                "0", relkind, "f", "f", "f", "f", "f", "f", "f", "", "0", "", "p", "d", "heap",
+            ]],
+        )
+    }
+
+    fn none(columns: usize) -> Vec<QueryResult> {
+        relations(&vec!["x"; columns], &[])
+    }
+
+    #[test]
+    fn d_with_a_pattern_describes_each_relation_it_finds() {
+        let answers = vec![
+            relations(&["oid", "nspname", "relname"], &[&["16384", "public", "t"]]),
+            table_info("r"),
+            relations(
+                &["attname"; 7],
+                &[
+                    &["a", "integer", "", "t", "", "", ""],
+                    &["b", "text", "'x'::text", "f", "C", "", ""],
+                ],
+            ),
+            // Foreign keys, references, policies, statistics, publications,
+            // parents, children: none of each.
+            none(4),
+            none(3),
+            none(6),
+            none(9),
+            none(3),
+            none(1),
+            none(4),
+        ];
+        let (run, seen) = run_with("\\d t", pg18(), Some(answers));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(run.stderr, "");
+        assert_eq!(seen.len(), 10);
+        assert!(seen[0].contains("WHERE c.relname OPERATOR(pg_catalog.~) '^(t)$'"));
+        assert!(seen[1].ends_with("WHERE c.oid = '16384';"));
+        assert!(seen[9].contains("WHERE c.oid = i.inhrelid AND i.inhparent = '16384'"));
+        assert_eq!(
+            run.stdout,
+            "                  Table \"public.t\"\n \
+             Column |  Type   | Collation | Nullable |  Default  \n\
+             --------+---------+-----------+----------+-----------\n \
+             a      | integer |           | not null | \n \
+             b      | text    | C         |          | 'x'::text\n\n"
+        );
+    }
+
+    #[test]
+    fn d_says_when_nothing_matched_unless_quiet_and_fails_either_way() {
+        let (run, _) = run_with("\\d nosuch", pg18(), Some(vec![none(3)]));
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: Did not find any relation named \"nosuch\".\n"
+        );
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..pg18()
+        };
+        let (run, _) = run_with("\\d nosuch", quiet, Some(vec![none(3)]));
+        assert_eq!(
+            (run.result, run.stderr.as_str()),
+            (CommandResult::Error, "")
+        );
+
+        // A relation dropped between the two queries.
+        let answers = vec![
+            relations(&["oid", "nspname", "relname"], &[&["16384", "public", "t"]]),
+            none(15),
+        ];
+        let (run, _) = run_with("\\d t", pg18(), Some(answers));
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: Did not find any relation with OID 16384.\n"
+        );
+
+        // An index whose `pg_index` row is gone stops without a word
+        // (`describe.c:2347`).
+        let answers = vec![
+            relations(&["oid", "nspname", "relname"], &[&["16385", "public", "i"]]),
+            table_info("i"),
+            relations(&["attname"; 4], &[&["a", "integer", "yes", "a"]]),
+            none(11),
+        ];
+        let (run, _) = run_with("\\d i", pg18(), Some(answers));
+        assert_eq!(
+            (run.result, run.stdout.as_str(), run.stderr.as_str()),
+            (CommandResult::Error, "", "")
+        );
+    }
+
+    #[test]
+    fn a_sequence_is_printed_as_a_query_and_x_expands_it() {
+        let answers = vec![
+            relations(&["oid", "nspname", "relname"], &[&["16386", "public", "s"]]),
+            table_info("S"),
+            relations(&["Type", "Start"], &[&["bigint", "1"]]),
+            relations(&["owner", "deptype"], &[&["public.t.id", "a"]]),
+        ];
+        let (run, seen) = run_with("\\dSx s", pg18(), Some(answers));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert!(seen[2].ends_with("FROM pg_catalog.pg_sequence\nWHERE seqrelid = '16386';"));
+        assert_eq!(
+            run.stdout,
+            "Sequence \"public.s\"\n\
+             -[ RECORD 1 ]-\n\
+             Type  | bigint\n\
+             Start | 1\n\
+             \n\
+             Owned by: public.t.id\n\n"
+        );
     }
 }

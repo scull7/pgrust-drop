@@ -540,6 +540,7 @@ mod tests {
         let opt = |value: &str, quote| SlashOption {
             value: value.to_string(),
             quote,
+            unquoted_tail: 0,
         };
         assert_eq!(echo_text(&[opt("a", None), opt("b", None)]), b"a b\n");
         assert_eq!(echo_text(&[opt("-n", None), opt("a", None)]), b"a");

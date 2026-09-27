@@ -21,6 +21,11 @@ pub struct SlashOption {
     pub value: String,
     /// The quoting mark, or `None` for an unquoted word.
     pub quote: Option<char>,
+    /// `unquoted_option_chars` (`psqlscanslash.l:47`): how many characters
+    /// at the end of the argument were not subject to any form of quoting,
+    /// which bounds how many trailing semicolons
+    /// [`SlashOption::without_trailing_semicolons`] may strip.
+    pub unquoted_tail: usize,
 }
 
 impl SlashOption {
@@ -30,6 +35,37 @@ impl SlashOption {
     pub fn backquote(&self) -> bool {
         self.quote == Some('`')
     }
+
+    /// The argument as `psql_scan_slash_option(…, semicolon = true)` returns
+    /// it for `OT_NORMAL` (`psqlscanslash.l:604`): unquoted trailing
+    /// semicolons stripped, so `\dt foo;` names `foo`.
+    #[must_use]
+    pub fn without_trailing_semicolons(&self) -> String {
+        let mut value = self.value.as_str();
+        let mut budget = self.unquoted_tail;
+        while budget > 0 && value.ends_with(';') {
+            value = &value[..value.len() - 1];
+            budget -= 1;
+        }
+        value.to_string()
+    }
+}
+
+/// What `Scanner::read_variable` made of a colon, which decides what
+/// happens to `unquoted_option_chars` (`psqlscanslash.l:230`-`:317`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColonRead {
+    /// `:name`, `:'name'` or `:"name"` was substituted: the argument is now
+    /// quoted as `':'`, and the count starts over.
+    Substituted,
+    /// `:name` with no such variable: emitted as typed, and the count still
+    /// starts over (`psqlscanslash.l:264`).
+    Undefined,
+    /// `:{?name}` became `TRUE` or `FALSE`, which leaves the count alone.
+    Tested,
+    /// Not a reference: the colon alone was emitted, as one more unquoted
+    /// character.
+    ThrownBack,
 }
 
 impl Scanner {
@@ -64,6 +100,7 @@ impl Scanner {
 
         let mut out = Vec::new();
         let mut quote: Option<char> = None;
+        let mut unquoted_tail = 0;
         loop {
             let rest = self.rest().to_vec();
             if rest.is_empty() {
@@ -78,30 +115,38 @@ impl Scanner {
             match c {
                 b'\'' => {
                     quote = Some('\'');
+                    unquoted_tail = 0;
                     self.skip(1);
                     self.read_single_quoted(&mut out);
                 }
                 b'"' => {
                     quote = Some('"');
+                    unquoted_tail = 0;
                     self.skip(1);
                     out.push(b'"');
                     self.read_double_quoted(&mut out);
                 }
                 b'`' => {
                     quote = Some('`');
+                    unquoted_tail = 0;
                     self.skip(1);
                     let n = self.rest().iter().take_while(|&&b| b != b'`').count();
                     out.extend_from_slice(&self.rest()[..n]);
                     self.skip(n + usize::from(self.rest().len() > n));
                 }
-                b':' => {
-                    if self.read_variable(&mut out, vars) {
+                b':' => match self.read_variable(&mut out, vars) {
+                    ColonRead::Substituted => {
                         quote = Some(':');
+                        unquoted_tail = 0;
                     }
-                }
+                    ColonRead::Undefined => unquoted_tail = 0,
+                    ColonRead::Tested => {}
+                    ColonRead::ThrownBack => unquoted_tail += 1,
+                },
                 _ => {
                     self.skip(1);
                     out.push(c);
+                    unquoted_tail += 1;
                 }
             }
         }
@@ -114,6 +159,7 @@ impl Scanner {
         Some(SlashOption {
             value: String::from_utf8_lossy(&out).into_owned(),
             quote,
+            unquoted_tail,
         })
     }
 
@@ -228,8 +274,8 @@ impl Scanner {
     }
 
     /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`).
-    /// Returns whether a substitution actually happened.
-    fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> bool {
+    /// Returns what it made of the colon.
+    fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> ColonRead {
         let rest = self.rest().to_vec();
 
         if let Some(&delim @ (b'\'' | b'"')) = rest.get(1) {
@@ -253,12 +299,12 @@ impl Scanner {
                 });
                 self.skip(3 + len);
                 out.extend_from_slice(value.as_bytes());
-                return true;
+                return ColonRead::Substituted;
             }
             // Throw back everything but the colon.
             self.skip(1);
             out.push(b':');
-            return false;
+            return ColonRead::ThrownBack;
         }
 
         if rest.get(1) == Some(&b'{') && rest.get(2) == Some(&b'?') {
@@ -271,11 +317,11 @@ impl Scanner {
                 let set = vars.get_variable(&name, QuoteType::Plain).is_some();
                 self.skip(4 + len);
                 out.extend_from_slice(if set { b"TRUE" } else { b"FALSE" });
-                return false;
+                return ColonRead::Tested;
             }
             self.skip(1);
             out.push(b':');
-            return false;
+            return ColonRead::ThrownBack;
         }
 
         let len = rest[1..]
@@ -285,18 +331,18 @@ impl Scanner {
         if len == 0 {
             self.skip(1);
             out.push(b':');
-            return false;
+            return ColonRead::ThrownBack;
         }
         let name = String::from_utf8_lossy(&rest[1..=len]).into_owned();
         self.skip(1 + len);
         if let Some(value) = vars.get_variable(&name, QuoteType::Plain) {
             out.extend_from_slice(value.as_bytes());
-            true
+            ColonRead::Substituted
         } else {
             // The value is emitted as typed when the variable is unset.
             out.push(b':');
             out.extend_from_slice(name.as_bytes());
-            false
+            ColonRead::Undefined
         }
     }
 }
@@ -426,5 +472,38 @@ mod tests {
     fn a_backquoted_argument_is_flagged_rather_than_run() {
         let (_, options) = slash("\\echo `date`", &NoVariables);
         assert!(options[0].backquote());
+    }
+
+    #[test]
+    fn unquoted_trailing_semicolons_are_stripped_on_request() {
+        // `psqlscanslash.l:604`: `\dt foo;` names `foo`.
+        let stripped = |line: &str| {
+            let (_, options) = slash(line, &NoVariables);
+            options[0].without_trailing_semicolons()
+        };
+        assert_eq!(stripped("\\dt foo;"), "foo");
+        assert_eq!(stripped("\\dt foo;;"), "foo");
+        // Only the characters after the last quote are unquoted.
+        assert_eq!(stripped("\\dt 'foo;'"), "foo;");
+        assert_eq!(stripped("\\dt \"a;\";"), "\"a;\"");
+        assert_eq!(stripped("\\dt 'a';;"), "a");
+        // Without the request, the semicolon is part of the value.
+        let (_, options) = slash("\\dt foo;", &NoVariables);
+        assert_eq!(options[0].value, "foo;");
+    }
+
+    #[test]
+    fn a_substituted_variable_is_quoted_so_its_semicolons_stay() {
+        struct Semi;
+        impl VariableSource for Semi {
+            fn get_variable(&self, _name: &str, _quote: QuoteType) -> Option<String> {
+                Some("x;".to_string())
+            }
+        }
+        // `psqlscanslash.l:264`: substitution starts the count over.
+        let (_, options) = slash("\\dt :v", &Semi);
+        assert_eq!(options[0].without_trailing_semicolons(), "x;");
+        let (_, options) = slash("\\dt :v;", &Semi);
+        assert_eq!(options[0].without_trailing_semicolons(), "x;");
     }
 }

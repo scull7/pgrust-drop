@@ -8,22 +8,25 @@
 //! the EVENTS of the test tables, and the outcome is what `SELECT
 //! current_enc()` returned, or `fail`. The tables are upstream's, verbatim.
 //!
-//! What is here: the two blocks a client without SSL and GSSAPI support can
-//! run — "Run tests with GSS and SSL disabled in the server" (`:227`-
-//! `:281`) and "Test negotiation over unix domain sockets" (`:584`-`:600`).
-//! `rlibpq` is such a client until its `tls` feature lands (NAT-392), so the
-//! first block takes the table upstream picks for a build without SSL
-//! (`:231`, `:255`); both tables are carried so the SSL build picks the other one.
-//! Upstream skips the three blocks that need SSL or Kerberos in the server
-//! for a client built without them (`:289`, `:367`-`:368`, `:478`-`:481`),
-//! and so does this port, by not having them yet.
+//! What is here: the blocks a client without GSSAPI support can run — "Run
+//! tests with GSS and SSL disabled in the server" (`:227`-`:281`), "Run
+//! tests with GSS disabled and SSL enabled in the server" (`:284`-`:360`)
+//! and "Test negotiation over unix domain sockets" (`:584`-`:600`). The
+//! first block's table depends on whether the client has SSL (`:231`,
+//! `:255`), which is `rlibpq`'s `tls` feature (ADR-0006), and the second is
+//! skipped without it (`:289`) — both exactly as upstream decides them.
+//! Upstream skips the two blocks that need Kerberos (`:367`-`:368`,
+//! `:478`-`:481`) for a client built without GSSAPI, and so does this port,
+//! by not having them: GSSAPI is feature-gated off (pgrust #40).
 //!
 //! Three deliberate differences from the Perl, none of which touches what
 //! is compared:
 //! - upstream connects with `host=enc-test-localhost.postgresql.example.com
 //!   hostaddr=127.0.0.1` (`:99`-`:100`, `:655`); `rlibpq` does not read `hostaddr`
 //!   yet, so this port says `host=127.0.0.1`. Both dial the same address, and
-//!   no row here verifies a certificate against the host name;
+//!   no row here verifies a certificate against the host name. (It does
+//!   change SNI: upstream's client sends the name, this port's sends none,
+//!   as for any IP literal; the server's certificate is the same either way);
 //! - the port is in the connection string, where `$node->psql` puts it in
 //!   `PGPORT`;
 //! - upstream runs only under `PG_TEST_EXTRA=libpq_encryption` (`:80`)
@@ -60,10 +63,9 @@ const ALL_GSSENCMODES: [&str; 3] = ["disable", "prefer", "require"];
 const ALL_SSLMODES: [&str; 4] = ["disable", "allow", "prefer", "require"];
 const ALL_SSLNEGOTIATIONS: [&str; 2] = ["postgres", "direct"];
 
-/// `:105`-`:113`, less `listen_addresses`, which `Cluster` passes itself.
-/// `ssl = off` is `:147`: this port has no server certificate to install,
-/// and with SSL off in the server that line is the only effect `:135`-`:148`
-/// has.
+/// `:105`-`:113`, less `listen_addresses`, which `Cluster` passes itself,
+/// and `ssl = off`, `:147`, which upstream writes when the client has SSL and
+/// is the server's default otherwise.
 const CONF: &str = "
 # Capturing the EVENTS that occur during tests requires these settings
 log_connections = 'receipt,authentication,authorization'
@@ -144,16 +146,59 @@ testuser    disable      disable      postgres       connect, authok            
 *           *            *            direct         -     -> fail
 	";
 
+/// `:291`-`:313`, "Run tests with GSS disabled and SSL enabled in the
+/// server".
+const SSL_ENABLED_IN_SERVER: &str = "
+# USER      GSSENCMODE   SSLMODE      SSLNEGOTIATION EVENTS                                          -> OUTCOME
+testuser    disable      disable      postgres       connect, authok                                 -> plain
+.           .            allow        postgres       connect, authok                                 -> plain
+.           .            prefer       postgres       connect, sslaccept, authok                      -> ssl
+.           .            require      postgres       connect, sslaccept, authok                      -> ssl
+.           .            .            direct         connect, directsslaccept, authok                -> ssl
+ssluser     .            disable      postgres       connect, authfail                               -> fail
+.           .            allow        postgres       connect, authfail, reconnect, sslaccept, authok -> ssl
+.           .            prefer       postgres       connect, sslaccept, authok                      -> ssl
+.           .            require      postgres       connect, sslaccept, authok                      -> ssl
+.           .            .            direct         connect, directsslaccept, authok                -> ssl
+nossluser   .            disable      postgres       connect, authok                                 -> plain
+.           .            allow        postgres       connect, authok                                 -> plain
+.           .            prefer       postgres       connect, sslaccept, authfail, reconnect, authok -> plain
+.           .            require      postgres       connect, sslaccept, authfail                    -> fail
+.           .            require      direct         connect, directsslaccept, authfail              -> fail
+
+# sslnegotiation=direct is not accepted unless sslmode=require or stronger
+*           *            disable      direct         -     -> fail
+*           *            allow        direct         -     -> fail
+*           *            prefer       direct         -     -> fail
+";
+
 /// `:270`-`:276`, appended to whichever table was picked.
 const GSSENCMODE_REQUIRE: &str = "
 testuser    require      *            *              - -> fail
 ";
 
-/// Start a cluster configured as `:103`-`:217` leaves it for the blocks
-/// with SSL and GSS off in the server, or `None` when the reference tools
-/// are absent.
+/// `:137`-`:144`: upstream's test certificate, vendored from the tag
+/// (`tests/ssl/README.md`).
+const SERVER_CRT: &[u8] = include_bytes!("ssl/server-cn-only.crt");
+const SERVER_KEY: &[u8] = include_bytes!("ssl/server-cn-only.key");
+
+/// Start a cluster configured as `:103`-`:217` leaves it — SSL and GSS off
+/// in the server — or `None` when the reference tools are absent.
 fn setup(port: u16) -> Option<Cluster> {
     let cluster = Cluster::start_configured("trust", port, HOSTADDR, CONF)?;
+    let data = cluster.dir.join("data");
+
+    // :135-:148 — installed when the client has SSL. Upstream copies them
+    // before the server starts; with `ssl = off` nothing reads them until
+    // the SSL block turns it on, so after is the same.
+    if Build::THIS.use_ssl {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(data.join("server.crt"), SERVER_CRT).expect("server.crt is written");
+        let key = data.join("server.key");
+        std::fs::write(&key, SERVER_KEY).expect("server.key is written");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to change permissions on server keys");
+    }
 
     let mut admin = cluster.connect();
     for user in USERS {
@@ -163,10 +208,9 @@ fn setup(port: u16) -> Option<Cluster> {
     let loaded = conf_load_time(&mut admin);
     drop(admin);
 
-    // :200-:216, without the hostssl and hostgssenc lines, which upstream
-    // writes only when the server has SSL (:209) or Kerberos (:213)
-    // enabled — and neither is, here.
-    let hba = format!(
+    // :200-:216, without the hostgssenc line, which upstream writes only
+    // with Kerberos (:213).
+    let mut hba = format!(
         "
 # TYPE        DATABASE        USER            ADDRESS                 METHOD             OPTIONS
 local         postgres        localuser                               trust
@@ -175,10 +219,35 @@ hostnossl     postgres        nossluser       {SERVERCIDR}             trust
 hostnogssenc  postgres        nogssuser       {SERVERCIDR}             trust
 "
     );
-    let data = cluster.dir.join("data");
+    // :209-:211
+    if Build::THIS.use_ssl {
+        use std::fmt::Write as _;
+        write!(
+            hba,
+            "
+hostssl       postgres        ssluser         {SERVERCIDR}             trust
+"
+        )
+        .expect("a String takes any write");
+    }
     std::fs::write(data.join("pg_hba.conf"), hba).expect("pg_hba.conf is written");
     reload(&cluster, &data, &loaded);
     Some(cluster)
+}
+
+/// `$node->adjust_conf('postgresql.conf', 'ssl', …)` then `$node->reload`
+/// (`:316`-`:317`, `:358`-`:359`). Appending wins over the earlier line, as
+/// the later of two settings does in `postgresql.conf`.
+fn set_ssl(cluster: &Cluster, on: bool) {
+    use std::io::Write as _;
+    let data = cluster.dir.join("data");
+    let loaded = conf_load_time(&mut localuser(cluster));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(data.join("postgresql.conf"))
+        .and_then(|mut conf| writeln!(conf, "ssl = {}", if on { "on" } else { "off" }))
+        .expect("postgresql.conf is appended to");
+    reload(cluster, &data, &loaded);
 }
 
 /// `$node->reload`, `:217`, and then wait until the server has read the new
@@ -193,19 +262,24 @@ fn reload(cluster: &Cluster, data: &Path, before: &[u8]) {
     assert!(out.status.success(), "reference pg_ctl reload failed");
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let localuser = format!(
-        "user=localuser dbname=postgres host={} port={}",
-        cluster.dir.display(),
-        cluster.port
-    );
     loop {
-        let mut conn = connect(&localuser).expect("localuser connects over the socket");
-        if conf_load_time(&mut conn) != before {
+        if conf_load_time(&mut localuser(cluster)) != before {
             return;
         }
         assert!(Instant::now() < deadline, "the server never reloaded");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// `connstr => "user=localuser host=$unixdir"` (`:329`): the one role
+/// `pg_hba.conf` lets in over the socket once setup has rewritten it.
+fn localuser(cluster: &Cluster) -> Connection {
+    connect(&format!(
+        "user=localuser dbname=postgres host={} port={}",
+        cluster.dir.display(),
+        cluster.port
+    ))
+    .expect("localuser connects over the socket")
 }
 
 fn conf_load_time(conn: &mut Connection) -> Vec<u8> {
@@ -458,6 +532,102 @@ fn running_tests_with_ssl_and_gss_disabled_in_the_server() {
     tally.assert_all_passed();
 }
 
+/// "Run tests with GSS disabled and SSL enabled in the server", `:284`-
+/// `:360`.
+#[test]
+fn running_tests_with_ssl_enabled_in_server() {
+    // :289
+    if !Build::THIS.use_ssl {
+        println!("SKIP: SSL not supported by this build (005_negotiate_encryption.pl:289)");
+        return;
+    }
+    let Some(cluster) = setup(55_502) else {
+        return;
+    };
+
+    // :315-:317
+    set_ssl(&cluster, true);
+
+    let mut tally = Tally::default();
+    test_matrix(
+        &cluster,
+        &mut tally,
+        &["testuser", "ssluser", "nossluser"],
+        &["disable"],
+        &ALL_SSLMODES,
+        &ALL_SSLNEGOTIATIONS,
+        &parse_table(SSL_ENABLED_IN_SERVER),
+    );
+
+    // :324-:355
+    if check_extension(&cluster, "injection_points") {
+        for (point, expected) in [
+            ("backend-initialize", "connect, backenderror -> fail"),
+            ("backend-initialize-v2-error", "connect, v2error -> fail"),
+            (
+                "backend-ssl-startup",
+                "connect, sslaccept, backenderror, reconnect, authok -> plain",
+            ),
+        ] {
+            let mut local = localuser(&cluster);
+            if point == "backend-initialize" {
+                // :165 — upstream creates the extension during setup.
+                exec_ok(
+                    &mut local,
+                    "CREATE EXTENSION IF NOT EXISTS injection_points;",
+                );
+            }
+            let attach = format!("SELECT injection_points_attach('{point}', 'error');");
+            let result = only(local.exec(attach.as_bytes()).expect("PQexec"));
+            assert_eq!(
+                result.status(),
+                ExecStatus::TuplesOk,
+                "{attach}: {result:?}"
+            );
+            drop(local);
+            connect_test(
+                &cluster,
+                &mut tally,
+                "user=testuser sslmode=prefer",
+                expected,
+            );
+            restart(&cluster);
+        }
+    } else {
+        println!(
+            "note: injection_points is not installed in the reference server, so \
+             005_negotiate_encryption.pl:324-:355 do not run, as upstream skips them"
+        );
+    }
+
+    // :357-:359
+    set_ssl(&cluster, false);
+    tally.assert_all_passed();
+}
+
+/// `$node->check_extension`, `Cluster.pm`: is it in `pg_available_extensions`?
+fn check_extension(cluster: &Cluster, name: &str) -> bool {
+    let mut admin = localuser(cluster);
+    let query = format!("SELECT count(*) FROM pg_available_extensions WHERE name = '{name}'");
+    let result = only(admin.exec(query.as_bytes()).expect("PQexec"));
+    result.value(0, 0) != Some(b"0")
+}
+
+/// `$node->restart`: `pg_ctl restart`, which clears every injection point.
+fn restart(cluster: &Cluster) {
+    let data = cluster.dir.join("data");
+    let out = Command::new(cluster.bin.join("pg_ctl"))
+        .args(["-D".as_ref(), data.as_os_str()])
+        .arg("-w")
+        .arg("-l")
+        .arg(cluster.dir.join("log"))
+        .arg("restart")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("reference pg_ctl runs");
+    assert!(out.status.success(), "reference pg_ctl restart failed");
+}
+
 /// "Test negotiation over unix domain sockets", `:584`-`:600`: libpq
 /// attempts neither SSL nor GSSAPI over a Unix socket.
 #[test]
@@ -507,6 +677,23 @@ fn the_tables_expand_as_parse_table_expands_them() {
     // %expanded)` does: `require` beats the `disable` rows' `direct`.
     assert_eq!(expected["testuser require disable postgres"], "- -> fail");
     assert_eq!(expected["testuser disable prefer direct"], "- -> fail");
+
+    // test_matrix's cube for the SSL block: every row it looks up exists.
+    let ssl_enabled = parse_table(SSL_ENABLED_IN_SERVER);
+    for user in ["testuser", "ssluser", "nossluser"] {
+        for sslmode in ALL_SSLMODES {
+            for negotiation in ALL_SSLNEGOTIATIONS {
+                assert!(
+                    ssl_enabled.contains_key(&format!("{user} disable {sslmode} {negotiation}")),
+                    "{user} {sslmode} {negotiation}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        ssl_enabled["ssluser disable allow postgres"],
+        "connect, authfail, reconnect, sslaccept, authok -> ssl"
+    );
 
     let with_ssl = parse_table(SSL_DISABLED_IN_SERVER_WITH_SSL_CLIENT);
     assert_eq!(

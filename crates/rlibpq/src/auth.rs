@@ -188,6 +188,9 @@ pub enum AuthError {
     SaslFinalBeforeCompletion,
     /// `fe-auth.c:449`.
     ChannelBindingRequiredWithoutSsl,
+    /// `fe-auth.c:513` — over SSL, the server offered SCRAM-SHA-256-PLUS
+    /// and `channel_binding=require`, but this client cannot bind yet.
+    ChannelBindingNotSupported,
     /// A failure inside the SCRAM exchange itself.
     Scram(ScramError),
 }
@@ -232,6 +235,9 @@ impl AuthError {
             AuthError::ChannelBindingRequiredWithoutSsl => {
                 b"channel binding required, but SSL not in use".to_vec()
             }
+            AuthError::ChannelBindingNotSupported => {
+                b"channel binding is required, but client does not support it".to_vec()
+            }
             AuthError::Scram(err) => err.message(),
         }
     }
@@ -264,9 +270,11 @@ pub enum AuthStep {
     Complete,
 }
 
-/// `channel_binding`, `fe-connect.c`'s option of the same name. Without TLS
-/// only `disable` and `prefer` can be honoured; `require` fails at
-/// `fe-auth.c:446`.
+/// `channel_binding`, `fe-connect.c`'s option of the same name. Without SSL
+/// in use only `disable` and `prefer` can be honoured; `require` fails at
+/// `fe-auth.c:446`. Over SSL, this client does not bind a channel yet
+/// (`tls-server-end-point` is NAT-392's next slice), so `require` fails at
+/// `:513` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelBinding {
     Disable,
@@ -281,6 +289,8 @@ pub struct Authenticator {
     user: Vec<u8>,
     password: Option<Vec<u8>>,
     channel_binding: ChannelBinding,
+    /// `conn->ssl_in_use`: the exchange runs over TLS.
+    ssl_in_use: bool,
     /// The bytes `pg_strong_random` would have drawn for the SCRAM nonce
     /// (`fe-auth-scram.c:363`), supplied so the exchange stays reproducible.
     raw_nonce: Vec<u8>,
@@ -296,6 +306,7 @@ impl Authenticator {
             user: user.to_vec(),
             password: password.map(<[u8]>::to_vec),
             channel_binding: ChannelBinding::default(),
+            ssl_in_use: false,
             raw_nonce: raw_nonce.to_vec(),
             scram: None,
             client_finished_auth: false,
@@ -305,6 +316,13 @@ impl Authenticator {
     #[must_use]
     pub fn with_channel_binding(mut self, channel_binding: ChannelBinding) -> Self {
         self.channel_binding = channel_binding;
+        self
+    }
+
+    /// `conn->ssl_in_use`, for the SASL mechanism choice.
+    #[must_use]
+    pub fn with_ssl_in_use(mut self, ssl_in_use: bool) -> Self {
+        self.ssl_in_use = ssl_in_use;
         self
     }
 
@@ -366,11 +384,16 @@ impl Authenticator {
         }
     }
 
-    /// `pg_SASL_init`, `fe-auth.c:435`, minus the arms a build without TLS,
-    /// GSSAPI or OAuth cannot reach.
+    /// `pg_SASL_init`, `fe-auth.c:435`, minus the GSSAPI and OAuth arms.
+    ///
+    /// Over SSL it takes the `#else` arm at `:504`, a client that cannot
+    /// bind a channel: SCRAM-SHA-256-PLUS is passed over, and refused
+    /// outright under `channel_binding=require`. The gs2-header is then `n`
+    /// (`fe-auth-scram.c:418`), which a server that offered PLUS accepts as
+    /// "client does not support channel binding".
     fn sasl_init(&mut self, mechanisms: &[Vec<u8>]) -> Result<AuthStep, AuthError> {
         // fe-auth.c:446 — require without SSL fails before anything else.
-        if self.channel_binding == ChannelBinding::Require {
+        if self.channel_binding == ChannelBinding::Require && !self.ssl_in_use {
             return Err(AuthError::ChannelBindingRequiredWithoutSsl);
         }
         if self.scram.is_some() {
@@ -380,8 +403,15 @@ impl Authenticator {
         let mut selected: Option<Mechanism> = None;
         for mechanism in mechanisms {
             if mechanism == SCRAM_SHA_256_PLUS_NAME {
-                // fe-auth.c:518 — offered without SSL, which is not sane.
-                return Err(AuthError::ScramPlusOverNonSsl);
+                if !self.ssl_in_use {
+                    // fe-auth.c:518 — offered without SSL, which is not sane.
+                    return Err(AuthError::ScramPlusOverNonSsl);
+                }
+                // fe-auth.c:511 — the client cannot bind, so PLUS is only
+                // an error when binding is required.
+                if self.channel_binding == ChannelBinding::Require {
+                    return Err(AuthError::ChannelBindingNotSupported);
+                }
             } else if mechanism == SCRAM_SHA_256_NAME && selected.is_none() {
                 selected = Some(Mechanism::ScramSha256);
             }
@@ -630,6 +660,31 @@ mod tests {
         assert_eq!(auth.respond(&AuthRequest::Ok), Ok(AuthStep::Complete));
     }
 
+    /// Over SSL a server lists SCRAM-SHA-256-PLUS first; a client that
+    /// cannot bind takes SCRAM-SHA-256 with an `n` gs2-header
+    /// (the `#else` at `fe-auth.c:504`, `fe-auth-scram.c:418`), whatever
+    /// `channel_binding` short of `require` says.
+    #[test]
+    fn over_ssl_plus_is_passed_over_for_plain_scram() {
+        for channel_binding in [ChannelBinding::Disable, ChannelBinding::Prefer] {
+            let mut auth = Authenticator::new(b"user", Some(b"pencil"), b"nonce")
+                .with_channel_binding(channel_binding)
+                .with_ssl_in_use(true);
+            let Ok(AuthStep::Send(Frontend::SaslInitialResponse {
+                mechanism,
+                initial_response: Some(response),
+            })) = auth.respond(&AuthRequest::Sasl(vec![
+                SCRAM_SHA_256_PLUS_NAME.to_vec(),
+                SCRAM_SHA_256_NAME.to_vec(),
+            ]))
+            else {
+                panic!("{channel_binding:?}: no SASLInitialResponse");
+            };
+            assert_eq!(mechanism, SCRAM_SHA_256_NAME);
+            assert!(response.starts_with(b"n,,n=,r="), "{channel_binding:?}");
+        }
+    }
+
     /// The SASL arms `pg_SASL_init` refuses.
     #[test]
     fn the_sasl_mechanism_list_is_checked() {
@@ -655,6 +710,18 @@ mod tests {
         assert_eq!(
             auth.respond(&AuthRequest::Sasl(vec![SCRAM_SHA_256_NAME.to_vec()])),
             Err(AuthError::ChannelBindingRequiredWithoutSsl)
+        );
+
+        // fe-auth.c:513 — over SSL, PLUS with require, and no binding here.
+        let mut auth = Authenticator::new(b"user", Some(b"pencil"), &[0; 18])
+            .with_channel_binding(ChannelBinding::Require)
+            .with_ssl_in_use(true);
+        assert_eq!(
+            auth.respond(&AuthRequest::Sasl(vec![
+                SCRAM_SHA_256_PLUS_NAME.to_vec(),
+                SCRAM_SHA_256_NAME.to_vec(),
+            ])),
+            Err(AuthError::ChannelBindingNotSupported)
         );
 
         // fe-auth.c:1244 — a continuation with no exchange in progress.

@@ -16,7 +16,18 @@ path = "src/lib.rs"
 name = "libpq_uri_regress"
 path = "src/bin/libpq_uri_regress.rs"
 
+[features]
+# ADR-0006: rustls behind a default-on `tls` feature. Without it the crate is
+# upstream's "compiled without SSL support" client (`USE_SSL` undefined), and
+# the negotiation still runs, with nothing but plaintext to choose from.
+default = ["tls"]
+tls = ["dep:rustls"]
+
 [dependencies]
+# ADR-0006: the `ring` provider, never rustls' default `aws-lc-rs`, so
+# `default-features = false`. `tls12` because libpq's floor,
+# `ssl_min_protocol_version`, defaults to TLSv1.2 (fe-connect.c:345).
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

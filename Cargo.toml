@@ -20,6 +20,8 @@ publish = false
 # All CLIs use usage-rs (owner decision, 2026-09-16). Aliased to `usage` in each crate.
 usage = { package = "usage-rs", version = "6" }
 thiserror = "2"
+# rlibpq's TLS backend (ADR-0006): rustls with the `ring` provider only.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

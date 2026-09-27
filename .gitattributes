@@ -2,3 +2,8 @@
 # normalised. See crates/rinitdb/image/README.md.
 crates/rinitdb/image/template.img binary
 crates/rinitdb/image/template.control binary
+
+# Vendored upstream regression files (NAT-400): byte for byte, trailing
+# spaces included, so no end-of-line conversion.
+crates/rpsql/tests/regress/psql.sql -text
+crates/rpsql/tests/regress/expected/psql.out -text

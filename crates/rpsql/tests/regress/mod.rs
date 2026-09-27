@@ -402,7 +402,10 @@ impl Cluster {
     /// # Panics
     /// When the connection fails.
     pub fn connect(&self) -> rlibpq::Connection<rlibpq::Stream> {
-        let mut conninfo = rlibpq::conndefaults(&rlibpq::Env::empty());
+        // No environment and no service files: nothing but the four keywords
+        // below may aim this connection.
+        let no_files = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut conninfo = rlibpq::conndefaults(&rlibpq::Env::empty(), &no_files);
         for (key, value) in [
             ("host", self.dir.display().to_string()),
             ("port", self.port.to_string()),

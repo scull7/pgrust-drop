@@ -146,6 +146,10 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
             // usage-rs's parse errors exit 2 (ADR-0004).
             ExitCode::from(2)
         }
+        Invocation::Fatal(rendered) => {
+            let _ = stderr.write_all(rendered.as_bytes());
+            ExitCode::from(EXIT_FAILURE)
+        }
         Invocation::Run(session) => run_session(*session, stdout, stderr),
     }
 }

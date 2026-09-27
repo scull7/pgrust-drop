@@ -297,11 +297,20 @@ impl Cluster {
     /// # Panics
     /// When `psql` cannot be started or its output read.
     pub fn run_script(&self, psql: &Path, script: &str) -> Vec<u8> {
+        self.run_script_with(psql, &[], script)
+    }
+
+    /// [`Cluster::run_script`] with `options` after `pg_regress`'s own.
+    ///
+    /// # Panics
+    /// When `psql` cannot be started or its output read.
+    pub fn run_script_with(&self, psql: &Path, options: &[&str], script: &str) -> Vec<u8> {
         let (mut reader, writer) = std::io::pipe().expect("a pipe for 2>&1");
         let mut command = Command::new(psql);
         command
             .args(["-X", "-a", "-q", "-d", "postgres"])
             .args(["-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"])
+            .args(options)
             // `pg_regress` names the server through the environment, too.
             .env("PGHOST", &self.dir)
             .env("PGPORT", self.port.to_string())

@@ -135,6 +135,31 @@ fn version_matches_c_psql() {
         .assert_clean();
 }
 
+/// An option the loop refuses exits 1 before any connection is tried, so C
+/// psql and rpsql must agree on stderr and the status with no server at all:
+/// `-P VAR=ARG` whose `do_pset` fails is `pg_fatal` (`startup.c:617`), and
+/// `-v NAME=VALUE` whose hook refuses is `exit(EXIT_FAILURE)` (`:659`).
+#[test]
+fn a_refused_option_value_matches_c_psql() {
+    let command_lines: [&[&str]; 6] = [
+        &["-P", "nosuch=1"],
+        &["-P", "nosuch"],
+        &["-P", "format=bogus"],
+        &["-P", "format=a"],
+        &["--pset=border=2", "--pset=csv_fieldsep=ab"],
+        &["-v", "ECHO=sideways"],
+    ];
+    for options in command_lines {
+        let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
+            return;
+        };
+        let mut argv: Vec<OsString> = vec![OsString::from("-X")];
+        argv.extend(options.iter().map(OsString::from));
+        argv.extend(["-c", "select 1"].map(OsString::from));
+        gate.with_args(argv).assert_clean();
+    }
+}
+
 /// Without a server, `-c` still reports a connection failure and exits 2
 /// (`EXIT_BADCONN`, `settings.h:200`) rather than succeeding or hanging.
 #[test]

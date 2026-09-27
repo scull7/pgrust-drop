@@ -307,6 +307,7 @@ const DOCUMENT_FORMAT_SECTIONS_PORT: u16 = 55_492;
 const NUMERICLOCALE_PORT: u16 = 55_493;
 const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
 const DISPLAY_WIDTH_PORT: u16 = 55_495;
+const DASH_P_PORT: u16 = 55_496;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -587,6 +588,70 @@ fn display_width_matches_c_psql() {
         }
     }
     diff_against_c_psql(&cluster, "display width", &script);
+}
+
+/// `-P VAR[=ARG]` (`startup.c:600`), against C psql: every parameter a bare
+/// `\pset` lists, set from the command line, with the options that write the
+/// same settings on either side of it, since the option loop applies argv in
+/// order. The script lists the settings and prints a result under them.
+#[test]
+fn dash_p_matches_c_psql() {
+    let Some(cluster) = Cluster::start(DASH_P_PORT) else {
+        return;
+    };
+    let script = "\\pset\nselect 1 as one, null as nothing, 'x|y' as bar;\n";
+    let command_lines: [&[&str]; 12] = [
+        &["-P", "border=2", "-P", "null=(nil)", "-P", "title=t"],
+        &["-P", "format=html", "-A"],
+        &["-A", "-P", "format=html"],
+        &["--csv", "-P", "csv_fieldsep=;"],
+        &["-P", "format=csv", "-H"],
+        &["-Pexpanded", "-P", "tuples_only"],
+        &["-x", "-P", "expanded=off", "-t", "-P", "tuples_only=off"],
+        &[
+            "-P",
+            "linestyle=unicode",
+            "-P",
+            "unicode_border_linestyle=double",
+        ],
+        &["-P", "fieldsep=;", "-A", "-F", ","],
+        &[
+            "-P",
+            "footer=off",
+            "-P",
+            "numericlocale",
+            "-P",
+            "pager=always",
+        ],
+        &[
+            "-P",
+            "tableattr=x",
+            "-P",
+            "recordsep_zero",
+            "-P",
+            "xheader_width=column",
+        ],
+        &[
+            "--pset=format=wrapped",
+            "--pset=columns=20",
+            "-P",
+            "pager_min_lines=3",
+        ],
+    ];
+    for options in command_lines {
+        let ours = cluster.run_script_with(Path::new(RPSQL), options, script);
+        let text = String::from_utf8_lossy(&ours);
+        assert!(!text.contains("error"), "rpsql {options:?}:\n{text}");
+        match cluster.reference_psql() {
+            Some(psql) => {
+                let theirs = cluster.run_script_with(&psql, options, script);
+                if let Some(diff) = first_difference(&theirs, &ours) {
+                    panic!("rpsql vs C psql ({options:?}): {diff}");
+                }
+            }
+            None => reference::skip("psql"),
+        }
+    }
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

@@ -303,6 +303,60 @@ impl Cluster {
         output
     }
 
+    /// Action: `$node->psql('postgres', $sql, on_error_stop => …)`
+    /// (`src/test/perl/PostgreSQL/Test/Cluster.pm:2116`) through `psql`:
+    /// `--no-psqlrc --no-align --tuples-only --quiet --file -` with `sql` on
+    /// stdin, and `--variable ON_ERROR_STOP=1` unless `on_error_stop` is
+    /// false (`:2163`). Like upstream, one trailing newline is chomped from
+    /// each stream (`:2228`-`:2236`).
+    ///
+    /// # Panics
+    /// When `psql` cannot be started, or is killed by a signal, which
+    /// upstream also dies on (`:2244`).
+    pub fn psql(&self, psql: &Path, sql: &str, on_error_stop: bool) -> PsqlOutcome {
+        let mut command = Command::new(psql);
+        command
+            .args(["--no-psqlrc", "--no-align", "--tuples-only", "--quiet"])
+            .args(["--dbname", "postgres", "--file", "-"]);
+        if on_error_stop {
+            command.args(["--variable", "ON_ERROR_STOP=1"]);
+        }
+        command
+            .env("PGHOST", &self.dir)
+            .env("PGPORT", self.port.to_string())
+            .env("PGUSER", "regress")
+            .env("LC_ALL", "C")
+            .env_remove("PGOPTIONS")
+            .env_remove("PGSERVICE")
+            .env_remove("PSQLRC")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("psql starts");
+        let mut stdin = child.stdin.take().expect("a stdin pipe");
+        let sql = sql.to_owned();
+        let feeder = std::thread::spawn(move || {
+            let _ = stdin.write_all(sql.as_bytes());
+        });
+        let output = child.wait_with_output().expect("psql's output is read");
+        feeder.join().expect("the script is fed");
+        let chomp = |bytes: Vec<u8>| {
+            let mut text = String::from_utf8(bytes).expect("psql writes UTF-8 here");
+            if text.ends_with('\n') {
+                text.pop();
+            }
+            text
+        };
+        PsqlOutcome {
+            ret: output
+                .status
+                .code()
+                .unwrap_or_else(|| panic!("psql exited with {}", output.status)),
+            stdout: chomp(output.stdout),
+            stderr: chomp(output.stderr),
+        }
+    }
+
     /// The reference `psql` beside `initdb`, if this lane's installation has
     /// one (the Maven bundles `scripts/fetch-ref-binaries.sh` fetches do not).
     pub fn reference_psql(&self) -> Option<PathBuf> {
@@ -319,6 +373,18 @@ impl Drop for Cluster {
             .output();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// What `Cluster.pm`'s `psql` returns in list context: `($ret, $stdout,
+/// $stderr)`.
+#[derive(Debug)]
+pub struct PsqlOutcome {
+    /// The exit status.
+    pub ret: i32,
+    /// Standard output, one trailing newline chomped.
+    pub stdout: String,
+    /// Standard error, one trailing newline chomped.
+    pub stderr: String,
 }
 
 /// A readable account of where `ours` first leaves `expected`: the line

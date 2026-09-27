@@ -6,6 +6,7 @@
 //! runs, and [`crate::print::print_query`], which renders the result.
 
 use std::io::Write;
+use std::time::Instant;
 
 use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
@@ -110,14 +111,62 @@ pub fn query_status_line(result: &QueryResult, pset: &PsqlSettings) -> Option<Ve
     Some(line)
 }
 
+/// `PrintTiming()` (`common.c:598`): `\timing`'s line for a query that took
+/// `elapsed_msec`, broken down into minutes, hours and days from one second
+/// up.
+#[must_use]
+// `(int) minutes` and friends: whole, non-negative values that fit, as
+// upstream's casts assume.
+#[allow(clippy::cast_possible_truncation)]
+pub fn timing_line(elapsed_msec: f64) -> String {
+    if elapsed_msec < 1000.0 {
+        return format!("Time: {elapsed_msec:.3} ms\n");
+    }
+    let mut seconds = elapsed_msec / 1000.0;
+    let mut minutes = (seconds / 60.0).floor();
+    seconds -= 60.0 * minutes;
+    if minutes < 60.0 {
+        return format!(
+            "Time: {elapsed_msec:.3} ms ({:02}:{seconds:06.3})\n",
+            minutes as i32
+        );
+    }
+    let mut hours = (minutes / 60.0).floor();
+    minutes -= 60.0 * hours;
+    if hours < 24.0 {
+        return format!(
+            "Time: {elapsed_msec:.3} ms ({:02}:{:02}:{seconds:06.3})\n",
+            hours as i32, minutes as i32
+        );
+    }
+    let days = (hours / 24.0).floor();
+    hours -= 24.0 * days;
+    format!(
+        "Time: {elapsed_msec:.3} ms ({days:.0} d {:02}:{:02}:{seconds:06.3})\n",
+        hours as i32, minutes as i32
+    )
+}
+
+/// `ClearOrSaveResult()` (`common.c:560`): keep an error result for
+/// `\errverbose`, drop anything else.
+pub fn clear_or_save_result(result: &QueryResult, pset: &mut PsqlSettings) {
+    if matches!(
+        result.status(),
+        ExecStatus::NonfatalError | ExecStatus::FatalError
+    ) {
+        pset.last_error_result = Some(result.clone());
+    }
+}
+
 /// `SendQuery()` (`common.c:1126`), for the simple-query path.
 ///
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
-/// `ON_ERROR_STOP`.
+/// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
+/// `\errverbose`.
 pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
-    pset: &PsqlSettings,
+    pset: &mut PsqlSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
@@ -129,54 +178,81 @@ pub fn send_query(
         let _ = stdout.write_all(b"\n");
     }
 
-    let results = match executor.exec(query) {
-        Ok(results) => results,
+    // `common.c:1128`: whether to time is decided before the query runs.
+    let timing = pset.timing;
+    // `ExecQueryAndProcessResults` takes its "after" once the last result has
+    // arrived and before it is printed (`common.c:2197`); `exec` returns only
+    // when every result has arrived, so this is the same interval.
+    let before = Instant::now();
+    let results = executor.exec(query);
+    let elapsed_msec = before.elapsed().as_secs_f64() * 1000.0;
+
+    let ok = match results {
+        Ok(results) => process_results(&results, pset, stdout, stderr),
+        // libpq's message, at info level like the server's errors
+        // (`common.c:1834`): `001_basic.pl:147` expects
+        // `psql:<stdin>:2: server closed the connection unexpectedly`.
         Err(err) => {
-            let _ = stderr.write_all(&err.rendered());
-            return false;
+            crate::logging::info(pset, err.as_bytes(), stderr);
+            false
         }
     };
 
+    // `common.c:1286`: the timing line follows success and failure alike,
+    // which is what `001_basic.pl:95` tests.
+    if timing {
+        let _ = stdout.write_all(timing_line(elapsed_msec).as_bytes());
+    }
+    ok
+}
+
+/// The printing half of `ExecQueryAndProcessResults()` (`common.c:1581`).
+fn process_results(
+    results: &[QueryResult],
+    pset: &mut PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
     let mut ok = true;
     let last = results.len().saturating_sub(1);
     for (i, result) in results.iter().enumerate() {
-        let is_last = i == last;
-        if !(is_last || pset.show_all_results) {
+        let accepted = matches!(
+            result.status(),
+            ExecStatus::TuplesOk | ExecStatus::CommandOk | ExecStatus::EmptyQuery
+        );
+        if !accepted {
+            // `common.c:1825`-`:1843`: an error is reported whether or not it
+            // is the last result, as `PQresultErrorMessage` renders it at the
+            // configured verbosity, and kept for `\errverbose`.
+            let message = match result.error() {
+                Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
+                None => result.error_message(),
+            };
+            if !message.is_empty() {
+                crate::logging::info(pset, &message, stderr);
+            }
+            clear_or_save_result(result, pset);
+            ok = false;
             continue;
         }
-        match result.status() {
-            ExecStatus::TuplesOk => {
-                match print_query(result, &pset.popt) {
-                    Ok(text) => {
-                        let _ = stdout.write_all(&text);
-                    }
-                    Err(err) => {
-                        let _ = writeln!(stderr, "psql: error: {err}");
-                        ok = false;
-                    }
+        if !(i == last || pset.show_all_results) {
+            continue;
+        }
+        if result.status() == ExecStatus::TuplesOk {
+            match print_query(result, &pset.popt) {
+                Ok(text) => {
+                    let _ = stdout.write_all(&text);
                 }
-                if let Some(status) = query_status_line(result, pset) {
-                    let _ = stdout.write_all(&status);
+                Err(err) => {
+                    crate::logging::error(pset, err.to_string(), stderr);
+                    ok = false;
                 }
             }
-            ExecStatus::CommandOk => {
-                if let Some(status) = query_status_line(result, pset) {
-                    let _ = stdout.write_all(&status);
-                }
-            }
-            ExecStatus::EmptyQuery => {}
-            _ => {
-                // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at
-                // the configured verbosity (`common.c:1831`).
-                let message = match result.error() {
-                    Some(error) => {
-                        error.message(result.status(), pset.verbosity, pset.show_context)
-                    }
-                    None => result.error_message(),
-                };
-                let _ = stderr.write_all(&message);
-                ok = false;
-            }
+        }
+        if result.status() != ExecStatus::EmptyQuery
+            && let Some(status) = query_status_line(result, pset)
+        {
+            let _ = stdout.write_all(&status);
         }
     }
     ok
@@ -238,7 +314,8 @@ mod tests {
         let mut executor = Replay(vec![results]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let ok = send_query(&mut executor, b"select 1", pset, &mut out, &mut err);
+        let mut pset = pset.clone();
+        let ok = send_query(&mut executor, b"select 1", &mut pset, &mut out, &mut err);
         (
             ok,
             String::from_utf8(out).unwrap(),
@@ -305,7 +382,12 @@ mod tests {
         runner
             .push(Backend::ReadyForQuery(TransactionStatus::Idle))
             .unwrap();
-        let (ok, out, err) = run(runner.into_results(), &PsqlSettings::default());
+        // Terse, as under `-c`: the server's text alone (`common.c:1834`).
+        let pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let (ok, out, err) = run(runner.into_results(), &pset);
         assert!(!ok);
         assert_eq!(out, "");
         assert_eq!(err, "ERROR:  syntax error at or near \"selec\"\n");
@@ -367,13 +449,13 @@ mod tests {
         let ok = send_query(
             &mut Broken,
             b"select 1",
-            &PsqlSettings::default(),
+            &mut PsqlSettings::default(),
             &mut out,
             &mut err,
         );
 
         assert!(!ok);
-        assert_eq!(err, b"psql: error: no such database \"\xc3\x28\"\n");
+        assert_eq!(err, b"psql: no such database \"\xc3\x28\"\n");
         assert!(!err.contains(&0xEF), "no U+FFFD may appear: {err:?}");
     }
 
@@ -418,9 +500,112 @@ mod tests {
         assert!(send_query(
             &mut Never,
             b"  \n ",
-            &PsqlSettings::default(),
+            &mut PsqlSettings::default(),
             &mut out,
             &mut err
         ));
+    }
+
+    fn select_error() -> Vec<QueryResult> {
+        let error = ResultError::new(vec![
+            (b'S', b"ERROR".to_vec()),
+            (b'C', b"42703".to_vec()),
+            (b'M', b"column \"error\" does not exist".to_vec()),
+        ]);
+        let mut runner = QueryRunner::new();
+        runner.push(Backend::ErrorResponse(error)).unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results()
+    }
+
+    #[test]
+    fn timing_is_milliseconds_alone_below_one_second() {
+        // `PrintTiming` (`common.c:605`).
+        assert_eq!(timing_line(0.0), "Time: 0.000 ms\n");
+        assert_eq!(timing_line(12.3456), "Time: 12.346 ms\n");
+        assert_eq!(timing_line(999.9994), "Time: 999.999 ms\n");
+    }
+
+    #[test]
+    fn timing_breaks_a_longer_interval_into_its_parts() {
+        // `common.c:618`-`:640`.
+        assert_eq!(timing_line(1000.0), "Time: 1000.000 ms (00:01.000)\n");
+        assert_eq!(timing_line(61_500.25), "Time: 61500.250 ms (01:01.500)\n");
+        assert_eq!(
+            timing_line(3_600_000.0),
+            "Time: 3600000.000 ms (01:00:00.000)\n"
+        );
+        assert_eq!(
+            timing_line(90_061_001.0),
+            "Time: 90061001.000 ms (1 d 01:01:01.001)\n"
+        );
+    }
+
+    #[test]
+    fn timing_follows_the_result_and_a_failure_too() {
+        // `common.c:1286`; `001_basic.pl:95` requires the line after an error.
+        let pset = PsqlSettings {
+            timing: true,
+            ..PsqlSettings::default()
+        };
+        let (ok, out, _) = run(one_row(), &pset);
+        assert!(ok);
+        assert!(out.starts_with(" ?column? \n"), "{out}");
+        assert!(out.lines().last().unwrap().starts_with("Time: "), "{out}");
+        assert!(out.ends_with(" ms\n"), "{out}");
+
+        let (ok, out, _) = run(select_error(), &pset);
+        assert!(!ok);
+        assert!(out.starts_with("Time: ") && out.ends_with(" ms\n"), "{out}");
+    }
+
+    #[test]
+    fn without_timing_there_is_no_time_line() {
+        let (_, out, _) = run(one_row(), &PsqlSettings::default());
+        assert!(!out.contains("Time:"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_result_is_kept_for_errverbose_and_a_later_success_keeps_it() {
+        // `ClearOrSaveResult` (`common.c:560`) replaces the saved result only
+        // with another error.
+        let mut executor = Replay(vec![select_error(), one_row()]);
+        let mut pset = PsqlSettings::default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(!send_query(
+            &mut executor,
+            b"select error",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        let saved = pset.last_error_result.clone().expect("the error is kept");
+        assert_eq!(saved.status(), ExecStatus::FatalError);
+        assert!(send_query(
+            &mut executor,
+            b"select 1",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(pset.last_error_result, Some(saved));
+    }
+
+    #[test]
+    fn a_server_error_under_a_file_carries_the_locus() {
+        // `001_basic.pl:175`: `psql:<stdin>:1: ERROR:  …`, no `error:` label,
+        // because psql logs the server's text at info level (`common.c:1834`).
+        let pset = PsqlSettings {
+            inputfile: Some("<stdin>".into()),
+            lineno: 1,
+            ..PsqlSettings::default()
+        };
+        let (_, _, err) = run(select_error(), &pset);
+        assert_eq!(
+            err,
+            "psql:<stdin>:1: ERROR:  column \"error\" does not exist\n"
+        );
     }
 }

@@ -3,13 +3,16 @@
 //! `HandleSlashCmds` (`command.c:231`) parses the command name, dispatches,
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
-//! plus the `\unset`, `\qecho` and `\warn` that share their code, and
-//! NAT-400 adds `\pset`. Everything
+//! plus the `\unset`, `\qecho` and `\warn` that share their code;
+//! NAT-400 adds `\pset`, and NAT-403 `\timing` and `\errverbose`. Everything
 //! else is [`CommandResult::Unknown`], which renders upstream's
 //! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
 
 use std::io::Write;
 
+use rlibpq::{ContextVisibility, Verbosity};
+
+use crate::logging;
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::PsqlSettings;
 use crate::slash::SlashOption;
@@ -106,9 +109,10 @@ pub fn dispatch_slash(
     *pset = vars.settings(&working);
 
     if matches!(status, CommandResult::Connect(_)) {
-        let _ = writeln!(
+        logging::error(
+            pset,
+            "\\connect is not implemented yet (Linear NAT-405)",
             stderr,
-            "psql: error: \\connect is not implemented yet (Linear NAT-405)"
         );
         return CommandResult::Error;
     }
@@ -131,7 +135,7 @@ pub fn handle_slash_cmds(
     let status = exec_command(&cmd, &options, ctx, stdout, stderr);
 
     let status = if status == CommandResult::Unknown {
-        let _ = writeln!(stderr, "psql: error: invalid command \\{cmd}");
+        logging::error(ctx.pset, format!("invalid command \\{cmd}"), stderr);
         CommandResult::Error
     } else {
         status
@@ -142,9 +146,10 @@ pub fn handle_slash_cmds(
     // warning upstream prints for the ones a command did not use.
     if status != CommandResult::Error {
         for extra in extra_arguments(&cmd, &options) {
-            let _ = writeln!(
+            logging::warning(
+                ctx.pset,
+                format!("\\{cmd}: extra argument \"{extra}\" ignored"),
                 stderr,
-                "psql: warning: \\{cmd}: extra argument \"{extra}\" ignored"
             );
         }
     }
@@ -161,7 +166,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "echo" | "qecho" | "warn" | "set" => return Vec::new(),
         "c" | "connect" => 4,
         "pset" => 2,
-        "unset" => 1,
+        "unset" | "timing" => 1,
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -196,16 +201,23 @@ fn exec_command(
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
-                let _ = writeln!(stderr, "psql: error: \\unset: missing required argument");
+                logging::error(ctx.pset, "\\unset: missing required argument", stderr);
                 return CommandResult::Error;
             };
             match ctx.vars.delete(&name.value) {
                 Ok(()) => CommandResult::SkipLine,
                 Err(err) => {
-                    let _ = writeln!(stderr, "psql: error: {}", err.message);
+                    logging::error(ctx.pset, &err.message, stderr);
                     CommandResult::Error
                 }
             }
+        }
+        // `exec_command_timing()` (`command.c:3166`).
+        "timing" => exec_command_timing(options, ctx, stdout, stderr),
+        // `exec_command_errverbose()` (`command.c:1643`).
+        "errverbose" => {
+            exec_command_errverbose(ctx.pset, stdout, stderr);
+            CommandResult::SkipLine
         }
         _ => CommandResult::Unknown,
     }
@@ -259,7 +271,7 @@ fn exec_command_pset(
             CommandResult::SkipLine
         }
         Err(err) => {
-            let _ = writeln!(stderr, "psql: error: {err}");
+            logging::error(ctx.pset, err.to_string(), stderr);
             CommandResult::Error
         }
     }
@@ -282,8 +294,65 @@ fn exec_command_set(
     match ctx.vars.set(&name.value, Some(&value)) {
         Ok(()) => CommandResult::SkipLine,
         Err(err) => {
-            let _ = writeln!(stderr, "psql: error: {}", err.message);
+            logging::error(ctx.pset, &err.message, stderr);
             CommandResult::Error
+        }
+    }
+}
+
+/// `exec_command_timing()` (`command.c:3166`): set `\timing` from its
+/// argument, or toggle it without one, and say which it is unless quiet.
+fn exec_command_timing(
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let mut success = true;
+    match options.first() {
+        Some(opt) => match crate::pset::parse_bool_named(&opt.value, "\\timing") {
+            Ok(on) => ctx.pset.timing = on,
+            Err(err) => {
+                // `ParseVariableBool` leaves the switch alone and logs; the
+                // state line below is still printed (`command.c:3179`).
+                logging::error(ctx.pset, err.to_string(), stderr);
+                success = false;
+            }
+        },
+        None => ctx.pset.timing = !ctx.pset.timing,
+    }
+    if !ctx.pset.quiet {
+        let _ = stdout.write_all(if ctx.pset.timing {
+            b"Timing is on.\n"
+        } else {
+            b"Timing is off.\n"
+        });
+    }
+    if success {
+        CommandResult::SkipLine
+    } else {
+        CommandResult::Error
+    }
+}
+
+/// `exec_command_errverbose()` (`command.c:1643`): the last failed result,
+/// again, at `PQERRORS_VERBOSE` with `PQSHOW_CONTEXT_ALWAYS`.
+fn exec_command_errverbose(pset: &PsqlSettings, stdout: &mut dyn Write, stderr: &mut dyn Write) {
+    match &pset.last_error_result {
+        Some(result) => {
+            // `PQresultVerboseErrorMessage()` (`fe-exec.c:3466`).
+            let message = match result.error() {
+                Some(error) => error.message(
+                    result.status(),
+                    Verbosity::Verbose,
+                    ContextVisibility::Always,
+                ),
+                None => result.error_message(),
+            };
+            logging::error(pset, message, stderr);
+        }
+        None => {
+            let _ = stdout.write_all(b"There is no previous error.\n");
         }
     }
 }
@@ -523,5 +592,146 @@ mod tests {
         assert_eq!(echo_text(&[opt("a", None), opt("b", None)]), b"a b\n");
         assert_eq!(echo_text(&[opt("-n", None), opt("a", None)]), b"a");
         assert_eq!(echo_text(&[]), b"\n");
+    }
+
+    /// Run `line` from `pset`, returning the result, the settings after it,
+    /// stdout and stderr.
+    fn run_from(line: &str, pset: PsqlSettings) -> (CommandResult, PsqlSettings, String, String) {
+        let mut vars = VariableSpace::new();
+        let mut pset = pset;
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        (
+            status,
+            pset,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    #[test]
+    fn timing_toggles_without_an_argument_and_says_so() {
+        // `command.c:3175`-`:3184`.
+        let (status, pset, out, _) = run_from("\\timing", PsqlSettings::default());
+        assert_eq!(status, CommandResult::SkipLine);
+        assert!(pset.timing);
+        assert_eq!(out, "Timing is on.\n");
+        let (_, pset, out, _) = run_from("\\timing", pset);
+        assert!(!pset.timing);
+        assert_eq!(out, "Timing is off.\n");
+    }
+
+    #[test]
+    fn timing_takes_a_boolean_and_is_silent_when_quiet() {
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..PsqlSettings::default()
+        };
+        let (status, pset, out, err) = run_from("\\timing on", quiet.clone());
+        assert_eq!(status, CommandResult::SkipLine);
+        assert!(pset.timing);
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+        let (_, pset, _, _) = run_from("\\timing off", pset);
+        assert!(!pset.timing);
+    }
+
+    #[test]
+    fn a_bad_timing_value_is_an_error_that_leaves_the_switch_and_still_reports_it() {
+        // `ParseVariableBool` leaves `pset.timing` alone (`variables.c:141`),
+        // and `\timing` prints the state regardless (`command.c:3179`).
+        let on = PsqlSettings {
+            timing: true,
+            ..PsqlSettings::default()
+        };
+        let (status, pset, out, err) = run_from("\\timing sideways", on);
+        assert_eq!(status, CommandResult::Error);
+        assert!(pset.timing);
+        assert_eq!(out, "Timing is on.\n");
+        assert_eq!(
+            err,
+            "psql: error: unrecognized value \"sideways\" for \"\\timing\": Boolean expected\n"
+        );
+    }
+
+    #[test]
+    fn timing_ignores_a_second_argument_with_a_warning() {
+        let (_, _, _, err) = run_from("\\timing on off", PsqlSettings::default());
+        assert_eq!(
+            err,
+            "psql: warning: \\timing: extra argument \"off\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn errverbose_with_nothing_saved_says_so_on_stdout() {
+        // `command.c:1663`; `001_basic.pl:159`.
+        let (status, _, out, err) = run_from("\\errverbose", PsqlSettings::default());
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(out, "There is no previous error.\n");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn errverbose_logs_the_saved_error_verbosely_with_context() {
+        use rlibpq::{Backend, QueryRunner, ResultError, TransactionStatus};
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::ErrorResponse(ResultError::new(vec![
+                (b'S', b"ERROR".to_vec()),
+                (b'C', b"42703".to_vec()),
+                (b'M', b"column \"error\" does not exist".to_vec()),
+                (b'W', b"SQL function \"f\"".to_vec()),
+                (b'F', b"parse_relation.c".to_vec()),
+                (b'L', b"3859".to_vec()),
+                (b'R', b"errorMissingColumn".to_vec()),
+            ])))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        let pset = PsqlSettings {
+            last_error_result: runner.into_results().pop(),
+            inputfile: Some("<stdin>".into()),
+            lineno: 2,
+            ..PsqlSettings::default()
+        };
+        let (status, pset, out, err) = run_from("\\errverbose", pset);
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(out, "");
+        // `001_basic.pl:178`-`:181`'s shape, less the `LINE 1:` cursor rlibpq
+        // does not draw (docs/divergences.md).
+        assert_eq!(
+            err,
+            "psql:<stdin>:2: error: ERROR:  42703: column \"error\" does not exist\n\
+             CONTEXT:  SQL function \"f\"\n\
+             LOCATION:  errorMissingColumn, parse_relation.c:3859\n"
+        );
+        assert!(pset.last_error_result.is_some(), "\\errverbose keeps it");
+    }
+
+    #[test]
+    fn a_message_is_terse_under_c_and_located_under_f() {
+        // `psql.out:4724`: `invalid command \lo`, no prefix at all.
+        let terse = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(run_from("\\lo", terse).3, "invalid command \\lo\n");
+        let located = PsqlSettings {
+            inputfile: Some("a.sql".into()),
+            lineno: 3,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(
+            run_from("\\lo", located).3,
+            "psql:a.sql:3: error: invalid command \\lo\n"
+        );
     }
 }

@@ -16,7 +16,8 @@
 //! `prompt.c`), enough of `print.c` to render the default aligned output, and
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
-//! `print.c`. `\d` is NAT-401's and interactive input is NAT-405's.
+//! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`
+//! and `\errverbose`. `\d` is NAT-401's and interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -33,6 +34,7 @@
 pub mod command;
 pub mod common;
 pub mod help;
+pub mod logging;
 pub mod mainloop;
 pub mod print;
 pub mod prompt;
@@ -220,7 +222,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     // `-1`: wrap every action in one transaction (`startup.c:366`). A failed
     // BEGIN only stops the run under ON_ERROR_STOP, and then it skips the
     // actions *and* the COMMIT, which is what upstream's `goto error` does.
-    let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", stderr);
+    let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", &mut session.pset, stderr);
     if begun || !session.pset.on_error_stop {
         for action in &actions {
             code = run_action(action, &mut session, &mut executor, stdout, stderr);
@@ -233,7 +235,9 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             // wise COMMIT, which the server itself turns into a rollback if
             // the transaction is already aborted (`startup.c:439`).
             let finish = single_txn_finish(code, session.pset.on_error_stop);
-            if !psql_exec(&mut executor, finish, stderr) && session.pset.on_error_stop {
+            if !psql_exec(&mut executor, finish, &mut session.pset, stderr)
+                && session.pset.on_error_stop
+            {
                 code = EXIT_USER;
             }
         }
@@ -263,7 +267,12 @@ pub fn single_txn_finish(code: u8, on_error_stop: bool) -> &'static [u8] {
 
 /// `PSQLexec()` (`common.c:657`): run a query psql issues for itself, printing
 /// nothing on success and the server's error on failure.
-fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write) -> bool {
+fn psql_exec(
+    executor: &mut LiveExecutor,
+    query: &[u8],
+    pset: &mut settings::PsqlSettings,
+    stderr: &mut impl Write,
+) -> bool {
     match executor.exec(query) {
         Ok(results) => {
             let mut ok = true;
@@ -279,14 +288,18 @@ fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write)
                         | ExecStatus::CopyOut
                 );
                 if !accepted {
-                    let _ = stderr.write_all(&result.error_message());
+                    // `AcceptResult` logs libpq's message at info level
+                    // (`common.c:457`), and `ClearOrSaveResult` keeps the
+                    // result for `\errverbose` (`common.c:694`).
+                    logging::info(pset, result.error_message(), stderr);
+                    common::clear_or_save_result(result, pset);
                     ok = false;
                 }
             }
             ok
         }
         Err(err) => {
-            let _ = stderr.write_all(&err.rendered());
+            logging::info(pset, err.as_bytes(), stderr);
             false
         }
     }
@@ -302,10 +315,11 @@ fn run_action(
     match action {
         // `ACT_SINGLE_QUERY` (`startup.c:382`).
         Action::SingleQuery(sql) => {
+            session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
             }
-            if send_query(executor, sql.as_bytes(), &session.pset, stdout, stderr) {
+            if send_query(executor, sql.as_bytes(), &mut session.pset, stdout, stderr) {
                 EXIT_SUCCESS
             } else {
                 EXIT_FAILURE
@@ -313,6 +327,7 @@ fn run_action(
         }
         // `ACT_SINGLE_SLASH` (`startup.c:392`).
         Action::SingleSlash(text) => {
+            session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{text}");
             }
@@ -338,36 +353,94 @@ fn run_action(
                 EXIT_SUCCESS
             }
         }
-        // `ACT_FILE` (`startup.c:418`): `None` is stdin.
-        Action::File(name) => {
-            let read = if let Some(name) = name {
-                std::fs::read(name).map_err(|err| format!("{name}: {err}"))
-            } else {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
-                    .map(|_| bytes)
-                    .map_err(|err| err.to_string())
-            };
-            let input = match read {
-                Ok(bytes) => bytes,
-                Err(message) => {
-                    let _ = writeln!(stderr, "psql: error: {message}");
-                    return EXIT_FAILURE;
-                }
-            };
-            let mut loop_session = LoopSession {
-                pset: &mut session.pset,
-                vars: &mut session.vars,
-            };
-            main_loop(
-                &mut Lines::new(&input),
-                &mut loop_session,
-                executor,
-                stdout,
-                stderr,
-            )
+        // `ACT_FILE` (`startup.c:418`).
+        Action::File(name) => process_file(name.as_deref(), session, executor, stdout, stderr),
+    }
+}
+
+/// Where `process_file()` reads from, and what it calls the input in
+/// messages (`command.c:4927`-`:4966`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputFile<'a> {
+    /// No `-f` at all: stdin, and no locus, so messages are terse.
+    Stdin,
+    /// `-f -`: stdin, called `<stdin>` "for future error messages".
+    StdinNamed,
+    /// `-f NAME`.
+    Path(&'a str),
+}
+
+impl<'a> InputFile<'a> {
+    /// Calculation: the `filename` argument's three cases.
+    #[must_use]
+    pub fn from_arg(name: Option<&'a str>) -> Self {
+        match name {
+            None => InputFile::Stdin,
+            Some("-") => InputFile::StdinNamed,
+            Some(path) => InputFile::Path(path),
         }
     }
+
+    /// The name `pset.inputfile` takes while the file is read.
+    #[must_use]
+    pub fn inputfile(&self) -> Option<&'a str> {
+        match self {
+            InputFile::Stdin => None,
+            InputFile::StdinNamed => Some("<stdin>"),
+            InputFile::Path(path) => Some(path),
+        }
+    }
+}
+
+/// `process_file()` (`command.c:4920`): read the input, run it through
+/// `MainLoop` with `pset.inputfile` naming it, then restore the name and the
+/// logging mode that goes with it.
+fn process_file(
+    name: Option<&str>,
+    session: &mut Session,
+    executor: &mut LiveExecutor,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    let input = InputFile::from_arg(name);
+    let read = match input {
+        InputFile::Path(path) => std::fs::read(path).map_err(|err| format!("{path}: {err}")),
+        InputFile::Stdin | InputFile::StdinNamed => {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                .map(|_| bytes)
+                .map_err(|err| err.to_string())
+        }
+    };
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            logging::error(&session.pset, message, stderr);
+            return EXIT_FAILURE;
+        }
+    };
+
+    let old = std::mem::replace(
+        &mut session.pset.inputfile,
+        input.inputfile().map(str::to_owned),
+    );
+    // `command.c:4970`.
+    session.pset.log_terse = session.pset.inputfile.is_none();
+    let mut loop_session = LoopSession {
+        pset: &mut session.pset,
+        vars: &mut session.vars,
+    };
+    let result = main_loop(
+        &mut Lines::new(&bytes),
+        &mut loop_session,
+        executor,
+        stdout,
+        stderr,
+    );
+    session.pset.inputfile = old;
+    // `command.c:4979`.
+    session.pset.log_terse = session.pset.inputfile.is_none();
+    result
 }
 
 #[cfg(test)]
@@ -466,5 +539,23 @@ mod tests {
             panic!("expected a session");
         };
         assert!(session.single_txn);
+    }
+
+    #[test]
+    fn process_file_names_its_input_the_way_upstream_does() {
+        // `command.c:4927`-`:4966`: no `-f` reads stdin with no name, and so
+        // logs tersely; `-f -` reads stdin as `<stdin>`.
+        assert_eq!(InputFile::from_arg(None).inputfile(), None);
+        assert_eq!(InputFile::from_arg(Some("-")), InputFile::StdinNamed);
+        assert_eq!(InputFile::from_arg(Some("-")).inputfile(), Some("<stdin>"));
+        assert_eq!(
+            InputFile::from_arg(Some("a.sql")).inputfile(),
+            Some("a.sql")
+        );
+        // Not canonicalized yet (`command.c:4934`; docs/divergences.md).
+        assert_eq!(
+            InputFile::from_arg(Some("./a.sql")).inputfile(),
+            Some("./a.sql")
+        );
     }
 }

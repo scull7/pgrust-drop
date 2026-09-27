@@ -15,8 +15,8 @@
 //!   `PQcancelFinish` (`:353`, which is `Drop`).
 //!
 //! The non-blocking half of the second — `PQcancelStart`, `PQcancelPoll`,
-//! `PQcancelSocket` — needs a readiness wait this crate does not have yet
-//! (NAT-520), and is not here.
+//! `PQcancelSocket` — is not ported yet. The readiness wait it needs is
+//! `poll::socket_poll` (ADR-0010).
 //!
 //! Both are plain data once built, so either can be moved to another thread
 //! and fired while the connection it came from is blocked in a query — which

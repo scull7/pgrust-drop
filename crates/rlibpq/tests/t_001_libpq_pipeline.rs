@@ -11,11 +11,10 @@
 //! ends as `PQfinish` ends it, whose Terminate is each trace's last line.
 //!
 //! All nine traces upstream ships are compared here, and
-//! `test_pipelined_insert`, which has none, runs as upstream runs it. Not here
-//! yet: `test_uniqviol`, which has no trace to compare either,
-//! `test_protocol_version`, which needs protocol 3.2 (NAT-391), and the second
-//! half of `test_cancel`, which drives `PQcancelStart` and `PQcancelPoll`
-//! with `select()`; those two are not ported yet. Its blocking half is
+//! `test_pipelined_insert` and `test_uniqviol`, which have none, run as
+//! upstream runs them. Not here yet: `test_protocol_version`, which needs
+//! protocol 3.2 (NAT-391), and the second half of `test_cancel`, which drives
+//! `PQcancelStart` and `PQcancelPoll` with `select()`. Its blocking half is
 //! `test_cancel_blocking`.
 //!
 //! Without the reference tools every test prints `SKIP (flagged, not silent)`

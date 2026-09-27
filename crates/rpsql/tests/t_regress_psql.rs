@@ -24,6 +24,7 @@
 
 mod regress;
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use rlibpq::{Backend, FieldDescription, QueryResult, QueryRunner, TransactionStatus};
@@ -39,7 +40,6 @@ use regress::{
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 
 fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut out, b| {
         let _ = write!(out, "{b:02x}");
         out
@@ -304,6 +304,8 @@ fn startup_popt() -> PrintQueryOpt {
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 const DOCUMENT_FORMAT_SECTIONS_PORT: u16 = 55_492;
+const NUMERICLOCALE_PORT: u16 = 55_493;
+const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -452,4 +454,116 @@ fn the_document_format_sections_run_live() {
         );
     }
     gate_section(&cluster, &section("-- check ambiguous format requests"));
+}
+
+/// `-- test numericlocale` (`psql.sql:584`), live, then the same setting
+/// over values the stolen section's small integers never group, against C
+/// psql alone since `psql.out` has no such block.
+///
+/// Both psqls run under `LC_ALL=C` (`Cluster::run_script`), whose
+/// `localeconv()` is the one `DecimalLocale::POSIX` this port always uses:
+/// groups of three, `,` between them, `.` for the point. The extra script
+/// covers every column type `column_type_alignment` right-aligns, a text
+/// column and a null (both left alone), a localized `money` value (not a
+/// number, so left alone), `NaN`, and every format and `expanded`, since
+/// `printQuery` rewrites the cell before any printer sees it
+/// (`print.c:3589`).
+#[test]
+fn the_numericlocale_section_runs_live() {
+    let Some(cluster) = Cluster::start(NUMERICLOCALE_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &section("-- test numericlocale (as best we can without control of psql's locale)"),
+    );
+
+    let mut script = String::from(
+        "\\pset numericlocale on\n\\pset null 12345\n\
+         prepare q as select 1234567::int8 as i8, -12345::int2 as i2, \
+         -1234567::int4 as i4, 12345.5::float4 as f4, -1234567.125::float8 as f8, \
+         1e20::float8 as e, 1234567.891::numeric as n, 'NaN'::numeric as nan, \
+         12345::oid as o, 1234567::money as m, '1234567'::text as t, \
+         null::int4 as z;\n",
+    );
+    for format in [
+        "aligned",
+        "unaligned",
+        "csv",
+        "html",
+        "asciidoc",
+        "latex",
+        "troff-ms",
+    ] {
+        for expanded in ["off", "on"] {
+            let _ = writeln!(
+                script,
+                "\\pset format {format}\n\\pset expanded {expanded}\nexecute q;"
+            );
+        }
+    }
+    diff_against_c_psql(&cluster, "numericlocale beyond psql.sql", &script);
+}
+
+/// The unicode line style, which `psql.sql` never draws: its two `execute
+/// q;` sections (`psql.sql:222`-`:484`) with every `\pset linestyle` in them
+/// turned to `unicode`, under each of the eight `unicode_border_linestyle`,
+/// `unicode_column_linestyle` and `unicode_header_linestyle` combinations,
+/// against C psql. That is aligned, wrapped and unaligned, normal and
+/// expanded, at borders 0, 1 and 2, in every weight each junction of
+/// `refresh_utf8format` (`print.c:3692`) can take.
+#[test]
+fn the_unicode_line_style_matches_c_psql() {
+    let Some(cluster) = Cluster::start(UNICODE_LINE_STYLE_PORT) else {
+        return;
+    };
+    let q_sections = sections(
+        "-- test multi-line headers, wrapping, and newline indicators",
+        "-- test single-line header and data",
+    );
+    let unicode = q_sections
+        .sql
+        .replace("\\pset linestyle old-ascii\n", "\\pset linestyle unicode\n")
+        .replace("\\pset linestyle ascii\n", "\\pset linestyle unicode\n");
+    assert_eq!(
+        unicode.matches("\\pset linestyle unicode\n").count(),
+        4,
+        "psql.sql's two sections set the line style four times"
+    );
+    for border in ["single", "double"] {
+        for column in ["single", "double"] {
+            for header in ["single", "double"] {
+                let script = format!(
+                    "\\pset unicode_border_linestyle {border}\n\
+                     \\pset unicode_column_linestyle {column}\n\
+                     \\pset unicode_header_linestyle {header}\n{unicode}"
+                );
+                diff_against_c_psql(
+                    &cluster,
+                    &format!("unicode border {border}, column {column}, header {header}"),
+                    &script,
+                );
+            }
+        }
+    }
+}
+
+/// A script `psql.out` has no expected output for: rpsql must render all of
+/// it, and print what C psql prints when this lane has C psql.
+fn diff_against_c_psql(cluster: &Cluster, what: &str, script: &str) {
+    let ours = cluster.run_script(Path::new(RPSQL), script);
+    let text = String::from_utf8_lossy(&ours);
+    assert!(
+        !text.contains("not implemented") && !text.contains("ERROR"),
+        "rpsql ({what}):\n{text}"
+    );
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script(&psql, script);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql ({what}): {diff}");
+            }
+        }
+        None => reference::skip("psql"),
+    }
 }

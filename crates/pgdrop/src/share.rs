@@ -3,18 +3,20 @@
 //! C `postgres` finds `timezonesets` and `tsearch_data` under `share_path`,
 //! `<bindir>/../share` of its own executable (`get_share_path(my_exec_path)`:
 //! `src/backend/utils/misc/tzparser.c:320`,
-//! `src/backend/tsearch/ts_utils.c:55`). pgrust does the same, except that a
-//! `PGRUST_PGSHAREDIR` in the environment comes first. A lone `pgdrop` has no
-//! `share/` beside it, so it carries one: `build.rs` compiles every file under
-//! `crates/pgdrop/share/` into [`FILES`], vendored byte for byte from
-//! PostgreSQL 18.6 (`crates/pgdrop/share/README.md`). Before the server
-//! starts, [`prepare`] writes them once to
-//! `$XDG_CACHE_HOME/pgdrop/<KEY>/share` and points `PGRUST_PGSHAREDIR` there.
+//! `src/backend/tsearch/ts_utils.c:55`), and the compiled timezone database
+//! under `share_path/timezone` (`pg_TZDIR`, `src/timezone/pgtz.c:43`-`:54`).
+//! pgrust does the same, except that a `PGRUST_PGSHAREDIR` in the environment
+//! comes first for the former and a `PGRUST_TZDIR` for the latter. A lone
+//! `pgdrop` has no `share/` beside it, so it carries one: `build.rs` compiles
+//! every file under `crates/pgdrop/share/` into [`FILES`] — PostgreSQL 18.6's
+//! files byte for byte, and its `zic`'s output for `timezone/`
+//! (`crates/pgdrop/share/README.md`). Before the server starts, [`prepare`]
+//! writes them once to `$XDG_CACHE_HOME/pgdrop/<KEY>/share` and points both
+//! variables there.
 //!
-//! A `PGRUST_PGSHAREDIR` the user set wins: nothing is extracted and the
-//! variable is left alone. The compiled timezone database (`share/timezone`,
-//! which pgrust finds through `PGRUST_TZDIR`) is not embedded yet; until it
-//! is, it is still read from beside the executable.
+//! Each variable the user set wins on its own: it is left alone, and the
+//! extracted copy serves only the other. When the user set both, nothing is
+//! extracted.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -28,6 +30,39 @@ pub use embedded::{FILES, KEY};
 
 /// The variable pgrust reads the share directory from before `share_path`.
 pub const SHAREDIR_VAR: &str = "PGRUST_PGSHAREDIR";
+
+/// The variable pgrust reads the timezone database from before
+/// `share_path/timezone`.
+pub const TZDIR_VAR: &str = "PGRUST_TZDIR";
+
+/// A variable [`prepare`] may point into the extracted share directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareVar {
+    /// `PGRUST_PGSHAREDIR`: `timezonesets/`, `tsearch_data/`.
+    Sharedir,
+    /// `PGRUST_TZDIR`: the compiled timezone database.
+    Tzdir,
+}
+
+impl ShareVar {
+    /// The environment variable's name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sharedir => SHAREDIR_VAR,
+            Self::Tzdir => TZDIR_VAR,
+        }
+    }
+
+    /// Pure: its value for the share directory `share`.
+    #[must_use]
+    pub fn value(self, share: &Path) -> PathBuf {
+        match self {
+            Self::Sharedir => share.to_path_buf(),
+            Self::Tzdir => share.join("timezone"),
+        }
+    }
+}
 
 /// A variable's value, if it is set to an absolute path. The XDG base
 /// directory specification has relative values ignored; an empty one is
@@ -53,19 +88,29 @@ pub fn extraction_dir(cache_home: &Path, key: &str) -> PathBuf {
     cache_home.join("pgdrop").join(key)
 }
 
-/// Pure: `None` when the user named a share directory of their own (a
-/// non-empty `PGRUST_PGSHAREDIR`), else the directory to extract into.
+/// Pure: the directory to extract into and the variables to point there —
+/// each of [`ShareVar`] the user did not set to a non-empty value — or
+/// `None` when the user set both.
 #[must_use]
 pub fn plan(
     sharedir: Option<&OsStr>,
+    tzdir: Option<&OsStr>,
     xdg_cache_home: Option<&OsStr>,
     home: Option<&OsStr>,
     tmp: &Path,
-) -> Option<PathBuf> {
-    match sharedir {
-        Some(value) if !value.is_empty() => None,
-        _ => Some(extraction_dir(&cache_home(xdg_cache_home, home, tmp), KEY)),
-    }
+) -> Option<(PathBuf, Vec<ShareVar>)> {
+    let unset = |value: Option<&OsStr>| value.is_none_or(OsStr::is_empty);
+    let vars: Vec<ShareVar> = [(ShareVar::Sharedir, sharedir), (ShareVar::Tzdir, tzdir)]
+        .into_iter()
+        .filter(|(_, value)| unset(*value))
+        .map(|(var, _)| var)
+        .collect();
+    (!vars.is_empty()).then(|| {
+        (
+            extraction_dir(&cache_home(xdg_cache_home, home, tmp), KEY),
+            vars,
+        )
+    })
 }
 
 /// Action: make `<dir>/share` hold `files`, and return it.
@@ -113,13 +158,14 @@ fn write_all(files: &[(&str, &[u8])], share: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Action: before the server starts, extract [`FILES`] (see [`plan`]) and set
-/// `PGRUST_PGSHAREDIR` to the result. A failure is reported on `stderr` as a
-/// warning and the server starts anyway, falling back to `share_path` as C
-/// does; whatever it then cannot find it reports itself.
+/// Action: before the server starts, extract [`FILES`] and set the
+/// variables [`plan`] names. A failure is reported on `stderr` as a warning
+/// and the server starts anyway, falling back to `share_path` as C does;
+/// whatever it then cannot find it reports itself.
 pub fn prepare(stderr: &mut dyn Write) {
-    let Some(dir) = plan(
+    let Some((dir, vars)) = plan(
         std::env::var_os(SHAREDIR_VAR).as_deref(),
+        std::env::var_os(TZDIR_VAR).as_deref(),
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
         &std::env::temp_dir(),
@@ -127,7 +173,11 @@ pub fn prepare(stderr: &mut dyn Write) {
         return;
     };
     match extract(FILES, &dir) {
-        Ok(share) => set_sharedir(&share),
+        Ok(share) => {
+            for var in vars {
+                set_var(var.name(), &var.value(&share));
+            }
+        }
         Err(error) => {
             let _ = writeln!(
                 stderr,
@@ -139,10 +189,10 @@ pub fn prepare(stderr: &mut dyn Write) {
 }
 
 #[allow(unsafe_code)]
-fn set_sharedir(share: &Path) {
+fn set_var(name: &str, value: &Path) {
     // SAFETY: called from `main`'s thread before `pg_main` and the seams
     // start any other thread, so nothing reads the environment concurrently.
-    unsafe { std::env::set_var(SHAREDIR_VAR, share) };
+    unsafe { std::env::set_var(name, value) };
 }
 
 #[cfg(test)]
@@ -151,8 +201,8 @@ mod tests {
 
     use std::ffi::OsString;
 
-    /// Each embedded file, the upstream path `make install` copies it from,
-    /// and that file's SHA-256 at tag `REL_18_6` (commit
+    /// Each embedded file outside `timezone/`, the upstream path `make
+    /// install` copies it from, and that file's SHA-256 at tag `REL_18_6` (commit
     /// `724edf9bde9d356724ad384a2e196edc3c9f80f7`). The install lists are
     /// `src/timezone/tznames/Makefile:15`-`:19`,
     /// `src/backend/tsearch/Makefile:17`-`:21` and
@@ -377,15 +427,22 @@ mod tests {
         }
     }
 
+    /// The embedded files outside `timezone/`, which [`UPSTREAM`] covers.
+    fn copied_files() -> impl Iterator<Item = &'static (&'static str, &'static [u8])> {
+        FILES
+            .iter()
+            .filter(|(path, _)| !path.starts_with("timezone/"))
+    }
+
     #[test]
     fn each_embedded_file_is_the_file_postgresql_18_6_installs() {
-        let embedded: Vec<&str> = FILES.iter().map(|(path, _)| *path).collect();
+        let embedded: Vec<&str> = copied_files().map(|(path, _)| *path).collect();
         let upstream: Vec<&str> = UPSTREAM.iter().map(|(path, _, _)| *path).collect();
         assert_eq!(
             embedded, upstream,
             "the embedded set is upstream's install set"
         );
-        for ((path, bytes), (_, upstream_path, digest)) in FILES.iter().zip(UPSTREAM) {
+        for ((path, bytes), (_, upstream_path, digest)) in copied_files().zip(UPSTREAM) {
             assert_eq!(
                 hex(&rlibpq::sha256::sha256(bytes)),
                 *digest,
@@ -394,6 +451,45 @@ mod tests {
                  crates/postgres-18.6-reference/ (see crates/pgdrop/share/README.md)"
             );
         }
+    }
+
+    /// `timezone/` is zic's output, not a copy, so its digests live in a
+    /// `sha256sum` manifest that `scripts/vendor-timezone.sh` writes beside
+    /// the tree from the release tarball; running the script again on a
+    /// clean checkout must leave both unchanged.
+    #[test]
+    fn each_embedded_timezone_file_is_zic_output_of_postgresql_18_6() {
+        let manifest: Vec<(&str, &str)> = include_str!("../timezone.sha256")
+            .lines()
+            .map(|line| {
+                let (digest, path) = line.split_once("  ").expect("<sha256>  <path>");
+                (path, digest)
+            })
+            .collect();
+        let embedded: Vec<(&str, String)> = FILES
+            .iter()
+            .filter(|(path, _)| path.starts_with("timezone/"))
+            .map(|(path, bytes)| (*path, hex(&rlibpq::sha256::sha256(bytes))))
+            .collect();
+        assert_eq!(
+            embedded.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            manifest.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            "the embedded timezone set is crates/pgdrop/timezone.sha256's"
+        );
+        for ((path, digest), (_, expected)) in embedded.iter().zip(&manifest) {
+            assert_eq!(
+                digest, expected,
+                "crates/pgdrop/share/{path} is not zic's output; \
+                 regenerate it with scripts/vendor-timezone.sh"
+            );
+        }
+        // tzdata.zi at REL_18_6 is release 2026c; a sample zone is there.
+        assert!(embedded.len() > 500, "{} zones", embedded.len());
+        assert!(
+            embedded
+                .iter()
+                .any(|(path, _)| *path == "timezone/Europe/Paris")
+        );
     }
 
     #[test]
@@ -436,16 +532,43 @@ mod tests {
 
     #[test]
     fn a_share_dir_the_user_named_wins() {
+        use ShareVar::{Sharedir, Tzdir};
         let tmp = Path::new("/tmp");
-        let (mine, xdg) = (os("/opt/pg/share"), os("/x"));
-        assert_eq!(plan(Some(&mine), Some(&xdg), None, tmp), None);
+        let (mine, tz, xdg, empty) = (
+            os("/opt/pg/share"),
+            os("/usr/share/zoneinfo"),
+            os("/x"),
+            os(""),
+        );
+        let dir = Path::new("/x/pgdrop").join(KEY);
+        assert_eq!(plan(Some(&mine), Some(&tz), Some(&xdg), None, tmp), None);
         assert_eq!(
-            plan(None, Some(&xdg), None, tmp),
-            Some(Path::new("/x/pgdrop").join(KEY))
+            plan(None, None, Some(&xdg), None, tmp),
+            Some((dir.clone(), vec![Sharedir, Tzdir]))
         );
         assert_eq!(
-            plan(Some(&os("")), Some(&xdg), None, tmp),
-            Some(Path::new("/x/pgdrop").join(KEY))
+            plan(Some(&mine), None, Some(&xdg), None, tmp),
+            Some((dir.clone(), vec![Tzdir]))
+        );
+        assert_eq!(
+            plan(None, Some(&tz), Some(&xdg), None, tmp),
+            Some((dir.clone(), vec![Sharedir]))
+        );
+        assert_eq!(
+            plan(Some(&empty), Some(&empty), Some(&xdg), None, tmp),
+            Some((dir, vec![Sharedir, Tzdir]))
+        );
+    }
+
+    #[test]
+    fn the_variables_point_into_the_share_directory() {
+        let share = Path::new("/c/pgdrop/k/share");
+        assert_eq!(ShareVar::Sharedir.name(), "PGRUST_PGSHAREDIR");
+        assert_eq!(ShareVar::Sharedir.value(share), share);
+        assert_eq!(ShareVar::Tzdir.name(), "PGRUST_TZDIR");
+        assert_eq!(
+            ShareVar::Tzdir.value(share),
+            Path::new("/c/pgdrop/k/share/timezone")
         );
     }
 

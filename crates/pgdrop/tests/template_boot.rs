@@ -9,17 +9,15 @@
 //! ADR-0003); rinitdb stays MIT and never reaches pgrust
 //! (`scripts/check-license-wall.sh`).
 //!
-//! pgrust reads `timezonesets` and `tsearch_data` from the share directory
-//! pgdrop embeds and extracts on first run (NAT-408), and still reads the
-//! compiled `timezone` database from `<bindir>/../share` of the executable it
-//! runs as (`find_my_exec`): that one is not embedded yet. So the server runs
-//! as a hard link named `postgres` in a scratch `bin/`, beside a `share/`
-//! holding only a link to this machine's timezone database, with
-//! `PGRUST_PGSHAREDIR` and `PGRUST_TZDIR` removed from its environment and
-//! `XDG_CACHE_HOME` pointed into the scratch directory. The pgrust half needs
-//! nothing else and always runs. Without a reference installation the C
-//! half prints `SKIP (flagged, not silent)` and passes;
-//! `PGDROP_REQUIRE_REF=1` makes it fail instead.
+//! pgrust reads its share files — `timezonesets`, `tsearch_data` and the
+//! compiled `timezone` database — from the copy pgdrop embeds and extracts on
+//! first run (NAT-408). So the server runs as a hard link named `postgres` in
+//! a scratch `bin/` with no `share/` beside it, with `PGRUST_PGSHAREDIR` and
+//! `PGRUST_TZDIR` removed from its environment and `XDG_CACHE_HOME` pointed
+//! into the scratch directory. The pgrust half needs nothing else and always
+//! runs. Without a reference installation the C half prints
+//! `SKIP (flagged, not silent)` and passes; `PGDROP_REQUIRE_REF=1` makes it
+//! fail instead.
 //!
 //! The NAT-408 tests steal upstream regression queries that read the
 //! embedded files and hold pgrust to upstream's expected output.
@@ -57,24 +55,15 @@ impl Drop for Scratch {
 }
 
 /// `<scratch>/bin/postgres`, a hard link to pgdrop (so `argv[0]` selects the
-/// applet and `find_my_exec` lands in `<scratch>/bin`), and
-/// `<scratch>/share/timezone`, linked to the timezone database rinitdb reads
-/// too — the one share file pgdrop does not embed yet. Nothing else is in
-/// `share/`: `timezonesets` and `tsearch_data` must come from the embedded
-/// copy.
+/// applet and `find_my_exec` lands in `<scratch>/bin`). There is no
+/// `<scratch>/share`: every share file must come from the embedded copy.
 fn install(scratch: &Path) -> PathBuf {
     let bin = scratch.join("bin");
     std::fs::create_dir_all(&bin).expect("create bin/");
-    std::fs::create_dir_all(scratch.join("share")).expect("create share/");
     let postgres = bin.join("postgres");
     if std::fs::hard_link(PGDROP, &postgres).is_err() {
         std::fs::copy(PGDROP, &postgres).expect("copy pgdrop");
     }
-    let tzdir = rinitdb::RealTzSource::from_env()
-        .expect("a timezone database on this machine")
-        .tzdir()
-        .to_path_buf();
-    std::os::unix::fs::symlink(tzdir, scratch.join("share/timezone")).expect("link timezone");
     postgres
 }
 
@@ -82,7 +71,7 @@ fn install(scratch: &Path) -> PathBuf {
 /// XDG cache of the test's own, `<scratch>/cache`.
 fn server_env(scratch: &Path) -> Environment {
     Environment::inherited()
-        .without_all([pgdrop::share::SHAREDIR_VAR, "PGRUST_TZDIR"])
+        .without_all([pgdrop::share::SHAREDIR_VAR, pgdrop::share::TZDIR_VAR])
         .with("XDG_CACHE_HOME", scratch.join("cache"))
 }
 
@@ -244,4 +233,70 @@ fn tsdicts_ispell_and_tsearch_english_stem() {
         ["{sky}", "{sky}"],
         "stdout: {stdout}"
     );
+}
+
+/// `timezone`, NAT-408's acceptance: `select now() at time zone
+/// 'Europe/Paris'` answers with neither `PGRUST_PGSHAREDIR` nor
+/// `PGRUST_TZDIR` set and no `share/` beside the binary. `now()` has no fixed
+/// expected value, so upstream's own Paris queries pin the zone's rules,
+/// under pg_regress's `PGDATESTYLE=Postgres, MDY`
+/// (`src/test/regress/pg_regress.c:786`):
+/// `src/test/regress/sql/timestamptz.sql:471`, expected
+/// `src/test/regress/expected/timestamptz.out:2484`-`:2488` (Paris's local
+/// mean time before 1891, 0:09:21 ahead of UTC); and `timestamptz.sql:655`-`:658`,
+/// expected `timestamptz.out:3253`-`:3265` (`AT LOCAL` under
+/// `SET LOCAL TIME ZONE 'Europe/Paris'`, CEST in July).
+#[test]
+fn timestamptz_europe_paris() {
+    let scratch = Scratch::new("share-timezone");
+    let pgrust = install(&scratch.0);
+    let pgdata = scratch.0.join("data");
+    pgdrop_initdb(&pgdata);
+    let stdout = single(
+        &pgrust,
+        &pgdata,
+        &server_env(&scratch.0),
+        "select now() at time zone 'Europe/Paris' as paris;\n\
+         set datestyle = 'Postgres, MDY';\n\
+         SELECT make_timestamptz(1881, 12, 10, 0, 0, 0, 'Europe/Paris') AT TIME ZONE 'UTC';\n\
+         BEGIN;\n\
+         SET LOCAL TIME ZONE 'Europe/Paris';\n\
+         VALUES (CAST('1978-07-07 19:38 America/New_York' AS TIMESTAMP WITH TIME ZONE) AT LOCAL);\n\
+         VALUES (TIMESTAMP '1978-07-07 19:38' AT LOCAL);\n\
+         COMMIT;\n",
+    );
+    let paris = values(&stdout, "paris");
+    assert_eq!(paris.len(), 1, "stdout: {stdout}");
+    assert!(
+        paris[0].len() >= "yyyy-mm-dd hh:mm:ss".len() && paris[0].as_bytes()[4] == b'-',
+        "an ISO timestamp: {paris:?}"
+    );
+    assert_eq!(
+        values(&stdout, "timezone"),
+        ["Fri Dec 09 23:50:39 1881"],
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        values(&stdout, "column1"),
+        ["Sat Jul 08 01:38:00 1978", "Fri Jul 07 19:38:00 1978 CEST"],
+        "stdout: {stdout}"
+    );
+}
+
+/// `timezone`: `src/test/regress/sql/sysviews.sql:94`, expected
+/// `src/test/regress/expected/sysviews.out:200`-`:204` — `pg_timezone_names`
+/// enumerates the embedded database and finds at least 24 distinct offsets.
+#[test]
+fn sysviews_timezone_names() {
+    let scratch = Scratch::new("share-tznames-view");
+    let pgrust = install(&scratch.0);
+    let pgdata = scratch.0.join("data");
+    pgdrop_initdb(&pgdata);
+    let stdout = single(
+        &pgrust,
+        &pgdata,
+        &server_env(&scratch.0),
+        "select count(distinct utc_offset) >= 24 as ok from pg_timezone_names;\n",
+    );
+    assert_eq!(values(&stdout, "ok"), ["t"], "stdout: {stdout}");
 }

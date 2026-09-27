@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn watch_interval_is_read_the_way_parse_variable_double_reads_it() {
         // `variables.c:195`-`:250`, through `watch_interval_hook`
-        // (`startup.c:956`); `001_basic.pl:425`-`:443`.
+        // (`startup.c:956`); `001_basic.pl:437`-`:455`.
         let mut vars = VariableSpace::new();
         let mut refused = |value: &str| {
             vars.set("WATCH_INTERVAL", Some(value))

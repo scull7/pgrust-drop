@@ -6,7 +6,8 @@
 //! stolen assertion through rpsql and, when the lane has one, through C psql
 //! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
-//! (lines 86-108) and `\errverbose with no previous error` (159-164). The
+//! (lines 86-108), `\errverbose with no previous error` (159-164) and
+//! `\errverbose after normal query with error` (170-181). The
 //! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
 //! `\errverbose` cases, and the rest of the file, land with Linear
 //! NAT-400 … NAT-405.
@@ -78,6 +79,7 @@ fn psql_help_arg() {
 const TIMING_WITH_SUCCESSFUL_QUERY_PORT: u16 = 55_401;
 const TIMING_WITH_QUERY_ERROR_PORT: u16 = 55_402;
 const ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT: u16 = 55_403;
+const ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT: u16 = 55_404;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -158,10 +160,9 @@ fn timing_with_query_error() {
 
 /// `# test \errverbose`, its first case — 001_basic.pl:153-164.
 ///
-/// The three cases after it (`:170`-`:210`) need `LINE 1:` and its caret,
-/// which rlibpq does not draw yet (`reportErrorPosition`; see
-/// `docs/divergences.md`), and `FETCH_COUNT` and `\gdesc`; they are NAT-403's
-/// remaining work, not narrowed here.
+/// Of the three cases after it, the first is
+/// [`errverbose_after_normal_query_with_error`]; the other two
+/// (`:183`-`:210`) need `FETCH_COUNT` and `\gdesc`, and land with them.
 #[test]
 fn errverbose_with_no_previous_error() {
     let Some(cluster) = Cluster::start(ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT) else {
@@ -173,6 +174,33 @@ fn errverbose_with_no_previous_error() {
         "^1\nThere is no previous error\\.$",
         "\\errverbose with no previous error",
     );
+}
+
+/// `\errverbose after normal query with error` — 001_basic.pl:166-181: the
+/// error with its `LINE 1:` cursor, then `\errverbose` repeating it at
+/// `VERBOSITY verbose`, cursor and all, through every psql in turn.
+#[test]
+fn errverbose_after_normal_query_with_error() {
+    let Some(cluster) = Cluster::start(ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT) else {
+        return;
+    };
+    for psql in every_psql(&cluster) {
+        let PsqlOutcome { stderr, .. } = cluster.psql(&psql, "SELECT error;\n\\errverbose", false);
+        assert_like(
+            &stderr,
+            "(?m)\\A^psql:<stdin>:1: ERROR:  .*$\n\
+             ^LINE 1: SELECT error;$\n\
+             ^ *^.*$\n\
+             ^psql:<stdin>:2: error: ERROR:  [0-9A-Z]{5}: .*$\n\
+             ^LINE 1: SELECT error;$\n\
+             ^ *^.*$\n\
+             ^LOCATION: .*$",
+            &format!(
+                "\\errverbose after normal query with error ({})",
+                psql.display()
+            ),
+        );
+    }
 }
 
 /// The Acceptance gate for `--help`, `--help=commands` and `--help=variables`:

@@ -117,6 +117,9 @@ impl std::error::Error for ArgumentError {}
 pub struct Plan {
     pub messages: Vec<Frontend>,
     pub class: QueryClass,
+    /// The text the command queue entry keeps (`entry->query`), for an
+    /// error's cursor: the SQL of a Query or a Parse, `None` otherwise.
+    pub query: Option<Vec<u8>>,
 }
 
 impl Plan {
@@ -238,6 +241,8 @@ fn query_guts(
     Ok(Plan {
         messages,
         class: QueryClass::Extended,
+        // fe-exec.c:1916 — the text, when there is a command to keep.
+        query: parse.map(|(command, _)| command.to_vec()),
     })
 }
 
@@ -257,6 +262,8 @@ pub fn prepare(statement: &[u8], query: &[u8], param_types: &[u32]) -> Result<Pl
             Frontend::Sync,
         ],
         class: QueryClass::Prepare,
+        // fe-exec.c:1623.
+        query: Some(query.to_vec()),
     })
 }
 
@@ -281,6 +288,7 @@ pub fn typed_command(command: TypedCommand, target: Target, name: &[u8]) -> Plan
     Plan {
         messages: vec![message, Frontend::Sync],
         class,
+        query: None,
     }
 }
 

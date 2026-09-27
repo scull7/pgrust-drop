@@ -3,8 +3,11 @@
 //!
 //! Ported from `src/interfaces/libpq/fe-exec.c` (the `PGresult` struct and its
 //! accessors) and `fe-protocol3.c` (`pqGetErrorNotice3`, `:899`, which fills
-//! the error fields, and `pqBuildErrorMessage3`, `:1031`, which renders them).
+//! the error fields, `pqBuildErrorMessage3`, `:1031`, which renders them, and
+//! `reportErrorPosition`, `:1202`, which draws the syntax cursor).
 //! Everything here is a calculation over bytes; nothing touches a socket.
+
+use crate::encoding::Encoding;
 
 /// `ExecStatusType`, `libpq-fe.h:122`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,16 +91,56 @@ pub enum ContextVisibility {
 }
 
 /// The broken-down fields of an ErrorResponse or NoticeResponse, in the order
-/// the server sent them (`pqSaveMessageField`, `fe-exec.c:1066`).
+/// the server sent them (`pqSaveMessageField`, `fe-exec.c:1066`), with the
+/// two things the `PGresult` holding them keeps for drawing a syntax cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultError {
     fields: Vec<(u8, Vec<u8>)>,
+    /// `res->errQuery`: the text of the command the error is about, kept
+    /// only when there is a `PG_DIAG_STATEMENT_POSITION` to point into it
+    /// (`fe-protocol3.c:966`).
+    err_query: Option<Vec<u8>>,
+    /// `res->client_encoding`, copied from the connection when the result is
+    /// made (`fe-exec.c:193`): what the cursor measures characters in.
+    client_encoding: Encoding,
 }
 
 impl ResultError {
+    /// Fields alone: no query kept, and SQL_ASCII, which is what
+    /// `PQmakeEmptyPGresult` gives a result made without a connection
+    /// (`fe-exec.c:234`).
     #[must_use]
     pub fn new(fields: Vec<(u8, Vec<u8>)>) -> Self {
-        Self { fields }
+        Self {
+            fields,
+            ..Self::default()
+        }
+    }
+
+    /// The same fields with `res->errQuery` set to `query`.
+    #[must_use]
+    pub fn with_err_query(mut self, query: Vec<u8>) -> Self {
+        self.err_query = Some(query);
+        self
+    }
+
+    /// The same fields with `res->client_encoding` set to `encoding`.
+    #[must_use]
+    pub fn with_client_encoding(mut self, encoding: Encoding) -> Self {
+        self.client_encoding = encoding;
+        self
+    }
+
+    /// `res->errQuery`.
+    #[must_use]
+    pub fn err_query(&self) -> Option<&[u8]> {
+        self.err_query.as_deref()
+    }
+
+    /// `res->client_encoding`.
+    #[must_use]
+    pub fn client_encoding(&self) -> Encoding {
+        self.client_encoding
     }
 
     /// `PQresultErrorField`, `fe-exec.c:3497`.
@@ -121,12 +164,9 @@ impl ResultError {
     }
 
     /// `pqBuildErrorMessage3`, `fe-protocol3.c:1031` — what
-    /// `PQresultErrorMessage` returns, trailing newline included.
-    ///
-    /// The syntax-cursor display (`reportErrorPosition`, `fe-protocol3.c:1202`)
-    /// is not ported: this result never carries the query text, which is the
-    /// case upstream renders as " at character %s" (`:1102`). See
-    /// `docs/divergences.md`.
+    /// `PQresultErrorMessage` returns, trailing newline included, with the
+    /// `LINE n:` and caret lines of the syntax cursor whenever there is a
+    /// query to draw them over and the verbosity is not terse.
     #[must_use]
     // `valf` / `vall` below are upstream's own names for the source file and
     // source line fields (`fe-protocol3.c:1174`).
@@ -164,29 +204,37 @@ impl ResultError {
         if let Some(val) = self.field(diag::MESSAGE_PRIMARY) {
             msg.extend_from_slice(val);
         }
-        // fe-protocol3.c:1089 — a statement position always renders as text
-        // here, because this result never carries the query it would point at
-        // (`res->errQuery`); that is the divergence `docs/divergences.md`
-        // records.
-        if let Some(val) = self.field(diag::STATEMENT_POSITION) {
-            msg.extend_from_slice(b" at character ");
-            msg.extend_from_slice(val);
-        } else if let Some(val) = self.field(diag::INTERNAL_POSITION) {
-            // fe-protocol3.c:1112 — an *internal* position has its query right
-            // here in `PG_DIAG_INTERNAL_QUERY`, so upstream draws a cursor
-            // over it and emits no " at character" text at all. The cursor is
-            // not ported; suppressing the text is, because otherwise the
-            // primary line differs from C libpq's for every error inside a
-            // PL/pgSQL EXECUTE. The query itself still reaches the reader on
-            // the "QUERY:  " line below.
-            if verbosity == Verbosity::Terse || self.field(diag::INTERNAL_QUERY).is_none() {
-                msg.extend_from_slice(b" at character ");
-                msg.extend_from_slice(val);
+        // fe-protocol3.c:1089-:1126 — a position becomes a cursor over the
+        // query it points into when there is one and the verbosity is not
+        // terse, and " at character %s" text otherwise. A statement position
+        // points into the command sent (`res->errQuery`), an internal one into
+        // `PG_DIAG_INTERNAL_QUERY`.
+        let mut cursor: Option<(&[u8], i32)> = None;
+        let (position, query) = match self.field(diag::STATEMENT_POSITION) {
+            Some(val) => (Some(val), self.err_query()),
+            None => (
+                self.field(diag::INTERNAL_POSITION),
+                self.field(diag::INTERNAL_QUERY),
+            ),
+        };
+        if let Some(val) = position {
+            match query {
+                Some(query) if verbosity != Verbosity::Terse => cursor = Some((query, atoi(val))),
+                _ => {
+                    msg.extend_from_slice(b" at character ");
+                    msg.extend_from_slice(val);
+                }
             }
         }
         msg.push(b'\n');
 
         if verbosity != Verbosity::Terse {
+            // fe-protocol3.c:1129.
+            if let Some((query, querypos)) = cursor
+                && querypos > 0
+            {
+                report_error_position(&mut msg, query, querypos, self.client_encoding);
+            }
             for (code, label) in [
                 (diag::MESSAGE_DETAIL, &b"DETAIL:  "[..]),
                 (diag::MESSAGE_HINT, &b"HINT:  "[..]),
@@ -245,6 +293,160 @@ impl ResultError {
 
         msg
     }
+}
+
+/// C's `atoi` over a position field: leading white space, an optional sign,
+/// then digits up to the first non-digit. The server sends a plain positive
+/// decimal; anything past `i32` saturates where C's behaviour is undefined.
+fn atoi(s: &[u8]) -> i32 {
+    let mut rest = s;
+    while let [c, tail @ ..] = rest
+        && matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    {
+        rest = tail;
+    }
+    let negative = rest.first() == Some(&b'-');
+    if matches!(rest.first(), Some(b'-' | b'+')) {
+        rest = &rest[1..];
+    }
+    let mut n: i32 = 0;
+    for &c in rest.iter().take_while(|c| c.is_ascii_digit()) {
+        let digit = i32::from(c - b'0');
+        n = if negative {
+            n.saturating_mul(10).saturating_sub(digit)
+        } else {
+            n.saturating_mul(10).saturating_add(digit)
+        };
+    }
+    n
+}
+
+/// `DISPLAY_SIZE`, `fe-protocol3.c:1204`: screen width limit, in columns.
+const DISPLAY_SIZE: usize = 60;
+/// `MIN_RIGHT_CUT`, `fe-protocol3.c:1205`: how far to try to keep the cursor
+/// from the end of the line.
+const MIN_RIGHT_CUT: usize = 10;
+
+/// `reportErrorPosition`, `fe-protocol3.c:1202`: append the `LINE n: …` line
+/// holding the 1-based character position `loc` of `query`, and under it a
+/// caret at that character's screen column. A position past the end of the
+/// query appends nothing.
+///
+/// Characters are measured in `encoding`: each one's byte length is
+/// `PQmblenBounded` and its width `pg_encoding_dsplen`, a control character
+/// counting as one column. Tabs are shown as spaces. A line wider than
+/// [`DISPLAY_SIZE`] columns is cut to fit, on the right first and on the left
+/// if that is not enough, with `...` where it was cut.
+fn report_error_position(msg: &mut Vec<u8>, query: &[u8], loc: i32, encoding: Encoding) {
+    // :1223 — 1-based to 0-based; nothing to draw before the start.
+    let Ok(loc) = usize::try_from(loc.saturating_sub(1)) else {
+        return;
+    };
+    // :1228 — a writable copy of the query as C sees it: up to its NUL.
+    let end = query.iter().position(|&c| c == 0).unwrap_or(query.len());
+    let mut wquery = query[..end].to_vec();
+
+    // :1271 — a single-byte encoding needs no width lookups.
+    let mb_encoding = encoding.max_length() != 1;
+
+    // :1282-:1344 — qidx[] and scridx[] hold each character's byte offset
+    // and starting screen column, filled as far as iend.
+    let mut qidx: Vec<usize> = Vec::new();
+    let mut scridx: Vec<usize> = Vec::new();
+    let mut qoffset = 0;
+    let mut scroffset = 0;
+    let mut loc_line = 1;
+    let mut ibeg = 0;
+    let mut iend = None;
+    let mut cno = 0;
+    while qoffset < wquery.len() {
+        let ch = wquery[qoffset];
+        qidx.push(qoffset);
+        scridx.push(scroffset);
+
+        if ch == b'\t' {
+            wquery[qoffset] = b' ';
+        } else if ch == b'\r' || ch == b'\n' {
+            // :1307 — each \r or \n is a line, except \r\n together.
+            if cno < loc {
+                if ch == b'\r' || cno == 0 || wquery[qidx[cno - 1]] != b'\r' {
+                    loc_line += 1;
+                }
+                ibeg = cno + 1;
+            } else {
+                iend = Some(cno);
+                break;
+            }
+        }
+
+        if mb_encoding {
+            // :1333 — any non-tab control character is one column wide.
+            let w = encoding.dsplen(&wquery[qoffset..]);
+            scroffset += usize::try_from(w).ok().filter(|&w| w > 0).unwrap_or(1);
+            qoffset += encoding.mblen_bounded(&wquery[qoffset..]);
+        } else {
+            scroffset += 1;
+            qoffset += 1;
+        }
+        cno += 1;
+    }
+    // :1347 — no end of line after loc: the line runs to the end.
+    let mut iend = iend.unwrap_or_else(|| {
+        qidx.push(qoffset);
+        scridx.push(scroffset);
+        cno
+    });
+
+    // :1355 — only if loc is within the query.
+    if loc > cno {
+        return;
+    }
+    let mut beg_trunc = false;
+    let mut end_trunc = false;
+    if scridx[iend] - scridx[ibeg] > DISPLAY_SIZE {
+        if scridx[ibeg] + DISPLAY_SIZE >= scridx[loc] + MIN_RIGHT_CUT {
+            // :1367 — cutting on the right is enough.
+            while scridx[iend] - scridx[ibeg] > DISPLAY_SIZE {
+                iend -= 1;
+            }
+            end_trunc = true;
+        } else {
+            // :1376 — cut on the right, short of the cursor, then on the
+            // left if still too long.
+            while scridx[loc] + MIN_RIGHT_CUT < scridx[iend] {
+                iend -= 1;
+                end_trunc = true;
+            }
+            while scridx[iend] - scridx[ibeg] > DISPLAY_SIZE {
+                ibeg += 1;
+                beg_trunc = true;
+            }
+        }
+    }
+
+    // :1395 — the LINE line, measuring the prefix's own width as it goes.
+    let start = msg.len();
+    msg.extend_from_slice(format!("LINE {loc_line}: ").as_bytes());
+    if beg_trunc {
+        msg.extend_from_slice(b"...");
+    }
+    let mut prefix_width = 0;
+    let mut i = start;
+    while i < msg.len() {
+        let w = encoding.dsplen(&msg[i..]);
+        prefix_width += usize::try_from(w).ok().filter(|&w| w > 0).unwrap_or(1);
+        i += encoding.mblen_bounded(&msg[i..]).max(1);
+    }
+    msg.extend_from_slice(&wquery[qidx[ibeg]..qidx[iend]]);
+    if end_trunc {
+        msg.extend_from_slice(b"...");
+    }
+    msg.push(b'\n');
+
+    // :1421 — the cursor line.
+    let column = prefix_width + scridx[loc] - scridx[ibeg];
+    msg.resize(msg.len() + column, b' ');
+    msg.extend_from_slice(b"^\n");
 }
 
 /// One column of a `RowDescription` — `PGresAttDesc`, `libpq-fe.h:305`, as
@@ -471,7 +673,9 @@ mod tests {
         ])
     }
 
-    /// The default rendering: severity, primary message, the position as text.
+    /// The default rendering: severity, primary message, and — with no
+    /// query kept to draw a cursor over (`res->errQuery` NULL) — the
+    /// position as text (`fe-protocol3.c:1102`).
     #[test]
     fn the_default_rendering_is_severity_message_and_position() {
         assert_eq!(
@@ -484,23 +688,64 @@ mod tests {
         );
     }
 
-    /// An error raised inside PL/pgSQL's EXECUTE: the server sends the
-    /// position as `p` together with the statement as `q`, and upstream then
-    /// puts the position on a cursor display rather than in the primary line
-    /// (`fe-protocol3.c:1112`). The cursor is not ported, so the primary line
-    /// is all this must match — and it must match, or every such error reads
-    /// differently here than through C libpq.
+    /// With the query kept, the position is a cursor below the primary line
+    /// at every verbosity but terse, which keeps the text
+    /// (`fe-protocol3.c:1092`-`:1103`); the cursor comes before DETAIL and
+    /// HINT (`:1129`).
     #[test]
-    fn an_internal_position_stays_out_of_the_primary_line() {
+    fn a_statement_position_draws_a_cursor_over_the_query_kept() {
+        let error = server_error()
+            .with_err_query(b"selct 1".to_vec())
+            .with_client_encoding(Encoding::Utf8);
+        let render = |verbosity| {
+            String::from_utf8(error.message(
+                ExecStatus::FatalError,
+                verbosity,
+                ContextVisibility::Errors,
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            render(Verbosity::Default),
+            "ERROR:  syntax error at or near \"selct\"\nLINE 1: selct 1\n        ^\n"
+        );
+        assert_eq!(
+            render(Verbosity::Verbose),
+            "ERROR:  42601: syntax error at or near \"selct\"\nLINE 1: selct 1\n        ^\n\
+             LOCATION:  scanner_yyerror, scan.l:1244\n"
+        );
+        assert_eq!(
+            render(Verbosity::Terse),
+            "ERROR:  syntax error at or near \"selct\" at character 1\n"
+        );
+        assert_eq!(render(Verbosity::Sqlstate), "ERROR:  42601\n");
+    }
+
+    /// An error raised inside PL/pgSQL: the server sends the position as `p`
+    /// with the statement as `q`, and upstream draws the cursor over that
+    /// (`fe-protocol3.c:1112`) — `src/test/regress/expected/plpgsql.out:1763`
+    /// -`:1768`, where the HINT follows the cursor and QUERY follows the HINT.
+    #[test]
+    fn an_internal_position_draws_its_cursor_over_the_internal_query() {
         let error = ResultError::new(vec![
             (diag::SEVERITY, b"ERROR".to_vec()),
-            (diag::SQLSTATE, b"42601".to_vec()),
+            (diag::SQLSTATE, b"42883".to_vec()),
             (
                 diag::MESSAGE_PRIMARY,
-                b"syntax error at or near \"selct\"".to_vec(),
+                b"operator does not exist: point + integer".to_vec(),
             ),
-            (diag::INTERNAL_POSITION, b"1".to_vec()),
-            (diag::INTERNAL_QUERY, b"selct 1".to_vec()),
+            (
+                diag::MESSAGE_HINT,
+                b"No operator matches the given name and argument types. \
+                  You might need to add explicit type casts."
+                    .to_vec(),
+            ),
+            (diag::INTERNAL_POSITION, b"3".to_vec()),
+            (diag::INTERNAL_QUERY, b"x + 1".to_vec()),
+            (
+                diag::CONTEXT,
+                b"PL/pgSQL function f1(anyelement) line 3 at RETURN".to_vec(),
+            ),
         ]);
         assert_eq!(
             String::from_utf8(error.message(
@@ -509,11 +754,16 @@ mod tests {
                 ContextVisibility::Errors
             ))
             .unwrap(),
-            "ERROR:  syntax error at or near \"selct\"\nQUERY:  selct 1\n"
+            "ERROR:  operator does not exist: point + integer\n\
+             LINE 1: x + 1\n          ^\n\
+             HINT:  No operator matches the given name and argument types. \
+             You might need to add explicit type casts.\n\
+             QUERY:  x + 1\n\
+             CONTEXT:  PL/pgSQL function f1(anyelement) line 3 at RETURN\n"
         );
 
-        // PQERRORS_TERSE has no QUERY line to carry the statement, so there
-        // the position does go in the text (`fe-protocol3.c:1121`).
+        // PQERRORS_TERSE has no cursor, so there the position goes in the
+        // text (`fe-protocol3.c:1121`).
         assert_eq!(
             String::from_utf8(error.message(
                 ExecStatus::FatalError,
@@ -521,7 +771,7 @@ mod tests {
                 ContextVisibility::Errors
             ))
             .unwrap(),
-            "ERROR:  syntax error at or near \"selct\" at character 1\n"
+            "ERROR:  operator does not exist: point + integer at character 3\n"
         );
 
         // With no internal query there is nothing to draw a cursor over, so
@@ -540,6 +790,146 @@ mod tests {
             .unwrap(),
             "ERROR:  boom at character 7\n"
         );
+    }
+
+    /// `reportErrorPosition` alone, as a string.
+    fn cursor(query: &str, loc: i32, encoding: Encoding) -> String {
+        let mut msg = Vec::new();
+        report_error_position(&mut msg, query.as_bytes(), loc, encoding);
+        String::from_utf8(msg).unwrap()
+    }
+
+    /// The cursor lines of upstream's own regression output: each query,
+    /// the `LINE` and caret lines C libpq drew for it, and the position
+    /// those two lines put the caret at. Short lines, a line cut on the
+    /// right, on the left, and on both sides, the second and third line of
+    /// a statement, and a position one past the end of the input.
+    #[test]
+    fn the_cursor_is_upstreams_regression_output() {
+        let cases = [
+            // aggregates.out:2669-:2672 — cut on the right only.
+            (
+                "select rank('fred') within group (order by x) from generate_series(1,5) x;",
+                13,
+                "LINE 1: select rank('fred') within group (order by x) from generate_...\n\
+                 \x20                   ^\n",
+            ),
+            // aggregates.out:2673-:2677 — the first of two lines, cut on
+            // both sides.
+            (
+                "select rank('adam'::text collate \"C\") within group (order by x collate \"POSIX\")\n  \
+                 from (values ('fred'),('jim')) v(x);",
+                64,
+                "LINE 1: ...adam'::text collate \"C\") within group (order by x collate \"P...\n\
+                 \x20                                                            ^\n",
+            ),
+            // alter_table.out:1767-:1770 — cut on the left only.
+            (
+                "alter table renameColumn add column y int check (x > 0) not enforced enforced;",
+                70,
+                "LINE 1: ...Column add column y int check (x > 0) not enforced enforced;\n\
+                 \x20                                                             ^\n",
+            ),
+            // alter_table.out:4033-:4036 — cut on both sides.
+            (
+                "ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES FROM (1) TO (10);",
+                63,
+                "LINE 1: ...list_parted ATTACH PARTITION fail_part FOR VALUES FROM (1) T...\n\
+                 \x20                                                            ^\n",
+            ),
+            // create_function_sql.out:301-:306 — the third line.
+            (
+                "CREATE FUNCTION functest_S_xx(x date) RETURNS boolean\n    LANGUAGE SQL\n    \
+                 RETURN x > 1;",
+                85,
+                "LINE 3:     RETURN x > 1;\n\x20                    ^\n",
+            ),
+            // boolean.out:299-:303 — the second line.
+            (
+                "INSERT INTO BOOLTBL2 (f1)\n   VALUES (bool 'XXX');",
+                43,
+                "LINE 2:    VALUES (bool 'XXX');\n\x20                       ^\n",
+            ),
+            // psql.out:4953-:4956 — "syntax error at end of input" points
+            // one past the last character.
+            (
+                "SELECT 4 AS ",
+                13,
+                "LINE 1: SELECT 4 AS \n\x20                   ^\n",
+            ),
+        ];
+        for (query, loc, expected) in cases {
+            assert_eq!(
+                cursor(query, loc, Encoding::SqlAscii),
+                expected,
+                "{query:?}"
+            );
+            assert_eq!(cursor(query, loc, Encoding::Utf8), expected, "{query:?}");
+        }
+    }
+
+    /// Line ends: `\r\n` is one line break, a lone `\r` or `\n` is one each
+    /// (`fe-protocol3.c:1307`); a tab is shown as one space; a position
+    /// before the start or two past the end draws nothing.
+    #[test]
+    fn line_ends_tabs_and_out_of_range_positions() {
+        let ascii = Encoding::SqlAscii;
+        assert_eq!(
+            cursor("select 1,\r\n\tfoo", 13, ascii),
+            "LINE 2:  foo\n         ^\n"
+        );
+        assert_eq!(
+            cursor("select 1,\r\rfoo", 12, ascii),
+            "LINE 3: foo\n        ^\n"
+        );
+        assert_eq!(
+            cursor("select 1,\n\nfoo", 12, ascii),
+            "LINE 3: foo\n        ^\n"
+        );
+        assert_eq!(
+            cursor("a\nb", 2, ascii),
+            "LINE 1: a\n         ^\n",
+            "a position on the line end itself belongs to the line it ends"
+        );
+        assert_eq!(cursor("selct 1", 0, ascii), "");
+        assert_eq!(cursor("selct 1", 9, ascii), "");
+        assert_eq!(
+            cursor("selct 1", 8, ascii),
+            "LINE 1: selct 1\n               ^\n"
+        );
+    }
+
+    /// In a multibyte encoding the position counts characters, and the
+    /// caret moves by each one's display width: two columns for a wide
+    /// character, and one for a combining character, since any width of
+    /// zero or less counts as one (`fe-protocol3.c:1333`). A single-byte
+    /// encoding counts bytes, one column each.
+    #[test]
+    fn a_multibyte_query_is_measured_in_characters_and_columns() {
+        let query = "select '\u{4e16}\u{754c}e\u{301}', foo";
+        // 8 characters, two wide ones, `e`, the accent, `', `: `foo` is the
+        // 16th character and starts in column 8 + 4 + 1 + 1 + 3.
+        assert_eq!(
+            cursor(query, 16, Encoding::Utf8),
+            format!("LINE 1: {query}\n{}^\n", " ".repeat(8 + 8 + 4 + 1 + 1 + 3))
+        );
+        let latin1 = b"select '\xe9', foo";
+        let mut msg = Vec::new();
+        report_error_position(&mut msg, latin1, 13, Encoding::Latin1);
+        let mut expected = b"LINE 1: ".to_vec();
+        expected.extend_from_slice(latin1);
+        expected.extend_from_slice(b"\n                    ^\n");
+        assert_eq!(msg, expected);
+    }
+
+    /// `atoi`: what the position field is read with.
+    #[test]
+    fn atoi_reads_like_c() {
+        assert_eq!(atoi(b"42"), 42);
+        assert_eq!(atoi(b" 7x"), 7);
+        assert_eq!(atoi(b"-3"), -3);
+        assert_eq!(atoi(b""), 0);
+        assert_eq!(atoi(b"99999999999"), i32::MAX);
     }
 
     /// `PQERRORS_TERSE` drops DETAIL, HINT, QUERY and CONTEXT;

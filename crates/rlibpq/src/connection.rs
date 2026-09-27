@@ -717,7 +717,10 @@ impl<S: Read + Write> Connection<S> {
                     AuthStep::Send(message) => conn.send(&message)?,
                     AuthStep::Nothing | AuthStep::Complete => {}
                 },
-                Backend::ParameterStatus { name, value } => conn.parameters.push((name, value)),
+                Backend::ParameterStatus { name, value } => {
+                    conn.state.save_parameter_status(&name, &value);
+                    conn.parameters.push((name, value));
+                }
                 Backend::BackendKeyData { pid, cancel_key } => {
                     conn.backend_pid = pid;
                     conn.cancel_key = cancel_key;
@@ -1009,6 +1012,8 @@ impl<S: Read + Write> Connection<S> {
         self.dispatch(Plan {
             messages: vec![Frontend::Query(query.to_vec())],
             class: QueryClass::Simple,
+            // fe-exec.c:1484.
+            query: Some(query.to_vec()),
         })
     }
 
@@ -1120,7 +1125,7 @@ impl<S: Read + Write> Connection<S> {
         if self.state.flushes_now(self.outbuf.len()) {
             self.flush()?;
         }
-        self.state.append(plan.class);
+        self.state.append_command(plan.class, plan.query);
         Ok(())
     }
 
@@ -1695,6 +1700,7 @@ impl<S: Read + Write> Connection<S> {
                 // pqGetErrorNotice3(conn, true) — the error replaces any
                 // result being built.
                 Backend::ErrorResponse(fields) => {
+                    let fields = fields.with_client_encoding(self.state.client_encoding());
                     error = Some(QueryResult::with_error(ExecStatus::FatalError, fields));
                     status = ExecStatus::FatalError;
                 }
@@ -1703,8 +1709,13 @@ impl<S: Read + Write> Connection<S> {
                     channel,
                     payload,
                 } => self.notifications.push((pid, channel, payload)),
-                Backend::NoticeResponse(notice) => self.notices.push(notice),
-                Backend::ParameterStatus { name, value } => self.parameters.push((name, value)),
+                Backend::NoticeResponse(notice) => self
+                    .notices
+                    .push(notice.with_client_encoding(self.state.client_encoding())),
+                Backend::ParameterStatus { name, value } => {
+                    self.state.save_parameter_status(&name, &value);
+                    self.parameters.push((name, value));
+                }
                 Backend::ReadyForQuery(xact) => {
                     self.transaction_status = xact;
                     // fe-protocol3.c:2348 — a result already made (the
@@ -2297,9 +2308,16 @@ mod tests {
                 .and_then(crate::result::ResultError::sqlstate),
             Some(&b"42601"[..])
         );
+        // The query sent is kept for the cursor (`fe-protocol3.c:966`,
+        // `fe-exec.c:1484`), so the position is drawn, not written.
+        assert_eq!(
+            results[0].error().and_then(ResultError::err_query),
+            Some(&b"selct 1"[..])
+        );
         assert_eq!(
             String::from_utf8(results[0].error_message()).unwrap(),
-            "ERROR:  syntax error at or near \"selct\" at character 1\nHINT:  Check your spelling.\n"
+            "ERROR:  syntax error at or near \"selct\"\nLINE 1: selct 1\n        ^\n\
+             HINT:  Check your spelling.\n"
         );
         assert_eq!(conn.transaction_status(), TransactionStatus::InError);
     }

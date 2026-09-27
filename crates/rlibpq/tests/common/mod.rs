@@ -202,9 +202,14 @@ impl Cluster {
     /// untitled, so only the values differ from ours. `verbosity` is passed
     /// through as psql's `VERBOSITY` variable.
     pub fn psql(&self, query: &str, verbosity: &str) -> (Vec<u8>, Vec<u8>, i32) {
+        self.psql_at(&self.conninfo(), query, verbosity)
+    }
+
+    /// [`Cluster::psql`] connecting with `conninfo` instead.
+    pub fn psql_at(&self, conninfo: &str, query: &str, verbosity: &str) -> (Vec<u8>, Vec<u8>, i32) {
         let out = Command::new(self.bin.join("psql"))
             .args(["-tAq", "-v", &format!("VERBOSITY={verbosity}")])
-            .args(["-c", query, "-d", &self.conninfo()])
+            .args(["-c", query, "-d", conninfo])
             .env("LC_ALL", "C")
             .env("PGPASSWORD", "gatepassword")
             .output()

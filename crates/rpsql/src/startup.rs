@@ -14,7 +14,7 @@ use std::ffi::{OsStr, OsString};
 
 use usage::Cli;
 
-use crate::settings::{PrintFormat, PsqlSettings, Trivalue};
+use crate::settings::{Expanded, PrintFormat, PsqlSettings, Trivalue};
 use crate::variables::{AssignError, VariableSpace};
 
 /// `getopt_long`'s option string (`startup.c:536`). A `:` means the option
@@ -391,7 +391,7 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
         pset.get_password = Trivalue::Yes;
     }
     if options.expanded {
-        pset.popt.topt.expanded = true;
+        pset.popt.topt.expanded = Expanded::On;
     }
     if options.field_separator_zero {
         pset.popt.topt.field_sep.separator_zero = true;
@@ -625,7 +625,10 @@ mod tests {
         assert_eq!(session(&["-H"]).pset.popt.topt.format, PrintFormat::Html);
         assert_eq!(session(&["--csv"]).pset.popt.topt.format, PrintFormat::Csv);
         assert!(session(&["-t"]).pset.popt.topt.tuples_only);
-        assert!(session(&["-x"]).pset.popt.topt.expanded);
+        assert_eq!(
+            session(&["-x"]).pset.popt.topt.expanded,
+            crate::settings::Expanded::On
+        );
     }
 
     #[test]

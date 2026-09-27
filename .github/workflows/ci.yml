@@ -147,6 +147,13 @@ jobs:
         run: su -c 'cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic' ci
       - name: test
         run: su -c 'cargo test --all-features' ci
+      # NAT-410: startup time (initdb, server ready, first select 1, stop;
+      # p50/p95) and the binary's size by embedded asset, printed to the log.
+      # It builds only the bench on top of the test step's artifacts and runs
+      # in ~10 s. No budget is enforced yet: the budgets are set from the
+      # baselines these logs record, in the issue's next slice.
+      - name: startup and size report
+        run: su -c 'cargo test --all-features --bench startup' ci
 
   apple:
     needs: musl
@@ -180,6 +187,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test
         run: cargo test --all-features
+      # NAT-410: startup time (initdb, server ready, first select 1, stop;
+      # p50/p95) and the binary's size by embedded asset, printed to the log.
+      # It builds only the bench on top of the test step's artifacts and runs
+      # in ~10 s. No budget is enforced yet: the budgets are set from the
+      # baselines these logs record, in the issue's next slice.
+      - name: startup and size report
+        run: cargo test --all-features --bench startup
 
   gnu:
     needs: musl
@@ -228,3 +242,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - name: test
         run: cargo test --all-features
+      # NAT-410: startup time (initdb, server ready, first select 1, stop;
+      # p50/p95) and the binary's size by embedded asset, printed to the log.
+      # It builds only the bench on top of the test step's artifacts and runs
+      # in ~10 s. No budget is enforced yet: the budgets are set from the
+      # baselines these logs record, in the issue's next slice.
+      - name: startup and size report
+        run: cargo test --all-features --bench startup

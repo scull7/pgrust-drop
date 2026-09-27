@@ -13,6 +13,9 @@
 //! reads embedded and extracted by [`share`] (NAT-408); the rest of
 //! embedding the server (allocator, stack: NAT-407) and `start` (NAT-409)
 //! are still to come.
+//!
+//! [`measure`] is the pure half of `benches/startup.rs`, which times a
+//! throwaway cluster's life and splits the binary's size (NAT-410).
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -24,5 +27,6 @@
 
 pub mod dispatch;
 pub mod install;
+pub mod measure;
 pub mod postgres;
 pub mod share;

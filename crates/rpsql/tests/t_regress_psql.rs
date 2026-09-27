@@ -334,6 +334,8 @@ const FUNCTION_TYPE_OPERATOR_LISTINGS_PORT: u16 = 55_502;
 const ROLES_AND_PRIVILEGES_PORT: u16 = 55_503;
 const PUBLICATIONS_SUBSCRIPTIONS_EXTENSIONS_PORT: u16 = 55_504;
 const SINGLE_QUERY_LISTINGS_PORT: u16 = 55_505;
+const INVALID_MULTIPART_NAMES_PORT: u16 = 55_506;
+const TEXT_SEARCH_AND_SQL_MED_PORT: u16 = 55_507;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -1509,9 +1511,10 @@ fn schema_footers_in_every_format() -> String {
 /// `\dd`, `\dl`, `\dL`, `\dn`, `\dO`, `\dX` and `\dy`.
 ///
 /// `psql.sql` names them only in its invalid-name sections (`:1679`-`:1919`),
-/// whose `\dF` and `\de` commands a later slice brings, so those lines are
-/// gated alone ([`only`]), verbatim, against their `psql.out` output and C
-/// psql's. The rest runs against C psql over [`SINGLE_QUERY_LISTINGS_SETUP`]:
+/// whose `\dF` and `\de` commands came a slice later. Those lines are gated
+/// alone ([`only`]), verbatim, against their `psql.out` output and C psql's,
+/// in database `postgres`; [`the_invalid_multipart_name_sections_run_live`]
+/// gates the sections whole, in `regression`. The rest runs against C psql over [`SINGLE_QUERY_LISTINGS_SETUP`]:
 /// [`INVALID_LISTING_NAMES_IN_REGRESSION`],
 /// [`SINGLE_QUERY_LISTING_COMMANDS`], then [`schema_footers_in_every_format`].
 #[test]
@@ -1542,6 +1545,210 @@ fn the_single_query_listings_match_c_psql() {
         schema_footers_in_every_format()
     );
     diff_against_c_psql(&cluster, "single-query listings", &script);
+}
+
+/// `psql.sql`'s invalid-name sections (`:1679`-`:1919`), whole: every `\d`
+/// command with too many dotted parts, a database part, quoted dots, and
+/// names that match nothing. With `\dF*` and `\de*` ported, no line of them
+/// needs cutting out any more.
+///
+/// A few lines name the database `regression` (`pg_regress`'s), which is
+/// then no cross-database reference, so the run connects to one of that
+/// name, created empty: every name the sections look up is one that matches
+/// nothing.
+#[test]
+fn the_invalid_multipart_name_sections_run_live() {
+    let Some(cluster) = Cluster::start(INVALID_MULTIPART_NAMES_PORT) else {
+        return;
+    };
+    let out = cluster.run_script(Path::new(RPSQL), "create database regression;\n");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+
+    let section = sections(
+        "-- check describing invalid multipart names",
+        "-- again, but with dotted database and dotted schema qualifications.",
+    );
+    let what = format!(
+        "psql.sql:{} vs psql.out:{} ({})",
+        section.sql_line, section.out_line, section.header
+    );
+    let ours = cluster.run_script_in(Path::new(RPSQL), "regression", section.sql);
+    if let Some(diff) = first_difference(section.expected.as_bytes(), &ours) {
+        panic!("rpsql, {what}: {diff}");
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script_in(&psql, "regression", section.sql);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql ({what}): {diff}");
+            }
+        }
+        None => reference::skip("psql"),
+    }
+}
+
+/// One object of each text search and SQL/MED kind, in a schema of its own,
+/// commented, and a second one of each where a listing could tell them
+/// apart (a visible one, one with no options, one with no handler). The
+/// wrapper with a validator uses core's `postgresql_fdw_validator`, as
+/// `foreign_data.sql` does, so no extension is needed.
+const TEXT_SEARCH_AND_SQL_MED_SETUP: &str = "set client_min_messages = error;\n\
+    create schema s7;\n\
+    create text search parser s7.prs (start = prsd_start, gettoken = prsd_nexttoken,\n\
+      end = prsd_end, lextypes = prsd_lextype, headline = prsd_headline);\n\
+    comment on text search parser s7.prs is 'a parser';\n\
+    create text search template s7.tmpl (init = dsimple_init, lexize = dsimple_lexize);\n\
+    comment on text search template s7.tmpl is 'a template';\n\
+    create text search dictionary s7.dict (template = s7.tmpl, accept = false);\n\
+    comment on text search dictionary s7.dict is 'a dictionary';\n\
+    create text search configuration s7.cfg (parser = s7.prs);\n\
+    alter text search configuration s7.cfg add mapping for asciiword, word with s7.dict, simple;\n\
+    alter text search configuration s7.cfg add mapping for int with simple;\n\
+    comment on text search configuration s7.cfg is 'a configuration';\n\
+    create text search configuration public.cfg2 (copy = pg_catalog.english);\n\
+    create foreign data wrapper s7_fdw options (\"test wrapper\" 'true', b 'it''s');\n\
+    grant usage on foreign data wrapper s7_fdw to public;\n\
+    comment on foreign data wrapper s7_fdw is 'a wrapper';\n\
+    create foreign data wrapper s7_fdw2 validator postgresql_fdw_validator;\n\
+    create server s7_srv type 'kind' version '1.0' foreign data wrapper s7_fdw\n\
+      options (host 'h', \"Odd Name\" 'x');\n\
+    grant usage on foreign server s7_srv to public;\n\
+    comment on server s7_srv is 'a server';\n\
+    create server s7_srv2 foreign data wrapper s7_fdw2;\n\
+    create user mapping for regress server s7_srv options (user 'u', password 'p');\n\
+    create user mapping for public server s7_srv2;\n\
+    create foreign table s7.ft (a int) server s7_srv options (tbl 't');\n\
+    comment on foreign table s7.ft is 'a foreign table';\n\
+    create foreign table public.ft2 (a int) server s7_srv2;\n";
+
+/// Each listing with and without a pattern, with `+` and `x`, and with
+/// nothing found, under `ECHO_HIDDEN` so every catalog query is compared
+/// too (the `+` describers' per-object queries included); a `+` describer
+/// that finds nothing, loud and quiet; then too many dots, and a database
+/// part, for each.
+const TEXT_SEARCH_AND_SQL_MED_COMMANDS: &str = "\\set QUIET off\n\
+    \\set ECHO_HIDDEN on\n\
+    \\dF\n\
+    \\dF s7.*\n\
+    \\dF+ s7.cfg\n\
+    \\dF+ cfg2\n\
+    \\dF+ *.simple\n\
+    \\dFx s7.cfg\n\
+    \\dF+x s7.cfg\n\
+    \\dF nonesuch\n\
+    \\dF+ nonesuch\n\
+    \\dFp\n\
+    \\dFp+\n\
+    \\dFp s7.*\n\
+    \\dFp+ s7.prs\n\
+    \\dFpx s7.prs\n\
+    \\dFp nonesuch\n\
+    \\dFp+ nonesuch\n\
+    \\dFd\n\
+    \\dFd+\n\
+    \\dFd s7.*\n\
+    \\dFd+ s7.dict\n\
+    \\dFdx+ s7.dict\n\
+    \\dFd nonesuch\n\
+    \\dFt\n\
+    \\dFt+\n\
+    \\dFt+ s7.*\n\
+    \\dFtx s7.tmpl\n\
+    \\dFt nonesuch\n\
+    \\des\n\
+    \\des+\n\
+    \\des s7_srv\n\
+    \\desx+ s7_srv\n\
+    \\des nonesuch\n\
+    \\deu\n\
+    \\deu+\n\
+    \\deu regress\n\
+    \\deu+ public\n\
+    \\deux+ s7_srv\n\
+    \\deu nonesuch\n\
+    \\dew\n\
+    \\dew+\n\
+    \\dew s7_fdw2\n\
+    \\dewx+ s7_fdw\n\
+    \\dew nonesuch\n\
+    \\det\n\
+    \\det+\n\
+    \\det s7.*\n\
+    \\detx+ ft2\n\
+    \\det nonesuch\n\
+    \\set ECHO_HIDDEN off\n\
+    \\set QUIET on\n\
+    \\dF+ nonesuch\n\
+    \\dFp+ nonesuch\n\
+    \\set QUIET off\n\
+    \\dF a.b.c.d\n\
+    \\dF+ a.b.c.d\n\
+    \\dFp a.b.c.d\n\
+    \\dFp+ a.b.c.d\n\
+    \\dFd a.b.c.d\n\
+    \\dFt a.b.c.d\n\
+    \\des a.b\n\
+    \\deu a.b\n\
+    \\dew a.b\n\
+    \\det a.b.c.d\n\
+    \\dF+ postgres.s7.cfg\n\
+    \\dFp+ other.s7.prs\n\
+    \\det postgres.s7.ft\n";
+
+/// `\dF+`'s two-line title and footerless table, and `\dFp+`'s footerless
+/// methods then footed token types, normal and expanded, in every format at
+/// borders 0 and 2, with `tuples_only`, and with `\pset footer off`, which
+/// `\dFp+`'s token types override. `wrapped` needs a target width this port
+/// does not take from the terminal, hence `\pset columns`.
+fn text_search_describers_in_every_format() -> String {
+    let mut script = String::from("\\pset columns 60\n");
+    for format in [
+        "aligned",
+        "wrapped",
+        "unaligned",
+        "csv",
+        "html",
+        "asciidoc",
+        "latex",
+        "latex-longtable",
+        "troff-ms",
+    ] {
+        let _ = writeln!(script, "\\pset format {format}");
+        for settings in [
+            "\\pset border 0\n",
+            "\\pset border 2\n",
+            "\\pset tuples_only on\n",
+            "\\pset tuples_only off\n\\pset footer off\n",
+        ] {
+            script.push_str(settings);
+            script.push_str("\\dF+ s7.cfg\n\\dF+x s7.cfg\n\\dFp+ s7.prs\n\\dFp+x s7.prs\n");
+        }
+        script.push_str("\\pset footer on\n\\pset border 1\n");
+    }
+    script
+}
+
+/// The text search and SQL/MED families, `NAT-401`'s last listing group:
+/// `\dF`, `\dFp`, `\dFd`, `\dFt` with the `+` describers of `\dF` and `\dFp`,
+/// and `\des`, `\deu`, `\dew`, `\det`. `psql.sql` names them only in the
+/// invalid-name sections, which [`the_invalid_multipart_name_sections_run_live`]
+/// gates; here they run against C psql over
+/// [`TEXT_SEARCH_AND_SQL_MED_SETUP`]: [`TEXT_SEARCH_AND_SQL_MED_COMMANDS`],
+/// then [`text_search_describers_in_every_format`].
+#[test]
+fn the_text_search_and_sql_med_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(TEXT_SEARCH_AND_SQL_MED_PORT) else {
+        return;
+    };
+    let out = cluster.run_script(Path::new(RPSQL), TEXT_SEARCH_AND_SQL_MED_SETUP);
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+    let script = format!(
+        "{TEXT_SEARCH_AND_SQL_MED_COMMANDS}{}",
+        text_search_describers_in_every_format()
+    );
+    diff_against_c_psql(&cluster, "text search and SQL/MED listings", &script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

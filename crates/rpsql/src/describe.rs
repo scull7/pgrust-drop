@@ -32,8 +32,15 @@
 //! [`list_large_objects_query`], `\dl`; [`list_languages_query`], `\dL`;
 //! [`list_schemas_query`], `\dn`; [`list_collations_query`], `\dO`;
 //! [`list_extended_stats_query`], `\dX`; [`list_event_triggers_query`],
-//! `\dy`). Every other command the switch recognizes is refused by name
-//! until its slice lands.
+//! `\dy`); and slice 7's text search family ([`list_ts_configs_query`],
+//! `\dF`, and its `+` describer [`describe_one_ts_config_query`];
+//! [`list_ts_parsers_query`], `\dFp`, and its `+` describer
+//! [`describe_one_ts_parser_query`]; [`list_ts_dictionaries_query`], `\dFd`;
+//! [`list_ts_templates_query`], `\dFt`) and SQL/MED family
+//! ([`list_foreign_servers_query`], `\des`; [`list_user_mappings_query`],
+//! `\deu`; [`list_foreign_data_wrappers_query`], `\dew`;
+//! [`list_foreign_tables_query`], `\det`). Only `\d` with a pattern
+//! (`describeTableDetails`) is still refused by name until its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -113,9 +120,24 @@ pub enum DescribeCommand {
     ExtendedStats,
     /// `listEventTriggers()` (`describe.c:4783`): `\dy`.
     EventTriggers,
-    /// A command the switch recognizes whose port has not landed yet; the
-    /// name is its `describe.c` function.
-    NotYet(&'static str),
+    /// `listTSConfigs()` (`describe.c:5704`): `\dF`, and with `+`
+    /// `listTSConfigsVerbose()` (`describe.c:5753`).
+    TextSearchConfigs,
+    /// `listTSParsers()` (`describe.c:5327`): `\dFp`, and with `+`
+    /// `listTSParsersVerbose()` (`describe.c:5379`).
+    TextSearchParsers,
+    /// `listTSDictionaries()` (`describe.c:5574`): `\dFd`.
+    TextSearchDictionaries,
+    /// `listTSTemplates()` (`describe.c:5639`): `\dFt`.
+    TextSearchTemplates,
+    /// `listForeignServers()` (`describe.c:5979`): `\des`.
+    ForeignServers,
+    /// `listUserMappings()` (`describe.c:6055`): `\deu`.
+    UserMappings,
+    /// `listForeignDataWrappers()` (`describe.c:5908`): `\dew`.
+    ForeignDataWrappers,
+    /// `listForeignTables()` (`describe.c:6110`): `\det`.
+    ForeignTables,
 }
 
 /// What `exec_command_d()` read off the command name besides the command
@@ -150,7 +172,6 @@ impl DescribeCommand {
     pub fn parse(cmd: &str, has_pattern: bool) -> Option<Self> {
         let b = cmd.as_bytes();
         let at = |i: usize| b.get(i).copied().unwrap_or(0);
-        let not_yet = |name| Some(Self::NotYet(name));
         match at(1) {
             0 | b'+' | b'S' => Some(if has_pattern {
                 Self::TableDetails
@@ -205,17 +226,17 @@ impl DescribeCommand {
                 _ => None,
             },
             b'F' => match at(2) {
-                0 | b'+' | b'x' => not_yet("listTSConfigs"),
-                b'p' => not_yet("listTSParsers"),
-                b'd' => not_yet("listTSDictionaries"),
-                b't' => not_yet("listTSTemplates"),
+                0 | b'+' | b'x' => Some(Self::TextSearchConfigs),
+                b'p' => Some(Self::TextSearchParsers),
+                b'd' => Some(Self::TextSearchDictionaries),
+                b't' => Some(Self::TextSearchTemplates),
                 _ => None,
             },
             b'e' => match at(2) {
-                b's' => not_yet("listForeignServers"),
-                b'u' => not_yet("listUserMappings"),
-                b'w' => not_yet("listForeignDataWrappers"),
-                b't' => not_yet("listForeignTables"),
+                b's' => Some(Self::ForeignServers),
+                b'u' => Some(Self::UserMappings),
+                b'w' => Some(Self::ForeignDataWrappers),
+                b't' => Some(Self::ForeignTables),
                 _ => None,
             },
             b'x' => Some(Self::Extensions),
@@ -3607,6 +3628,565 @@ pub fn list_large_objects_query(verbose: bool) -> String {
     buf
 }
 
+/// The pattern clause every text search listing shares: a schema-qualified
+/// name, up to a database part (`maxparts` 3), visible objects only without
+/// a schema.
+fn text_search_pattern(
+    buf: &mut String,
+    pattern: Option<&str>,
+    have_where: bool,
+    namevar: &str,
+    visibilityrule: &str,
+    server: ServerContext<'_>,
+) -> Result<(), PatternError> {
+    validate_sql_name_pattern(
+        buf,
+        pattern,
+        have_where,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some(namevar),
+            altnamevar: None,
+            visibilityrule: Some(visibilityrule),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    Ok(())
+}
+
+/// A `"schema.name"`, or `"name"` for no schema, as the text search
+/// describers quote it into their titles (`describe.c:5514`-`:5518`).
+fn qualified(nspname: Option<&str>, name: &str) -> String {
+    match nspname {
+        Some(nspname) => format!("\"{nspname}.{name}\""),
+        None => format!("\"{name}\""),
+    }
+}
+
+/// What `listTSParsersVerbose()` and `listTSConfigsVerbose()` log, when not
+/// quiet, for nothing found (`describe.c:5413`-`:5419`, `:5791`-`:5797`):
+/// `what` is "text search parser" or "text search configuration".
+#[must_use]
+pub fn text_search_not_found(what: &str, pattern: Option<&str>) -> String {
+    match pattern {
+        Some(pattern) => format!("Did not find any {what} named \"{pattern}\"."),
+        None => format!("Did not find any {what}s."),
+    }
+}
+
+/// The query half of `listTSParsers()` (`describe.c:5327`-`:5359`), for
+/// `\dFp`, whose title is "List of text search parsers".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_parsers_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT\n",
+        "  n.nspname as \"Schema\",\n",
+        "  p.prsname as \"Name\",\n",
+        "  pg_catalog.obj_description(p.oid, 'pg_ts_parser') as \"Description\"\n",
+        "FROM pg_catalog.pg_ts_parser p\n",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.prsnamespace\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        false,
+        "p.prsname",
+        "pg_catalog.pg_ts_parser_is_visible(p.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query of `listTSParsersVerbose()` (`describe.c:5379`-`:5404`), for
+/// `\dFp+`: each matching parser's oid, schema and name, which
+/// [`describe_one_ts_parser_query`] and [`ts_parser_titles`] take.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_parsers_verbose_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT p.oid,\n",
+        "  n.nspname,\n",
+        "  p.prsname\n",
+        "FROM pg_catalog.pg_ts_parser p\n",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.prsnamespace\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        false,
+        "p.prsname",
+        "pg_catalog.pg_ts_parser_is_visible(p.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The first query of `describeOneTSParser()` (`describe.c:5463`-`:5506`):
+/// the parser's five methods, one row each. `oid` is pasted in as the
+/// server sent it, as upstream does.
+#[must_use]
+pub fn describe_one_ts_parser_query(oid: &str) -> String {
+    format!(
+        "SELECT 'Start parse' AS \"Method\",\n   \
+         p.prsstart::pg_catalog.regproc AS \"Function\",\n   \
+         pg_catalog.obj_description(p.prsstart, 'pg_proc') as \"Description\"\n \
+         FROM pg_catalog.pg_ts_parser p\n \
+         WHERE p.oid = '{oid}'\n\
+         UNION ALL\n\
+         SELECT 'Get next token',\n   \
+         p.prstoken::pg_catalog.regproc,\n   \
+         pg_catalog.obj_description(p.prstoken, 'pg_proc')\n \
+         FROM pg_catalog.pg_ts_parser p\n \
+         WHERE p.oid = '{oid}'\n\
+         UNION ALL\n\
+         SELECT 'End parse',\n   \
+         p.prsend::pg_catalog.regproc,\n   \
+         pg_catalog.obj_description(p.prsend, 'pg_proc')\n \
+         FROM pg_catalog.pg_ts_parser p\n \
+         WHERE p.oid = '{oid}'\n\
+         UNION ALL\n\
+         SELECT 'Get headline',\n   \
+         p.prsheadline::pg_catalog.regproc,\n   \
+         pg_catalog.obj_description(p.prsheadline, 'pg_proc')\n \
+         FROM pg_catalog.pg_ts_parser p\n \
+         WHERE p.oid = '{oid}'\n\
+         UNION ALL\n\
+         SELECT 'Get token types',\n   \
+         p.prslextype::pg_catalog.regproc,\n   \
+         pg_catalog.obj_description(p.prslextype, 'pg_proc')\n \
+         FROM pg_catalog.pg_ts_parser p\n \
+         WHERE p.oid = '{oid}';"
+    )
+}
+
+/// The second query of `describeOneTSParser()` (`describe.c:5531`-`:5539`):
+/// the parser's token types.
+#[must_use]
+pub fn ts_parser_token_types_query(oid: &str) -> String {
+    format!(
+        "SELECT t.alias as \"Token name\",\n  \
+         t.description as \"Description\"\n\
+         FROM pg_catalog.ts_token_type( '{oid}'::pg_catalog.oid ) as t\n\
+         ORDER BY 1;"
+    )
+}
+
+/// `describeOneTSParser()`'s two titles (`describe.c:5514`-`:5518`,
+/// `:5549`-`:5553`): the methods', then the token types'.
+#[must_use]
+pub fn ts_parser_titles(nspname: Option<&str>, prsname: &str) -> (String, String) {
+    let name = qualified(nspname, prsname);
+    (
+        format!("Text search parser {name}"),
+        format!("Token types for parser {name}"),
+    )
+}
+
+/// The query half of `listTSDictionaries()` (`describe.c:5574`-`:5617`),
+/// for `\dFd`, whose title is "List of text search dictionaries". `+` adds
+/// the template and its init options.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_dictionaries_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT\n",
+        "  n.nspname as \"Schema\",\n",
+        "  d.dictname as \"Name\",\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "  ( SELECT COALESCE(nt.nspname, '(null)')::pg_catalog.text || '.' || t.tmplname FROM\n",
+            "    pg_catalog.pg_ts_template t\n",
+            "    LEFT JOIN pg_catalog.pg_namespace nt ON nt.oid = t.tmplnamespace\n",
+            "    WHERE d.dicttemplate = t.oid ) AS  \"Template\",\n",
+            "  d.dictinitoption as \"Init options\",\n",
+        ));
+    }
+    buf.push_str(concat!(
+        "  pg_catalog.obj_description(d.oid, 'pg_ts_dict') as \"Description\"\n",
+        "FROM pg_catalog.pg_ts_dict d\n",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        false,
+        "d.dictname",
+        "pg_catalog.pg_ts_dict_is_visible(d.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listTSTemplates()` (`describe.c:5639`-`:5682`), for
+/// `\dFt`, whose title is "List of text search templates". `+` adds the
+/// init and lexize functions.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_templates_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT\n",
+        "  n.nspname AS \"Schema\",\n",
+        "  t.tmplname AS \"Name\",\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "  t.tmplinit::pg_catalog.regproc AS \"Init\",\n",
+            "  t.tmpllexize::pg_catalog.regproc AS \"Lexize\",\n",
+        ));
+    }
+    buf.push_str(concat!(
+        "  pg_catalog.obj_description(t.oid, 'pg_ts_template') AS \"Description\"\n",
+        "FROM pg_catalog.pg_ts_template t\n",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.tmplnamespace\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        false,
+        "t.tmplname",
+        "pg_catalog.pg_ts_template_is_visible(t.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listTSConfigs()` (`describe.c:5704`-`:5736`), for
+/// `\dF`, whose title is "List of text search configurations".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_configs_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT\n",
+        "   n.nspname as \"Schema\",\n",
+        "   c.cfgname as \"Name\",\n",
+        "   pg_catalog.obj_description(c.oid, 'pg_ts_config') as \"Description\"\n",
+        "FROM pg_catalog.pg_ts_config c\n",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        false,
+        "c.cfgname",
+        "pg_catalog.pg_ts_config_is_visible(c.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query of `listTSConfigsVerbose()` (`describe.c:5753`-`:5782`), for
+/// `\dF+`: each matching configuration's oid, name and schema, and its
+/// parser's name and schema, which [`describe_one_ts_config_query`] and
+/// [`ts_config_title`] take. The query has its `WHERE` already.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_ts_configs_verbose_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT c.oid, c.cfgname,\n",
+        "   n.nspname,\n",
+        "   p.prsname,\n",
+        "   np.nspname as pnspname\n",
+        "FROM pg_catalog.pg_ts_config c\n",
+        "   LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.cfgnamespace,\n",
+        " pg_catalog.pg_ts_parser p\n",
+        "   LEFT JOIN pg_catalog.pg_namespace np ON np.oid = p.prsnamespace\n",
+        "WHERE  p.oid = c.cfgparser\n",
+    ));
+    text_search_pattern(
+        &mut buf,
+        pattern,
+        true,
+        "c.cfgname",
+        "pg_catalog.pg_ts_config_is_visible(c.oid)",
+        server,
+    )?;
+    buf.push_str("ORDER BY 3, 2;");
+    Ok(buf)
+}
+
+/// The query of `describeOneTSConfig()` (`describe.c:5846`-`:5865`): each
+/// token type the configuration maps, with its dictionaries in order.
+#[must_use]
+pub fn describe_one_ts_config_query(oid: &str) -> String {
+    format!(
+        "SELECT\n  \
+         ( SELECT t.alias FROM\n    \
+         pg_catalog.ts_token_type(c.cfgparser) AS t\n    \
+         WHERE t.tokid = m.maptokentype ) AS \"Token\",\n  \
+         pg_catalog.btrim(\n    \
+         ARRAY( SELECT mm.mapdict::pg_catalog.regdictionary\n           \
+         FROM pg_catalog.pg_ts_config_map AS mm\n           \
+         WHERE mm.mapcfg = m.mapcfg AND mm.maptokentype = m.maptokentype\n           \
+         ORDER BY mapcfg, maptokentype, mapseqno\n    \
+         ) :: pg_catalog.text,\n  \
+         '{{}}') AS \"Dictionaries\"\n\
+         FROM pg_catalog.pg_ts_config AS c, pg_catalog.pg_ts_config_map AS m\n\
+         WHERE c.oid = '{oid}' AND m.mapcfg = c.oid\n\
+         GROUP BY m.mapcfg, m.maptokentype, c.cfgparser\n\
+         ORDER BY 1;"
+    )
+}
+
+/// `describeOneTSConfig()`'s title (`describe.c:5874`-`:5886`): two lines,
+/// the configuration, then its parser.
+#[must_use]
+pub fn ts_config_title(
+    nspname: Option<&str>,
+    cfgname: &str,
+    pnspname: Option<&str>,
+    prsname: &str,
+) -> String {
+    format!(
+        "Text search configuration {}\nParser: {}",
+        qualified(nspname, cfgname),
+        qualified(pnspname, prsname)
+    )
+}
+
+/// The "FDW options" column the SQL/MED listings share
+/// (`describe.c:5926`-`:5931`, `:6002`-`:6007`, `:6072`-`:6077`,
+/// `:6130`-`:6135`): `column`'s options as `(name 'value', …)`, or empty
+/// for none.
+fn push_fdw_options_column(buf: &mut String, column: &str) {
+    let _ = write!(
+        buf,
+        "CASE WHEN {column} IS NULL THEN '' ELSE   \
+         '(' || pg_catalog.array_to_string(ARRAY(SELECT   \
+         pg_catalog.quote_ident(option_name) ||  ' ' ||   \
+         pg_catalog.quote_literal(option_value)  FROM   \
+         pg_catalog.pg_options_to_table({column})),  ', ') || ')'   \
+         END AS \"FDW options\""
+    );
+}
+
+/// The query half of `listForeignDataWrappers()` (`describe.c:5908`-
+/// `:5957`), for `\dew`, whose title is "List of foreign-data wrappers".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`: a wrapper has no schema.
+pub fn list_foreign_data_wrappers_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT fdw.fdwname AS \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(fdw.fdwowner) AS \"Owner\",\n",
+        "  fdw.fdwhandler::pg_catalog.regproc AS \"Handler\",\n",
+        "  fdw.fdwvalidator::pg_catalog.regproc AS \"Validator\"",
+    ));
+    if verbose {
+        buf.push_str(",\n  ");
+        push_acl_column(&mut buf, "fdwacl");
+        buf.push_str(",\n ");
+        push_fdw_options_column(&mut buf, "fdwoptions");
+        buf.push_str(",\n  d.description AS \"Description\" ");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_foreign_data_wrapper fdw\n");
+    if verbose {
+        buf.push_str(concat!(
+            "LEFT JOIN pg_catalog.pg_description d\n",
+            "       ON d.classoid = fdw.tableoid ",
+            "AND d.objoid = fdw.oid AND d.objsubid = 0\n",
+        ));
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("fdwname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The query half of `listForeignServers()` (`describe.c:5979`-`:6033`),
+/// for `\des`, whose title is "List of foreign servers".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`: a server has no schema.
+pub fn list_foreign_servers_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT s.srvname AS \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(s.srvowner) AS \"Owner\",\n",
+        "  f.fdwname AS \"Foreign-data wrapper\"",
+    ));
+    if verbose {
+        buf.push_str(",\n  ");
+        push_acl_column(&mut buf, "s.srvacl");
+        buf.push_str(concat!(
+            ",\n",
+            "  s.srvtype AS \"Type\",\n",
+            "  s.srvversion AS \"Version\",\n  ",
+        ));
+        push_fdw_options_column(&mut buf, "srvoptions");
+        buf.push_str(",\n  d.description AS \"Description\"");
+    }
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_foreign_server s\n",
+        "     JOIN pg_catalog.pg_foreign_data_wrapper f ON f.oid=s.srvfdw\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "LEFT JOIN pg_catalog.pg_description d\n       ",
+            "ON d.classoid = s.tableoid AND d.objoid = s.oid ",
+            "AND d.objsubid = 0\n",
+        ));
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("s.srvname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The query half of `listUserMappings()` (`describe.c:6055`-`:6088`), for
+/// `\deu`, whose title is "List of user mappings". The pattern matches the
+/// server's name or the user's.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`: a mapping has no schema.
+pub fn list_user_mappings_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT um.srvname AS \"Server\",\n",
+        "  um.usename AS \"User name\"",
+    ));
+    if verbose {
+        buf.push_str(",\n ");
+        push_fdw_options_column(&mut buf, "umoptions");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_user_mappings um\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("um.srvname"),
+            altnamevar: Some("um.usename"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listForeignTables()` (`describe.c:6110`-`:6160`), for
+/// `\det`, whose title is "List of foreign tables".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_foreign_tables_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname AS \"Schema\",\n",
+        "  c.relname AS \"Table\",\n",
+        "  s.srvname AS \"Server\"",
+    ));
+    if verbose {
+        buf.push_str(",\n ");
+        push_fdw_options_column(&mut buf, "ftoptions");
+        buf.push_str(",\n  d.description AS \"Description\"");
+    }
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_foreign_table ft\n",
+        "  INNER JOIN pg_catalog.pg_class c ON c.oid = ft.ftrelid\n",
+        "  INNER JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n",
+        "  INNER JOIN pg_catalog.pg_foreign_server s ON s.oid = ft.ftserver\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "   LEFT JOIN pg_catalog.pg_description d\n",
+            "          ON d.classoid = c.tableoid AND ",
+            "d.objoid = c.oid AND d.objsubid = 0\n",
+        ));
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("c.relname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_table_is_visible(c.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3835,14 +4415,8 @@ mod tests {
         );
         assert_eq!(p("dT+", true), Some(DescribeCommand::Types));
         assert_eq!(p("doS", true), Some(DescribeCommand::Operators));
-        assert_eq!(
-            p("dFp", false),
-            Some(DescribeCommand::NotYet("listTSParsers"))
-        );
-        assert_eq!(
-            p("des", false),
-            Some(DescribeCommand::NotYet("listForeignServers"))
-        );
+        assert_eq!(p("dFp", false), Some(DescribeCommand::TextSearchParsers));
+        assert_eq!(p("des", false), Some(DescribeCommand::ForeignServers));
         assert_eq!(p("dx+", false), Some(DescribeCommand::Extensions));
         assert_eq!(p("dRp+x", true), Some(DescribeCommand::Publications));
         assert_eq!(p("dRs", false), Some(DescribeCommand::Subscriptions));
@@ -5534,6 +6108,242 @@ mod tests {
             "as \"Owner\",\n  CASE WHEN pg_catalog.array_length(lomacl, 1) = 0 \
                  THEN '(none)' ELSE pg_catalog.array_to_string(lomacl, E'\\n') END \
                  AS \"Access privileges\",\n  pg_catalog.obj_description"
+        ));
+    }
+
+    #[test]
+    fn the_text_search_and_foreign_data_commands_parse_to_their_functions() {
+        let p = DescribeCommand::parse;
+        assert_eq!(p("dF", false), Some(DescribeCommand::TextSearchConfigs));
+        assert_eq!(p("dF+", true), Some(DescribeCommand::TextSearchConfigs));
+        assert_eq!(p("dFx", true), Some(DescribeCommand::TextSearchConfigs));
+        assert_eq!(p("dFp+", false), Some(DescribeCommand::TextSearchParsers));
+        assert_eq!(
+            p("dFd", false),
+            Some(DescribeCommand::TextSearchDictionaries)
+        );
+        assert_eq!(p("dFt+", true), Some(DescribeCommand::TextSearchTemplates));
+        assert_eq!(p("dFS", false), None);
+        assert_eq!(p("des+", false), Some(DescribeCommand::ForeignServers));
+        assert_eq!(p("deu", true), Some(DescribeCommand::UserMappings));
+        assert_eq!(p("dewx", false), Some(DescribeCommand::ForeignDataWrappers));
+        assert_eq!(p("det+", true), Some(DescribeCommand::ForeignTables));
+        assert_eq!(p("de", false), None);
+        assert_eq!(p("dex", false), None);
+    }
+
+    #[test]
+    fn the_verbose_dictionary_listing_is_upstreams() {
+        assert_eq!(
+            list_ts_dictionaries_query(Some("s.d*"), true, PG18).unwrap(),
+            "SELECT\n  n.nspname as \"Schema\",\n  d.dictname as \"Name\",\n  \
+             ( SELECT COALESCE(nt.nspname, '(null)')::pg_catalog.text || '.' || t.tmplname FROM\n    \
+             pg_catalog.pg_ts_template t\n    \
+             LEFT JOIN pg_catalog.pg_namespace nt ON nt.oid = t.tmplnamespace\n    \
+             WHERE d.dicttemplate = t.oid ) AS  \"Template\",\n  \
+             d.dictinitoption as \"Init options\",\n  \
+             pg_catalog.obj_description(d.oid, 'pg_ts_dict') as \"Description\"\n\
+             FROM pg_catalog.pg_ts_dict d\n\
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace\n\
+             WHERE d.dictname OPERATOR(pg_catalog.~) '^(d.*)$' COLLATE pg_catalog.default\n  \
+             AND n.nspname OPERATOR(pg_catalog.~) '^(s)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1, 2;"
+        );
+        // Without `+`, no template and no options; without a pattern,
+        // visible dictionaries only.
+        assert_eq!(
+            list_ts_dictionaries_query(None, false, PG18).unwrap(),
+            "SELECT\n  n.nspname as \"Schema\",\n  d.dictname as \"Name\",\n  \
+             pg_catalog.obj_description(d.oid, 'pg_ts_dict') as \"Description\"\n\
+             FROM pg_catalog.pg_ts_dict d\n\
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.dictnamespace\n\
+             WHERE pg_catalog.pg_ts_dict_is_visible(d.oid)\n\
+             ORDER BY 1, 2;"
+        );
+    }
+
+    #[test]
+    fn a_template_listing_shows_its_functions_with_plus() {
+        let plain = list_ts_templates_query(None, false, PG18).unwrap();
+        let verbose = list_ts_templates_query(None, true, PG18).unwrap();
+        assert!(!plain.contains("\"Init\""));
+        assert_eq!(
+            verbose,
+            plain.replace(
+                "  pg_catalog.obj_description",
+                "  t.tmplinit::pg_catalog.regproc AS \"Init\",\n  \
+                 t.tmpllexize::pg_catalog.regproc AS \"Lexize\",\n  \
+                 pg_catalog.obj_description"
+            )
+        );
+        assert!(
+            verbose.ends_with("WHERE pg_catalog.pg_ts_template_is_visible(t.oid)\nORDER BY 1, 2;")
+        );
+    }
+
+    #[test]
+    fn the_verbose_configuration_listing_extends_its_own_where() {
+        let q = list_ts_configs_verbose_query(Some("cfg"), PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "WHERE  p.oid = c.cfgparser\n  \
+                 AND c.cfgname OPERATOR(pg_catalog.~) '^(cfg)$' COLLATE pg_catalog.default\n  \
+                 AND pg_catalog.pg_ts_config_is_visible(c.oid)\n\
+                 ORDER BY 3, 2;"
+            ),
+            "{q}"
+        );
+        // A text search object's name has up to three parts.
+        assert_eq!(
+            list_ts_configs_query(Some("a.b.c.d"), PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): a.b.c.d".to_string()
+            ))
+        );
+        assert_eq!(
+            list_ts_parsers_verbose_query(Some("other.s.p"), PG18),
+            Err(PatternError(
+                "cross-database references are not implemented: other.s.p".to_string()
+            ))
+        );
+        assert!(list_ts_parsers_query(Some("regression.s.p"), PG18).is_ok());
+    }
+
+    #[test]
+    fn the_text_search_describers_query_by_oid_and_title_by_name() {
+        let q = describe_one_ts_parser_query("3722");
+        assert!(q.starts_with(
+            "SELECT 'Start parse' AS \"Method\",\n   \
+             p.prsstart::pg_catalog.regproc AS \"Function\",\n   \
+             pg_catalog.obj_description(p.prsstart, 'pg_proc') as \"Description\"\n \
+             FROM pg_catalog.pg_ts_parser p\n \
+             WHERE p.oid = '3722'\nUNION ALL\nSELECT 'Get next token',\n   \
+             p.prstoken::pg_catalog.regproc,\n"
+        ));
+        assert_eq!(q.matches("\nUNION ALL\n").count(), 4);
+        assert_eq!(q.matches(" WHERE p.oid = '3722'").count(), 5);
+        assert!(q.ends_with(
+            "   pg_catalog.obj_description(p.prslextype, 'pg_proc')\n \
+             FROM pg_catalog.pg_ts_parser p\n WHERE p.oid = '3722';"
+        ));
+        assert_eq!(
+            ts_parser_token_types_query("3722"),
+            "SELECT t.alias as \"Token name\",\n  t.description as \"Description\"\n\
+             FROM pg_catalog.ts_token_type( '3722'::pg_catalog.oid ) as t\nORDER BY 1;"
+        );
+        assert!(describe_one_ts_config_query("9").contains(
+            "  '{}') AS \"Dictionaries\"\n\
+                 FROM pg_catalog.pg_ts_config AS c, pg_catalog.pg_ts_config_map AS m\n\
+                 WHERE c.oid = '9' AND m.mapcfg = c.oid\n"
+        ));
+        assert_eq!(
+            ts_parser_titles(Some("pg_catalog"), "default"),
+            (
+                "Text search parser \"pg_catalog.default\"".to_string(),
+                "Token types for parser \"pg_catalog.default\"".to_string()
+            )
+        );
+        assert_eq!(ts_parser_titles(None, "p").0, "Text search parser \"p\"");
+        assert_eq!(
+            ts_config_title(Some("s"), "c", None, "p"),
+            "Text search configuration \"s.c\"\nParser: \"p\""
+        );
+        assert_eq!(
+            text_search_not_found("text search parser", None),
+            "Did not find any text search parsers."
+        );
+        assert_eq!(
+            text_search_not_found("text search configuration", Some("x")),
+            "Did not find any text search configuration named \"x\"."
+        );
+    }
+
+    #[test]
+    fn the_verbose_foreign_data_wrapper_listing_is_upstreams() {
+        assert_eq!(
+            list_foreign_data_wrappers_query(Some("w"), true, PG18).unwrap(),
+            "SELECT fdw.fdwname AS \"Name\",\n  \
+             pg_catalog.pg_get_userbyid(fdw.fdwowner) AS \"Owner\",\n  \
+             fdw.fdwhandler::pg_catalog.regproc AS \"Handler\",\n  \
+             fdw.fdwvalidator::pg_catalog.regproc AS \"Validator\",\n  \
+             CASE WHEN pg_catalog.array_length(fdwacl, 1) = 0 THEN '(none)' \
+             ELSE pg_catalog.array_to_string(fdwacl, E'\\n') END AS \"Access privileges\",\n \
+             CASE WHEN fdwoptions IS NULL THEN '' ELSE   '(' || \
+             pg_catalog.array_to_string(ARRAY(SELECT   pg_catalog.quote_ident(option_name) \
+             ||  ' ' ||   pg_catalog.quote_literal(option_value)  FROM   \
+             pg_catalog.pg_options_to_table(fdwoptions)),  ', ') || ')'   END AS \"FDW options\",\n  \
+             d.description AS \"Description\" \n\
+             FROM pg_catalog.pg_foreign_data_wrapper fdw\n\
+             LEFT JOIN pg_catalog.pg_description d\n       \
+             ON d.classoid = fdw.tableoid AND d.objoid = fdw.oid AND d.objsubid = 0\n\
+             WHERE fdwname OPERATOR(pg_catalog.~) '^(w)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1;"
+        );
+    }
+
+    #[test]
+    fn the_verbose_server_listing_adds_type_version_and_options() {
+        let q = list_foreign_servers_query(None, true, PG18).unwrap();
+        assert!(q.contains(
+            "END AS \"Access privileges\",\n  s.srvtype AS \"Type\",\n  \
+             s.srvversion AS \"Version\",\n  CASE WHEN srvoptions IS NULL"
+        ));
+        assert!(q.ends_with(
+            "END AS \"FDW options\",\n  d.description AS \"Description\"\n\
+             FROM pg_catalog.pg_foreign_server s\n     \
+             JOIN pg_catalog.pg_foreign_data_wrapper f ON f.oid=s.srvfdw\n\
+             LEFT JOIN pg_catalog.pg_description d\n       \
+             ON d.classoid = s.tableoid AND d.objoid = s.oid AND d.objsubid = 0\n\
+             ORDER BY 1;"
+        ));
+        assert_eq!(
+            list_foreign_servers_query(Some("a.b"), false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): a.b".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_user_mapping_pattern_matches_the_server_or_the_user() {
+        assert_eq!(
+            list_user_mappings_query(Some("u"), true, PG18).unwrap(),
+            "SELECT um.srvname AS \"Server\",\n  um.usename AS \"User name\",\n \
+             CASE WHEN umoptions IS NULL THEN '' ELSE   '(' || \
+             pg_catalog.array_to_string(ARRAY(SELECT   pg_catalog.quote_ident(option_name) \
+             ||  ' ' ||   pg_catalog.quote_literal(option_value)  FROM   \
+             pg_catalog.pg_options_to_table(umoptions)),  ', ') || ')'   END AS \"FDW options\"\n\
+             FROM pg_catalog.pg_user_mappings um\n\
+             WHERE (um.srvname OPERATOR(pg_catalog.~) '^(u)$' COLLATE pg_catalog.default\n        \
+             OR um.usename OPERATOR(pg_catalog.~) '^(u)$' COLLATE pg_catalog.default)\n\
+             ORDER BY 1, 2;"
+        );
+    }
+
+    #[test]
+    fn a_foreign_table_listing_shows_visible_tables_without_a_schema() {
+        assert_eq!(
+            list_foreign_tables_query(None, false, PG18).unwrap(),
+            "SELECT n.nspname AS \"Schema\",\n  c.relname AS \"Table\",\n  \
+             s.srvname AS \"Server\"\n\
+             FROM pg_catalog.pg_foreign_table ft\n  \
+             INNER JOIN pg_catalog.pg_class c ON c.oid = ft.ftrelid\n  \
+             INNER JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+             INNER JOIN pg_catalog.pg_foreign_server s ON s.oid = ft.ftserver\n\
+             WHERE pg_catalog.pg_table_is_visible(c.oid)\n\
+             ORDER BY 1, 2;"
+        );
+        let q = list_foreign_tables_query(Some("s.t"), true, PG18).unwrap();
+        assert!(q.contains(
+            "END AS \"FDW options\",\n  d.description AS \"Description\"\n\
+             FROM pg_catalog.pg_foreign_table ft\n"
+        ));
+        assert!(q.ends_with(
+            "   LEFT JOIN pg_catalog.pg_description d\n          \
+             ON d.classoid = c.tableoid AND d.objoid = c.oid AND d.objsubid = 0\n\
+             WHERE c.relname OPERATOR(pg_catalog.~) '^(t)$' COLLATE pg_catalog.default\n  \
+             AND n.nspname OPERATOR(pg_catalog.~) '^(s)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1, 2;"
         ));
     }
 }

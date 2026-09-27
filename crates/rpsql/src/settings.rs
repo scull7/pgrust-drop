@@ -5,8 +5,8 @@
 //! unit-tested with a settings value built in the test.
 //!
 //! Only the fields this port has reached are present; the one-shot `\g`,
-//! `\gset`, `\crosstabview` and pipeline fields belong to NAT-402/NAT-403 and
-//! are not declared as dead weight here.
+//! `\gset` and pipeline fields belong to NAT-402/NAT-403/NAT-404 and are not
+//! declared as dead weight here. `\crosstabview`'s is (NAT-404).
 
 use rlibpq::{ContextVisibility, QueryResult, Verbosity};
 
@@ -415,6 +415,9 @@ pub struct PsqlSettings {
     /// at `startup.c:384`, `:397`, `:462` and `command.c:4970`, `:4979`; it is
     /// kept here so [`crate::logging`] reads all of its state from one place.
     pub log_terse: bool,
+    /// `crosstab_flag` and `ctv_args` (`settings.h:132`-`:133`): the one-shot
+    /// request `\crosstabview` leaves for the next `SendQuery`, which takes it.
+    pub crosstab: Option<crate::crosstab::CtvArgs>,
 
     // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
@@ -483,6 +486,7 @@ impl Default for PsqlSettings {
             last_error_result: None,
             // `log_flags` starts at 0 (`logging.c:24`).
             log_terse: false,
+            crosstab: None,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,

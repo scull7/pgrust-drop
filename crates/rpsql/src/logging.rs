@@ -159,6 +159,25 @@ mod tests {
     }
 
     #[test]
+    fn warnings_follow_the_same_prefixing() {
+        // `pg_regress` runs `psql < file`: `process_file(NULL)` leaves
+        // `inputfile` unset and turns on PG_LOG_FLAG_TERSE (`command.c:4970`).
+        assert_eq!(
+            text(true, None, Level::Warning, "\\q: extra"),
+            "\\q: extra\n"
+        );
+        // `-f -` names stdin `<stdin>` (`command.c:4964`).
+        assert_eq!(
+            text(false, Some(("<stdin>", 1)), Level::Warning, "w"),
+            "psql:<stdin>:1: warning: w\n"
+        );
+        assert_eq!(
+            text(false, Some(("a.sql", 7)), Level::Error, "boom"),
+            "psql:a.sql:7: error: boom\n"
+        );
+    }
+
+    #[test]
     fn line_zero_prints_no_line() {
         // `logging.c:261`.
         assert_eq!(

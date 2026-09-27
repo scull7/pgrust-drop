@@ -1,6 +1,7 @@
-//! The harness for the stolen `src/test/regress/sql/psql.sql`: the vendored
-//! script and its expected output, the splitter that cuts both into
-//! sections, and a PostgreSQL 18 cluster to run a section against.
+//! The harness for the stolen `src/test/regress/sql/psql.sql` and
+//! `psql_crosstab.sql`: the vendored scripts and their expected output, the
+//! splitter that cuts `psql.sql` into sections, and a PostgreSQL 18 cluster
+//! to run a section or a whole script against.
 //!
 //! `psql.sql` is one 2,000-line script. Gated whole, one wrong byte anywhere
 //! fails everything and the diff is unreviewable, so it is cut into the
@@ -32,6 +33,28 @@ pub const PSQL_SQL_SHA256: &str =
 /// See [`PSQL_SQL_SHA256`].
 pub const PSQL_OUT_SHA256: &str =
     "588bf1582a4deff3708e37f9b51c7879f83ca8be103656f0df6990d8257e8dc7";
+
+/// `src/test/regress/sql/psql_crosstab.sql` at `REL_18_6`, byte for byte.
+pub const PSQL_CROSSTAB_SQL: &str = include_str!("psql_crosstab.sql");
+/// `src/test/regress/expected/psql_crosstab.out` at `REL_18_6`, byte for byte.
+pub const PSQL_CROSSTAB_OUT: &str = include_str!("expected/psql_crosstab.out");
+/// See [`PSQL_SQL_SHA256`].
+pub const PSQL_CROSSTAB_SQL_SHA256: &str =
+    "7159d1605cad80cf2f810174cc47b9d71b4d2386b0a533a0daa9e48eeaf3052d";
+/// See [`PSQL_SQL_SHA256`].
+pub const PSQL_CROSSTAB_OUT_SHA256: &str =
+    "44039026efc4430898aaae7b35f4da5a72ac83bab67130dac9158b7b2dec4502";
+
+/// Lower-case hex of `bytes`' SHA-256, to hold a vendored file to its digest.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    rlibpq::sha256::sha256(bytes)
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
 
 /// One section of `psql.sql` and the slice of `psql.out` it produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +408,30 @@ pub struct PsqlOutcome {
     pub stdout: String,
     /// Standard error, one trailing newline chomped.
     pub stderr: String,
+}
+
+/// Run `section` through `rpsql` against `cluster`, and through C psql when
+/// this lane has one, and require both to print exactly the expected slice.
+///
+/// # Panics
+/// On the first byte either one gets wrong.
+pub fn gate_section(cluster: &Cluster, rpsql: &Path, section: &Section<'_>) {
+    let ours = cluster.run_script(rpsql, section.sql);
+    if let Some(diff) = first_difference(section.expected.as_bytes(), &ours) {
+        panic!(
+            "rpsql, sql:{} vs out:{} ({}): {diff}",
+            section.sql_line, section.out_line, section.header
+        );
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script(&psql, section.sql);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql ({}): {diff}", section.header);
+            }
+        }
+        None => reference::skip("psql"),
+    }
 }
 
 /// A readable account of where `ours` first leaves `expected`: the line

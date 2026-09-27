@@ -212,7 +212,7 @@ fn connect_to(conninfo: &str) -> Connection {
     let mut info = parse_conninfo(conninfo.as_bytes()).expect("conninfo parses");
     info.add_defaults(&Env::empty(), &Filesystem)
         .expect("no service to look up");
-    Connection::connect(&info).expect("rlibpq connects")
+    Connection::connect(&info, &Env::empty(), &Filesystem).expect("rlibpq connects")
 }
 
 /// What [`wait_for_connection_state`] waits for: its `state` or its

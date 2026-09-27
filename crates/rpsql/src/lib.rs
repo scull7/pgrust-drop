@@ -142,10 +142,11 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
         // one is a bug in this function rather than in the command line.
         let _ = conninfo.set(key.as_bytes(), value.as_bytes());
     }
-    if let Err(err) = conninfo.add_defaults(&Env::from_process(), &Filesystem) {
+    let env = Env::from_process();
+    if let Err(err) = conninfo.add_defaults(&env, &Filesystem) {
         return Err(ConnectionError::from(err).into());
     }
-    match Connection::connect(&conninfo) {
+    match Connection::connect(&conninfo, &env, &Filesystem) {
         Ok(connection) => Ok(LiveExecutor {
             connection,
             alive: true,

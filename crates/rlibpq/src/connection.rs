@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::cancel::Peer;
-use crate::conninfo::ConnInfo;
+use crate::conninfo::{ConnInfo, Env};
 use crate::error::ConnError;
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
 use crate::message::{
@@ -33,6 +33,7 @@ use crate::message::{
     next_copy_frame, next_frame,
 };
 use crate::negotiate::{Build, EncMethod, EncryptionOptions, Negotiation};
+use crate::passfile::{FilePassword, PasswordLookup};
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::pipeline::{
     Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
@@ -40,6 +41,7 @@ use crate::pipeline::{
 };
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
+use crate::service::Files;
 use crate::trace::{self, AuthResponse, Origin, TraceFlags};
 
 /// Anything that can stop a connection or a query.
@@ -56,6 +58,13 @@ pub enum ConnectionError {
     Auth(AuthError),
     /// An ErrorResponse during startup, before any result exists.
     Server(Box<ResultError>),
+    /// `pgpassfileWarning`, `fe-connect.c:8053`: the server refused the
+    /// password (SQLSTATE 28P01) it asked for, and that password came from
+    /// `passfile` — so the message says where it came from.
+    ServerRefusedPassfile {
+        error: Box<ResultError>,
+        passfile: Vec<u8>,
+    },
     /// A message that is well-formed but cannot appear here
     /// (`fe-protocol3.c:447`).
     UnexpectedMessage(u8),
@@ -89,6 +98,18 @@ impl ConnectionError {
                 crate::result::Verbosity::default(),
                 crate::result::ContextVisibility::default(),
             ),
+            ConnectionError::ServerRefusedPassfile { error, passfile } => {
+                let mut message = error.message(
+                    ExecStatus::FatalError,
+                    crate::result::Verbosity::default(),
+                    crate::result::ContextVisibility::default(),
+                );
+                // libpq_append_conn_error, fe-connect.c:8065.
+                message.extend_from_slice(b"password retrieved from file \"");
+                message.extend_from_slice(passfile);
+                message.extend_from_slice(b"\"\n");
+                message
+            }
             ConnectionError::UnexpectedMessage(id) => {
                 ProtocolError::UnexpectedResponse(*id).message()
             }
@@ -167,6 +188,9 @@ pub fn is_unixsock_path(host: &[u8]) -> bool {
 /// `PQconninfoOptions[]` stores; `the_two_spellings_of_def_pgport_agree` pins
 /// the pair, so only one of them can drift.
 const DEF_PGPORT: u16 = 5432;
+
+/// `ERRCODE_INVALID_PASSWORD`, `fe-connect.c:93`.
+const ERRCODE_INVALID_PASSWORD: &[u8] = b"28P01";
 
 /// `isspace` in the "C" locale — the bytes `strtol` skips before a number
 /// (`fe-connect.c:8206`) and the ones `pqParseIntParam` skips after one
@@ -505,14 +529,29 @@ impl Connection<Stream> {
     ///
     /// The caller is expected to have run `ConnInfo::add_defaults` already —
     /// `add_defaults(&Env::from_process(), &Filesystem)` is what
-    /// `PQconnectdb` does with the environment and the service files.
+    /// `PQconnectdb` does with the environment and the service files. `env`
+    /// and `files` are then the ones `pqConnectOptions2` reads the password
+    /// file through (`fe-connect.c:1426`): `HOME` for `~/.pgpass`, and the
+    /// file itself. A warning about that file is written to stderr here, as
+    /// `passwordFromFile` writes it with `fprintf` (`fe-connect.c:7950`,
+    /// `:7960`).
     ///
     /// # Errors
     /// An encryption option this build refuses (`sslmode=require` without
     /// TLS, say), the `port` is not one `PQconnectPoll` would use, the socket could not
     /// be opened, the nonce could not be drawn, the server refused the
     /// connection, or authentication failed.
-    pub fn connect(conninfo: &ConnInfo) -> Result<Self, ConnectionError> {
+    pub fn connect(
+        conninfo: &ConnInfo,
+        env: &Env,
+        files: &impl Files,
+    ) -> Result<Self, ConnectionError> {
+        // fe-connect.c:1426 — the password file is read before any of the
+        // option checks below, so its warning comes first on stderr.
+        let lookup = PasswordLookup::new(conninfo, env, files);
+        if let Some(warning) = &lookup.warning {
+            let _ = io::stderr().write_all(&warning.message());
+        }
         // fe-connect.c:1747-:1987 — `pqConnectOptions2` runs at
         // `PQconnectStart`, before `PQconnectPoll` looks at the port.
         let options = EncryptionOptions::from_conninfo(conninfo, Build::THIS)?;
@@ -533,7 +572,8 @@ impl Connection<Stream> {
         let stream = Stream::connect(&address)?;
         let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
-        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
+        let mut conn =
+            Connection::start_up_with_passfile(stream, conninfo, lookup.found.as_ref(), &nonce)?;
         conn.raddr = raddr;
         Ok(conn)
     }
@@ -563,8 +603,26 @@ impl<S: Read + Write> Connection<S> {
     /// The server sent an ErrorResponse, a message that cannot appear during
     /// startup, or an authentication request this build cannot answer.
     pub fn start_up(
+        stream: S,
+        conninfo: &ConnInfo,
+        raw_nonce: &[u8],
+    ) -> Result<Self, ConnectionError> {
+        Connection::start_up_with_passfile(stream, conninfo, None, raw_nonce)
+    }
+
+    /// [`Connection::start_up`], with the password `passwordFromFile` found
+    /// for this host. It is the password sent when there is one
+    /// (`conn->connhost[whichhost].password` before `conn->pgpass`,
+    /// `fe-auth.c:1202`), and a 28P01 refusal of it names its file
+    /// (`pgpassfileWarning`, `fe-connect.c:8053`).
+    ///
+    /// # Errors
+    /// As [`Connection::start_up`];
+    /// [`ConnectionError::ServerRefusedPassfile`] for that refusal.
+    pub fn start_up_with_passfile(
         mut stream: S,
         conninfo: &ConnInfo,
+        from_file: Option<&FilePassword>,
         raw_nonce: &[u8],
     ) -> Result<Self, ConnectionError> {
         let startup = Frontend::Startup {
@@ -581,7 +639,9 @@ impl<S: Read + Write> Connection<S> {
         };
         let mut authenticator = Authenticator::new(
             conninfo.get("user").unwrap_or_default(),
-            conninfo.get("password"),
+            from_file
+                .map(|file| file.password.as_slice())
+                .or_else(|| conninfo.get("password")),
             raw_nonce,
         )
         .with_channel_binding(channel_binding);
@@ -602,11 +662,15 @@ impl<S: Read + Write> Connection<S> {
             raddr: None,
         };
 
+        // PQconnectPoll's CONNECTION_AWAITING_RESPONSE, where
+        // pgpassfileWarning runs (fe-connect.c:4143), ends at AuthenticationOk.
+        let mut authenticated = false;
         loop {
             match conn.read_message()? {
                 Backend::Authentication(request) => match authenticator.respond(&request)? {
                     AuthStep::Send(message) => conn.send(&message)?,
-                    AuthStep::Nothing | AuthStep::Complete => {}
+                    AuthStep::Complete => authenticated = true,
+                    AuthStep::Nothing => {}
                 },
                 Backend::ParameterStatus { name, value } => conn.parameters.push((name, value)),
                 Backend::BackendKeyData { pid, cancel_key } => {
@@ -615,6 +679,17 @@ impl<S: Read + Write> Connection<S> {
                 }
                 Backend::NoticeResponse(notice) => conn.notices.push(notice),
                 Backend::ErrorResponse(error) => {
+                    // pgpassfileWarning, fe-connect.c:8053.
+                    if let Some(file) = from_file
+                        && !authenticated
+                        && authenticator.password_needed()
+                        && error.sqlstate() == Some(ERRCODE_INVALID_PASSWORD)
+                    {
+                        return Err(ConnectionError::ServerRefusedPassfile {
+                            error: Box::new(error),
+                            passfile: file.passfile.clone(),
+                        });
+                    }
                     return Err(ConnectionError::Server(Box::new(error)));
                 }
                 Backend::ReadyForQuery(status) => {
@@ -1665,7 +1740,12 @@ mod tests {
     #[test]
     fn an_invalid_port_stops_a_connection_before_any_socket_is_opened() {
         let info = conninfo("host=/nonexistent-socket-dir port=99999");
-        let error = Connection::connect(&info).unwrap_err();
+        let error = Connection::connect(
+            &info,
+            &crate::conninfo::Env::empty(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         assert_eq!(error.message(), b"invalid port number: \"99999\"".to_vec());
     }
 
@@ -1676,7 +1756,12 @@ mod tests {
     #[test]
     fn a_refused_encryption_option_stops_a_connection_before_the_port_is_read() {
         let info = conninfo("host=/nonexistent-socket-dir port=99999 sslmode=require");
-        let error = Connection::connect(&info).unwrap_err();
+        let error = Connection::connect(
+            &info,
+            &crate::conninfo::Env::empty(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
         assert_eq!(
             error.message(),
             b"sslmode value \"require\" invalid when SSL support is not compiled in".to_vec()
@@ -1832,6 +1917,105 @@ mod tests {
             String::from_utf8(err.message()).unwrap(),
             "fe_sendauth: no password supplied\n"
         );
+    }
+
+    fn error_response(sqlstate: &[u8], primary: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (code, value) in [
+            (diag::SEVERITY, &b"FATAL"[..]),
+            (diag::SQLSTATE, sqlstate),
+            (diag::MESSAGE_PRIMARY, primary),
+        ] {
+            body.push(code);
+            body.extend_from_slice(value);
+            body.push(0);
+        }
+        body.push(0);
+        message(b'E', &body)
+    }
+
+    fn from_file(password: &str) -> FilePassword {
+        FilePassword {
+            password: password.as_bytes().to_vec(),
+            passfile: b"/home/alice/.pgpass".to_vec(),
+        }
+    }
+
+    /// `fe-auth.c:1202`: the password file's password is the one sent, ahead
+    /// of the conninfo's (which, being non-empty, would have stopped the
+    /// lookup — an empty one does not).
+    #[test]
+    fn a_password_from_the_file_is_the_one_sent() {
+        let mut script = message(b'R', &3u32.to_be_bytes());
+        script.extend(auth_ok());
+        script.extend(ready(b'I'));
+        let info = conninfo("user=alice dbname=postgres password=");
+        let file = from_file("filepw");
+        let conn =
+            Connection::start_up_with_passfile(Scripted::new(script), &info, Some(&file), &[0; 18])
+                .unwrap();
+        assert!(
+            conn.stream
+                .to_server
+                .ends_with(&Frontend::PasswordMessage(b"filepw".to_vec()).encode())
+        );
+    }
+
+    /// `pgpassfileWarning`, `fe-connect.c:8053`: a password the server asked
+    /// for, that came from the file, and that it refused with 28P01 — the
+    /// message then names the file, on a line of its own.
+    #[test]
+    fn a_refused_password_from_the_file_names_the_file() {
+        let refused = || {
+            let mut script = message(b'R', &3u32.to_be_bytes());
+            script.extend(error_response(
+                b"28P01",
+                b"password authentication failed for user \"alice\"",
+            ));
+            script
+        };
+        let info = conninfo("user=alice dbname=postgres");
+        let err = Connection::start_up_with_passfile(
+            Scripted::new(refused()),
+            &info,
+            Some(&from_file("wrong")),
+            &[0; 18],
+        )
+        .unwrap_err();
+        assert_eq!(
+            String::from_utf8(err.message()).unwrap(),
+            "FATAL:  password authentication failed for user \"alice\"\n\
+             password retrieved from file \"/home/alice/.pgpass\"\n"
+        );
+
+        // The same refusal of a password that was not from the file.
+        let info = conninfo("user=alice dbname=postgres password=wrong");
+        let err = Connection::start_up(Scripted::new(refused()), &info, &[0; 18]).unwrap_err();
+        assert_eq!(
+            String::from_utf8(err.message()).unwrap(),
+            "FATAL:  password authentication failed for user \"alice\"\n"
+        );
+    }
+
+    /// Any other SQLSTATE, or an error before a password was asked for, is
+    /// the server's message alone.
+    #[test]
+    fn only_a_28p01_after_a_password_request_names_the_file() {
+        let info = conninfo("user=alice dbname=postgres");
+        let file = from_file("pw");
+
+        let mut script = message(b'R', &3u32.to_be_bytes());
+        script.extend(error_response(b"28000", b"no pg_hba.conf entry"));
+        let err =
+            Connection::start_up_with_passfile(Scripted::new(script), &info, Some(&file), &[0; 18])
+                .unwrap_err();
+        assert!(matches!(err, ConnectionError::Server(_)), "{err:?}");
+
+        let script = error_response(b"28P01", b"password authentication failed");
+        let err =
+            Connection::start_up_with_passfile(Scripted::new(script), &info, Some(&file), &[0; 18])
+                .unwrap_err();
+        assert!(matches!(err, ConnectionError::Server(_)), "{err:?}");
     }
 
     /// An ErrorResponse during startup — a wrong database name — comes back

@@ -308,7 +308,12 @@ fn another_superuser_is_the_templates_renamed_under_pgrust() {
     let pgrust = install(&scratch.0);
 
     let beside = scratch.0.join("data-beside");
-    initdb_alice(&scratch.0, &link_pgdrop(&scratch.0, "initdb"), None, &beside);
+    initdb_alice(
+        &scratch.0,
+        &link_pgdrop(&scratch.0, "initdb"),
+        None,
+        &beside,
+    );
     assert_eq!(
         superuser(&pgrust, &beside, &server_env(&scratch.0)),
         (vec!["alice".to_owned(), "alice".to_owned()], Vec::new())

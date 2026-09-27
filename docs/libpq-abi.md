@@ -23,7 +23,7 @@ a `cdylib` crate type, and musl is the lane CI gates first (ADR-0007).
 is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 `rlibpq` has none of the three yet.
 
-35 of 210 symbols implemented, 0 stubbed with an error, 175 not yet.
+54 of 210 symbols implemented, 0 stubbed with an error, 156 not yet.
 
 | ordinal | symbol | coverage | follows |
 |--:|---|---|---|
@@ -62,15 +62,15 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 33 | `PQresultStatus` | implemented | fe-exec.c:3442 |
 | 34 | `PQntuples` | implemented | fe-exec.c:3512 |
 | 35 | `PQnfields` | implemented | fe-exec.c:3520 |
-| 36 | `PQbinaryTuples` | not yet |  |
+| 36 | `PQbinaryTuples` | implemented | fe-exec.c:3528 |
 | 37 | `PQfname` | implemented | fe-exec.c:3598 |
-| 38 | `PQfnumber` | not yet |  |
-| 39 | `PQftype` | not yet |  |
-| 40 | `PQfsize` | not yet |  |
-| 41 | `PQfmod` | not yet |  |
+| 38 | `PQfnumber` | implemented | fe-exec.c:3620 |
+| 39 | `PQftype` | implemented | fe-exec.c:3750 |
+| 40 | `PQfsize` | implemented | fe-exec.c:3761 |
+| 41 | `PQfmod` | implemented | fe-exec.c:3772 |
 | 42 | `PQcmdStatus` | implemented | fe-exec.c:3783 |
-| 43 | `PQoidStatus` | not yet |  |
-| 44 | `PQcmdTuples` | not yet |  |
+| 43 | `PQoidStatus` | implemented | fe-exec.c:3796 |
+| 44 | `PQcmdTuples` | implemented | fe-exec.c:3853 |
 | 45 | `PQgetvalue` | implemented | fe-exec.c:3907 |
 | 46 | `PQgetlength` | implemented | fe-exec.c:3918 |
 | 47 | `PQgetisnull` | implemented | fe-exec.c:3932 |
@@ -97,7 +97,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 68 | `appendPQExpBufferChar` | not yet |  |
 | 69 | `initPQExpBuffer` | not yet |  |
 | 70 | `resetPQExpBuffer` | not yet |  |
-| 71 | `PQoidValue` | not yet |  |
+| 71 | `PQoidValue` | implemented | fe-exec.c:3824 |
 | 72 | `PQclientEncoding` | not yet |  |
 | 73 | `PQenv2encoding` | not yet |  |
 | 74 | `appendBinaryPQExpBuffer` | not yet |  |
@@ -127,16 +127,16 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 98 | `PQprotocolVersion` | not yet |  |
 | 99 | `PQsetErrorVerbosity` | not yet |  |
 | 100 | `PQsetNoticeReceiver` | not yet |  |
-| 101 | `PQexecParams` | not yet |  |
+| 101 | `PQexecParams` | implemented | fe-exec.c:2293 |
 | 102 | `PQsendQueryParams` | not yet |  |
 | 103 | `PQputCopyData` | not yet |  |
 | 104 | `PQputCopyEnd` | not yet |  |
 | 105 | `PQgetCopyData` | not yet |  |
-| 106 | `PQresultErrorField` | not yet |  |
-| 107 | `PQftable` | not yet |  |
-| 108 | `PQftablecol` | not yet |  |
-| 109 | `PQfformat` | not yet |  |
-| 110 | `PQexecPrepared` | not yet |  |
+| 106 | `PQresultErrorField` | implemented | fe-exec.c:3497 |
+| 107 | `PQftable` | implemented | fe-exec.c:3717 |
+| 108 | `PQftablecol` | implemented | fe-exec.c:3728 |
+| 109 | `PQfformat` | implemented | fe-exec.c:3739 |
+| 110 | `PQexecPrepared` | implemented | fe-exec.c:2340 |
 | 111 | `PQsendQueryPrepared` | not yet |  |
 | 112 | `PQdsplen` | not yet |  |
 | 113 | `PQserverVersion` | not yet |  |
@@ -144,7 +144,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 115 | `pg_char_to_encoding` | not yet |  |
 | 116 | `pg_valid_server_encoding` | not yet |  |
 | 117 | `pqsignal` | not yet |  |
-| 118 | `PQprepare` | not yet |  |
+| 118 | `PQprepare` | implemented | fe-exec.c:2323 |
 | 119 | `PQsendPrepare` | not yet |  |
 | 120 | `PQgetCancel` | not yet |  |
 | 121 | `PQfreeCancel` | not yet |  |
@@ -157,10 +157,10 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 128 | `PQencryptPassword` | not yet |  |
 | 129 | `PQisthreadsafe` | implemented | fe-exec.c:4023 |
 | 130 | `enlargePQExpBuffer` | not yet |  |
-| 131 | `PQnparams` | not yet |  |
-| 132 | `PQparamtype` | not yet |  |
-| 133 | `PQdescribePrepared` | not yet |  |
-| 134 | `PQdescribePortal` | not yet |  |
+| 131 | `PQnparams` | implemented | fe-exec.c:3946 |
+| 132 | `PQparamtype` | implemented | fe-exec.c:3957 |
+| 133 | `PQdescribePrepared` | implemented | fe-exec.c:2472 |
+| 134 | `PQdescribePortal` | implemented | fe-exec.c:2491 |
 | 135 | `PQsendDescribePrepared` | not yet |  |
 | 136 | `PQsendDescribePortal` | not yet |  |
 | 137 | `lo_truncate` | not yet |  |

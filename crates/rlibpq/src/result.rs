@@ -473,9 +473,9 @@ pub struct QueryResult {
     /// `paramDescs`: the parameter types a ParameterDescription reported
     /// (`getParamDescriptions`, `fe-protocol3.c:690`).
     params: Vec<u32>,
-    /// `binary`: set only by a COPY response (`getCopyStart`,
-    /// `fe-protocol3.c:1719`); a RowDescription's columns carry their own
-    /// formats instead.
+    /// `binary`: a COPY response's overall format (`getCopyStart`,
+    /// `fe-protocol3.c:1719`), or whether a RowDescription's columns are all
+    /// binary ([`QueryResult::set_fields`]).
     binary: bool,
 }
 
@@ -553,7 +553,11 @@ impl QueryResult {
         &self.fields
     }
 
+    /// A RowDescription's columns, and with them `binary`: "true only if
+    /// ALL columns are binary", and false with no columns
+    /// (`getRowDescriptions`, `fe-protocol3.c:571`-`:572`, `:619`-`:620`).
     pub(crate) fn set_fields(&mut self, fields: Vec<FieldDescription>) {
+        self.binary = !fields.is_empty() && fields.iter().all(|field| field.format == 1);
         self.fields = fields;
     }
 
@@ -586,7 +590,7 @@ impl QueryResult {
     }
 
     /// `PQbinaryTuples`, `fe-exec.c:3528`: whether a COPY result's data is
-    /// binary.
+    /// binary, or every column of a row result is.
     #[must_use]
     pub fn binary_tuples(&self) -> bool {
         self.binary
@@ -1082,6 +1086,29 @@ mod tests {
         assert_eq!(res.value(1, 0), Some(&b""[..]));
         assert_eq!(res.fname(0), Some(&b"x"[..]));
         assert_eq!(res.ntuples(), 2);
+    }
+
+    /// `getRowDescriptions`, `fe-protocol3.c:571`-`:572`, `:619`-`:620`:
+    /// `PQbinaryTuples` is 1 only for a row result whose every column is
+    /// binary.
+    #[test]
+    fn binary_tuples_is_true_only_when_every_column_is_binary() {
+        let column = |format| FieldDescription {
+            name: b"x".to_vec(),
+            tableid: 0,
+            columnid: 0,
+            typid: 23,
+            typlen: 4,
+            atttypmod: -1,
+            format,
+        };
+        let mut res = QueryResult::new(ExecStatus::TuplesOk);
+        res.set_fields(vec![column(1), column(1)]);
+        assert!(res.binary_tuples());
+        res.set_fields(vec![column(1), column(0)]);
+        assert!(!res.binary_tuples());
+        res.set_fields(Vec::new());
+        assert!(!res.binary_tuples());
     }
 
     /// Every `pgresStatus` spelling, since rpsql prints them.

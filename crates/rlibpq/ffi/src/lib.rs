@@ -19,6 +19,9 @@
 //! Then the opaque [`PGconn`] and [`PGresult`] and the blocking calls over
 //! them — `PQconnectdb`, `PQstatus`, `PQerrorMessage`, `PQexec`, `PQfinish`
 //! and the result accessors — enough for `src/test/examples/testlibpq.c`.
+//! Then the extended-query calls — `PQexecParams`, `PQprepare`,
+//! `PQexecPrepared`, `PQdescribePrepared`, `PQdescribePortal` — and the rest
+//! of a result's metadata, enough for `src/test/examples/testlibpq3.c`.
 //! The rest follows in later slices of NAT-395.
 //!
 //! This is the one crate in the workspace that allows `unsafe`: a C ABI is
@@ -35,6 +38,7 @@ mod alloc;
 mod conn;
 mod conninfo;
 mod ctext;
+mod extended;
 mod misc;
 mod result;
 mod secure;

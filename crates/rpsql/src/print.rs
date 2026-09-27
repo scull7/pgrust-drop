@@ -292,6 +292,10 @@ struct Line {
 /// the East-Asian-width and non-spacing tables `ucs_wcwidth` searches
 /// (`wchar.c:646`) are not ported, which is a recorded divergence. A cell
 /// that is not UTF-8 is walked byte by byte, one column per byte.
+///
+/// Upstream steps and measures by the client encoding (`PQmblen`, `PQdsplen`,
+/// `mbprint.c:304`, `:307`); this walk is UTF-8's whatever it is, because the
+/// client encoding is not tracked yet. That too is a recorded divergence.
 fn format_cell(cell: &[u8]) -> Vec<Line> {
     fn push_escaped(line: &mut Line, text: &str) {
         line.bytes.extend_from_slice(text.as_bytes());
@@ -984,6 +988,26 @@ mod tests {
         let mut opt = PrintQueryOpt::default();
         opt.topt.numeric_locale = true;
         assert!(print_query(&text_only, &opt).is_ok());
+    }
+
+    /// Pins the recorded divergence: the walk is UTF-8's whatever the client
+    /// encoding. Under `SQL_ASCII` C would count `é` as two columns and print
+    /// `C2 85` raw; here they are one column and `\u0085`, as C does under
+    /// UTF8. A byte sequence that is not UTF-8 is one column per byte.
+    #[test]
+    fn a_cell_is_measured_as_utf8_whatever_the_client_encoding() {
+        let lines = format_cell("é".as_bytes());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width, 1);
+        assert_eq!(lines[0].bytes, "é".as_bytes());
+
+        let lines = format_cell(b"\xC2\x85");
+        assert_eq!(lines[0].bytes, b"\\u0085");
+        assert_eq!(lines[0].width, 6);
+
+        let lines = format_cell(b"\xE9t\xE9");
+        assert_eq!(lines[0].bytes, b"\xE9t\xE9");
+        assert_eq!(lines[0].width, 3);
     }
 
     fn with(edit: impl Fn(&mut PrintQueryOpt)) -> PrintQueryOpt {

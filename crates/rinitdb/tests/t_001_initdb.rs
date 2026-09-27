@@ -2,6 +2,10 @@
 //! order. Only the server-free assertions exist so far; each later chunk adds
 //! the next block of the Perl file (Linear NAT-379 … NAT-386).
 //!
+//! Beside the Perl file's own cases sits the whole-datadir tree diff against
+//! C initdb that NAT-386 adds (`the_finished_data_directory_matches_reference_initdb`),
+//! with its allow-list recorded in `docs/test-stealing.md`.
+//!
 //! Every `command_fails` case below is doubly pinned: the stolen assertion
 //! itself (the command must fail), and the exact stderr C writes, transcribed
 //! from the `pg_log_error` / `pg_fatal` site named in the comment. The second
@@ -617,6 +621,421 @@ fn the_data_directory_tree_matches_reference_initdb() {
             "PG_VERSION content ({tag})"
         );
     }
+}
+
+// --- data directory tree diff (Linear NAT-386) ------------------------------
+
+/// The differences the tree diff expects between the data directory C initdb
+/// makes and the one rinitdb makes for the same command line, each with the
+/// reason and the narrower check that runs in its place. Recorded in
+/// `docs/test-stealing.md` ("The data directory tree diff").
+///
+/// Nothing else may differ: not a directory, not a mode, not `PG_VERSION`,
+/// and — when the reference is the template's twin — not one catalog file.
+/// Timestamps are not compared at all (`testkit::tree`).
+#[cfg(unix)]
+const TREE_ALLOWANCES: [testkit::tree::Allowance; 4] = {
+    use testkit::tree::{Allowance, Aspect, Covers};
+    [
+        Allowance {
+            covers: Covers::Path("global/pg_control"),
+            aspects: &[Aspect::Content],
+            why: "every cluster gets its own system identifier, mock authentication nonce \
+                  (InitControlFile, xlog.c:4217-4218) and timestamps (controldata_utils.c:197), \
+                  and rinitdb's checkpoint sits one segment past the template's redo pointer, \
+                  where pg_resetwal -f puts it (ADR-0002, 2026-09-23 amendment); every other \
+                  field is compared by pg_control_matches_the_reference",
+        },
+        Allowance {
+            covers: Covers::FilesUnder("pg_wal"),
+            aspects: &[Aspect::Presence, Aspect::Content],
+            why: "C's segments hold the WAL its bootstrap and single-user sessions wrote; \
+                  rinitdb writes one segment holding one shutdown checkpoint (ADR-0002, \
+                  2026-09-23 amendment; tests/first_segment.rs holds it to pg_resetwal byte for \
+                  byte); the_wal_is_the_segment_pg_control_names checks which one it is",
+        },
+        Allowance {
+            covers: Covers::Path("pg_stat/pgstat.stat"),
+            aspects: &[Aspect::Presence],
+            why: "the statistics C initdb's own server wrote at shutdown (pgstat_write_statsfile, \
+                  pgstat.c:1570); the template strips them (image::STRIPPED_FILES) and a server \
+                  that finds no file starts from empty counters (pgstat.c:1776-1784); checked to \
+                  be absent from ours, not merely allowed to be",
+        },
+        Allowance {
+            covers: Covers::Path("postgresql.conf"),
+            aspects: &[Aspect::Content],
+            why: "setup_config writes what the reference build and host decide — its \
+                  DEFAULT_PGSOCKET_DIR, a distribution's patched sample, the probed \
+                  max_connections and shared_buffers, the host's time zone and on macOS its \
+                  locale — and the_configuration_files_match_reference_initdb and \
+                  the_time_zone_lines_match_reference_initdb diff it byte for byte with each \
+                  of those accounted for",
+        },
+    ]
+};
+
+/// Pure: is `path` a file the template image decides — one `image::strip`
+/// keeps, so rinitdb copies it out of the image rather than writing it?
+#[cfg(unix)]
+fn template_owned(path: &Path, node: &testkit::tree::Node) -> bool {
+    node.kind == testkit::EntryKind::File
+        && path
+            .to_str()
+            .and_then(|path| rinitdb::image::ImagePath::new(path).ok())
+            .is_some_and(|path| rinitdb::image::keeps(&rinitdb::image::Entry::file(path, ())))
+}
+
+/// Pure: the template-owned files of C's tree `theirs` that are not the
+/// embedded template's, byte for byte — missing from one side, or different.
+///
+/// Empty means the reference is the template's twin: the `initdb` and the
+/// host that minted it (ADR-0002). Then the catalogs rinitdb copies out of the
+/// image are the very ones C wrote, and the tree diff holds them to that.
+/// Otherwise the host put other rows into `pg_collation`
+/// (`pg_import_system_collations`, `initdb.c:1781`; ICU's version and `locale
+/// -a`'s answer), every OID assigned after them moves, and no catalog file can
+/// be compared — which is ADR-0002's design, not a defect.
+#[cfg(unix)]
+fn template_mismatches(theirs: &testkit::tree::Tree) -> Vec<PathBuf> {
+    let template: BTreeMap<PathBuf, (u64, u64)> = rinitdb::image::parse(rinitdb::image::TEMPLATE)
+        .expect("parse the embedded template")
+        .into_iter()
+        .filter_map(|entry| match entry.node {
+            rinitdb::image::Node::File(contents) => Some((
+                PathBuf::from(entry.path.as_str()),
+                (contents.len() as u64, testkit::tree::digest(contents)),
+            )),
+            rinitdb::image::Node::Dir => None,
+        })
+        .collect();
+    let c_owned: BTreeMap<PathBuf, (u64, u64)> = theirs
+        .iter()
+        .filter(|(path, node)| template_owned(path, node))
+        .map(|(path, node)| (path.clone(), (node.size, node.digest)))
+        .collect();
+    let paths: BTreeSet<&PathBuf> = template.keys().chain(c_owned.keys()).collect();
+    paths
+        .into_iter()
+        .filter(|path| template.get(*path) != c_owned.get(*path))
+        .cloned()
+        .collect()
+}
+
+/// The narrower check behind the `global/pg_control` allowance: C's
+/// `pg_control` and ours agree on every field but the ones named here.
+///
+/// Taken from ours, whatever the reference: the four facts every cluster gets
+/// of its own (`InitControlFile`, `xlog.c:4217`-`:4218`; the file's time,
+/// `controldata_utils.c:197`, and the checkpoint's), and the checkpoint's
+/// position. With a twin, that position is checked instead to be
+/// `pg_resetwal -f`'s: one segment past C's redo pointer, just after the long
+/// page header (`control::for_new_cluster`). Without one, the counters the
+/// catalogs are consistent with — the checkpoint's next XID, next OID and
+/// oldest XID — are the template's and not C's to agree with (another host's
+/// collation import runs another number of transactions and assigns another
+/// number of OIDs), so they are taken from ours too. The multixact fields,
+/// the oldest XID's database and the rest of the checkpoint are not host
+/// facts and must still be C's.
+///
+/// Everything else — versions, state, the recorded server settings, the
+/// build's sizes and alignment, the checksum version, char signedness — must
+/// be C's, byte for byte once the CRC is recomputed.
+#[cfg(unix)]
+fn pg_control_matches_the_reference(theirs_dir: &Path, ours_dir: &Path, twin: bool, tag: &str) {
+    let read = |dir: &Path| {
+        let path = testkit::control_file_path(dir);
+        let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        ControlFile::parse(&bytes).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    };
+    let (theirs, ours) = (read(theirs_dir), read(ours_dir));
+    assert!(ours.crc_is_valid(), "our pg_control's CRC ({tag})");
+
+    let mut expected = theirs;
+    expected.system_identifier = ours.system_identifier;
+    expected.mock_authentication_nonce = ours.mock_authentication_nonce;
+    expected.time = ours.time;
+    expected.check_point_copy.time = ours.check_point_copy.time;
+    expected.check_point = ours.check_point;
+    expected.check_point_copy.redo = ours.check_point_copy.redo;
+    if twin {
+        let seg_size = theirs.xlog_seg_size;
+        let resetwal = rinitdb::control::segment_offset_to_lsn(
+            rinitdb::control::segment_of(theirs.check_point_copy.redo, seg_size) + 1,
+            rinitdb::control::SIZE_OF_XLOG_LONG_PHD,
+            seg_size,
+        );
+        assert_eq!(
+            (ours.check_point, ours.check_point_copy.redo),
+            (resetwal, resetwal),
+            "our checkpoint is not pg_resetwal -f's placement past C's redo pointer ({tag})"
+        );
+    } else {
+        let (cp, from) = (&mut expected.check_point_copy, &ours.check_point_copy);
+        cp.next_xid = from.next_xid;
+        cp.next_oid = from.next_oid;
+        cp.oldest_xid = from.oldest_xid;
+    }
+    // Not a field to agree on: `to_bytes` recomputes it. Set so the rendered
+    // diff below shows only fields that matter.
+    expected.crc = ours.crc;
+
+    if expected.to_bytes() != ours.to_bytes() {
+        let diff = testkit::diff::unified(
+            &format!("{expected:#?}\n"),
+            &format!("{ours:#?}\n"),
+            "C initdb (allowed fields taken from rinitdb)",
+            "rinitdb",
+        )
+        .unwrap_or_else(|| "(the fields agree; the bytes do not)".to_owned());
+        panic!("pg_control differs from C initdb's beyond the allowance ({tag})\n{diff}");
+    }
+}
+
+/// The narrower check behind the `pg_wal` allowance: our `pg_wal` holds one
+/// regular file, the segment our `pg_control`'s checkpoint is in, at the
+/// build's segment size.
+#[cfg(unix)]
+fn the_wal_is_the_segment_pg_control_names(ours_dir: &Path, ours: &testkit::tree::Tree, tag: &str) {
+    let control = ControlFile::parse(
+        &std::fs::read(testkit::control_file_path(ours_dir)).expect("read our pg_control"),
+    )
+    .expect("parse our pg_control");
+    let segments: Vec<(&PathBuf, u64)> = ours
+        .iter()
+        .filter(|(path, node)| path.starts_with("pg_wal") && node.kind == testkit::EntryKind::File)
+        .map(|(path, node)| (path, node.size))
+        .collect();
+    let expected = Path::new("pg_wal").join(rinitdb::wal::checkpoint_segment_file_name(&control));
+    assert_eq!(
+        segments,
+        [(&expected, u64::from(control.xlog_seg_size))],
+        "our pg_wal ({tag})"
+    );
+}
+
+/// The issue's gate (Linear NAT-386): the whole data directory C initdb makes
+/// against the one rinitdb makes for the same command line — every entry's
+/// presence, kind, mode, size and contents — with nothing allowed to differ
+/// but [`TREE_ALLOWANCES`], each of which runs a narrower check in its place.
+///
+/// The command line is the template's own recipe (`image::MINT_ARGS`), once
+/// as it is and once with `--allow-group-access`. It is the one C initdb
+/// command line whose catalogs rinitdb can claim: the template fixes the
+/// encoding, locale and superuser (`docs/divergences.md`), and any other
+/// command line would be refused by one side.
+///
+/// The catalog files are compared only when the reference is the template's
+/// twin ([`template_mismatches`]). With any other reference they are left out
+/// of both trees and the narrowing is printed `SKIP (flagged, not silent)`,
+/// naming the first file that differs from the template; the directories,
+/// the modes, the files rinitdb writes itself and the checks behind every
+/// allowance still run. `PGDROP_REQUIRE_REF` does not turn that into a
+/// failure: a reference that is not the minting host is ADR-0002's normal
+/// case (CI's musl container is Alpine 3.23, the template's mint host 3.24),
+/// not a missing tool.
+///
+/// Missing reference binary → `SKIP (flagged, not silent)`.
+#[cfg(unix)]
+#[test]
+fn the_finished_data_directory_matches_reference_initdb() {
+    let Some(reference) = reference::find("initdb") else {
+        reference::skip("initdb");
+        return;
+    };
+    for (tag, extra) in [
+        ("finished-default", &[][..]),
+        ("finished-group", &["--allow-group-access"][..]),
+    ] {
+        let tempdir = TempDir::new(tag);
+        let theirs_dir = tempdir.join("c");
+        let ours_dir = tempdir.join("rinitdb");
+        for (binary, datadir) in [
+            (reference.as_path(), &theirs_dir),
+            (Path::new(RINITDB), &ours_dir),
+        ] {
+            let mut argv = args(&rinitdb::image::MINT_ARGS);
+            argv.extend(args(extra));
+            argv.push(OsString::from("-D"));
+            argv.push(OsString::from(datadir));
+            let outcome = testkit::run(binary, &argv).expect("run initdb");
+            assert!(
+                outcome.succeeded(),
+                "{} {argv:?} failed: {}",
+                binary.display(),
+                outcome.stderr_text()
+            );
+        }
+
+        let read = |dir: &Path| {
+            testkit::tree::read_tree(dir)
+                .unwrap_or_else(|err| panic!("read the tree under {}: {err}", dir.display()))
+        };
+        let (mut theirs, mut ours) = (read(&theirs_dir), read(&ours_dir));
+
+        let mismatched = template_mismatches(&theirs);
+        let twin = mismatched.is_empty();
+        if !twin {
+            reference::announce_skip(&format!(
+                "{}: the catalog files of the tree diff ({tag}): the reference initdb at {} is \
+                 not the template's twin — {} of the files the template decides differ from \
+                 it, the first {} — so they are left out of both trees; everything else is \
+                 still compared (ADR-0002)",
+                reference::SKIP_FLAG,
+                reference.display(),
+                mismatched.len(),
+                mismatched[0].display()
+            ));
+            theirs.retain(|path, node| !template_owned(path, node));
+            ours.retain(|path, node| !template_owned(path, node));
+        }
+
+        let found = testkit::tree::differences(&theirs, &ours);
+        let left = testkit::tree::unexplained(&found, &TREE_ALLOWANCES);
+        assert!(
+            left.is_empty(),
+            "the data directory differs from C initdb's ({tag}):\n{}",
+            left.iter()
+                .map(|difference| format!("  - {difference}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        pg_control_matches_the_reference(&theirs_dir, &ours_dir, twin, tag);
+        the_wal_is_the_segment_pg_control_names(&ours_dir, &ours, tag);
+        assert!(
+            !ours.contains_key(Path::new("pg_stat/pgstat.stat")),
+            "a new cluster carries no statistics ({tag})"
+        );
+    }
+}
+
+/// The twin branch of [`pg_control_matches_the_reference`], which no CI lane
+/// reaches with a real reference (none is the template's mint host), driven
+/// with a stand-in for C's file: ours, with the four per-cluster facts
+/// changed and the checkpoint put back where C's would be, one segment
+/// earlier. That must pass; the same stand-in with one recorded setting
+/// changed, or with the checkpoint left where ours is, must not.
+#[cfg(unix)]
+#[test]
+fn the_pg_control_check_takes_from_ours_only_what_it_names() {
+    let tempdir = TempDir::new("pg-control-check");
+    let ours_dir = tempdir.join("rinitdb");
+    let mut argv = args(&rinitdb::image::MINT_ARGS);
+    argv.push(OsString::from(&ours_dir));
+    let outcome = testkit::run(Path::new(RINITDB), &argv).expect("run rinitdb");
+    assert!(outcome.succeeded(), "{}", outcome.stderr_text());
+    let ours = ControlFile::parse(
+        &std::fs::read(testkit::control_file_path(&ours_dir)).expect("read our pg_control"),
+    )
+    .expect("parse our pg_control");
+
+    let mut c_like = ours;
+    c_like.system_identifier = SystemIdentifier::from_raw(ours.system_identifier.get() ^ 1);
+    c_like.mock_authentication_nonce[0] ^= 0xff;
+    c_like.time -= 7;
+    c_like.check_point_copy.time -= 7;
+    let seg_size = ours.xlog_seg_size;
+    let c_redo = rinitdb::control::segment_offset_to_lsn(
+        rinitdb::control::segment_of(ours.check_point_copy.redo, seg_size) - 1,
+        4096,
+        seg_size,
+    );
+    c_like.check_point = c_redo + 104;
+    c_like.check_point_copy.redo = c_redo;
+
+    let write = |name: &str, control: &ControlFile| {
+        let dir = tempdir.join(name);
+        std::fs::create_dir_all(dir.join("global")).expect("create global/");
+        std::fs::write(testkit::control_file_path(&dir), control.to_bytes())
+            .expect("write pg_control");
+        dir
+    };
+    pg_control_matches_the_reference(&write("c", &c_like), &ours_dir, true, "stand-in");
+
+    let mut other_setting = c_like;
+    other_setting.max_connections += 1;
+    let mut same_segment = c_like;
+    same_segment.check_point_copy.redo = ours.check_point_copy.redo;
+    for (name, control) in [("setting", other_setting), ("segment", same_segment)] {
+        let dir = write(name, &control);
+        let caught = std::panic::catch_unwind(|| {
+            pg_control_matches_the_reference(&dir, &ours_dir, true, name);
+        });
+        assert!(caught.is_err(), "{name}: the check let it through");
+    }
+}
+
+/// The pure half of the gate, over trees made by hand: an allowance hides
+/// only its own aspects at its own entries, so a catalog file or a mode that
+/// differed would still fail the gate — the gate is not vacuous even where no
+/// reference binary is installed to drive it.
+#[cfg(unix)]
+#[test]
+fn the_tree_allowances_explain_only_what_they_name() {
+    use testkit::tree::{Node, Tree, differences, unexplained};
+
+    let tree = |entries: &[(&str, Node)]| -> Tree {
+        entries
+            .iter()
+            .map(|(path, node)| (PathBuf::from(path), *node))
+            .collect()
+    };
+    let theirs = tree(&[
+        ("", Node::dir(0o700)),
+        ("base/1/1259", Node::file(0o600, b"catalog")),
+        ("global/pg_control", Node::file(0o600, b"C's")),
+        ("pg_stat/pgstat.stat", Node::file(0o600, b"stats")),
+        (
+            "pg_wal/000000010000000000000001",
+            Node::file(0o600, b"C's WAL"),
+        ),
+        ("pg_hba.conf", Node::file(0o600, b"host all all")),
+        ("postgresql.conf", Node::file(0o600, b"#port = 5432")),
+    ]);
+    let ours = tree(&[
+        ("", Node::dir(0o700)),
+        ("base/1/1259", Node::file(0o600, b"CATALOG")),
+        ("global/pg_control", Node::file(0o640, b"ours")),
+        (
+            "pg_wal/000000010000000000000002",
+            Node::file(0o600, b"ours"),
+        ),
+        ("pg_hba.conf", Node::file(0o600, b"host all none")),
+        ("postgresql.conf", Node::file(0o600, b"#port = 5433")),
+    ]);
+    let found = differences(&theirs, &ours);
+    let left: Vec<String> = unexplained(&found, &TREE_ALLOWANCES)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "base/1/1259: contents differ (both 7 bytes)",
+            "global/pg_control: mode 0600 in the reference, 0640 here",
+            "pg_hba.conf: 12 bytes in the reference, 13 here",
+        ]
+    );
+
+    // And which files a twin check and the narrowing speak for.
+    for (path, owned) in [
+        ("base/1/1259", true),
+        ("pg_xact/0000", true),
+        ("base/1/PG_VERSION", true),
+        ("PG_VERSION", false),
+        ("global/pg_control", false),
+        ("postgresql.conf", false),
+        ("pg_wal/000000010000000000000001", false),
+        ("pg_stat/pgstat.stat", false),
+    ] {
+        assert_eq!(
+            template_owned(Path::new(path), &Node::file(0o600, b"")),
+            owned,
+            "{path}"
+        );
+    }
+    assert!(!template_owned(Path::new("base/1"), &Node::dir(0o700)));
 }
 
 // --- pg_control (Linear NAT-382) --------------------------------------------

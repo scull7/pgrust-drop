@@ -105,3 +105,52 @@ through `reference::skip` so the strict policy covers it too is a follow-up.
 a permanent exemption and must never be added to `UNSHIPPED_TOOLS`: PGDG ships
 `pg_controldata` and `initdb`. This note stays here until the round-trip has
 actually run green at least once.
+
+## The data directory tree diff (NAT-386)
+
+`the_finished_data_directory_matches_reference_initdb`
+(`crates/rinitdb/tests/t_001_initdb.rs`) runs C `initdb` and `rinitdb` with the
+same command line — the template's own recipe, `rinitdb::image::MINT_ARGS`,
+plain and with `--allow-group-access` — and diffs the two data directories with
+`testkit::tree`: every entry's presence, kind, permission bits, size and a
+digest of its contents. Timestamps are not part of the manifest, so no
+allowance is needed for them. Everything not in the allow-list below must be
+identical, including the root's mode, every directory, `PG_VERSION` and
+`pg_hba.conf`, `pg_ident.conf` and `postgresql.auto.conf`.
+
+The allow-list is `TREE_ALLOWANCES` in that file. Each entry names the aspects
+that may differ at its entries, and a narrower check runs in its place:
+
+| entry | may differ | why | checked instead by |
+| ----- | ---------- | --- | ------------------ |
+| `global/pg_control` | contents | Every cluster gets its own system identifier and mock authentication nonce (`InitControlFile`, `xlog.c:4217`-`:4218`) and timestamps (`controldata_utils.c:197`); rinitdb's checkpoint is one segment past the template's redo pointer, where `pg_resetwal -f` puts it (ADR-0002, 2026-09-23 amendment). The CRC follows. | `pg_control_matches_the_reference`: every other field must be C's, byte for byte once the CRC is recomputed. With a twin reference (below), the checkpoint must be exactly one segment past C's redo pointer. Without one, the checkpoint's next XID, next OID and oldest XID are the template's and are taken from ours too. |
+| every regular file under `pg_wal/` | presence, contents | C's segments hold the WAL its bootstrap and single-user sessions wrote. rinitdb writes one segment holding one shutdown checkpoint (ADR-0002, 2026-09-23 amendment). | `the_wal_is_the_segment_pg_control_names`: our `pg_wal` holds exactly one file, the segment our checkpoint is in, at the segment size. Its bytes are held to `pg_resetwal`'s by `crates/rinitdb/tests/first_segment.rs`. |
+| `pg_stat/pgstat.stat` | presence | The statistics C initdb's own server wrote at shutdown (`pgstat_write_statsfile`, `pgstat.c:1570`). The template strips them (`image::STRIPPED_FILES`), and a server that finds no file starts from empty counters (`pgstat.c:1776`-`:1784`). This is a divergence and has a row in `docs/divergences.md`. | The gate asserts the file is absent from ours, so the allowance runs in one direction only. |
+| `postgresql.conf` | contents | `setup_config` writes values the reference build and host decide: its `DEFAULT_PGSOCKET_DIR`, a distribution's patched sample, probed `max_connections`/`shared_buffers`, the host's time zone, and on macOS the host's locale. | `the_configuration_files_match_reference_initdb` and `the_time_zone_lines_match_reference_initdb`, which diff it byte for byte after accounting for each of those values. |
+
+`postmaster.opts` is not on the list. Only a postmaster writes it
+(`CreateOptsFile`, `postmaster.c:1288`), and initdb never starts one, so neither
+tree has the file. If either side ever grew one, the gate would report it.
+
+**Catalog files, and the twin rule.** The files the template image carries
+(`image::keeps`: everything under `base/` and `global/` except `pg_control`,
+plus `pg_xact`, `pg_multixact` and the rest) are compared byte for byte only
+when the reference is the *template's twin*. That means C's tree, stripped,
+holds exactly the template's files (`template_mismatches`). With any other
+reference, the host imported other rows into `pg_collation`
+(`pg_import_system_collations`, `initdb.c:1781`: ICU's version, `locale -a`),
+so every OID assigned after them moves and no catalog file can match. That is
+ADR-0002's design, not a defect. In that case those files are left out of both
+trees and the gate prints `SKIP (flagged, not silent)`, naming how many
+differ and the first one. `PGDROP_REQUIRE_REF` does not make this a failure,
+because a reference that is not the mint host is not a missing tool.
+
+What this costs today: the template was minted on Alpine 3.24 and every CI
+lane has a different host (musl runs in `alpine:3.23`; gnu and apple differ in
+libc and ICU). So no CI lane runs the catalog half live, and it prints the
+flagged skip on all three. The twin branch of the `pg_control` check is
+exercised without a reference by
+`the_pg_control_check_takes_from_ours_only_what_it_names`, and the allow-list
+by `the_tree_allowances_explain_only_what_they_name`. Two changes would make
+the catalog half run live, and both are owner decisions: moving the musl
+container to `alpine:3.24` (the mint host), or re-minting on `alpine:3.23`.

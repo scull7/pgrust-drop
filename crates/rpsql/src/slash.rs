@@ -21,9 +21,20 @@ pub struct SlashOption {
     pub value: String,
     /// The quoting mark, or `None` for an unquoted word.
     pub quote: Option<char>,
+    /// How many of `value`'s trailing semicolons no quoting produced: what
+    /// `psql_scan_slash_option(…, semicolon = true)` strips
+    /// (`psqlscanslash.l:604`-`:613`).
+    pub unquoted_semicolons: usize,
 }
 
 impl SlashOption {
+    /// The argument as a command that passes `semicolon = true` reads it, so
+    /// `\x on;` means `\x on` but `\x 'on;'` does not (`psqlscanslash.l:530`).
+    #[must_use]
+    pub fn semicolon_stripped(&self) -> &str {
+        &self.value[..self.value.len() - self.unquoted_semicolons]
+    }
+
     /// Was this argument produced by a backquote, i.e. a shell command that
     /// this issue does not run?
     #[must_use]
@@ -64,6 +75,9 @@ impl Scanner {
 
         let mut out = Vec::new();
         let mut quote: Option<char> = None;
+        // `unquoted_option_chars` (`psqlscanslash.l:47`): how many bytes at the
+        // end of `out` no quoting produced.
+        let mut unquoted = 0usize;
         loop {
             let rest = self.rest().to_vec();
             if rest.is_empty() {
@@ -78,42 +92,57 @@ impl Scanner {
             match c {
                 b'\'' => {
                     quote = Some('\'');
+                    unquoted = 0;
                     self.skip(1);
                     self.read_single_quoted(&mut out);
                 }
                 b'"' => {
                     quote = Some('"');
+                    unquoted = 0;
                     self.skip(1);
                     out.push(b'"');
                     self.read_double_quoted(&mut out);
                 }
                 b'`' => {
                     quote = Some('`');
+                    unquoted = 0;
                     self.skip(1);
                     let n = self.rest().iter().take_while(|&&b| b != b'`').count();
                     out.extend_from_slice(&self.rest()[..n]);
                     self.skip(n + usize::from(self.rest().len() > n));
                 }
                 b':' => {
-                    if self.read_variable(&mut out, vars) {
+                    if self.read_variable(&mut out, vars, &mut unquoted) {
                         quote = Some(':');
                     }
                 }
                 _ => {
+                    unquoted += 1;
                     self.skip(1);
                     out.push(c);
                 }
             }
         }
 
+        // `psqlscanslash.l:607`: only the unquoted tail can lose semicolons.
+        let mut unquoted_semicolons = out
+            .iter()
+            .rev()
+            .take(unquoted)
+            .take_while(|&&b| b == b';')
+            .count();
         // The option comes back as a `char *` (`psqlscanslash.l:671`), which
         // every command reads as a C string: an escaped zero byte ends it.
+        // The zero byte came from a quote, so the semicolons after it are
+        // already gone.
         if let Some(nul) = out.iter().position(|&b| b == 0) {
             out.truncate(nul);
+            unquoted_semicolons = 0;
         }
         Some(SlashOption {
             value: String::from_utf8_lossy(&out).into_owned(),
             quote,
+            unquoted_semicolons,
         })
     }
 
@@ -125,6 +154,13 @@ impl Scanner {
             all.push(option);
         }
         all
+    }
+
+    /// `psql_scan_slash_option(OT_WHOLE_LINE)` read until it runs dry: its
+    /// `<xslashwholeline>` rules (`psqlscanslash.l:423`) match newlines too,
+    /// so nothing of the input line is left.
+    pub fn slash_discard_line(&mut self) {
+        self.skip(self.rest().len());
     }
 
     /// `psql_scan_slash_command_end()` (`psqlscanslash.l:678`): swallow a
@@ -229,7 +265,12 @@ impl Scanner {
 
     /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`).
     /// Returns whether a substitution actually happened.
-    fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> bool {
+    fn read_variable(
+        &mut self,
+        out: &mut Vec<u8>,
+        vars: &dyn VariableSource,
+        unquoted: &mut usize,
+    ) -> bool {
         let rest = self.rest().to_vec();
 
         if let Some(&delim @ (b'\'' | b'"')) = rest.get(1) {
@@ -253,11 +294,13 @@ impl Scanner {
                 });
                 self.skip(3 + len);
                 out.extend_from_slice(value.as_bytes());
+                *unquoted = 0;
                 return true;
             }
             // Throw back everything but the colon.
             self.skip(1);
             out.push(b':');
+            *unquoted += 1;
             return false;
         }
 
@@ -275,6 +318,7 @@ impl Scanner {
             }
             self.skip(1);
             out.push(b':');
+            *unquoted += 1;
             return false;
         }
 
@@ -285,10 +329,12 @@ impl Scanner {
         if len == 0 {
             self.skip(1);
             out.push(b':');
+            *unquoted += 1;
             return false;
         }
         let name = String::from_utf8_lossy(&rest[1..=len]).into_owned();
         self.skip(1 + len);
+        *unquoted = 0;
         if let Some(value) = vars.get_variable(&name, QuoteType::Plain) {
             out.extend_from_slice(value.as_bytes());
             true
@@ -398,6 +444,25 @@ mod tests {
         let (_, options) = slash("\\echo :x", &V);
         assert_eq!(values(&options), ["42"]);
         assert_eq!(options[0].quote, Some(':'));
+    }
+
+    #[test]
+    fn only_semicolons_no_quoting_produced_are_strippable() {
+        // `psqlscanslash.l:604`-`:613` strips at most `unquoted_option_chars`
+        // bytes, which every quote and substitution resets to zero.
+        struct V;
+        impl VariableSource for V {
+            fn get_variable(&self, name: &str, _quote: QuoteType) -> Option<String> {
+                (name == "v").then(|| "a;".to_string())
+            }
+        }
+        let (_, options) = slash("\\x on;; 'on;' 'on'; :v :v; ;x; :;; '\\0';", &V);
+        let stripped: Vec<&str> = options
+            .iter()
+            .map(SlashOption::semicolon_stripped)
+            .collect();
+        assert_eq!(stripped, ["on", "on;", "on", "a;", "a;", ";x", ":", ""]);
+        assert_eq!(values(&options)[0], "on;;");
     }
 
     #[test]

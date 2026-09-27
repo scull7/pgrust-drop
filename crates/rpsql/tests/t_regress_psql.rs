@@ -32,7 +32,7 @@ use rpsql::pset::do_pset;
 use rpsql::settings::{PrintQueryOpt, PsqlSettings};
 use testkit::reference;
 
-use regress::{Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, split};
+use regress::{Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, split};
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 
@@ -229,6 +229,7 @@ fn startup_popt() -> PrintQueryOpt {
 
 /// Ports used by the live gates here; each gate starts its own cluster.
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
+const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -263,14 +264,15 @@ fn show_all_pset_options() {
 
 /// `-- test multi-line headers, wrapping, and newline indicators` and
 /// `-- test single-line header and data` (`psql.sql:222`, `:343`), replayed
-/// in file order so each starts from the state the one before left.
+/// server-free in file order so each starts from the state the one before
+/// left.
 ///
-/// The first section has 36 `execute q;` blocks and the second 45. In each, the 12 neither expanded
-/// nor wrapped — aligned and unaligned, at borders 0, 1 and 2, in ascii and
-/// old-ascii — render here. The other 24 and 33 are NAT-400's next slice,
-/// and the counts are pinned so that slice has to move them.
+/// The first section has 36 `execute q;` blocks and the second 45: aligned,
+/// unaligned and wrapped, normal and expanded, at borders 0, 1 and 2, in
+/// ascii and old-ascii. Every one renders and matches; the counts are pinned
+/// so a block cannot drop out of the gate unnoticed.
 #[test]
-fn the_aligned_and_unaligned_blocks_match_psql_out() {
+fn every_execute_q_block_matches_psql_out() {
     let mut popt = startup_popt();
     let multi = replay(
         &section("-- test multi-line headers, wrapping, and newline indicators"),
@@ -282,20 +284,32 @@ fn the_aligned_and_unaligned_blocks_match_psql_out() {
         &single_line_q(),
         &mut popt,
     );
-    for (name, r, deferred) in [("multi-line", &multi, 24), ("single-line", &single, 33)] {
+    for (name, r, blocks) in [("multi-line", &multi, 36), ("single-line", &single, 45)] {
         assert_eq!(
             (r.matched, r.deferred.len()),
-            (12, deferred),
+            (blocks, 0),
             "{name}: matched {} and deferred {:#?}",
             r.matched,
             r.deferred
         );
-        assert!(
-            r.deferred
-                .iter()
-                .all(|at| at.contains("format wrapped") || !at.contains("expanded Off")),
-            "{name}: only wrapped and expanded blocks may be deferred: {:#?}",
-            r.deferred
-        );
     }
+}
+
+/// The same two sections and `-- expanded output with short-width columns`
+/// (`psql.sql:486`), live: `prepare`, `execute` and a table of `int`s through
+/// rpsql against a server. They run as one script because the third starts
+/// from the `\pset` state the second leaves (wrapped, old-ascii, `\pset
+/// columns 20`).
+#[test]
+fn the_output_format_sections_run_live() {
+    let Some(cluster) = Cluster::start(OUTPUT_FORMAT_SECTIONS_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &sections(
+            "-- test multi-line headers, wrapping, and newline indicators",
+            "-- expanded output with short-width columns",
+        ),
+    );
 }

@@ -1,27 +1,33 @@
 //! Result rendering: `src/fe_utils/print.c`.
 //!
-//! Scope, so far. `PRINT_ALIGNED` at every border (0, 1, 2) in the ascii and
-//! old-ascii line styles, and `PRINT_UNALIGNED`. NAT-400 owns the rest of the
-//! matrix and delivers it in slices: wrapped and expanded next, then csv,
-//! html, latex, latex-longtable, troff-ms and asciidoc, then the unicode line
-//! style and `numericlocale`. Until then each of those is
+//! Scope, so far. `PRINT_ALIGNED`, `PRINT_WRAPPED` and `PRINT_UNALIGNED`,
+//! each at every border (0, 1, 2) in the ascii and old-ascii line styles,
+//! normal and expanded (`\pset expanded on`, and `auto` under a `\pset
+//! columns` target). NAT-400 owns the rest of the matrix and delivers it in
+//! slices: csv, html, latex, latex-longtable, troff-ms and asciidoc next, then
+//! the unicode line style and `numericlocale`. Until then each of those is
 //! [`PrintError::Unsupported`], which the caller reports rather than printing
-//! something that only looks right.
+//! something that only looks right. So is a table whose layout depends on the
+//! terminal's width, which is never read (see [`Unsupported::TerminalWidth`]).
 //!
 //! The whole module is a pure function from a result to bytes; nothing here
 //! opens a file or a pager.
 
 use rlibpq::QueryResult;
 
-use crate::settings::{Expanded, LineStyle, PrintFormat, PrintQueryOpt, TableOpt};
+use crate::settings::{Expanded, LineStyle, PrintFormat, PrintQueryOpt, TableOpt, XheaderWidth};
 
 /// What this port cannot render yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
     /// An output format a later slice of NAT-400 ports.
     Format(PrintFormat),
-    /// `\pset expanded on`, or `auto` once the table is too wide.
-    Expanded,
+    /// A layout that depends on the target width while `\pset columns` is 0.
+    /// C then takes the terminal's width when stdout is one (`print.c:803`-
+    /// `:818`); this port never reads it, so it refuses rather than guess.
+    /// That is `wrapped`, `expanded auto` over more than one column, and
+    /// `xheader_width page`.
+    TerminalWidth,
     /// `\pset linestyle unicode`.
     Unicode,
     /// `\pset numericlocale on` over a right-aligned column.
@@ -40,7 +46,9 @@ impl std::fmt::Display for PrintError {
         let Self::Unsupported(what) = self;
         match what {
             Unsupported::Format(format) => write!(f, "output format {}", format.name())?,
-            Unsupported::Expanded => f.write_str("expanded output")?,
+            Unsupported::TerminalWidth => {
+                f.write_str("a target width taken from the terminal (\\pset columns 0)")?;
+            }
             Unsupported::Unicode => f.write_str("the unicode line style")?,
             Unsupported::NumericLocale => f.write_str("locale-adjusted numeric output")?,
         }
@@ -252,21 +260,32 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         aligns,
     };
 
+    // `printTable()`'s switch (`print.c:3472`). Only `expanded on` (C's `1`)
+    // selects a vertical printer here; `auto` is decided inside
+    // `print_aligned_text`, since the pager that would force it
+    // (`print.c:3488`) is not ported.
+    let vertical = opt.topt.expanded == Expanded::On;
     match opt.topt.format {
-        PrintFormat::Unaligned => {
-            if opt.topt.expanded == Expanded::On {
-                return Err(PrintError::Unsupported(Unsupported::Expanded));
-            }
-            Ok(print_unaligned_text(&cont))
-        }
-        // `PRINT_WRAPPED` shares `print_aligned_text` but is a later slice's.
-        PrintFormat::Aligned => {
-            if opt.topt.expanded == Expanded::On {
-                return Err(PrintError::Unsupported(Unsupported::Expanded));
-            }
-            print_aligned_text(&cont)
-        }
+        PrintFormat::Unaligned if vertical => Ok(print_unaligned_vertical(&cont)),
+        PrintFormat::Unaligned => Ok(print_unaligned_text(&cont)),
+        PrintFormat::Aligned | PrintFormat::Wrapped if vertical => print_aligned_vertical(&cont),
+        PrintFormat::Aligned | PrintFormat::Wrapped => print_aligned_text(&cont),
         other => Err(PrintError::Unsupported(Unsupported::Format(other))),
+    }
+}
+
+/// The target width, `output_columns` (`print.c:801`-`:818`, `:1440`-
+/// `:1458`): `\pset columns`, or 0 for no target.
+///
+/// Under `\pset columns 0` C reads `$COLUMNS` or `TIOCGWINSZ` when stdout is
+/// a terminal and has no target otherwise. This port reads neither, so when
+/// `depends` says the layout would change with a target it refuses; when it
+/// would not, 0 is exactly C's answer either way.
+fn output_columns(opt: &TableOpt, depends: bool) -> Result<usize, PrintError> {
+    match usize::try_from(opt.columns) {
+        Ok(columns) if columns > 0 => Ok(columns),
+        _ if depends => Err(PrintError::Unsupported(Unsupported::TerminalWidth)),
+        _ => Ok(0),
     }
 }
 
@@ -277,6 +296,9 @@ struct Line {
     bytes: Vec<u8>,
     /// `lineptr.width`: display width.
     width: usize,
+    /// Whether the cell was walked as UTF-8, so that [`strlen_max_width`]
+    /// steps through these bytes the way [`format_cell`] measured them.
+    utf8: bool,
 }
 
 /// `pg_wcsformat()` (`mbprint.c:294`): split a cell at its newlines and make
@@ -302,17 +324,18 @@ fn format_cell(cell: &[u8]) -> Vec<Line> {
         line.width += text.len();
     }
 
-    let mut lines = vec![Line {
+    let text = std::str::from_utf8(cell).ok();
+    let utf8 = text.is_some();
+    let new_line = || Line {
         bytes: Vec::new(),
         width: 0,
-    }];
+        utf8,
+    };
+    let mut lines = vec![new_line()];
     let push = |c: Option<char>, raw: &[u8], lines: &mut Vec<Line>| {
         let line = lines.last_mut().expect("there is always a current line");
         match raw {
-            b"\n" => lines.push(Line {
-                bytes: Vec::new(),
-                width: 0,
-            }),
+            b"\n" => lines.push(new_line()),
             b"\r" => push_escaped(line, "\\r"),
             b"\t" => loop {
                 line.bytes.push(b' ');
@@ -333,7 +356,7 @@ fn format_cell(cell: &[u8]) -> Vec<Line> {
             },
         }
     };
-    if let Ok(text) = std::str::from_utf8(cell) {
+    if let Some(text) = text {
         let mut buf = [0; 4];
         for c in text.chars() {
             push(Some(c), c.encode_utf8(&mut buf).as_bytes(), &mut lines);
@@ -349,6 +372,34 @@ fn format_cell(cell: &[u8]) -> Vec<Line> {
 /// The widest line of a formatted cell: `pg_wcssize`'s `result_width`.
 fn widest(lines: &[Line]) -> usize {
     lines.iter().map(|l| l.width).max().unwrap_or(0)
+}
+
+/// `strlen_max_width()` (`print.c:3747`): how many bytes of `bytes` fill at
+/// most `target_width` display columns. `target_width` becomes the number of
+/// columns actually filled. The first character is taken even when it alone
+/// is wider than the target.
+///
+/// `bytes` is a [`Line`]'s, already escaped, so every character in it is one
+/// column wide, as [`format_cell`] measured it.
+fn strlen_max_width(bytes: &[u8], utf8: bool, target_width: &mut usize) -> usize {
+    let mut pos = 0;
+    let mut curr_width = 0;
+    while pos < bytes.len() {
+        let char_width = 1;
+        if *target_width < curr_width + char_width && curr_width != 0 {
+            break;
+        }
+        curr_width += char_width;
+        // `PQmblen`: a UTF-8 lead byte says how long its character is.
+        let len = if utf8 {
+            bytes[pos].leading_ones().max(1) as usize
+        } else {
+            1
+        };
+        pos = (pos + len).min(bytes.len());
+    }
+    *target_width = curr_width;
+    pos
 }
 
 fn pad(out: &mut Vec<u8>, n: usize) {
@@ -392,25 +443,25 @@ fn print_horizontal_line(
 }
 
 /// `printTextLineWrap` (`print.h:61`): why a column's next display line
-/// continues its cell. `PRINT_LINE_WRAP_WRAP` needs the wrapped format, which
-/// is a later slice's, so a line here only ever continues after a newline.
+/// continues its cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineWrap {
     /// `PRINT_LINE_WRAP_NONE`
     None,
+    /// `PRINT_LINE_WRAP_WRAP`
+    Wrap,
     /// `PRINT_LINE_WRAP_NEWLINE`
     Newline,
 }
 
-/// `print_aligned_text()` (`print.c:635`), without wrapping: every column is
-/// exactly as wide as its widest line, so `width_wrap[]` is `max_width[]` and
-/// `strlen_max_width` always yields the whole line.
+/// `print_aligned_text()` (`print.c:635`), for `PRINT_ALIGNED` and
+/// `PRINT_WRAPPED`.
 ///
-/// The pager is not ported, so neither is the pager arithmetic; the target
-/// width `output_columns` matters only to `expanded auto`, which escapes to
-/// the vertical format (a later slice) when the table is wider. That width is
-/// `\pset columns`; the terminal's (`$COLUMNS`, `TIOCGWINSZ`) is not read yet,
-/// so `expanded auto` under `\pset columns 0` is refused.
+/// The pager is not ported, so neither is the pager arithmetic. The target
+/// width `output_columns` matters to the wrapped format, which squeezes the
+/// columns to fit it, and to `expanded auto`, which escapes to
+/// [`print_aligned_vertical`] when the table is wider; see [`output_columns`]
+/// for why `\pset columns 0` refuses both.
 // One function, as upstream's is, so a reader can follow the two side by side.
 #[allow(clippy::too_many_lines)]
 fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
@@ -422,10 +473,12 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
     let col_count = cont.headers.len();
     let mut out = Vec::new();
 
-    // Scan every header and cell for the widest line (`print.c:710`).
+    // Scan every header and cell for the widest line, and sum each column's
+    // widths for its average (`print.c:710`).
     let header_lines: Vec<Vec<Line>> = cont.headers.iter().map(|h| format_cell(h)).collect();
     let width_header: Vec<usize> = header_lines.iter().map(|l| widest(l)).collect();
     let mut max_width = width_header.clone();
+    let mut width_average = vec![0_usize; col_count];
     let row_lines: Vec<Vec<Vec<Line>>> = cont
         .cells
         .iter()
@@ -433,7 +486,15 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
         .collect();
     for row in &row_lines {
         for (i, lines) in row.iter().enumerate() {
-            max_width[i] = max_width[i].max(widest(lines));
+            let width = widest(lines);
+            max_width[i] = max_width[i].max(width);
+            width_average[i] += width;
+        }
+    }
+    // If we have rows, compute the average (`print.c:754`).
+    if col_count != 0 && !row_lines.is_empty() {
+        for average in &mut width_average {
+            *average /= row_lines.len();
         }
     }
 
@@ -446,18 +507,49 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
     let total_header_width = width_total + width_header.iter().sum::<usize>();
     width_total += max_width.iter().sum::<usize>();
 
+    // No word wrap by default: every column as wide as its widest line.
+    let mut width_wrap = max_width.clone();
+
+    let wrapped = opt.format == PrintFormat::Wrapped;
+    let auto = opt.expanded == Expanded::Auto && col_count > 1;
+    let output_columns = output_columns(opt, wrapped || auto)?;
+
+    // The wrapped format shrinks, one column at a time, the column with the
+    // highest ratio of its width to its average width, slightly biased
+    // against wide ones, until the table fits; never below a header
+    // (`print.c:820`).
+    if wrapped && output_columns > 0 && output_columns >= total_header_width {
+        while width_total > output_columns {
+            let mut max_ratio = 0.0;
+            let mut worst_col = None;
+            for i in 0..col_count {
+                if width_average[i] != 0 && width_wrap[i] > width_header[i] {
+                    // C's `(double)` arithmetic; a width fits a double exactly.
+                    #[allow(clippy::cast_precision_loss)]
+                    let ratio =
+                        width_wrap[i] as f64 / width_average[i] as f64 + max_width[i] as f64 * 0.01;
+                    if ratio > max_ratio {
+                        max_ratio = ratio;
+                        worst_col = Some(i);
+                    }
+                }
+            }
+            // Nothing left to squeeze.
+            let Some(worst_col) = worst_col else {
+                break;
+            };
+            width_wrap[worst_col] -= 1;
+            width_total -= 1;
+        }
+    }
+
     // Expanded auto escapes to vertical when the table is wider than the
-    // target and has more than one column (`print.c:877`). Under `\pset
-    // columns 0` the target is the terminal's (`print.c:804`-`:816`), which is
-    // not read here, so whether C goes vertical cannot be decided: refuse.
-    let output_columns = usize::try_from(opt.columns).unwrap_or(0);
-    if opt.expanded == Expanded::Auto
-        && col_count > 1
-        && (output_columns == 0
-            || output_columns < total_header_width
-            || output_columns < width_total)
+    // target and has more than one column (`print.c:877`).
+    if auto
+        && output_columns > 0
+        && (output_columns < total_header_width || output_columns < width_total)
     {
-        return Err(PrintError::Unsupported(Unsupported::Expanded));
+        return print_aligned_vertical(cont);
     }
 
     if opt.start_table {
@@ -475,10 +567,10 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
         }
 
         // Headers, centred, one display line per embedded newline
-        // (`print.c:952`).
+        // (`print.c:952`). A header is never wrapped.
         if !opt_tuples_only {
             if opt_border == 2 {
-                print_horizontal_line(&mut out, &max_width, opt_border, Rule::Top, format);
+                print_horizontal_line(&mut out, &width_wrap, opt_border, Rule::Top, format);
             }
             let mut more_col_wrapping = col_count;
             let mut curr_nl_line = 0;
@@ -496,10 +588,10 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
                         });
                     }
                     if header_done[i] {
-                        pad(&mut out, max_width[i]);
+                        pad(&mut out, width_wrap[i]);
                     } else {
                         let this_line = &header_lines[i][curr_nl_line];
-                        let nbspace = max_width[i] - this_line.width;
+                        let nbspace = width_wrap[i] - this_line.width;
                         pad(&mut out, nbspace / 2);
                         out.extend_from_slice(&this_line.bytes);
                         pad(&mut out, nbspace.div_ceil(2));
@@ -525,13 +617,14 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
                 }
                 out.push(b'\n');
             }
-            print_horizontal_line(&mut out, &max_width, opt_border, Rule::Middle, format);
+            print_horizontal_line(&mut out, &width_wrap, opt_border, Rule::Middle, format);
         }
     }
 
     // Cells, one loop per row, one display line per pass (`print.c:1022`).
-    // `wrap[]` outlives the row, as upstream's does; every column's is back
-    // to `None` by the time a row ends.
+    // A display line holds a whole line of a cell, or as much of it as
+    // `width_wrap` has room for. `wrap[]` outlives the row, as upstream's
+    // does; every column's is back to `None` by the time a row ends.
     let mut wrap = vec![LineWrap::None; col_count];
     // A result with rows but no columns has no cells, and upstream's loop
     // walks cells, so it prints no row at all.
@@ -542,6 +635,7 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
     };
     for row in rows {
         let mut curr_nl_line = vec![0_usize; col_count];
+        let mut bytes_output = vec![0_usize; col_count];
         loop {
             let mut more_lines = false;
             if opt_border == 2 {
@@ -549,12 +643,13 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
             }
             for j in 0..col_count {
                 let lines = &row[j];
-                let mut chars_to_output = max_width[j];
+                let mut chars_to_output = width_wrap[j];
                 let finalspaces = opt_border == 2 || j + 1 < col_count;
 
-                // Left-hand newline mark (`print.c:1066`).
+                // Left-hand wrap or newline mark (`print.c:1066`).
                 if opt_border != 0 {
                     match wrap[j] {
+                        LineWrap::Wrap => out.extend_from_slice(format.wrap_left.as_bytes()),
                         LineWrap::Newline => out.extend_from_slice(format.nl_left.as_bytes()),
                         LineWrap::None => out.push(b' '),
                     }
@@ -568,47 +663,68 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
                         }
                     }
                     Some(this_line) => {
-                        chars_to_output = this_line.width;
+                        let rest = &this_line.bytes[bytes_output[j]..];
+                        let bytes_to_output =
+                            strlen_max_width(rest, this_line.utf8, &mut chars_to_output);
+                        // A single character wider than the column is
+                        // printed as if it fitted (`print.c:1095`).
+                        chars_to_output = chars_to_output.min(width_wrap[j]);
                         if cont.aligns[j] == Align::Right {
-                            pad(&mut out, max_width[j] - chars_to_output);
+                            pad(&mut out, width_wrap[j] - chars_to_output);
                         }
-                        out.extend_from_slice(&this_line.bytes);
-                        curr_nl_line[j] += 1;
-                        if curr_nl_line[j] < lines.len() {
+                        out.extend_from_slice(&rest[..bytes_to_output]);
+                        bytes_output[j] += bytes_to_output;
+
+                        if bytes_output[j] < this_line.bytes.len() {
+                            // More of this line to wrap.
                             more_lines = true;
+                        } else {
+                            // Advance to the cell's next line.
+                            curr_nl_line[j] += 1;
+                            if curr_nl_line[j] < lines.len() {
+                                more_lines = true;
+                            }
+                            bytes_output[j] = 0;
                         }
                     }
                 }
 
-                // The next display line's wrap status for this column.
-                wrap[j] = if curr_nl_line[j] < lines.len() && curr_nl_line[j] != 0 {
+                // The next display line's wrap status for this column
+                // (`print.c:1127`).
+                wrap[j] = if curr_nl_line[j] >= lines.len() {
+                    LineWrap::None
+                } else if bytes_output[j] != 0 {
+                    LineWrap::Wrap
+                } else if curr_nl_line[j] != 0 {
                     LineWrap::Newline
                 } else {
                     LineWrap::None
                 };
 
                 // Left-aligned cells pad when a column or a mark follows
-                // (`print.c:1138`).
+                // (`print.c:1141`).
                 if cont.aligns[j] != Align::Right && (finalspaces || wrap[j] != LineWrap::None) {
-                    pad(&mut out, max_width[j] - chars_to_output);
+                    pad(&mut out, width_wrap[j] - chars_to_output);
                 }
 
-                // Right-hand newline mark.
-                if wrap[j] == LineWrap::Newline {
-                    out.extend_from_slice(format.nl_right.as_bytes());
-                } else if finalspaces {
-                    out.push(b' ');
+                // Right-hand wrap or newline mark.
+                match wrap[j] {
+                    LineWrap::Wrap => out.extend_from_slice(format.wrap_right.as_bytes()),
+                    LineWrap::Newline => out.extend_from_slice(format.nl_right.as_bytes()),
+                    LineWrap::None if finalspaces => out.push(b' '),
+                    LineWrap::None => {}
                 }
 
                 // Column divider, chosen by the *next* column's state
                 // (`print.c:1158`).
                 if opt_border != 0 && j + 1 < col_count {
-                    let divider = if wrap[j + 1] == LineWrap::Newline {
-                        format.midvrule_nl
-                    } else if curr_nl_line[j + 1] >= row[j + 1].len() {
-                        format.midvrule_blank
-                    } else {
-                        dformat.midvrule
+                    let divider = match wrap[j + 1] {
+                        LineWrap::Wrap => format.midvrule_wrap,
+                        LineWrap::Newline => format.midvrule_nl,
+                        LineWrap::None if curr_nl_line[j + 1] >= row[j + 1].len() => {
+                            format.midvrule_blank
+                        }
+                        LineWrap::None => dformat.midvrule,
                     };
                     out.extend_from_slice(divider.as_bytes());
                 }
@@ -625,7 +741,7 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
 
     if opt.stop_table {
         if opt_border == 2 {
-            print_horizontal_line(&mut out, &max_width, opt_border, Rule::Bottom, format);
+            print_horizontal_line(&mut out, &width_wrap, opt_border, Rule::Bottom, format);
         }
         if let Some(footer) = cont.default_footer()
             && !opt_tuples_only
@@ -633,6 +749,406 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
             out.extend_from_slice(footer.as_bytes());
             out.push(b'\n');
         }
+        out.push(b'\n');
+    }
+
+    Ok(out)
+}
+
+/// `print_aligned_vertical_line()` (`print.c:1225`): the rule above a record,
+/// `[ RECORD n ]` in it unless `record` is 0, or the rule under the last.
+///
+/// It reads `topt->border` unclamped, where its caller clamps its own copy to
+/// 2, so a border above 2 draws a record line with no frame; that is kept.
+#[allow(clippy::too_many_arguments)]
+fn print_aligned_vertical_line(
+    out: &mut Vec<u8>,
+    opt: &TableOpt,
+    format: &TextFormat,
+    record: usize,
+    hwidth: usize,
+    dwidth: usize,
+    output_columns: usize,
+    pos: Rule,
+) {
+    /// C's `reclen-- <= 0`.
+    fn post_decrement_le_zero(reclen: &mut i64) -> bool {
+        let was = *reclen;
+        *reclen -= 1;
+        was <= 0
+    }
+
+    let lformat = &format.lrule[pos as usize];
+    let opt_border = opt.border;
+    let xheader = opt.expanded_header_width;
+    let hrule = lformat.hrule.as_bytes();
+    let fill = if opt_border > 0 { hrule } else { b" " };
+    let hwidth = i64::try_from(hwidth).unwrap_or(i64::MAX);
+    let mut dwidth = i64::try_from(dwidth).unwrap_or(i64::MAX);
+
+    if opt_border == 2 {
+        out.extend_from_slice(lformat.leftvrule.as_bytes());
+        out.extend_from_slice(hrule);
+    } else if opt_border == 1 {
+        out.extend_from_slice(hrule);
+    }
+
+    let mut reclen: i64 = 0;
+    if record != 0 {
+        let text = if opt_border == 0 {
+            format!("* Record {record}")
+        } else {
+            format!("[ RECORD {record} ]")
+        };
+        out.extend_from_slice(text.as_bytes());
+        reclen = i64::try_from(text.len()).unwrap_or(i64::MAX);
+    }
+    if opt_border != 2 {
+        reclen += 1;
+    }
+    for _ in reclen..hwidth {
+        out.extend_from_slice(fill);
+    }
+    reclen -= hwidth;
+
+    if opt_border > 0 {
+        if post_decrement_le_zero(&mut reclen) {
+            out.extend_from_slice(hrule);
+        }
+        if post_decrement_le_zero(&mut reclen) {
+            out.extend_from_slice(if xheader == XheaderWidth::Column {
+                lformat.rightvrule.as_bytes()
+            } else {
+                lformat.midvrule.as_bytes()
+            });
+        }
+        if post_decrement_le_zero(&mut reclen) && xheader != XheaderWidth::Column {
+            out.extend_from_slice(hrule);
+        }
+    } else if post_decrement_le_zero(&mut reclen) {
+        out.push(b' ');
+    }
+
+    if xheader != XheaderWidth::Column {
+        let target = match xheader {
+            XheaderWidth::Page => Some(i64::try_from(output_columns).unwrap_or(i64::MAX)),
+            XheaderWidth::ExactWidth(width) => Some(i64::from(width)),
+            XheaderWidth::Full | XheaderWidth::Column => None,
+        };
+        if let Some(target) = target
+            && target > 0
+        {
+            // The frame around the data at each border; 2 is kept "for
+            // consistency" though its right border makes it meaningless
+            // (`print.c:1299`).
+            let frame = match opt_border {
+                0 => Some(0),
+                1 => Some(3),
+                2 => Some(7),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                dwidth = dwidth.min((target - hwidth - frame).max(0));
+            }
+        }
+        reclen = reclen.max(0);
+        dwidth = dwidth.max(reclen);
+        for _ in reclen..dwidth {
+            out.extend_from_slice(fill);
+        }
+        if opt_border == 2 {
+            out.extend_from_slice(hrule);
+            out.extend_from_slice(lformat.rightvrule.as_bytes());
+        }
+    }
+    out.push(b'\n');
+}
+
+/// `print_aligned_vertical()` (`print.c:1324`): expanded output, one
+/// `header | value` line per cell, each record under a `[ RECORD n ]` rule.
+///
+/// Only `printQuery`'s tables reach it, so `cont->footers` is `NULL` and no
+/// footer is printed except the `(0 rows)` of an empty result. Record numbers
+/// start at 1: `prior_records` belongs to `FETCH_COUNT`, which is not ported.
+#[allow(clippy::too_many_lines)]
+fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
+    let opt = cont.opt;
+    let opt_tuples_only = opt.tuples_only;
+    let opt_border = opt.border.min(2);
+    let format = line_style(opt)?;
+    let dformat = &format.lrule[Rule::Data as usize];
+    let old_ascii = opt.line_style == LineStyle::OldAscii;
+    let col_count = cont.headers.len();
+    let wrapped = opt.format == PrintFormat::Wrapped;
+    let mut out = Vec::new();
+
+    // No cells at all: just the footer (`print.c:1354`).
+    if (col_count == 0 || cont.cells.is_empty()) && opt.start_table && opt.stop_table {
+        if let Some(footer) = cont.default_footer()
+            && !opt_tuples_only
+        {
+            out.extend_from_slice(footer.as_bytes());
+            out.push(b'\n');
+        }
+        out.push(b'\n');
+        return Ok(out);
+    }
+
+    // The widest and tallest header, and the widest and tallest cell
+    // (`print.c:1383`).
+    let header_lines: Vec<Vec<Line>> = cont.headers.iter().map(|h| format_cell(h)).collect();
+    let row_lines: Vec<Vec<Vec<Line>>> = cont
+        .cells
+        .iter()
+        .map(|row| row.iter().map(|cell| format_cell(cell)).collect())
+        .collect();
+    let hwidth = header_lines.iter().map(|l| widest(l)).max().unwrap_or(0);
+    let hmultiline = header_lines.iter().any(|l| l.len() > 1);
+    let data = || row_lines.iter().flatten();
+    let mut dwidth = data().map(|l| widest(l)).max().unwrap_or(0);
+    let mut dmultiline = data().any(|l| l.len() > 1);
+
+    if opt.start_table
+        && let Some(title) = cont.title
+        && !opt_tuples_only
+    {
+        out.extend_from_slice(title.as_bytes());
+        out.push(b'\n');
+    }
+
+    let output_columns = output_columns(
+        opt,
+        wrapped || opt.expanded_header_width == XheaderWidth::Page,
+    )?;
+
+    // The data column's width: fit the target in wrapped mode, or line up
+    // with the record header lines in aligned mode (`print.c:1460`).
+    let mut swidth = match opt_border {
+        // One space in the middle, and one for header newline marks.
+        0 => 1 + usize::from(hmultiline),
+        // Two spaces and a vrule, and one for old-ascii's left header marks.
+        1 => 3 + usize::from(hmultiline && old_ascii),
+        // Both vrules and their spacers, which double as the marks.
+        _ => 7,
+    };
+    // A column for data newline marks, too, if needed.
+    if dmultiline && opt_border < 2 && !old_ascii {
+        swidth += 1;
+    }
+    // The width the record header lines need.
+    let mut rwidth = 0;
+    if !opt_tuples_only {
+        let nrows = cont.cells.len();
+        if nrows > 0 {
+            rwidth = 1 + nrows.ilog10() as usize;
+        }
+        rwidth += match opt_border {
+            0 => 9,  // "* RECORD "
+            1 => 12, // "-[ RECORD  ]"
+            _ => 15, // "+-[ RECORD  ]-+"
+        };
+    }
+    // Twice, if wrapping turns out to need a mark column.
+    loop {
+        let width = (hwidth + swidth + dwidth).max(rwidth);
+        let newdwidth = if wrapped && output_columns > 0 {
+            // At least room for three columns of data, and for the record
+            // header lines.
+            let min_width = (hwidth + swidth + 3).max(rwidth);
+            if output_columns >= width {
+                width - hwidth - swidth
+            } else if output_columns < min_width {
+                min_width - hwidth - swidth
+            } else {
+                output_columns - hwidth - swidth
+            }
+        } else {
+            width - hwidth - swidth
+        };
+        if newdwidth < dwidth && !dmultiline && opt_border < 2 && !old_ascii {
+            dmultiline = true;
+            swidth += 1;
+        } else {
+            dwidth = newdwidth;
+            break;
+        }
+    }
+
+    // The records (`print.c:1588`).
+    let mut record = 1;
+    for (r, row) in row_lines.iter().enumerate() {
+        for (c, dlines) in row.iter().enumerate() {
+            let hlines = &header_lines[c];
+            let pos = if r == 0 && c == 0 {
+                Rule::Top
+            } else {
+                Rule::Middle
+            };
+
+            // The record header above each record.
+            if c == 0 {
+                let lhwidth = hwidth + usize::from(opt_border < 2 && hmultiline && old_ascii);
+                if !opt_tuples_only {
+                    print_aligned_vertical_line(
+                        &mut out,
+                        opt,
+                        format,
+                        record,
+                        lhwidth,
+                        dwidth,
+                        output_columns,
+                        pos,
+                    );
+                    record += 1;
+                } else if r != 0 || !opt.start_table || opt_border == 2 {
+                    print_aligned_vertical_line(
+                        &mut out,
+                        opt,
+                        format,
+                        0,
+                        lhwidth,
+                        dwidth,
+                        output_columns,
+                        pos,
+                    );
+                }
+            }
+
+            // Header and data in parallel, newline by newline and wrap by
+            // wrap, until both are exhausted.
+            let mut hline = 0;
+            let mut dline = 0;
+            let mut hcomplete = false;
+            let mut dcomplete = false;
+            let mut offset = 0;
+            let mut chars_to_output = dlines[0].width;
+            while !dcomplete || !hcomplete {
+                if opt_border == 2 {
+                    out.extend_from_slice(dformat.leftvrule.as_bytes());
+                }
+
+                // The header: never wrapped, so only newlines to handle.
+                if hcomplete {
+                    let mut swidth = hwidth + usize::from(opt_border);
+                    if opt_border < 2 && hmultiline && old_ascii {
+                        swidth += 1;
+                    }
+                    if opt_border == 0 && !old_ascii && hmultiline {
+                        swidth += 1;
+                    }
+                    // `"%*s", swidth, " "`: at least the one space.
+                    pad(&mut out, swidth.max(1));
+                } else {
+                    if opt_border == 2 || (hmultiline && old_ascii) {
+                        out.extend_from_slice(if hline > 0 {
+                            format.header_nl_left.as_bytes()
+                        } else {
+                            b" "
+                        });
+                    }
+                    let this_line = &hlines[hline];
+                    out.extend_from_slice(&this_line.bytes);
+                    pad(&mut out, hwidth - this_line.width);
+                    let marks = opt_border > 0 || (hmultiline && !old_ascii);
+                    if hline + 1 < hlines.len() {
+                        // More lines after this one, after a newline.
+                        if marks {
+                            out.extend_from_slice(format.header_nl_right.as_bytes());
+                        }
+                        hline += 1;
+                    } else {
+                        if marks {
+                            out.push(b' ');
+                        }
+                        hcomplete = true;
+                    }
+                }
+
+                // The separator.
+                if opt_border > 0 {
+                    out.extend_from_slice(if offset != 0 {
+                        format.midvrule_wrap.as_bytes()
+                    } else if dline == 0 {
+                        dformat.midvrule.as_bytes()
+                    } else {
+                        format.midvrule_nl.as_bytes()
+                    });
+                }
+
+                // The data.
+                if dcomplete {
+                    // Out of data before the header ran out of lines.
+                    if opt_border < 2 {
+                        out.push(b'\n');
+                    } else {
+                        pad(&mut out, dwidth + 2);
+                        out.extend_from_slice(dformat.rightvrule.as_bytes());
+                        out.push(b'\n');
+                    }
+                    continue;
+                }
+                out.extend_from_slice(if offset == 0 {
+                    b" "
+                } else {
+                    format.wrap_left.as_bytes()
+                });
+                let this_line = &dlines[dline];
+                let rest = &this_line.bytes[offset..];
+                let mut target_width = dwidth;
+                let bytes_to_output = strlen_max_width(rest, this_line.utf8, &mut target_width);
+                out.extend_from_slice(&rest[..bytes_to_output]);
+                // Every character is one column wide here, so this reaches 0
+                // exactly at the end of the line.
+                chars_to_output = chars_to_output.saturating_sub(target_width);
+                offset += bytes_to_output;
+                let spacer = dwidth.saturating_sub(target_width);
+                let marks = opt_border > 1 || (dmultiline && !old_ascii);
+                if chars_to_output != 0 {
+                    // Continuing a wrapped line.
+                    if marks {
+                        pad(&mut out, spacer);
+                        out.extend_from_slice(format.wrap_right.as_bytes());
+                    }
+                } else if dline + 1 < dlines.len() {
+                    // Reached a newline in the cell.
+                    if marks {
+                        pad(&mut out, spacer);
+                        out.extend_from_slice(format.nl_right.as_bytes());
+                    }
+                    dline += 1;
+                    offset = 0;
+                    chars_to_output = dlines[dline].width;
+                } else {
+                    // Reached the end of the cell.
+                    if opt_border > 1 {
+                        pad(&mut out, spacer);
+                        out.push(b' ');
+                    }
+                    dcomplete = true;
+                }
+                if opt_border == 2 {
+                    out.extend_from_slice(dformat.rightvrule.as_bytes());
+                }
+                out.push(b'\n');
+            }
+        }
+    }
+
+    if opt.stop_table {
+        if opt_border == 2 {
+            print_aligned_vertical_line(
+                &mut out,
+                opt,
+                format,
+                0,
+                hwidth,
+                dwidth,
+                output_columns,
+                Rule::Bottom,
+            );
+        }
+        // `cont->footers` is `NULL` under `printQuery`: nothing to print
+        // but the blank line.
         out.push(b'\n');
     }
 
@@ -706,6 +1222,59 @@ fn print_unaligned_text(cont: &TableContent<'_>) -> Vec<u8> {
             } else {
                 out.push(b'\n');
             }
+        }
+    }
+
+    out
+}
+
+/// `print_unaligned_vertical()` (`print.c:513`): one `header<fieldsep>value`
+/// per cell, records apart by two record separators. Cells are written raw.
+///
+/// Only `printQuery`'s tables reach it, so `cont->footers` is `NULL` and no
+/// footer is printed, not even the default one.
+fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
+    let opt = cont.opt;
+    let mut out = Vec::new();
+    let mut need_recordsep = false;
+
+    if opt.start_table {
+        if let Some(title) = cont.title
+            && !opt.tuples_only
+        {
+            out.extend_from_slice(title.as_bytes());
+            need_recordsep = true;
+        }
+    } else {
+        // Assume a continuing printout.
+        need_recordsep = true;
+    }
+
+    for row in &cont.cells {
+        for (i, cell) in row.iter().enumerate() {
+            if need_recordsep {
+                // Two record separators between records in this mode.
+                print_separator(&mut out, &opt.record_sep);
+                print_separator(&mut out, &opt.record_sep);
+                need_recordsep = false;
+            }
+            out.extend_from_slice(&cont.headers[i]);
+            print_separator(&mut out, &opt.field_sep);
+            out.extend_from_slice(cell);
+            if i + 1 < row.len() {
+                print_separator(&mut out, &opt.record_sep);
+            } else {
+                need_recordsep = true;
+            }
+        }
+    }
+
+    // As in `print_unaligned_text` (`print.c:575`).
+    if opt.stop_table && need_recordsep {
+        if opt.record_sep.separator_zero {
+            print_separator(&mut out, &opt.record_sep);
+        } else {
+            out.push(b'\n');
         }
     }
 
@@ -908,7 +1477,6 @@ mod tests {
         for format in [
             PrintFormat::Csv,
             PrintFormat::Html,
-            PrintFormat::Wrapped,
             PrintFormat::Latex,
             PrintFormat::LatexLongtable,
             PrintFormat::Asciidoc,
@@ -929,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_unicode_and_numericlocale_are_refused_not_faked() {
+    fn unicode_numericlocale_and_the_terminal_width_are_refused_not_faked() {
         let res = result(
             vec![int4_field("n"), text_field("s")],
             vec![vec![Some("1"), Some("a")]],
@@ -940,25 +1508,6 @@ mod tests {
             print_query(&res, &opt).expect_err("must be refused")
         };
         assert_eq!(
-            refused(&|o| o.topt.expanded = Expanded::On),
-            PrintError::Unsupported(Unsupported::Expanded)
-        );
-        assert_eq!(
-            refused(&|o| {
-                o.topt.expanded = Expanded::On;
-                o.topt.format = PrintFormat::Unaligned;
-            }),
-            PrintError::Unsupported(Unsupported::Expanded)
-        );
-        // Auto goes vertical only once the table is wider than the target.
-        assert_eq!(
-            refused(&|o| {
-                o.topt.expanded = Expanded::Auto;
-                o.topt.columns = 3;
-            }),
-            PrintError::Unsupported(Unsupported::Expanded)
-        );
-        assert_eq!(
             refused(&|o| o.topt.line_style = LineStyle::Unicode),
             PrintError::Unsupported(Unsupported::Unicode)
         );
@@ -968,17 +1517,46 @@ mod tests {
         );
 
         // Under `\pset columns 0` C measures the terminal, when stdout is
-        // one (`print.c:804`), and this port does not: refused, not guessed.
+        // one (`print.c:803`), and this port does not: whatever would change
+        // with that width is refused, not guessed.
+        let terminal = PrintError::Unsupported(Unsupported::TerminalWidth);
+        assert_eq!(refused(&|o| o.topt.format = PrintFormat::Wrapped), terminal);
+        assert_eq!(refused(&|o| o.topt.expanded = Expanded::Auto), terminal);
         assert_eq!(
-            refused(&|o| o.topt.expanded = Expanded::Auto),
-            PrintError::Unsupported(Unsupported::Expanded)
+            refused(&|o| {
+                o.topt.expanded = Expanded::On;
+                o.topt.format = PrintFormat::Wrapped;
+            }),
+            terminal
+        );
+        assert_eq!(
+            refused(&|o| {
+                o.topt.expanded = Expanded::On;
+                o.topt.expanded_header_width = XheaderWidth::Page;
+            }),
+            terminal
         );
 
         // And each is a no-op where upstream's is.
-        let mut opt = PrintQueryOpt::default();
-        opt.topt.expanded = Expanded::Auto;
-        opt.topt.columns = 80;
-        assert!(print_query(&res, &opt).is_ok());
+        let ok = |edit: &dyn Fn(&mut PrintQueryOpt)| {
+            let mut opt = PrintQueryOpt::default();
+            edit(&mut opt);
+            assert!(print_query(&res, &opt).is_ok());
+        };
+        ok(&|o| o.topt.expanded = Expanded::On);
+        ok(&|o| {
+            o.topt.expanded = Expanded::On;
+            o.topt.expanded_header_width = XheaderWidth::ExactWidth(10);
+        });
+        ok(&|o| {
+            o.topt.expanded = Expanded::On;
+            o.topt.format = PrintFormat::Unaligned;
+        });
+        // Auto never applies to the unaligned format (`print.c:3475`).
+        ok(&|o| {
+            o.topt.expanded = Expanded::Auto;
+            o.topt.format = PrintFormat::Unaligned;
+        });
         // One column never goes vertical (`print.c:877`), whatever the width.
         let one_column = result(vec![int4_field("n")], vec![vec![Some("1")]]);
         let mut opt = PrintQueryOpt::default();
@@ -988,6 +1566,154 @@ mod tests {
         let mut opt = PrintQueryOpt::default();
         opt.topt.numeric_locale = true;
         assert!(print_query(&text_only, &opt).is_ok());
+    }
+
+    #[test]
+    fn strlen_max_width_takes_whole_characters_and_at_least_one() {
+        // `print.c:3747`.
+        let mut target = 2;
+        assert_eq!(strlen_max_width(b"abcd", false, &mut target), 2);
+        assert_eq!(target, 2);
+        let mut target = 9;
+        assert_eq!(strlen_max_width(b"abcd", false, &mut target), 4);
+        assert_eq!(target, 4);
+        // A UTF-8 character is stepped over whole, as `PQmblen` does.
+        let mut target = 1;
+        assert_eq!(strlen_max_width("éé".as_bytes(), true, &mut target), 2);
+        assert_eq!(target, 1);
+        // The first character is taken even past the target.
+        let mut target = 0;
+        assert_eq!(strlen_max_width(b"ab", false, &mut target), 1);
+        assert_eq!(target, 1);
+    }
+
+    #[test]
+    fn wrapped_squeezes_a_column_to_the_target_and_marks_the_wraps() {
+        // `print.c:820`: the only column shrinks from 10 to 4 so that the
+        // table, 2 wider than its column at border 1, fits 6; `wrap_right`
+        // and `wrap_left` mark each break (`print.c:1068`, `:1151`).
+        let res = result(vec![text_field("t")], vec![vec![Some("aaaaaaaaaa")]]);
+        let opt = with(|o| {
+            o.topt.format = PrintFormat::Wrapped;
+            o.topt.columns = 6;
+        });
+        assert_eq!(
+            render(&res, &opt),
+            "  t   \n------\n aaaa.\n.aaaa.\n.aa\n(1 row)\n\n"
+        );
+        // Never below the header: a target narrower than the headers leaves
+        // the table as the aligned format draws it (`print.c:829`).
+        let opt = with(|o| {
+            o.topt.format = PrintFormat::Wrapped;
+            o.topt.columns = 2;
+        });
+        let aligned = with(|o| o.topt.columns = 2);
+        assert_eq!(render(&res, &opt), render(&res, &aligned));
+    }
+
+    #[test]
+    fn expanded_prints_a_record_per_row_and_no_row_count() {
+        // `print_aligned_vertical` (`print.c:1324`) prints `cont->footers`,
+        // which `printQuery` leaves empty, so there is no `(n rows)`.
+        let res = result(
+            vec![int4_field("n"), text_field("s")],
+            vec![vec![Some("1"), Some("a")], vec![Some("2"), Some("b")]],
+        );
+        let opt = with(|o| o.topt.expanded = Expanded::On);
+        assert_eq!(
+            render(&res, &opt),
+            "-[ RECORD 1 ]\nn | 1\ns | a\n-[ RECORD 2 ]\nn | 2\ns | b\n\n"
+        );
+        // An empty result is the one that does get a footer (`print.c:1354`).
+        let empty = result(vec![int4_field("n"), text_field("s")], vec![]);
+        assert_eq!(render(&empty, &opt), "(0 rows)\n\n");
+        // Unaligned: header, field separator, value; records apart by two
+        // record separators (`print.c:513`).
+        let opt = with(|o| {
+            o.topt.expanded = Expanded::On;
+            o.topt.format = PrintFormat::Unaligned;
+            o.topt.field_sep.separator = Some("|".to_string());
+            o.topt.record_sep.separator = Some("\n".to_string());
+        });
+        assert_eq!(render(&res, &opt), "n|1\ns|a\n\nn|2\ns|b\n");
+        assert_eq!(render(&empty, &opt), "");
+    }
+
+    #[test]
+    fn expanded_auto_goes_vertical_only_when_the_table_is_too_wide() {
+        // `print.c:877`.
+        let res = result(
+            vec![int4_field("n"), text_field("s")],
+            vec![vec![Some("1"), Some("a")]],
+        );
+        let vertical = render(&res, &with(|o| o.topt.expanded = Expanded::On));
+        let horizontal = render(&res, &PrintQueryOpt::default());
+        let auto = |columns| {
+            render(
+                &res,
+                &with(|o| {
+                    o.topt.expanded = Expanded::Auto;
+                    o.topt.columns = columns;
+                }),
+            )
+        };
+        // " n | s " is 7 wide.
+        assert_eq!(auto(7), horizontal);
+        assert_eq!(auto(6), vertical);
+    }
+
+    #[test]
+    fn wrapped_expanded_output_wraps_the_value_column() {
+        // `print.c:1526`: the 10-wide value would need 14 columns; the
+        // record line needs 13, so the value gets 13 less the header and the
+        // separator (now 4 wide, a mark column added), and wraps at 8.
+        let res = result(vec![text_field("t")], vec![vec![Some("aaaaaaaaaa")]]);
+        let opt = with(|o| {
+            o.topt.expanded = Expanded::On;
+            o.topt.format = PrintFormat::Wrapped;
+            o.topt.columns = 12;
+        });
+        assert_eq!(
+            render(&res, &opt),
+            "-[ RECORD 1 ]\nt | aaaaaaaa.\n  |.aa\n\n"
+        );
+    }
+
+    #[test]
+    fn xheader_width_bounds_the_record_line() {
+        // `print_aligned_vertical_line` (`print.c:1225`): `full` rules the
+        // whole value column, `column` stops at the divider, and `page` and
+        // an exact width cut the rule to fit.
+        let header = "abcdefghijklmn";
+        let res = result(
+            vec![text_field(header)],
+            vec![vec![Some("xxxxxxxxxxxxxxxxxxxx")]],
+        );
+        let record_line = |xheader, columns| {
+            let out = render(
+                &res,
+                &with(|o| {
+                    o.topt.expanded = Expanded::On;
+                    o.topt.expanded_header_width = xheader;
+                    o.topt.columns = columns;
+                }),
+            );
+            out.lines().next().unwrap().to_string()
+        };
+        let rule = |n| "-".repeat(n);
+        assert_eq!(
+            record_line(XheaderWidth::Full, 0),
+            format!("-[ RECORD 1 ]--+-{}", rule(20))
+        );
+        assert_eq!(record_line(XheaderWidth::Column, 0), "-[ RECORD 1 ]--+");
+        assert_eq!(
+            record_line(XheaderWidth::ExactWidth(25), 0),
+            format!("-[ RECORD 1 ]--+-{}", rule(8))
+        );
+        assert_eq!(
+            record_line(XheaderWidth::Page, 25),
+            format!("-[ RECORD 1 ]--+-{}", rule(8))
+        );
     }
 
     /// Pins the recorded divergence: the walk is UTF-8's whatever the client
@@ -1068,6 +1794,7 @@ mod tests {
                 // do-while and always advances at least once.
                 bytes: b"a\\rb\\x01        c".to_vec(),
                 width: 17,
+                utf8: true,
             }]
         );
         assert_eq!(
@@ -1075,6 +1802,7 @@ mod tests {
             vec![Line {
                 bytes: b"\\u0085".to_vec(),
                 width: 6,
+                utf8: true,
             }]
         );
         assert_eq!(format_cell(b"x\ny").len(), 2);

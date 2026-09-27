@@ -15,8 +15,9 @@
 //! issue names ([`command`], `command.c`), the prompt renderer ([`prompt`],
 //! `prompt.c`) and enough of `print.c` to render the default aligned output.
 //! NAT-400 adds `\pset` ([`pset`], `command.c`'s `do_pset`) and grows
-//! [`print`] toward the whole of `print.c`. `--help` is NAT-399's, `\d` is
-//! NAT-401's and interactive input is NAT-405's.
+//! [`print`] toward the whole of `print.c`. `--help` is NAT-399's.
+//! NAT-401 ports the `\d` family ([`describe`], `describe.c`) a command group
+//! at a time, starting with `listTables`. Interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -32,6 +33,7 @@
 
 pub mod command;
 pub mod common;
+pub mod describe;
 pub mod mainloop;
 pub mod print;
 pub mod prompt;
@@ -69,6 +71,9 @@ pub fn version_line() -> String {
 struct LiveExecutor {
     connection: Connection<Stream>,
     alive: bool,
+    /// `conn->dbName` as `connectOptions2` settles it (`fe-connect.c:1414`):
+    /// the `dbname` asked for, else the user name.
+    db: Option<String>,
 }
 
 impl Executor for LiveExecutor {
@@ -84,6 +89,10 @@ impl Executor for LiveExecutor {
 
     fn connected(&self) -> bool {
         self.alive
+    }
+
+    fn db(&self) -> Option<&str> {
+        self.db.as_deref()
     }
 }
 
@@ -116,10 +125,16 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
         // one is a bug in this function rather than in the command line.
         let _ = conninfo.set(key.as_bytes(), value.as_bytes());
     }
+    let db = [conninfo.get("dbname"), conninfo.get("user")]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(|v| String::from_utf8_lossy(v).into_owned());
     match Connection::connect(&conninfo) {
         Ok(connection) => Ok(LiveExecutor {
             connection,
             alive: true,
+            db,
         }),
         Err(err) => Err(err.into()),
     }
@@ -195,6 +210,8 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             return ExitCode::from(EXIT_BADCONN);
         }
     };
+    // `SyncVariables()` (`command.c:4582`).
+    session.pset.sversion = executor.connection.server_version();
 
     // The list is consumed here and never read again, so it moves out rather
     // than being cloned past the `&mut session` the loop needs.
@@ -311,6 +328,7 @@ fn run_action(
                     &mut scanner,
                     &mut session.pset,
                     &mut session.vars,
+                    executor,
                     stdout,
                     stderr,
                 )

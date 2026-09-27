@@ -34,7 +34,8 @@ use rpsql::settings::{PrintQueryOpt, PsqlSettings};
 use testkit::reference;
 
 use regress::{
-    Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, split, tail,
+    Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, head, section, sections, split, tail,
+    without,
 };
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
@@ -307,6 +308,8 @@ const DOCUMENT_FORMAT_SECTIONS_PORT: u16 = 55_492;
 const NUMERICLOCALE_PORT: u16 = 55_493;
 const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
 const DISPLAY_WIDTH_PORT: u16 = 55_495;
+const CONDITIONAL_AM_DISPLAY_PORT: u16 = 55_496;
+const RELATION_LISTINGS_PORT: u16 = 55_497;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -318,20 +321,38 @@ fn gate_section(cluster: &Cluster, section: &Section<'_>) {
 /// state an earlier part of the file left. `-a -q` echoes them and prints
 /// nothing else for them, so they are expected back verbatim.
 fn gate_script(cluster: &Cluster, section: &Section<'_>, preamble: &str) {
-    let script = format!("{preamble}{}", section.sql);
-    let expected = format!("{preamble}{}", section.expected);
-    let ours = cluster.run_script(Path::new(RPSQL), &script);
-    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
-        panic!(
-            "rpsql, psql.sql:{} vs psql.out:{} ({}, after {preamble:?}): {diff}",
+    gate_text(
+        cluster,
+        &format!(
+            "psql.sql:{} vs psql.out:{} ({}, after {preamble:?})",
             section.sql_line, section.out_line, section.header
-        );
+        ),
+        &format!("{preamble}{}", section.sql),
+        &format!("{preamble}{}", section.expected),
+        None,
+    );
+}
+
+/// Run `script` through rpsql against `cluster`, and through C psql when this
+/// lane has one, and require both to print exactly `expected`.
+///
+/// `reset`, when given, runs between the two to undo what `script` left in
+/// the cluster; its output is not gated, but it must not fail.
+fn gate_text(cluster: &Cluster, what: &str, script: &str, expected: &str, reset: Option<&str>) {
+    let ours = cluster.run_script(Path::new(RPSQL), script);
+    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
+        panic!("rpsql, {what}: {diff}");
     }
     match cluster.reference_psql() {
         Some(psql) => {
-            let theirs = cluster.run_script(&psql, &script);
+            if let Some(reset) = reset {
+                let out = cluster.run_script(Path::new(RPSQL), reset);
+                let text = String::from_utf8_lossy(&out);
+                assert!(!text.contains("ERROR"), "reset after {what}:\n{text}");
+            }
+            let theirs = cluster.run_script(&psql, script);
             if let Some(diff) = first_difference(&theirs, &ours) {
-                panic!("rpsql vs C psql ({}): {diff}", section.header);
+                panic!("rpsql vs C psql ({what}): {diff}");
             }
         }
         None => reference::skip("psql"),
@@ -587,6 +608,111 @@ fn display_width_matches_c_psql() {
         }
     }
     diff_against_c_psql(&cluster, "display width", &script);
+}
+
+/// `-- check conditional am display` (`psql.sql:548`), live: `\d+`, `\dt+`,
+/// `\dm+` and `\dv+` with and without `HIDE_TABLEAM`, and `\d+x`, over
+/// tables, a view and a materialized view in two table access methods.
+///
+/// The section also describes three tables one by one (`\d+ tbl_heap_psql`,
+/// `\d+ tbl_heap` twice each, and `\d+x tbl_heap`). That is
+/// `describeTableDetails`, a later NAT-401 slice, and nothing else in the
+/// section reads what it prints, so those five lines and their tables are
+/// cut from both files ([`without`]).
+///
+/// The section's clean-up, from `RESET ROLE;` on, is cut too ([`head`]):
+/// its `DROP SCHEMA … CASCADE` makes the server send a NOTICE, and rpsql
+/// does not print server notices yet (psql's `NoticeProcessor`,
+/// `common.c:281`). Everything before it is gated whole, and the clean-up
+/// still runs, ungated, before the same script goes through C psql.
+///
+/// The section runs in the print state `psql.sql` leaves it: `\pset format
+/// wrapped` (`psql.sql:535`) and `\pset columns 40` (`:432`), under which C
+/// wraps nothing here because every header row is wider than 40
+/// (`print.c:829`). The preamble restores both.
+#[test]
+fn the_conditional_am_display_section_runs_live() {
+    let Some(cluster) = Cluster::start(CONDITIONAL_AM_DISPLAY_PORT) else {
+        return;
+    };
+    let full = section("-- check conditional am display");
+    let whole = head(&full, "RESET ROLE;");
+    let (sql, expected) = without(
+        &whole,
+        &["\\d+ tbl_heap_psql", "\\d+ tbl_heap", "\\d+x tbl_heap"],
+    );
+    let preamble = "\\pset format wrapped\n\\pset columns 40\n";
+    gate_text(
+        &cluster,
+        &format!(
+            "psql.sql:{} vs psql.out:{} ({}, without \\d <table>)",
+            whole.sql_line, whole.out_line, whole.header
+        ),
+        &format!("{preamble}{sql}"),
+        &format!("{preamble}{expected}"),
+        // The section's own clean-up, so that C psql starts where rpsql did.
+        Some(tail(&full, "RESET ROLE;").sql),
+    );
+}
+
+/// `listTables` beyond what `psql.sql` exercises, against C psql: every
+/// relation type letter alone and combined, `S`, `+` and `x`, schema-qualified,
+/// quoted, wildcard and database-qualified patterns, a trailing semicolon,
+/// `HIDE_TABLEAM`, the not-found messages (which `-q` would silence, hence
+/// `QUIET off`), and a pattern with too many dots. `ECHO_HIDDEN` is on for
+/// most of it, so the catalog query itself is compared byte for byte, and
+/// `noexec` once, which stops before the query runs.
+#[test]
+fn the_relation_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(RELATION_LISTINGS_PORT) else {
+        return;
+    };
+    let script = "\\set QUIET off\n\
+        create schema s1;\n\
+        create table s1.\"Mixed\" (a int primary key);\n\
+        create unlogged table s1.logless (a int);\n\
+        create view s1.v as select 1 as one;\n\
+        create materialized view s1.mv as select 1 as x;\n\
+        create sequence s1.seq;\n\
+        create table s1.part (a int) partition by range (a);\n\
+        create index part_a on s1.part (a);\n\
+        comment on table s1.logless is 'no WAL';\n\
+        create table plain (b text);\n\
+        \\d\n\
+        \\set ECHO_HIDDEN on\n\
+        \\d\n\
+        \\dt\n\
+        \\dti s1.*\n\
+        \\di+ s1.*\n\
+        \\dv s1.*\n\
+        \\dm+ s1.*\n\
+        \\ds s1.*\n\
+        \\dE\n\
+        \\dE nosuch\n\
+        \\dt \"Mixed\"\n\
+        \\dt s1.\"Mixed\"\n\
+        \\dt s1.mixed\n\
+        \\dt S1.?ogless\n\
+        \\dt s1.m*\n\
+        \\dtS pg_class\n\
+        \\dtS+ pg_am\n\
+        \\dt postgres.s1.*\n\
+        \\dt+ s1.*;\n\
+        \\dv nosuch;\n\
+        \\dix s1.*\n\
+        \\d+\n\
+        \\set HIDE_TABLEAM on\n\
+        \\dt+ s1.*\n\
+        \\set ECHO_HIDDEN noexec\n\
+        \\dt\n\
+        \\set ECHO_HIDDEN off\n\
+        \\dt a.b.c.d\n\
+        \\dm\n\
+        set client_min_messages = warning;\n\
+        drop schema s1 cascade;\n\
+        drop table plain;\n\
+        \\d\n";
+    diff_against_c_psql(&cluster, "relation listings", script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

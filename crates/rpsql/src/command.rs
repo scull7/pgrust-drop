@@ -3,16 +3,20 @@
 //! `HandleSlashCmds` (`command.c:231`) parses the command name, dispatches,
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
-//! plus the `\unset`, `\qecho` and `\warn` that share their code, and
-//! NAT-400 adds `\pset`. Everything
-//! else is [`CommandResult::Unknown`], which renders upstream's
+//! plus the `\unset`, `\qecho` and `\warn` that share their code, NAT-400
+//! adds `\pset`, and NAT-401 the `\d` family ([`crate::describe`]).
+//! Everything else is [`CommandResult::Unknown`], which renders upstream's
 //! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
 
 use std::io::Write;
 
-use crate::common::{LogLevel, log_prefix};
+use crate::common::{Executor, LogLevel, log_prefix, psql_exec};
+use crate::describe::{
+    DescribeCommand, DescribeFlags, ServerContext, TableTypes, list_tables_query,
+};
+use crate::print::print_query;
 use crate::scan::{Scanner, VariableSource};
-use crate::settings::PsqlSettings;
+use crate::settings::{Expanded, PsqlSettings};
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
@@ -69,6 +73,8 @@ pub struct CommandContext<'a> {
     pub pset: &'a mut PsqlSettings,
     /// `pset.vars`.
     pub vars: &'a mut VariableSpace,
+    /// `pset.db`, for the commands that query the server.
+    pub executor: &'a mut dyn Executor,
 }
 
 /// One whole backslash command, from the variable snapshot the lexer reads to
@@ -87,6 +93,7 @@ pub fn dispatch_slash(
     scanner: &mut Scanner,
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
+    executor: &mut dyn Executor,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> CommandResult {
@@ -99,6 +106,7 @@ pub fn dispatch_slash(
         let mut ctx = CommandContext {
             pset: &mut working,
             vars,
+            executor,
         };
         handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
     };
@@ -169,6 +177,9 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "c" | "connect" => 4,
         "pset" => 2,
         "unset" => 1,
+        // `exec_command_d` reads one pattern; the commands that read a
+        // second are not ported yet.
+        d if d.starts_with('d') => 1,
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -200,6 +211,8 @@ fn exec_command(
         "pset" => exec_command_pset(options, ctx, stdout, stderr),
         // `exec_command_set()` (`command.c:2881`).
         "set" => exec_command_set(options, ctx, stdout, stderr),
+        // `exec_command_d()` (`command.c:1021`).
+        d if d.starts_with('d') => exec_command_d(d, options, ctx, stdout, stderr),
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
@@ -224,6 +237,121 @@ fn exec_command(
             }
         }
         _ => CommandResult::Unknown,
+    }
+}
+
+/// `exec_command_d()` (`command.c:1021`): the `\d` family.
+///
+/// The pattern is the first option with its unquoted trailing semicolons
+/// stripped (`psql_scan_slash_option(…, true)`). An `x` after the second
+/// character turns expanded mode on for this command alone.
+fn exec_command_d(
+    cmd: &str,
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let pattern = options
+        .first()
+        .map(SlashOption::without_trailing_semicolons);
+    let flags = DescribeFlags::parse(cmd);
+    let Some(command) = DescribeCommand::parse(cmd, pattern.is_some()) else {
+        return CommandResult::Unknown;
+    };
+
+    // `save_expanded` / restore (`command.c:1046`, `:1290`): the command sees
+    // a copy of the settings, so there is nothing to restore.
+    let mut pset = ctx.pset.clone();
+    if flags.expanded {
+        pset.popt.topt.expanded = Expanded::On;
+    }
+
+    let success = match command {
+        DescribeCommand::ListTables(tabtypes) => list_tables(
+            &tabtypes,
+            pattern.as_deref(),
+            flags,
+            &pset,
+            ctx.executor,
+            stdout,
+            stderr,
+        ),
+        DescribeCommand::TableDetails => {
+            not_yet(&pset, cmd, "describeTableDetails", stderr);
+            false
+        }
+        DescribeCommand::NotYet(function) => {
+            not_yet(&pset, cmd, function, stderr);
+            false
+        }
+    };
+    if success {
+        CommandResult::SkipLine
+    } else {
+        CommandResult::Error
+    }
+}
+
+/// Refuse a `\d` command whose `describe.c` function has not been ported,
+/// naming both, rather than print something that only looks right.
+fn not_yet(pset: &PsqlSettings, cmd: &str, function: &str, stderr: &mut dyn Write) {
+    let _ = writeln!(
+        stderr,
+        "{}\\{cmd}: {function} is not implemented yet (Linear NAT-401)",
+        log_prefix(pset, LogLevel::Error)
+    );
+}
+
+/// `listTables()` (`describe.c:4011`): build the query, run it through
+/// `PSQLexec`, and print the result under its title — or, when nothing
+/// matched and psql is not quiet, say so instead (`describe.c:4179`).
+fn list_tables(
+    tabtypes: &str,
+    pattern: Option<&str>,
+    flags: DescribeFlags,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let types = TableTypes::parse(tabtypes);
+    let server = ServerContext {
+        sversion: pset.sversion,
+        hide_tableam: pset.hide_tableam,
+        db: executor.db(),
+    };
+    let query = match list_tables_query(types, pattern, flags.verbose, flags.system, server) {
+        Ok(query) => query,
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{}", log_prefix(pset, LogLevel::Error), err.0);
+            return false;
+        }
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+
+    if result.ntuples() == 0 && !pset.quiet {
+        let _ = writeln!(
+            stderr,
+            "{}{}",
+            log_prefix(pset, LogLevel::Error),
+            types.not_found(pattern)
+        );
+        return true;
+    }
+    let mut opt = pset.popt.clone();
+    opt.title = Some(types.title().to_string());
+    match print_query(&result, &opt) {
+        Ok(text) => {
+            let _ = stdout.write_all(&text);
+            true
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
+            false
+        }
     }
 }
 
@@ -312,7 +440,10 @@ fn exec_command_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::ErrorMessage;
     use crate::scan::{NoVariables, ScanResult};
+    use crate::settings::EchoHidden;
+    use rlibpq::{Backend, FieldDescription, QueryResult, QueryRunner, TransactionStatus};
 
     struct Run {
         result: CommandResult,
@@ -321,9 +452,41 @@ mod tests {
         vars: VariableSpace,
     }
 
+    /// An executor that records each query and answers from a queue, or
+    /// reports no connection when the queue is `None`.
+    struct Canned {
+        answers: Option<Vec<Vec<QueryResult>>>,
+        seen: Vec<String>,
+    }
+
+    impl Executor for Canned {
+        fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+            self.seen.push(String::from_utf8(query.to_vec()).unwrap());
+            Ok(self.answers.as_mut().expect("connected").remove(0))
+        }
+        fn connected(&self) -> bool {
+            self.answers.is_some()
+        }
+        fn db(&self) -> Option<&str> {
+            Some("regression")
+        }
+    }
+
     fn run(line: &str) -> Run {
+        run_with(line, PsqlSettings::default(), None).0
+    }
+
+    /// [`run`], with the settings and the executor's answers given.
+    fn run_with(
+        line: &str,
+        mut pset: PsqlSettings,
+        answers: Option<Vec<Vec<QueryResult>>>,
+    ) -> (Run, Vec<String>) {
+        let mut executor = Canned {
+            answers,
+            seen: Vec::new(),
+        };
         let mut vars = VariableSpace::new();
-        let mut pset = PsqlSettings::default();
         let mut scanner = Scanner::new();
         scanner.setup(line.as_bytes(), true);
         let mut buf = Vec::new();
@@ -335,6 +498,7 @@ mod tests {
             let mut ctx = CommandContext {
                 pset: &mut pset,
                 vars: &mut vars,
+                executor: &mut executor,
             };
             handle_slash_cmds(
                 &mut scanner,
@@ -344,12 +508,15 @@ mod tests {
                 &mut stderr,
             )
         };
-        Run {
-            result,
-            stdout: String::from_utf8(stdout).unwrap(),
-            stderr: String::from_utf8(stderr).unwrap(),
-            vars,
-        }
+        (
+            Run {
+                result,
+                stdout: String::from_utf8(stdout).unwrap(),
+                stderr: String::from_utf8(stderr).unwrap(),
+                vars,
+            },
+            executor.seen,
+        )
     }
 
     #[test]
@@ -466,7 +633,18 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        let mut executor = Canned {
+            answers: None,
+            seen: Vec::new(),
+        };
+        let status = dispatch_slash(
+            &mut scanner,
+            &mut pset,
+            &mut vars,
+            &mut executor,
+            &mut stdout,
+            &mut stderr,
+        );
 
         (status, pset, String::from_utf8(stderr).unwrap())
     }
@@ -545,5 +723,186 @@ mod tests {
         assert_eq!(echo_text(&[opt("a", None), opt("b", None)]), b"a b\n");
         assert_eq!(echo_text(&[opt("-n", None), opt("a", None)]), b"a");
         assert_eq!(echo_text(&[]), b"\n");
+    }
+
+    /// A `\\d` answer: `text` columns and rows, as the wire delivers them.
+    fn relations(headers: &[&str], rows: &[&[&str]]) -> Vec<QueryResult> {
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(
+                headers
+                    .iter()
+                    .map(|h| FieldDescription {
+                        name: h.as_bytes().to_vec(),
+                        tableid: 0,
+                        columnid: 0,
+                        typid: 19,
+                        typlen: 64,
+                        atttypmod: -1,
+                        format: 0,
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+        for row in rows {
+            runner
+                .push(Backend::DataRow(
+                    row.iter().map(|c| Some(c.as_bytes().to_vec())).collect(),
+                ))
+                .unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(
+                format!("SELECT {}", rows.len()).into_bytes(),
+            ))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results()
+    }
+
+    fn pg18() -> PsqlSettings {
+        PsqlSettings {
+            sversion: 180_006,
+            ..PsqlSettings::default()
+        }
+    }
+
+    const LISTING: [&str; 4] = ["Schema", "Name", "Type", "Owner"];
+
+    #[test]
+    fn dt_prints_its_listing_under_its_title() {
+        let answer = relations(&LISTING, &[&["public", "t", "table", "me"]]);
+        let (run, seen) = run_with("\\dt", pg18(), Some(vec![answer]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].contains("WHERE c.relkind IN ('r','p','')\n"),
+            "{}",
+            seen[0]
+        );
+        assert_eq!(
+            run.stdout,
+            "        List of tables\n \
+             Schema | Name | Type  | Owner \n\
+             --------+------+-------+-------\n \
+             public | t    | table | me\n\
+             (1 row)\n\n"
+        );
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn the_pattern_loses_its_trailing_semicolon() {
+        let answer = relations(&LISTING, &[]);
+        let (_, seen) = run_with("\\dv foo;", pg18(), Some(vec![answer]));
+        assert!(
+            seen[0].contains("c.relname OPERATOR(pg_catalog.~) '^(foo)$'"),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn nothing_found_is_an_error_message_unless_quiet() {
+        // `describe.c:4179`: psql says so, and the command still succeeds.
+        let (run, _) = run_with("\\dv foo", pg18(), Some(vec![relations(&LISTING, &[])]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(run.stdout, "");
+        assert_eq!(
+            run.stderr,
+            "psql: error: Did not find any views named \"foo\".\n"
+        );
+        // Quiet, the empty table is printed instead.
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..pg18()
+        };
+        let (run, _) = run_with("\\d", quiet, Some(vec![relations(&LISTING, &[])]));
+        assert!(
+            run.stdout.starts_with("      List of relations\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(run.stdout.ends_with("(0 rows)\n\n"), "{}", run.stdout);
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn x_expands_the_listing_for_this_command_only() {
+        let answer = relations(&LISTING, &[&["public", "t", "table", "me"]]);
+        let (run, _) = run_with("\\dtx", pg18(), Some(vec![answer]));
+        assert_eq!(
+            run.stdout,
+            "List of tables\n\
+             -[ RECORD 1 ]--\n\
+             Schema | public\n\
+             Name   | t\n\
+             Type   | table\n\
+             Owner  | me\n\n"
+        );
+    }
+
+    #[test]
+    fn echo_hidden_shows_the_query_and_noexec_stops_there() {
+        let noexec = PsqlSettings {
+            echo_hidden: EchoHidden::NoExec,
+            ..pg18()
+        };
+        let (run, seen) = run_with("\\dt", noexec, Some(vec![]));
+        assert!(seen.is_empty());
+        assert!(
+            run.stdout
+                .starts_with("/******** QUERY *********/\nSELECT n.nspname"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .ends_with("ORDER BY 1,2;\n/************************/\n\n"),
+            "{}",
+            run.stdout
+        );
+        // `PSQLexec` returns NULL, so the command fails (`describe.c:4169`-`:4172`).
+        assert_eq!(run.result, CommandResult::Error);
+    }
+
+    #[test]
+    fn a_bad_pattern_fails_without_a_query() {
+        let (run, seen) = run_with("\\dt a.b.c.d", pg18(), Some(vec![]));
+        assert!(seen.is_empty());
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: improper qualified name (too many dotted names): a.b.c.d\n"
+        );
+    }
+
+    #[test]
+    fn without_a_connection_d_says_so() {
+        let (run, _) = run_with("\\dt", pg18(), None);
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: You are currently not connected to a database.\n"
+        );
+    }
+
+    #[test]
+    fn an_unported_d_command_is_refused_by_name_and_an_unknown_one_is_invalid() {
+        let refused = run("\\dn");
+        assert_eq!(refused.result, CommandResult::Error);
+        assert_eq!(
+            refused.stderr,
+            "psql: error: \\dn: listSchemas is not implemented yet (Linear NAT-401)\n"
+        );
+        let details = run("\\d t");
+        assert_eq!(
+            details.stderr,
+            "psql: error: \\d: describeTableDetails is not implemented yet (Linear NAT-401)\n"
+        );
+        let unknown = run("\\dz");
+        assert_eq!(unknown.stderr, "psql: error: invalid command \\dz\n");
     }
 }

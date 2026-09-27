@@ -10,7 +10,7 @@ use std::io::Write;
 use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
 use crate::print::print_query;
-use crate::settings::{Echo, PsqlSettings};
+use crate::settings::{Echo, EchoHidden, PsqlSettings};
 
 /// A `pg_log_*` level psql reports at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub enum LogLevel {
     Error,
     /// `pg_log_warning`
     Warning,
+    /// `pg_log_info`: the locus, but no level.
+    Info,
 }
 
 /// What `pg_log_generic_v()` (`logging.c:219`) writes before a message, with
@@ -48,6 +50,7 @@ pub fn log_prefix(pset: &PsqlSettings, level: LogLevel) -> String {
         out.push_str(match level {
             LogLevel::Error => "error: ",
             LogLevel::Warning => "warning: ",
+            LogLevel::Info => "",
         });
     }
     out
@@ -113,6 +116,84 @@ pub trait Executor {
 
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
+
+    /// `PQdb(pset.db)` (`fe-connect.c:7472`): the database the connection
+    /// is to, or `None` when there is none to ask.
+    fn db(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// `PSQLexec()` (`common.c:657`): run a query psql builds for itself — a
+/// `\d` catalog query — and hand back its result, or `None` after logging
+/// why there is none.
+///
+/// `ECHO_HIDDEN` prints the query first, and under `noexec` stops there.
+/// A failed result is `AcceptResult(res, true)`'s (`common.c:418`): the
+/// error goes to stderr through `pg_log_info`, with the locus but no level.
+pub fn psql_exec(
+    executor: &mut dyn Executor,
+    query: &str,
+    pset: &PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Option<QueryResult> {
+    if !executor.connected() {
+        let _ = writeln!(
+            stderr,
+            "{}You are currently not connected to a database.",
+            log_prefix(pset, LogLevel::Error)
+        );
+        return None;
+    }
+    if pset.echo_hidden != EchoHidden::Off {
+        let _ = write!(
+            stdout,
+            "/******** QUERY *********/\n{query}\n/************************/\n\n"
+        );
+        if pset.echo_hidden == EchoHidden::NoExec {
+            return None;
+        }
+    }
+
+    let failed = |message: &[u8], stderr: &mut dyn Write| {
+        if !message.is_empty() {
+            let _ = stderr.write_all(log_prefix(pset, LogLevel::Info).as_bytes());
+            // `pg_log_generic_v` drops the message's own trailing newline and
+            // writes one (`logging.c:331`).
+            let _ = stderr.write_all(message.strip_suffix(b"\n").unwrap_or(message));
+            let _ = stderr.write_all(b"\n");
+        }
+    };
+    let result = match executor.exec(query.as_bytes()) {
+        // `PQexec` keeps only the last result.
+        Ok(mut results) => results.pop(),
+        Err(err) => {
+            failed(err.as_bytes(), stderr);
+            return None;
+        }
+    };
+    let result = result?;
+    match result.status() {
+        ExecStatus::CommandOk
+        | ExecStatus::TuplesOk
+        | ExecStatus::EmptyQuery
+        | ExecStatus::CopyIn
+        | ExecStatus::CopyOut => Some(result),
+        _ => {
+            failed(&result_error_message(&result, pset), stderr);
+            None
+        }
+    }
+}
+
+/// `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering of a failed
+/// result, at the configured verbosity (`common.c:1831`).
+fn result_error_message(result: &QueryResult, pset: &PsqlSettings) -> Vec<u8> {
+    match result.error() {
+        Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
+        None => result.error_message(),
+    }
 }
 
 /// What `ECHO` prints before a query runs, or `None`.
@@ -207,15 +288,7 @@ pub fn send_query(
             }
             ExecStatus::EmptyQuery => {}
             _ => {
-                // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at
-                // the configured verbosity (`common.c:1831`).
-                let message = match result.error() {
-                    Some(error) => {
-                        error.message(result.status(), pset.verbosity, pset.show_context)
-                    }
-                    None => result.error_message(),
-                };
-                let _ = stderr.write_all(&message);
+                let _ = stderr.write_all(&result_error_message(result, pset));
                 ok = false;
             }
         }

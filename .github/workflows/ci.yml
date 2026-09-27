@@ -70,10 +70,14 @@ jobs:
       CARGO_HOME: /usr/local/cargo
       PGDROP_REF_BIN_MUSL: /usr/libexec/postgresql18
     steps:
+      # zstd is for Swatinem/rust-cache, not the build: actions/cache compresses
+      # with zstd only if a `zstd` binary is on PATH and otherwise falls back to
+      # gzip, which on this ~700 MB cache took 91 s to save and 49 s to unpack
+      # (NAT-598). With zstdmt both are a few seconds, as on the other lanes.
       - name: Install the Alpine toolchain and the PostgreSQL 18 reference
         run: |
           apk add --no-cache bash build-base curl git libstdc++ linux-headers musl-dev \
-            perl tar unzip xz postgresql18 postgresql18-client
+            perl tar unzip xz zstd postgresql18 postgresql18-client
       - uses: actions/checkout@v4
       # Toolchain in a shared, world-writable prefix (the layout the official
       # rust image uses) so the unprivileged user below can run cargo.

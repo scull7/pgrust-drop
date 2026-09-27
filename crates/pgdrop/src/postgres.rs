@@ -51,7 +51,8 @@ pub fn transport(args: &[OsString]) -> seams_init::Transport {
 }
 
 /// Run the applet. `argv0` is the name the process was started as: pgrust
-/// finds its share directory from it (`find_my_exec`), as C does.
+/// finds the share files pgdrop does not embed from it (`find_my_exec`), as
+/// C does.
 ///
 /// Write failures on the version line are ignored and the exit status is
 /// still 0, as `main.c:170`'s unchecked `fputs` is.
@@ -67,13 +68,15 @@ pub fn run(argv0: &OsStr, args: &[OsString], stdout: &mut dyn Write) -> ExitCode
 }
 
 /// Action: `bin/postgres.rs`'s `main` and `run`, minus what NAT-407 owns
-/// (see the module header).
+/// (see the module header), after the embedded share directory is in place
+/// ([`crate::share::prepare`], NAT-408).
 ///
 /// `pg_main` ends a clean shutdown by unwinding an `ipc::ProcExitThread`
 /// rather than calling `exit(2)`; it is caught here and its code becomes the
 /// process's, with `std::process::exit` exactly as `bin/postgres.rs` does.
 /// Any other panic is re-raised untouched.
 fn serve(argv0: &OsStr, args: &[OsString]) -> ExitCode {
+    crate::share::prepare(&mut std::io::stderr());
     seams_init::init_all_with_transport(transport(args));
     let pg_argv = main_main::argv_from_os(std::iter::once(argv0.to_owned()).chain(args.to_vec()));
     match std::panic::catch_unwind(|| main_main::pg_main(&pg_argv)) {

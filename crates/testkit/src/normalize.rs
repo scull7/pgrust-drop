@@ -118,6 +118,30 @@ pub const PG_CTL_DIRECTORY: Normalizer = Normalizer {
     apply: pg_ctl_directory,
 };
 
+/// Alpine's `postgresql18` package patches initdb's closing instructions down
+/// to a bare `Success.`: the pg_ctl command line is not how a server is
+/// started there. Observed on the musl lane's reference
+/// (`/usr/libexec/postgresql18/initdb`), which prints `\nSuccess.\n\n` where
+/// upstream prints `\nSuccess. You can now start the database server
+/// using:\n\n    <command>\n\n`.
+///
+/// Upstream: `src/bin/initdb/initdb.c:3554`. A gate applies this only when
+/// its reference has been seen printing the patched form, and says so; with
+/// an unpatched reference the instructions are compared in full. It folds
+/// exactly the upstream block — the fixed sentence, one blank line, one
+/// four-space-indented command — to the patched line, so anything else
+/// around it still differs. The command's own bytes are pinned without it
+/// (`the_pg_ctl_directory_is_replaced_and_the_rest_of_the_line_kept`, and
+/// rinitdb's own-output test).
+pub const PATCHED_SUCCESS: Normalizer = Normalizer {
+    name: "patched-success",
+    justification: "Alpine's postgresql18 initdb prints a bare `Success.` for the instructions at src/bin/initdb/initdb.c:3554",
+    apply: patched_success,
+};
+
+/// What a distribution-patched initdb prints in place of the instructions.
+pub const PATCHED_SUCCESS_LINE: &str = "Success.";
+
 /// The three nondeterminism normalizers, in the order a psql gate wants them.
 ///
 /// [`EXTRA_VERSION`] is deliberately not one of them: only a gate that runs
@@ -214,6 +238,30 @@ fn strip_pg_ctl_directory(line: &str) -> Option<String> {
         return None;
     }
     Some(format!("{INDENT}{PG_CTL_PLACEHOLDER} -D {rest}"))
+}
+
+fn patched_success(text: &str) -> String {
+    const HEAD: &str = "Success. You can now start the database server using:\n\n    ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(HEAD) {
+        let at_line_start = at == 0 || rest[..at].ends_with('\n');
+        let command = &rest[at + HEAD.len()..];
+        match command.find('\n') {
+            Some(end) if at_line_start && !command[..end].is_empty() => {
+                out.push_str(&rest[..at]);
+                out.push_str(PATCHED_SUCCESS_LINE);
+                out.push('\n');
+                rest = &command[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..at + HEAD.len()]);
+                rest = command;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn extra_version(text: &str) -> String {
@@ -490,6 +538,26 @@ mod tests {
             "/a/pg_ctl -D data -l logfile start",
         ] {
             assert_eq!(normalize(untouched), untouched);
+        }
+    }
+    #[test]
+    fn the_upstream_instructions_fold_to_the_patched_line() {
+        let upstream = "ok\n\nSuccess. You can now start the database server using:\n\n    \
+                        pg_ctl -D data -l logfile start\n\n";
+        let alpine = "ok\n\nSuccess.\n\n";
+        assert_eq!(PATCHED_SUCCESS.normalize(upstream), alpine);
+        assert_eq!(PATCHED_SUCCESS.normalize(alpine), alpine);
+    }
+
+    #[test]
+    fn the_patched_success_fold_leaves_everything_else_alone() {
+        for text in [
+            "ok\n\nSuccess. You can now start the database server using:\n\n    \n\n",
+            "ok\n\nSuccess. You can now start the database server using:\n\npg_ctl start\n",
+            "x Success. You can now start the database server using:\n\n    pg_ctl\n",
+            "Sync to disk skipped.\n",
+        ] {
+            assert_eq!(PATCHED_SUCCESS.normalize(text), text, "{text:?}");
         }
     }
 }

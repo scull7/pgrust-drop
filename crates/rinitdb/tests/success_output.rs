@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use testkit::normalize::PG_CTL_DIRECTORY;
+use testkit::normalize::{PATCHED_SUCCESS, PATCHED_SUCCESS_LINE, PG_CTL_DIRECTORY};
 use testkit::{CommandOutcome, Environment, Scope, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
@@ -121,12 +121,31 @@ fn gate(tag: &str, argv: &[&str], prepare: impl Fn(&Path)) {
         "C initdb {argv:?} ({tag}): {}",
         theirs.stderr_text()
     );
-    let report = testkit::gate::compare(&theirs, &ours, &[PG_CTL_DIRECTORY], Scope::Everything);
+    let mut normalizers = vec![PG_CTL_DIRECTORY];
+    if prints_patched_success(&theirs.stdout_text()) {
+        reference::announce_skip(&format!(
+            "{}: the reference initdb at {} prints a bare `{PATCHED_SUCCESS_LINE}` where upstream \
+             prints the closing instructions (Alpine's package patch), so ours are folded to it \
+             for this gate ({tag}); their bytes are pinned by \
+             rinitdb_prints_upstreams_success_text",
+            reference::SKIP_FLAG,
+            initdb.display()
+        ));
+        normalizers.push(PATCHED_SUCCESS);
+    }
+    let report = testkit::gate::compare(&theirs, &ours, &normalizers, Scope::Everything);
     assert!(
         report.is_clean(),
         "gate {} vs {RINITDB} {argv:?} ({tag})\n{report}",
         initdb.display()
     );
+}
+
+/// Whether C's stdout ends with a distribution's bare `Success.` instead of
+/// upstream's instructions (`initdb.c:3554`) — see
+/// [`testkit::normalize::PATCHED_SUCCESS`].
+fn prints_patched_success(stdout: &str) -> bool {
+    stdout.ends_with(&format!("\n\n{PATCHED_SUCCESS_LINE}\n\n"))
 }
 
 fn nothing(_: &Path) {}

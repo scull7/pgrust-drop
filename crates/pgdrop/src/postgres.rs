@@ -15,7 +15,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+use rinitdb::single_user::Server;
+
+use crate::dispatch::applet_from_argv0;
 
 /// pgrust's `postgres --version` line, `"postgres (PostgreSQL) 18.6\n"`.
 pub const VERSION_LINE: &str = main_main::PG_BACKEND_VERSIONSTR;
@@ -67,6 +72,30 @@ pub fn run(argv0: &OsStr, args: &[OsString], stdout: &mut dyn Write) -> ExitCode
     }
 }
 
+/// Action: this binary, as the `postgres` `initdb` runs its single-user
+/// session with when there is none beside it (NAT-383,
+/// `rinitdb::single_user::resolve_server`).
+#[must_use]
+pub fn embedded_server() -> Option<Server> {
+    // Resolved, so that a symlink named `initdb` is seen as the pgdrop it
+    // points to (std resolves it on Linux already, not on macOS).
+    embedded_server_at(
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .ok()?,
+    )
+}
+
+/// Pure: `exe` as a multicall server, `pgdrop postgres …` — unless its own
+/// name selects an applet (a hard link named `initdb`), which would win over
+/// the first word and make it that applet instead.
+#[must_use]
+pub fn embedded_server_at(exe: PathBuf) -> Option<Server> {
+    applet_from_argv0(exe.as_os_str())
+        .is_none()
+        .then(|| Server::multicall(exe))
+}
+
 /// Action: `bin/postgres.rs`'s `main` and `run`, minus what NAT-407 owns
 /// (see the module header), after the embedded share directory is in place
 /// ([`crate::share::prepare`], NAT-408).
@@ -112,6 +141,20 @@ mod tests {
         assert_eq!(request(&args(&["-D", "x", "--version"])), Request::Server);
         assert_eq!(request(&args(&["--single"])), Request::Server);
         assert_eq!(request(&[]), Request::Server);
+    }
+
+    #[test]
+    fn the_embedded_server_is_this_binary_unless_its_name_is_an_applet() {
+        assert_eq!(
+            embedded_server_at(PathBuf::from("/opt/bin/pgdrop")),
+            Some(Server::multicall(PathBuf::from("/opt/bin/pgdrop")))
+        );
+        for name in ["initdb", "psql", "postgres"] {
+            assert_eq!(
+                embedded_server_at(PathBuf::from("/opt/bin").join(name)),
+                None
+            );
+        }
     }
 
     #[test]

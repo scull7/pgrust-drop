@@ -121,7 +121,8 @@ pub fn dispatch(argv: &[OsString]) -> Dispatch {
 
 /// A symlink or copy named `initdb`, `psql` or `postgres` selects that applet.
 /// A trailing `.exe` is tolerated for the sake of a future Windows build.
-fn applet_from_argv0(argv0: &OsStr) -> Option<Applet> {
+#[must_use]
+pub fn applet_from_argv0(argv0: &OsStr) -> Option<Applet> {
     let path = Path::new(argv0);
     let name = path.file_name()?;
     let stem = if path.extension().is_some_and(|ext| ext == "exe") {

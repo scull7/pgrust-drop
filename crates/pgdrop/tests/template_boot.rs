@@ -63,19 +63,31 @@ impl Drop for Scratch {
 /// `share/`: `timezonesets` and `tsearch_data` must come from the embedded
 /// copy.
 fn install(scratch: &Path) -> PathBuf {
+    install_as(scratch, "postgres")
+}
+
+/// [`install`], with the link in `bin/` named `name`.
+fn install_as(scratch: &Path, name: &str) -> PathBuf {
     let bin = scratch.join("bin");
     std::fs::create_dir_all(&bin).expect("create bin/");
     std::fs::create_dir_all(scratch.join("share")).expect("create share/");
-    let postgres = bin.join("postgres");
-    if std::fs::hard_link(PGDROP, &postgres).is_err() {
-        std::fs::copy(PGDROP, &postgres).expect("copy pgdrop");
-    }
+    let link = link_pgdrop(scratch, name);
     let tzdir = rinitdb::RealTzSource::from_env()
         .expect("a timezone database on this machine")
         .tzdir()
         .to_path_buf();
     std::os::unix::fs::symlink(tzdir, scratch.join("share/timezone")).expect("link timezone");
-    postgres
+    link
+}
+
+/// `<scratch>/bin/<name>`, a hard link to pgdrop (a copy where the
+/// filesystem will not link).
+fn link_pgdrop(scratch: &Path, name: &str) -> PathBuf {
+    let link = scratch.join("bin").join(name);
+    if std::fs::hard_link(PGDROP, &link).is_err() {
+        std::fs::copy(PGDROP, &link).expect("copy pgdrop");
+    }
+    link
 }
 
 /// The server's environment: no share directory named by the caller, and an
@@ -243,5 +255,72 @@ fn tsdicts_ispell_and_tsearch_english_stem() {
         values(&stdout, "ts_lexize"),
         ["{sky}", "{sky}"],
         "stdout: {stdout}"
+    );
+}
+
+/// `<initdb> [initdb] -U alice --no-sync <pgdata>` in `scratch`'s
+/// [`server_env`] with no `PGDROP_POSTGRES`: exit 0, and nothing on stderr
+/// but pgrust's own LOG lines. pgrust's `--single` ends a session with status
+/// 0 even after an ERROR (C's `exit_on_error` would make it FATAL), so an
+/// ERROR on stderr is the only sign one happened.
+fn initdb_alice(scratch: &Path, initdb: &Path, first_word: Option<&str>, pgdata: &Path) {
+    let argv: Vec<OsString> = first_word
+        .into_iter()
+        .chain(["-U", "alice", "--no-sync"])
+        .map(OsString::from)
+        .chain([pgdata.into()])
+        .collect();
+    let env = server_env(scratch).without(rinitdb::single_user::SERVER_ENV);
+    let outcome = testkit::run_in(initdb, &argv, &[], &env).expect("run initdb");
+    let stderr = outcome.stderr_text();
+    assert_eq!(outcome.status, Some(0), "{argv:?}\nstderr: {stderr}");
+    for line in stderr.lines() {
+        assert!(line.contains(" LOG:  "), "{argv:?}\nstderr: {stderr}");
+    }
+}
+
+/// pgrust `--single` on `pgdata`: who the superuser is now.
+fn superuser(postgres: &Path, pgdata: &Path, env: &Environment) -> (Vec<String>, Vec<String>) {
+    let stdout = single(
+        postgres,
+        pgdata,
+        env,
+        "select rolname as su from pg_authid where oid = 10;\n\
+         select current_user as me;\n\
+         select rolname as leftover from pg_authid where rolname = 'postgres';\n",
+    );
+    let owned = |column: &str| -> Vec<String> {
+        values(&stdout, column)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    };
+    ([owned("su"), owned("me")].concat(), owned("leftover"))
+}
+
+/// NAT-383: `-U alice` renames the template's superuser in a pgrust
+/// single-user session, found the two ways pgdrop finds one — `postgres`
+/// beside `initdb` (`setup_bin_paths`, `initdb.c:2648`), and pgdrop itself
+/// when nothing is beside it.
+#[test]
+fn another_superuser_is_the_templates_renamed_under_pgrust() {
+    let scratch = Scratch::new("superuser");
+    let pgrust = install(&scratch.0);
+
+    let beside = scratch.0.join("data-beside");
+    initdb_alice(&scratch.0, &link_pgdrop(&scratch.0, "initdb"), None, &beside);
+    assert_eq!(
+        superuser(&pgrust, &beside, &server_env(&scratch.0)),
+        (vec!["alice".to_owned(), "alice".to_owned()], Vec::new())
+    );
+
+    // A bin/ with pgdrop alone: the embedded server, `pgdrop postgres`.
+    let alone = Scratch::new("superuser-embedded");
+    let pgdrop = install_as(&alone.0, "pgdrop");
+    let embedded = alone.0.join("data");
+    initdb_alice(&alone.0, &pgdrop, Some("initdb"), &embedded);
+    assert_eq!(
+        superuser(&pgrust, &embedded, &server_env(&scratch.0)),
+        (vec!["alice".to_owned(), "alice".to_owned()], Vec::new())
     );
 }

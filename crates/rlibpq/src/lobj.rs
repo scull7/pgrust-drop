@@ -404,9 +404,7 @@ impl<S: Read + Write> Connection<S> {
         let len = int32_len(buf.len(), "lo_read")?;
         let args: [Option<&[u8]>; 2] = [Some(&int4(fd)), Some(&len)];
         let call = self.nfn(funcs.lo_read, &args, Some(buf.len()))?;
-        let value = command_ok(call)?.unwrap_or_default();
-        buf[..value.len()].copy_from_slice(&value);
-        Ok(value.len())
+        Ok(read_into(buf, command_ok(call)?))
     }
 
     /// `lo_write`, `fe-lobj.c:295`: the number of bytes written.
@@ -595,6 +593,16 @@ impl<S: Read + Write> Connection<S> {
     }
 }
 
+/// `lo_read`'s value copied into `buf`: its length, and 0 for a NULL, where
+/// C returns `PQfn`'s `result_len` of -1 (`fe-protocol3.c:2291`,
+/// `fe-lobj.c:279`); see `docs/divergences.md`. `nfn` has already refused
+/// a value longer than `buf`.
+fn read_into(buf: &mut [u8], value: Option<Vec<u8>>) -> usize {
+    let value = value.unwrap_or_default();
+    buf[..value.len()].copy_from_slice(&value);
+    value.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +733,15 @@ mod tests {
         );
         assert!(int8_value(Some(vec![0; 4])).is_err());
         assert_eq!(int4_value(Some(vec![0xff; 4])).unwrap(), -1);
+    }
+
+    #[test]
+    fn a_null_lo_read_value_reads_nothing() {
+        let mut buf = [7u8; 4];
+        assert_eq!(read_into(&mut buf, None), 0);
+        assert_eq!(buf, [7; 4]);
+        assert_eq!(read_into(&mut buf, Some(b"ab".to_vec())), 2);
+        assert_eq!(buf, [b'a', b'b', 7, 7]);
     }
 
     #[test]

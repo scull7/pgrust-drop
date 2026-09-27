@@ -353,6 +353,30 @@ mod tests {
     }
 
     #[test]
+    fn a_server_error_under_a_file_carries_no_locus_yet() {
+        // Divergence (docs/divergences.md): C writes it with `pg_log_info`
+        // (`common.c:457`), whose locus callback (`startup.c:99`) prefixes
+        // `psql:<file>:<line>: ` while `-f` runs. rpsql writes it bare.
+        let error = ResultError::new(vec![
+            (b'S', b"ERROR".to_vec()),
+            (b'C', b"22012".to_vec()),
+            (b'M', b"division by zero".to_vec()),
+        ]);
+        let mut runner = QueryRunner::new();
+        runner.push(Backend::ErrorResponse(error)).unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        let pset = PsqlSettings {
+            inputfile: Some("f.sql".to_string()),
+            lineno: 3,
+            ..PsqlSettings::default()
+        };
+        let (_, _, err) = run(runner.into_results(), &pset);
+        assert_eq!(err, "ERROR:  division by zero\n");
+    }
+
+    #[test]
     fn echo_queries_prints_the_query_first() {
         let pset = PsqlSettings {
             echo: Echo::Queries,

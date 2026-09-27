@@ -4,8 +4,9 @@
 //!
 //! Data / Calculations / Actions:
 //!
-//! - [`Files`] is the two questions the C asks of the filesystem — does
-//!   `stat` succeed, and what does `fopen` + `fgets` read — so the lookup
+//! - [`Files`] is the questions the C asks of the filesystem — does
+//!   `stat` succeed, what does `fopen` + `fgets` read, and (for the password
+//!   file, `crate::passfile`) what mode does `fstat` report — so the lookup
 //!   order is a calculation over an answer set. An in-memory map answers them
 //!   in the unit tests below, which port `t/006_service.pl`'s cases.
 //! - [`parse_service_file`] and [`parse_service_info`] are pure.
@@ -36,10 +37,15 @@ pub trait Files {
     /// `fopen` fails (`fe-connect.c:6012`). A read error after a successful
     /// open ends the file where it happened, as `fgets` returning NULL does.
     fn read(&self, path: &[u8]) -> Option<Vec<u8>>;
+
+    /// `fopen(path, "r")` then `fstat(fileno(fp))` (`fe-connect.c:7937`,
+    /// `:7942`): the file's `st_mode`, or `None` when either fails.
+    /// `passwordFromFile` asks this before it reads anything.
+    fn mode(&self, path: &[u8]) -> Option<u32>;
 }
 
 /// Files held in memory, keyed by path: a value a test states instead of a
-/// directory it has to create.
+/// directory it has to create. Every one is a regular file, mode 0600.
 impl Files for BTreeMap<Vec<u8>, Vec<u8>> {
     fn exists(&self, path: &[u8]) -> bool {
         self.contains_key(path)
@@ -47,6 +53,10 @@ impl Files for BTreeMap<Vec<u8>, Vec<u8>> {
 
     fn read(&self, path: &[u8]) -> Option<Vec<u8>> {
         self.get(path).cloned()
+    }
+
+    fn mode(&self, path: &[u8]) -> Option<u32> {
+        self.contains_key(path).then_some(0o100_600)
     }
 }
 
@@ -67,6 +77,14 @@ impl Files for Filesystem {
         // just ends — it is not "not found".
         let _ = file.read_to_end(&mut contents);
         Some(contents)
+    }
+
+    fn mode(&self, path: &[u8]) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        // Opened, not just stat'ed: a file the user cannot read is ignored
+        // without a warning in C, because fopen fails first.
+        let file = std::fs::File::open(os_path(path)).ok()?;
+        file.metadata().ok().map(|metadata| metadata.mode())
     }
 }
 

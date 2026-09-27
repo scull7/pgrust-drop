@@ -224,7 +224,7 @@ fn connect(conninfo: &str) -> Result<Connection, String> {
     let mut info = parse_conninfo(conninfo.as_bytes()).map_err(|err| err.to_string())?;
     info.add_defaults(&Env::empty(), &Filesystem)
         .expect("no service to look up");
-    Connection::connect(&info).map_err(|err| err.to_string())
+    Connection::connect(&info, &Env::empty(), &Filesystem).map_err(|err| err.to_string())
 }
 
 /// Collects every mismatch, so one run reports the whole matrix as `prove`

@@ -8,7 +8,8 @@
 //! What is here so far is the connection-string front end
 //! (`PQconninfoOptions[]` and the two parsers that fill a working copy of it,
 //! proved against `t/001_uri.pl`, and the connection service files that fill
-//! in its defaults, proved against `t/006_service.pl`) and the protocol version 3 core: the wire
+//! in its defaults, proved against `t/006_service.pl`; and the password file,
+//! `~/.pgpass`, proved against `001_password.pl`'s `.pgpass` block) and the protocol version 3 core: the wire
 //! messages, the authentication methods a build without TLS or GSSAPI can do
 //! (trust, password, md5, SCRAM-SHA-256), and a `Connection` that runs simple
 //! queries and the extended-query commands, blocking (`PQexec`,
@@ -50,6 +51,7 @@ pub mod hmac;
 pub mod md5;
 pub mod message;
 pub mod negotiate;
+pub mod passfile;
 pub mod pg_config;
 pub mod pipeline;
 pub mod regress;
@@ -81,6 +83,7 @@ pub use negotiate::{
     AfterRefusal, Build, EncMethod, EncryptionOptions, GssEncMode, Negotiation, SslMode,
     SslNegotiation,
 };
+pub use passfile::{FilePassword, PassfileWarning, PasswordLookup};
 pub use pipeline::{
     AsyncStatus, CopyStep, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass,
     QueryRunner, RowMode,

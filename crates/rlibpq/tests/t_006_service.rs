@@ -52,7 +52,8 @@ fn connect_ok(env: &Env, connstr: &str, test_name: &str, sql: &str, expected_std
     if let Err(err) = info.add_defaults(env, &Filesystem) {
         panic!("{test_name}: {err}");
     }
-    let mut conn = Connection::connect(&info).unwrap_or_else(|err| panic!("{test_name}: {err}"));
+    let mut conn = Connection::connect(&info, env, &Filesystem)
+        .unwrap_or_else(|err| panic!("{test_name}: {err}"));
     let result = only(conn.exec(sql.as_bytes()).expect("PQexec"));
     assert_eq!(result.status(), ExecStatus::TuplesOk, "{test_name}");
     let stdout = String::from_utf8(unaligned(&result)).expect("utf-8");
@@ -69,7 +70,7 @@ fn connect_fails(env: &Env, connstr: &str, test_name: &str, expected_stderr: &st
     let mut info = parse_conninfo(connstr.as_bytes()).expect("conninfo parses");
     let error = match info.add_defaults(env, &Filesystem) {
         Err(err) => err.to_string(),
-        Ok(()) => match Connection::connect(&info) {
+        Ok(()) => match Connection::connect(&info, env, &Filesystem) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("{test_name}: connected"),
         },

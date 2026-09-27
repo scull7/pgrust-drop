@@ -287,6 +287,9 @@ pub struct Authenticator {
     scram: Option<ScramClient>,
     /// `conn->client_finished_auth`, `fe-auth.c:1219`.
     client_finished_auth: bool,
+    /// `conn->password_needed`: the server asked for something only a
+    /// password answers (`fe-auth.c:538`, `:1201`).
+    password_needed: bool,
 }
 
 impl Authenticator {
@@ -299,6 +302,7 @@ impl Authenticator {
             raw_nonce: raw_nonce.to_vec(),
             scram: None,
             client_finished_auth: false,
+            password_needed: false,
         }
     }
 
@@ -313,6 +317,14 @@ impl Authenticator {
     #[must_use]
     pub fn client_finished_auth(&self) -> bool {
         self.client_finished_auth
+    }
+
+    /// True once the server has asked for a password — cleartext, md5 or
+    /// SCRAM — whether or not there was one to send (`conn->password_needed`,
+    /// which `pgpassfileWarning` reads, `fe-connect.c:8057`).
+    #[must_use]
+    pub fn password_needed(&self) -> bool {
+        self.password_needed
     }
 
     /// The errors upstream appends without failing, from the SCRAM exchange.
@@ -339,12 +351,14 @@ impl Authenticator {
             AuthRequest::Gss | AuthRequest::GssContinue(_) => Err(AuthError::GssapiNotSupported),
             AuthRequest::Sspi => Err(AuthError::SspiNotSupported),
             AuthRequest::CleartextPassword => {
+                self.password_needed = true;
                 let password = self.password()?.to_vec();
                 self.client_finished_auth = true;
                 Ok(AuthStep::Send(Frontend::PasswordMessage(password)))
             }
             AuthRequest::Md5Password(salt) => {
                 // fe-auth.c:818 — md5(md5(password || user) || salt).
+                self.password_needed = true;
                 let password = self.password()?.to_vec();
                 let first = md5::md5_encrypt(&password, &self.user);
                 let crypt_pwd = md5::md5_encrypt(&first[b"md5".len()..], salt);
@@ -389,6 +403,8 @@ impl Authenticator {
         let Some(mechanism) = selected else {
             return Err(AuthError::NoSaslMechanismSupported);
         };
+        // fe-auth.c:538 — SCRAM needs the password.
+        self.password_needed = true;
 
         let password = self.password()?.to_vec();
         let mut scram = ScramClient::new(&password, mechanism, &self.raw_nonce);

@@ -499,7 +499,12 @@ mod tests {
             format!("host=127.0.0.1 port={} user=u", addr.port()).as_bytes(),
         )
         .unwrap();
-        let mut conn = Connection::connect(&info).unwrap();
+        let mut conn = Connection::connect(
+            &info,
+            &crate::conninfo::Env::empty(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         connected.send(()).unwrap();
         server.join().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -629,7 +634,12 @@ mod tests {
             format!("host={} port=5432 user=u", link.display()).as_bytes(),
         )
         .unwrap();
-        let conn = Connection::connect(&info).unwrap();
+        let conn = Connection::connect(
+            &info,
+            &crate::conninfo::Env::empty(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         let socket = server.join().unwrap();
 
         let dialled = link.join(".s.PGSQL.5432");

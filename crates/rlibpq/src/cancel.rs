@@ -496,7 +496,8 @@ mod tests {
         });
 
         let info = crate::conninfo::parse_conninfo(
-            format!("host=127.0.0.1 port={} user=u", addr.port()).as_bytes(),
+            // The scripted peer does not answer an SSLRequest.
+            format!("host=127.0.0.1 port={} user=u sslmode=disable", addr.port()).as_bytes(),
         )
         .unwrap();
         let mut conn = Connection::connect(&info).unwrap();

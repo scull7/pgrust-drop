@@ -8,7 +8,7 @@
 //! What is here so far is the connection-string front end
 //! (`PQconninfoOptions[]` and the two parsers that fill a working copy of it,
 //! proved against `t/001_uri.pl`) and the protocol version 3 core: the wire
-//! messages, the authentication methods a build without TLS or GSSAPI can do
+//! messages, the authentication methods a build without GSSAPI can do
 //! (trust, password, md5, SCRAM-SHA-256), and a `Connection` that runs simple
 //! queries and the extended-query commands, blocking (`PQexec`,
 //! `PQexecParams`, `PQprepare`, `PQexecPrepared`, `PQdescribePrepared`,
@@ -21,9 +21,10 @@
 //! `PQcancelCreate`, `PQcancelBlocking`); and the
 //! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`; and
 //! the encryption negotiation (`sslmode`, `sslnegotiation`, `gssencmode`) as
-//! a pure state machine, run today with no TLS backend, so every connection
-//! is plaintext and a mode that needs TLS is refused as a C libpq built
-//! without SSL refuses it. The
+//! a pure state machine, with SSL over rustls behind the default-on `tls`
+//! feature (ADR-0006). Without that feature every connection is plaintext
+//! and a mode that needs TLS is refused, as a C libpq built without SSL
+//! refuses it. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -54,8 +55,11 @@ pub mod pipeline;
 pub mod regress;
 pub mod result;
 pub mod scram;
+pub mod secure;
 pub mod sha256;
 mod text;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod trace;
 pub mod uri;
 
@@ -88,6 +92,7 @@ pub use result::{
     ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,
 };
 pub use scram::{Mechanism, ScramClient, ScramError};
+pub use secure::{RootCert, SslResponse, TlsError};
 pub use text::RawText;
 pub use trace::{AuthResponse, Origin, TraceFlags};
 pub use uri::{parse_uri, uri_decode};

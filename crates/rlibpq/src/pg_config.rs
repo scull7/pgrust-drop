@@ -27,13 +27,11 @@ pub const PG_KRB_SRVNAM: &str = "postgres";
 /// `scram_*_key` options, which is `SCRAM_MAX_KEY_LEN * 2`.
 pub const SCRAM_MAX_KEY_LEN: usize = 32;
 
-/// `USE_SSL` — false here, because this crate has no TLS backend yet.
-///
-/// ADR-0006 puts `rustls` behind a `tls` feature that NAT-392 adds; until then
-/// the `#else` arms at `fe-connect.c:125` and `:133` are the honest ones. A
-/// distribution libpq is built with SSL and so answers `prefer` where we answer
-/// `disable` — recorded in `docs/divergences.md`.
-pub const USE_SSL: bool = false;
+/// `USE_SSL` — the `tls` feature (ADR-0006: rustls, on by default). With it
+/// the defaults are a distribution libpq's, `prefer` (`fe-connect.c:123`,
+/// `:130`); without it the crate is upstream's client "compiled without SSL
+/// support" and takes the `#else` arms, `disable` (`:125`, `:133`).
+pub const USE_SSL: bool = cfg!(feature = "tls");
 
 /// `ENABLE_GSS` — false here; GSSAPI is feature-gated work that no issue in
 /// this milestone opens (`fe-connect.c:141`'s arm).
@@ -85,15 +83,20 @@ pub const DEFAULT_PGSOCKET_DIR: &str = "";
 mod tests {
     use super::*;
 
-    /// The pin for the `docs/divergences.md` entry: a build without TLS and
-    /// without GSSAPI takes the `#else` arm of all three, and changing that is
-    /// NAT-392's job, not a quiet edit.
+    /// The pin for the `docs/divergences.md` entry: `USE_SSL` is the `tls`
+    /// feature and picks both SSL arms; GSSAPI is never built, so its arm is
+    /// always `#else`.
     #[test]
-    fn the_ssl_and_gss_defaults_are_the_arms_a_build_without_them_takes() {
-        const { assert!(!USE_SSL) };
+    fn the_ssl_and_gss_defaults_are_the_arms_this_build_takes() {
+        assert_eq!(USE_SSL, cfg!(feature = "tls"));
         const { assert!(!ENABLE_GSS) };
-        assert_eq!(DEFAULT_SSL_MODE, "disable");
-        assert_eq!(DEFAULT_CHANNEL_BINDING, "disable");
+        let ssl_default = if cfg!(feature = "tls") {
+            "prefer"
+        } else {
+            "disable"
+        };
+        assert_eq!(DEFAULT_SSL_MODE, ssl_default);
+        assert_eq!(DEFAULT_CHANNEL_BINDING, ssl_default);
         assert_eq!(DEFAULT_GSS_MODE, "disable");
     }
 

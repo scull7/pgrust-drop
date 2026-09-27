@@ -371,9 +371,13 @@ mod tests {
     #[test]
     fn unset_options_take_the_compiled_in_defaults() {
         assert_eq!(
-            options("", NO_SSL),
+            options("", Build::THIS),
             Ok(EncryptionOptions {
-                sslmode: SslMode::Disable,
+                sslmode: if Build::THIS.use_ssl {
+                    SslMode::Prefer
+                } else {
+                    SslMode::Disable
+                },
                 sslnegotiation: SslNegotiation::Postgres,
                 gssencmode: GssEncMode::Disable,
             })
@@ -489,10 +493,11 @@ mod tests {
         assert!(options("sslrootcert=system sslmode=verify-full", SSL).is_ok());
     }
 
-    /// The guarantee `Connection::connect` leans on: in this build every
+    /// The guarantee `Connection::connect` leans on: in this build GSSAPI is
+    /// never current, and without the `tls` feature neither is SSL — so every
     /// combination the options accept starts, and ends, with plaintext.
     #[test]
-    fn this_build_only_ever_negotiates_plaintext() {
+    fn this_build_never_negotiates_what_it_cannot_do() {
         for sslmode in ["disable", "allow", "prefer", "require", "verify-full"] {
             for gssencmode in ["disable", "prefer", "require"] {
                 for sslnegotiation in ["postgres", "direct"] {
@@ -505,8 +510,14 @@ mod tests {
                     for unix_socket in [false, true] {
                         let mut negotiation =
                             Negotiation::start(&options, Build::THIS, unix_socket).unwrap();
-                        assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
-                        assert!(!negotiation.connection_failed(), "{conninfo}");
+                        assert!(negotiation.current().is_some(), "{conninfo}");
+                        while let Some(method) = negotiation.current() {
+                            assert_ne!(method, EncMethod::Gssapi, "{conninfo}");
+                            if !Build::THIS.use_ssl || unix_socket {
+                                assert_eq!(method, EncMethod::Plaintext, "{conninfo}");
+                            }
+                            negotiation.connection_failed();
+                        }
                     }
                 }
             }

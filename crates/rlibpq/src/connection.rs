@@ -32,7 +32,7 @@ use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
     next_copy_frame, next_frame,
 };
-use crate::negotiate::{Build, EncMethod, EncryptionOptions, Negotiation};
+use crate::negotiate::{AfterRefusal, Build, EncMethod, EncryptionOptions, Negotiation};
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::pipeline::{
     Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
@@ -40,6 +40,7 @@ use crate::pipeline::{
 };
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
+use crate::secure::TlsError;
 use crate::trace::{self, AuthResponse, Origin, TraceFlags};
 
 /// Anything that can stop a connection or a query.
@@ -70,6 +71,9 @@ pub enum ConnectionError {
     /// blocking call in pipeline mode, a second command outside it, leaving
     /// pipeline mode with results outstanding.
     Pipeline(PipelineError),
+    /// SSL negotiation failed: the server's answer, the root certificate,
+    /// or the handshake.
+    Tls(TlsError),
 }
 
 impl ConnectionError {
@@ -95,6 +99,7 @@ impl ConnectionError {
             ConnectionError::Conninfo(err) => err.message(),
             ConnectionError::Argument(err) => err.message(),
             ConnectionError::Pipeline(err) => err.message(),
+            ConnectionError::Tls(err) => err.message(),
         }
     }
 }
@@ -140,6 +145,12 @@ impl From<PipelineError> for ConnectionError {
 impl From<ConnError> for ConnectionError {
     fn from(err: ConnError) -> Self {
         ConnectionError::Conninfo(err)
+    }
+}
+
+impl From<TlsError> for ConnectionError {
+    fn from(err: TlsError) -> Self {
+        ConnectionError::Tls(err)
     }
 }
 
@@ -333,11 +344,15 @@ pub fn strong_random(len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// A socket: `PGconn`'s `sock`, which is either kind.
+/// A socket: `PGconn`'s `sock`, which is either kind, and, once a TLS
+/// handshake has run over a TCP one, `conn->ssl` with it.
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),
+    /// A TLS session over TCP (`conn->ssl_in_use`).
+    #[cfg(feature = "tls")]
+    Tls(Box<crate::tls::TlsStream>),
 }
 
 impl Stream {
@@ -375,6 +390,8 @@ impl Stream {
         match (self, address) {
             (_, Address::Unix(path)) => Some(Peer::Unix(path.clone())),
             (Stream::Tcp(s), Address::Tcp { .. }) => s.peer_addr().ok().map(Peer::Tcp),
+            #[cfg(feature = "tls")]
+            (Stream::Tls(s), Address::Tcp { .. }) => s.sock.peer_addr().ok().map(Peer::Tcp),
             (Stream::Unix(_), Address::Tcp { .. }) => None,
         }
     }
@@ -387,6 +404,8 @@ impl Stream {
         match self {
             Stream::Tcp(s) => s.set_nonblocking(nonblocking),
             Stream::Unix(s) => s.set_nonblocking(nonblocking),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => s.sock.set_nonblocking(nonblocking),
         }
     }
 }
@@ -396,6 +415,8 @@ impl Read for Stream {
         match self {
             Stream::Tcp(s) => s.read(buf),
             Stream::Unix(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => crate::tls::read(s, buf),
         }
     }
 }
@@ -405,6 +426,8 @@ impl Write for Stream {
         match self {
             Stream::Tcp(s) => s.write(buf),
             Stream::Unix(s) => s.write(buf),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => crate::tls::write(s, buf),
         }
     }
 
@@ -412,6 +435,8 @@ impl Write for Stream {
         match self {
             Stream::Tcp(s) => s.flush(),
             Stream::Unix(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => crate::tls::flush(s),
         }
     }
 }
@@ -499,9 +524,206 @@ pub struct Connection<S = Stream> {
     raddr: Option<Peer>,
 }
 
+/// How one connection attempt, on one socket, ended.
+enum Attempt {
+    /// ReadyForQuery.
+    Connected(Box<Connection<Stream>>),
+    /// The server refused a method on a socket that cannot carry the next
+    /// one: open another (`ENCRYPTION_NEGOTIATION_FAILED`'s case 2).
+    NewSocket,
+    /// `CONNECTION_FAILED()`: the method failed; the next, if any, gets a
+    /// new socket.
+    Failed(ConnectionError),
+}
+
+/// Action: `PQconnectPoll` from `CONNECTION_MADE` to ReadyForQuery on one
+/// socket — encryption first, falling back on the same socket when the
+/// server refuses it and the mode allows (`fe-connect.c:3187`-`:3219`),
+/// then the startup exchange.
+///
+/// # Errors
+/// What `PQconnectPoll` sends to `error_return` rather than retrying.
+fn attempt(
+    mut stream: Stream,
+    negotiation: &mut Negotiation,
+    options: EncryptionOptions,
+    conninfo: &ConnInfo,
+    address: &Address,
+) -> Result<Attempt, ConnectionError> {
+    let mut ssl_in_use = false;
+    loop {
+        match negotiation.current() {
+            Some(EncMethod::Plaintext) => break,
+            Some(EncMethod::Ssl) => match open_ssl(stream, options, conninfo, address)? {
+                SslStep::Established(tls) => {
+                    stream = tls;
+                    ssl_in_use = true;
+                    break;
+                }
+                SslStep::Refused(plain) => match negotiation.encryption_negotiation_failed() {
+                    AfterRefusal::GiveUp => return Err(TlsError::SslRequired.into()),
+                    AfterRefusal::SameConnection => stream = plain,
+                    AfterRefusal::Reconnect => return Ok(Attempt::NewSocket),
+                },
+                SslStep::Failed(err) => return Ok(Attempt::Failed(err)),
+            },
+            // Nothing selects GSSAPI without `ENABLE_GSS`, and a method is
+            // current until `connection_failed` says none is left
+            // (`negotiate::tests::this_build_never_negotiates_what_it_cannot_do`).
+            Some(EncMethod::Gssapi) | None => {
+                unreachable!("no GSSAPI in this build, and a method is always current")
+            }
+        }
+    }
+    let nonce = strong_random(RAW_NONCE_LEN)?;
+    match Connection::start_up_over(stream, conninfo, &nonce, ssl_in_use) {
+        Ok(conn) => Ok(Attempt::Connected(Box::new(conn))),
+        Err(StartupFailure::Retry(err)) => Ok(Attempt::Failed(err)),
+        Err(StartupFailure::Fatal(err)) => Err(err),
+    }
+}
+
+/// Where SSL negotiation on one socket left it.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+enum SslStep {
+    /// The handshake completed: this is the TLS stream.
+    Established(Stream),
+    /// The server answered the SSLRequest with `N`; the plaintext socket is
+    /// still good.
+    Refused(Stream),
+    /// The handshake failed, or could not start: `CONNECTION_FAILED()`
+    /// (`fe-connect.c:3861`).
+    Failed(ConnectionError),
+}
+
+/// Action: `CONNECTION_MADE`'s SSL arm and `CONNECTION_SSL_STARTUP`,
+/// `fe-connect.c:3662`-`:3869` — the SSLRequest and its answer under
+/// `sslnegotiation=postgres`, then the handshake.
+///
+/// # Errors
+/// What `CONNECTION_SSL_STARTUP` sends to `error_return`: the socket failed,
+/// the server answered `E` or nonsense, or sent bytes before the handshake.
+#[cfg(feature = "tls")]
+fn open_ssl(
+    stream: Stream,
+    options: EncryptionOptions,
+    conninfo: &ConnInfo,
+    address: &Address,
+) -> Result<SslStep, ConnectionError> {
+    use crate::negotiate::SslNegotiation;
+    use crate::secure::{self, RootCert, SslResponse};
+
+    let (Stream::Tcp(mut tcp), Address::Tcp { host, .. }) = (stream, address) else {
+        // fe-connect.c:4698 — a Unix socket only ever allows plaintext.
+        unreachable!("SSL is only negotiated over TCP")
+    };
+    let direct = options.sslnegotiation == SslNegotiation::Direct;
+    if !direct {
+        // fe-connect.c:3680
+        tcp.write_all(&secure::ssl_request())?;
+        let mut answer = [0u8; 1];
+        if tcp.read(&mut answer)? == 0 {
+            return Err(ConnectionError::ServerClosedConnection);
+        }
+        match SslResponse::from_byte(answer[0]) {
+            SslResponse::Accepted => {}
+            SslResponse::Refused => return Ok(SslStep::Refused(Stream::Tcp(tcp))),
+            SslResponse::Error => return Err(TlsError::ErrorResponseDuringSslExchange.into()),
+            SslResponse::Invalid(byte) => return Err(TlsError::InvalidSslResponse(byte).into()),
+        }
+        // fe-connect.c:3845 — anything already here arrived unencrypted.
+        if unencrypted_data_waiting(&tcp)? {
+            return Err(TlsError::UnencryptedDataAfterSslResponse.into());
+        }
+    }
+
+    // initialize_SSL (fe-secure-openssl.c:902-:1002); its failures, like
+    // the handshake's, are PGRES_POLLING_FAILED, so CONNECTION_FAILED().
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let root = secure::root_cert(
+        conninfo.get("sslrootcert"),
+        home.as_deref(),
+        options.sslmode,
+        std::path::Path::exists,
+    );
+    let unsupported =
+        |root: &[u8]| TlsError::VerificationNotSupported(crate::text::RawText::new(root.to_vec()));
+    let failed = |err: TlsError| Ok(SslStep::Failed(err.into()));
+    match root {
+        Ok(RootCert::Absent) => {}
+        Ok(RootCert::File(path)) => {
+            use std::os::unix::ffi::OsStrExt as _;
+            return failed(unsupported(path.as_os_str().as_bytes()));
+        }
+        Ok(RootCert::System) => return failed(unsupported(b"system")),
+        Err(err) => return failed(err),
+    }
+
+    let sni = secure::sni_host(conninfo.get("sslsni"), host);
+    match crate::tls::open_client_unverified(tcp, sni, direct) {
+        Ok(tls) => Ok(SslStep::Established(Stream::Tls(Box::new(tls)))),
+        Err(err) => failed(err),
+    }
+}
+
+/// Without `USE_SSL` no method but plaintext is ever current
+/// (`negotiate::tests::this_build_never_negotiates_what_it_cannot_do`).
+#[cfg(not(feature = "tls"))]
+fn open_ssl(
+    _stream: Stream,
+    _options: EncryptionOptions,
+    _conninfo: &ConnInfo,
+    _address: &Address,
+) -> Result<SslStep, ConnectionError> {
+    unreachable!("SSL is never negotiated without the tls feature")
+}
+
+/// Action: whether bytes are already waiting on the socket, without
+/// consuming them — `conn->inCursor != conn->inEnd` after the `S`
+/// (`fe-connect.c:3845`), asked of the kernel because nothing here reads
+/// ahead of the one byte.
+#[cfg(feature = "tls")]
+fn unencrypted_data_waiting(tcp: &TcpStream) -> io::Result<bool> {
+    tcp.set_nonblocking(true)?;
+    let peeked = tcp.peek(&mut [0u8; 1]);
+    tcp.set_nonblocking(false)?;
+    match peeked {
+        Ok(n) => Ok(n > 0),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// How the startup exchange failed, in `PQconnectPoll`'s two kinds.
+enum StartupFailure {
+    /// An ErrorResponse before AuthenticationOk
+    /// (`CONNECTION_AWAITING_RESPONSE`, `fe-connect.c:4145`): the next
+    /// encryption method may still get in.
+    Retry(ConnectionError),
+    /// Everything else: `goto error_return`.
+    Fatal(ConnectionError),
+}
+
+impl StartupFailure {
+    fn into_error(self) -> ConnectionError {
+        match self {
+            StartupFailure::Retry(err) | StartupFailure::Fatal(err) => err,
+        }
+    }
+}
+
+impl<E: Into<ConnectionError>> From<E> for StartupFailure {
+    fn from(err: E) -> Self {
+        StartupFailure::Fatal(err.into())
+    }
+}
+
 impl Connection<Stream> {
-    /// `PQconnectdb`: open the socket the `ConnInfo` names, send the startup
-    /// packet, authenticate, and return once ReadyForQuery arrives.
+    /// `PQconnectdb`: open the socket the `ConnInfo` names, negotiate
+    /// encryption, send the startup packet, authenticate, and return once
+    /// ReadyForQuery arrives.
     ///
     /// The caller is expected to have run `ConnInfo::add_defaults` already —
     /// `conndefaults(&Env::from_process())` is what `PQconnectdb` does with
@@ -509,9 +731,11 @@ impl Connection<Stream> {
     ///
     /// # Errors
     /// An encryption option this build refuses (`sslmode=require` without
-    /// TLS, say), the `port` is not one `PQconnectPoll` would use, the socket could not
-    /// be opened, the nonce could not be drawn, the server refused the
-    /// connection, or authentication failed.
+    /// TLS, say), the `port` is not one `PQconnectPoll` would use, the socket
+    /// could not be opened, SSL negotiation failed where the mode allows no
+    /// fallback, the nonce could not be drawn, the server refused the
+    /// connection with every method left to try, or authentication failed.
+    /// The error is the last attempt's; C libpq reports every attempt's.
     pub fn connect(conninfo: &ConnInfo) -> Result<Self, ConnectionError> {
         // fe-connect.c:1747-:1987 — `pqConnectOptions2` runs at
         // `PQconnectStart`, before `PQconnectPoll` looks at the port.
@@ -523,19 +747,26 @@ impl Connection<Stream> {
         let address = socket_address(conninfo)?;
         // fe-connect.c:3285 — the first method is chosen before the socket
         // is opened, so a combination with none fails without connecting.
-        let negotiation =
+        let mut negotiation =
             Negotiation::start(&options, Build::THIS, matches!(address, Address::Unix(_)))?;
-        // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is ever
-        // allowed (`fe-connect.c:4721`-`:4741`; pinned by
-        // `negotiate::tests::this_build_only_ever_negotiates_plaintext`), so
-        // there is no SSLRequest to send and no method to fall back to.
-        debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
-        let stream = Stream::connect(&address)?;
-        let raddr = stream.raddr(&address);
-        let nonce = strong_random(RAW_NONCE_LEN)?;
-        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
-        conn.raddr = raddr;
-        Ok(conn)
+        loop {
+            let stream = Stream::connect(&address)?;
+            let raddr = stream.raddr(&address);
+            match attempt(stream, &mut negotiation, options, conninfo, &address)? {
+                Attempt::Connected(mut conn) => {
+                    conn.raddr = raddr;
+                    return Ok(*conn);
+                }
+                // fe-connect.c:3197 — ENCRYPTION_NEGOTIATION_FAILED's case 2.
+                Attempt::NewSocket => {}
+                // fe-connect.c:3208 — CONNECTION_FAILED().
+                Attempt::Failed(err) => {
+                    if !negotiation.connection_failed() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
     }
 
     /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
@@ -563,10 +794,23 @@ impl<S: Read + Write> Connection<S> {
     /// The server sent an ErrorResponse, a message that cannot appear during
     /// startup, or an authentication request this build cannot answer.
     pub fn start_up(
-        mut stream: S,
+        stream: S,
         conninfo: &ConnInfo,
         raw_nonce: &[u8],
     ) -> Result<Self, ConnectionError> {
+        Connection::start_up_over(stream, conninfo, raw_nonce, false)
+            .map_err(StartupFailure::into_error)
+    }
+
+    /// [`Connection::start_up`], told whether `stream` is a TLS session
+    /// (`conn->ssl_in_use`, which the SASL mechanism choice reads), and
+    /// reporting which failures `PQconnectPoll` would retry.
+    fn start_up_over(
+        mut stream: S,
+        conninfo: &ConnInfo,
+        raw_nonce: &[u8],
+        ssl_in_use: bool,
+    ) -> Result<Self, StartupFailure> {
         let startup = Frontend::Startup {
             version: PROTOCOL_VERSION_3_0,
             parameters: startup_parameters(conninfo),
@@ -584,7 +828,8 @@ impl<S: Read + Write> Connection<S> {
             conninfo.get("password"),
             raw_nonce,
         )
-        .with_channel_binding(channel_binding);
+        .with_channel_binding(channel_binding)
+        .with_ssl_in_use(ssl_in_use);
 
         let mut conn = Connection {
             stream,
@@ -602,11 +847,15 @@ impl<S: Read + Write> Connection<S> {
             raddr: None,
         };
 
+        // CONNECTION_AWAITING_RESPONSE until AuthenticationOk, then
+        // CONNECTION_AUTH_OK (fe-connect.c:4309).
+        let mut authenticated = false;
         loop {
             match conn.read_message()? {
                 Backend::Authentication(request) => match authenticator.respond(&request)? {
                     AuthStep::Send(message) => conn.send(&message)?,
-                    AuthStep::Nothing | AuthStep::Complete => {}
+                    AuthStep::Nothing => {}
+                    AuthStep::Complete => authenticated = true,
                 },
                 Backend::ParameterStatus { name, value } => conn.parameters.push((name, value)),
                 Backend::BackendKeyData { pid, cancel_key } => {
@@ -615,7 +864,16 @@ impl<S: Read + Write> Connection<S> {
                 }
                 Backend::NoticeResponse(notice) => conn.notices.push(notice),
                 Backend::ErrorResponse(error) => {
-                    return Err(ConnectionError::Server(Box::new(error)));
+                    // fe-connect.c:4135 — "cannot connect now" moves to the
+                    // next host, not the next encryption method, and there
+                    // is only one host here.
+                    let retry = !authenticated && error.sqlstate() != Some(b"57P03");
+                    let err = ConnectionError::Server(Box::new(error));
+                    return Err(if retry {
+                        StartupFailure::Retry(err)
+                    } else {
+                        StartupFailure::Fatal(err)
+                    });
                 }
                 Backend::ReadyForQuery(status) => {
                     conn.transaction_status = status;
@@ -624,7 +882,9 @@ impl<S: Read + Write> Connection<S> {
                 // A 3.0 startup can still be answered with this when the
                 // server dislikes a `_pq_.` option (fe-protocol3.c:1444).
                 Backend::NegotiateProtocolVersion { .. } => {}
-                other => return Err(ConnectionError::UnexpectedMessage(message_id(&other))),
+                other => {
+                    return Err(ConnectionError::UnexpectedMessage(message_id(&other)).into());
+                }
             }
         }
     }
@@ -1671,11 +1931,11 @@ mod tests {
     /// show no `connection received` in the server log.
     #[test]
     fn a_refused_encryption_option_stops_a_connection_before_the_port_is_read() {
-        let info = conninfo("host=/nonexistent-socket-dir port=99999 sslmode=require");
+        let info = conninfo("host=/nonexistent-socket-dir port=99999 gssencmode=require");
         let error = Connection::connect(&info).unwrap_err();
         assert_eq!(
             error.message(),
-            b"sslmode value \"require\" invalid when SSL support is not compiled in".to_vec()
+            b"gssencmode value \"require\" invalid when GSSAPI support is not compiled in".to_vec()
         );
     }
 
@@ -2554,5 +2814,128 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, 1000);
+    }
+
+    /// One scripted server session: how to answer an SSLRequest, if one is
+    /// expected, and whether a trust startup follows on the same socket.
+    #[cfg(feature = "tls")]
+    type Session = (Option<&'static [u8]>, bool);
+
+    /// Action: serve `sessions` one accepted connection each, then close the
+    /// listener, so a reconnect nobody scripted is refused rather than left
+    /// hanging. Returns the port and how many sessions were served.
+    #[cfg(feature = "tls")]
+    fn scripted_ssl_server(sessions: &'static [Session]) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut served = 0;
+            for (ssl_answer, startup) in sessions {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    break;
+                };
+                served += 1;
+                if let Some(answer) = ssl_answer {
+                    let mut request = [0u8; 8];
+                    socket.read_exact(&mut request).unwrap();
+                    assert_eq!(request, crate::secure::ssl_request());
+                    socket.write_all(answer).unwrap();
+                }
+                if *startup {
+                    let mut len = [0u8; 4];
+                    socket.read_exact(&mut len).unwrap();
+                    let mut body = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+                    socket.read_exact(&mut body).unwrap();
+                    let mut reply = auth_ok();
+                    reply.extend(ready(b'I'));
+                    socket.write_all(&reply).unwrap();
+                }
+                // Hold the socket until the client is done with it.
+                let _ = socket.read(&mut [0u8; 1]);
+            }
+            served
+        });
+        (port, server)
+    }
+
+    #[cfg(feature = "tls")]
+    fn connect_scripted(
+        sessions: &'static [Session],
+        options: &str,
+    ) -> (Result<(), String>, usize) {
+        let (port, server) = scripted_ssl_server(sessions);
+        let info = conninfo(&format!(
+            "host=127.0.0.1 port={port} sslrootcert=/nonexistent/root.crt {options}"
+        ));
+        let result = Connection::connect(&info)
+            .map(drop)
+            .map_err(|err| err.to_string());
+        (result, server.join().unwrap())
+    }
+
+    /// `fe-connect.c:3801`-`:3812`: an `N` under `prefer` leaves the socket
+    /// good for the startup packet; under `require` nothing is left.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_refused_sslrequest_falls_back_on_the_same_socket_or_fails() {
+        let (result, served) = connect_scripted(&[(Some(b"N"), true)], "sslmode=prefer");
+        assert_eq!((result, served), (Ok(()), 1));
+
+        let (result, served) = connect_scripted(&[(Some(b"N"), false)], "sslmode=require");
+        assert_eq!(
+            (result, served),
+            (
+                Err("server does not support SSL, but SSL was required".to_string()),
+                1
+            )
+        );
+    }
+
+    /// `fe-connect.c:3813`-`:3830`, `:3845`: an `E`, a byte that is not an
+    /// answer, and bytes sent after the `S` all end the connection, with no
+    /// fallback even under `prefer`.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_bad_answer_to_the_sslrequest_is_fatal() {
+        const ERROR: &[Session] = &[(Some(b"E"), false)];
+        const INVALID: &[Session] = &[(Some(b"R"), false)];
+        const INJECTED: &[Session] = &[(Some(b"SX"), false)];
+        for (sessions, expected) in [
+            (ERROR, "server sent an error response during SSL exchange"),
+            (INVALID, "received invalid response to SSL negotiation: R"),
+            (INJECTED, "received unencrypted data after SSL response"),
+        ] {
+            let (result, served) = connect_scripted(sessions, "sslmode=prefer");
+            assert_eq!((result, served), (Err(expected.to_string()), 1));
+        }
+    }
+
+    /// `initialize_SSL` failing is `PGRES_POLLING_FAILED`, so
+    /// `CONNECTION_FAILED()` (`fe-connect.c:3861`): `prefer` reconnects in
+    /// plaintext, `verify-ca` has nothing left. The root file is only
+    /// looked for once the server has said `S`.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_root_certificate_failure_falls_back_where_the_mode_allows() {
+        let (result, served) = connect_scripted(
+            &[(Some(b"S"), false), (None, true)],
+            concat!(
+                "sslmode=prefer sslrootcert=",
+                env!("CARGO_MANIFEST_DIR"),
+                "/Cargo.toml"
+            ),
+        );
+        assert_eq!((result, served), (Ok(()), 2));
+
+        let (result, served) = connect_scripted(&[(Some(b"S"), false)], "sslmode=verify-ca");
+        assert_eq!(
+            (result, served),
+            (
+                Err("root certificate file \"/nonexistent/root.crt\" does not exist\n\
+                     Either provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+                    .to_string()),
+                1
+            )
+        );
     }
 }

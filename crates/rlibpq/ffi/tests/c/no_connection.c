@@ -76,6 +76,24 @@ main(void)
 	printf("PQgetvalue %s PQgetlength %d PQgetisnull %d\n",
 		   null_or_set(PQgetvalue(NULL, 0, 0)), PQgetlength(NULL, 0, 0),
 		   PQgetisnull(NULL, 0, 0));
+	printf("PQbinaryTuples %d PQfnumber %d\n", PQbinaryTuples(NULL),
+		   PQfnumber(NULL, "a"));
+	printf("PQftable %u PQftablecol %d PQfformat %d\n", PQftable(NULL, 0),
+		   PQftablecol(NULL, 0), PQfformat(NULL, 0));
+	printf("PQftype %u PQfsize %d PQfmod %d\n", PQftype(NULL, 0),
+		   PQfsize(NULL, 0), PQfmod(NULL, 0));
+	printf("PQoidStatus \"%s\" PQoidValue %u PQcmdTuples \"%s\"\n",
+		   PQoidStatus(NULL), PQoidValue(NULL), PQcmdTuples(NULL));
+	printf("PQnparams %d PQparamtype %u\n", PQnparams(NULL), PQparamtype(NULL, 0));
+	printf("PQresultErrorField %s\n",
+		   null_or_set(PQresultErrorField(NULL, PG_DIAG_SQLSTATE)));
+	printf("PQexecParams %s PQprepare %s PQexecPrepared %s\n",
+		   null_or_set(PQexecParams(NULL, "select 1", 0, NULL, NULL, NULL, NULL, 0)),
+		   null_or_set(PQprepare(NULL, "s", "select 1", 0, NULL)),
+		   null_or_set(PQexecPrepared(NULL, "s", 0, NULL, NULL, NULL, 0)));
+	printf("PQdescribePrepared %s PQdescribePortal %s\n",
+		   null_or_set(PQdescribePrepared(NULL, "s")),
+		   null_or_set(PQdescribePortal(NULL, "p")));
 	PQclear(NULL);
 	PQfinish(NULL);
 
@@ -85,6 +103,12 @@ main(void)
 	printf("PQstatus %d\n", PQstatus(conn));
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
 	printf("PQexec %s\n", null_or_set(PQexec(conn, "select 1")));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	/* PQsendQueryStart refuses before any argument is looked at */
+	printf("PQexecParams %s\n",
+		   null_or_set(PQexecParams(conn, NULL, -1, NULL, NULL, NULL, NULL, 0)));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	printf("PQdescribePortal %s\n", null_or_set(PQdescribePortal(conn, NULL)));
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
 	PQfinish(conn);
 	return 0;

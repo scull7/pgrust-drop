@@ -48,10 +48,13 @@ fn every_shim_in_the_matrix_links_from_c() {
 
 /// Past the probes, the NULL arms of every `PGconn` and `PGresult` shim
 /// (`fe-connect.c:7575`, `:7638`; `fe-exec.c:3442`, `:3450`, `:3458`, `:3512`,
-/// `:3520`, `:3541`, `:3556`, `:3783`), then a conninfo that does not parse:
-/// `PQconnectdb` still returns a `PGconn`, `CONNECTION_BAD` with
-/// `conninfo_parse`'s message (`fe-connect.c:6347`), and `PQexec` on it sends
-/// nothing (`fe-exec.c:1706`).
+/// `:3520`, `:3541`, `:3556`, `:3783`; the metadata of `:3497`, `:3528`,
+/// `:3620`, `:3717`-`:3772`, `:3796`, `:3824`, `:3853`, `:3946`, `:3957`;
+/// and `PQexecStart`'s NULL `conn`, `:2365`), then a conninfo that does not
+/// parse: `PQconnectdb` still returns a `PGconn`, `CONNECTION_BAD` with
+/// `conninfo_parse`'s message (`fe-connect.c:6347`), and `PQexec`,
+/// `PQexecParams` and `PQdescribePortal` on it send nothing
+/// (`fe-exec.c:1706`), before any argument is checked.
 #[test]
 fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
     let program = build(
@@ -86,10 +89,22 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQfname NULL\n\
          PQcmdStatus NULL\n\
          PQgetvalue NULL PQgetlength 0 PQgetisnull 1\n\
+         PQbinaryTuples 0 PQfnumber -1\n\
+         PQftable 0 PQftablecol 0 PQfformat 0\n\
+         PQftype 0 PQfsize 0 PQfmod 0\n\
+         PQoidStatus \"\" PQoidValue 0 PQcmdTuples \"\"\n\
+         PQnparams 0 PQparamtype 0\n\
+         PQresultErrorField NULL\n\
+         PQexecParams NULL PQprepare NULL PQexecPrepared NULL\n\
+         PQdescribePrepared NULL PQdescribePortal NULL\n\
          PQconnectdb set\n\
          PQstatus 1\n\
          PQerrorMessage missing \"=\" after \"bogus\" in connection info string\n\
          PQexec NULL\n\
+         PQerrorMessage no connection to the server\n\
+         PQexecParams NULL\n\
+         PQerrorMessage no connection to the server\n\
+         PQdescribePortal NULL\n\
          PQerrorMessage no connection to the server\n"
     );
     assert_eq!(outcome.status, Some(0));

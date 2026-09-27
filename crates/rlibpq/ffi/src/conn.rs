@@ -1,6 +1,7 @@
 //! `PGconn` and the blocking calls of `fe-connect.c` and `fe-exec.c` that
 //! open, use and close one: `PQconnectdb`, `PQstatus`, `PQerrorMessage`,
-//! `PQexec` and `PQfinish`.
+//! `PQexec` and `PQfinish`; and [`exec_with`], the `PQexecStart` /
+//! `PQexecFinish` frame the extended-query calls share with `PQexec`.
 //!
 //! The connection itself is an `rlibpq` [`Connection`]; this module keeps
 //! what C reads beside it — the status, `conn->errorMessage` as a C string —
@@ -158,16 +159,6 @@ fn connect(conninfo: &[u8]) -> Result<Connection, Vec<u8>> {
     Connection::connect(&info).map_err(|err| with_newline(err.message()))
 }
 
-/// The bytes of a C string argument, or `None` for NULL.
-///
-/// # Safety
-///
-/// `text` is null or a NUL-terminated string.
-unsafe fn c_bytes<'a>(text: *const c_char) -> Option<&'a [u8]> {
-    // SAFETY: the caller's contract.
-    (!text.is_null()).then(|| unsafe { CStr::from_ptr(text) }.to_bytes())
-}
-
 /// `PQconnectdb`, `fe-connect.c:820`: connect, blocking, and return the
 /// `PGconn` whatever happened; `PQstatus` and `PQerrorMessage` tell.
 ///
@@ -233,6 +224,78 @@ pub unsafe extern "C" fn PQerrorMessage(conn: *const PGconn) -> *mut c_char {
     }
 }
 
+/// Why `PQsendQueryParams` and its siblings sent nothing: an argument they
+/// check once the connection is known to be idle, the message without the
+/// newline `libpq_append_conn_error` adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused(pub(crate) Vec<u8>);
+
+impl Refused {
+    /// `fe-exec.c:1524`, `:1570`: "command string is a null pointer".
+    pub(crate) fn null_command() -> Self {
+        Refused(b"command string is a null pointer".to_vec())
+    }
+
+    /// `fe-exec.c:1565`, `:1664`: "statement name is a null pointer".
+    pub(crate) fn null_statement() -> Self {
+        Refused(b"statement name is a null pointer".to_vec())
+    }
+}
+
+/// Action: the shape every blocking `PQexec*` shares — `PQexecStart`,
+/// `PQsendQueryStart`, the call's own work, then `PQexecFinish` — with
+/// `send` checking the call's arguments and running it on the open
+/// connection.
+///
+/// NULL for a NULL `conn` (`PQexecStart`, `fe-exec.c:2365`), for a
+/// connection that is not up (`PQsendQueryStart`, `:1704`-`:1708`) and for
+/// an argument `send` refuses; otherwise the last result.
+///
+/// # Safety
+///
+/// `conn` is null or a live `PGconn` from this library.
+pub(crate) unsafe fn exec_with(
+    conn: *mut PGconn,
+    send: impl FnOnce(&mut Connection) -> Result<Result<Vec<QueryResult>, ConnectionError>, Refused>,
+) -> *mut PGresult {
+    // SAFETY: the caller's contract.
+    let Some(conn) = (unsafe { conn.as_mut() }) else {
+        return null_mut();
+    };
+    // `PQexecStart`, `fe-exec.c:2374`: a new query cycle clears the error.
+    conn.error_message = CText::default();
+    let Some(connection) = conn.connection.as_mut() else {
+        conn.error_message = CText::new(b"no connection to the server\n");
+        return null_mut();
+    };
+    let outcome = match send(connection) {
+        Ok(outcome) => exec_outcome(outcome),
+        Err(Refused(message)) => {
+            conn.error_message = CText::new(&with_newline(message));
+            return null_mut();
+        }
+    };
+    conn.report_notices();
+    conn.error_message = CText::new(&outcome.error_message);
+    if outcome.lost {
+        conn.connection = None;
+        conn.status = ConnStatus::Bad;
+    }
+    outcome
+        .result
+        .map_or(null_mut(), |result| Box::into_raw(Box::new(result)))
+}
+
+/// The bytes of a C string argument, or `None` for NULL.
+///
+/// # Safety
+///
+/// `text` is null or a NUL-terminated string that outlives `'a`.
+pub(crate) unsafe fn c_bytes<'a>(text: *const c_char) -> Option<&'a [u8]> {
+    // SAFETY: the caller's contract.
+    (!text.is_null()).then(|| unsafe { CStr::from_ptr(text) }.to_bytes())
+}
+
 /// `PQexec`, `fe-exec.c:2279`: send `query` and wait for every result;
 /// return the last, or NULL when nothing was sent.
 ///
@@ -243,32 +306,14 @@ pub unsafe extern "C" fn PQerrorMessage(conn: *const PGconn) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PQexec(conn: *mut PGconn, query: *const c_char) -> *mut PGresult {
     // SAFETY: the caller's contract.
-    let Some(conn) = (unsafe { conn.as_mut() }) else {
-        return null_mut();
-    };
-    // `PQexecStart`, `fe-exec.c:2374`: a new query cycle clears the error.
-    conn.error_message = CText::default();
-    // `PQsendQueryStart`, `fe-exec.c:1704`-`:1708`, then the argument check
-    // of `PQsendQueryInternal`, `:1453`-`:1457`.
-    let Some(connection) = conn.connection.as_mut() else {
-        conn.error_message = CText::new(b"no connection to the server\n");
-        return null_mut();
-    };
-    // SAFETY: the caller's contract.
-    let Some(query) = (unsafe { c_bytes(query) }) else {
-        conn.error_message = CText::new(b"command string is a null pointer\n");
-        return null_mut();
-    };
-    let outcome = exec_outcome(connection.exec(query));
-    conn.report_notices();
-    conn.error_message = CText::new(&outcome.error_message);
-    if outcome.lost {
-        conn.connection = None;
-        conn.status = ConnStatus::Bad;
+    unsafe {
+        exec_with(conn, |connection| {
+            // The argument check of `PQsendQueryInternal`,
+            // `fe-exec.c:1453`-`:1457`.
+            let query = c_bytes(query).ok_or_else(Refused::null_command)?;
+            Ok(connection.exec(query))
+        })
     }
-    outcome
-        .result
-        .map_or(null_mut(), |result| Box::into_raw(Box::new(result)))
 }
 
 #[cfg(test)]

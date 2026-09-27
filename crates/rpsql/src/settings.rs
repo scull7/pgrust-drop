@@ -5,8 +5,8 @@
 //! unit-tested with a settings value built in the test.
 //!
 //! Only the fields this port has reached are present; the one-shot `\g`,
-//! `\gset`, `\crosstabview` and pipeline fields belong to NAT-402/NAT-403 and
-//! are not declared as dead weight here.
+//! `\gdesc`, `\crosstabview` and pipeline fields belong to NAT-402/NAT-403/NAT-404
+//! and are not declared as dead weight here.
 
 use rlibpq::{ContextVisibility, Verbosity};
 
@@ -411,6 +411,11 @@ pub struct PsqlSettings {
     pub stmt_lineno: u64,
     /// `timing`
     pub timing: bool,
+    /// `gset_prefix`: the one-shot `\gset` trigger and the prefix it puts on
+    /// every variable name (`settings.h:117`). `Some("")` is a bare `\gset`.
+    pub gset_prefix: Option<String>,
+    /// `gexec_flag`: the one-shot `\gexec` trigger (`settings.h:119`).
+    pub gexec_flag: bool,
 
     // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
@@ -477,6 +482,8 @@ impl Default for PsqlSettings {
             lineno: 0,
             stmt_lineno: 1,
             timing: false,
+            gset_prefix: None,
+            gexec_flag: false,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,

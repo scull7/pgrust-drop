@@ -245,6 +245,11 @@ impl Cluster {
             .env("PGPORT", self.port.to_string())
             .env("PGUSER", "regress")
             .env("LC_ALL", "C")
+            // "Set timezone and datestyle for datetime-related tests"
+            // (`pg_regress.c:785`-`:786`); libpq sends both at startup.
+            .env("PGTZ", "America/Los_Angeles")
+            .env("PGDATESTYLE", "Postgres, MDY")
+            .env_remove("PGGEQO")
             .env_remove("PGOPTIONS")
             .env_remove("PGSERVICE")
             .env_remove("PSQLRC")

@@ -288,6 +288,14 @@ impl VariableSpace {
             .and_then(|i| self.entries[i].value.as_deref())
     }
 
+    /// `VariableHasHook()` (`variables.c:438`): whether psql treats the
+    /// variable specially, set or not.
+    #[must_use]
+    pub fn has_hook(&self, name: &str) -> bool {
+        self.position(name)
+            .is_ok_and(|i| self.entries[i].substitute.is_some() || self.entries[i].assign.is_some())
+    }
+
     /// `GetVariableBool()`'s reading of a value (`variables.c` via
     /// `ParseVariableBool`), defaulting to false when unset.
     #[must_use]

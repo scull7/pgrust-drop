@@ -251,6 +251,56 @@ fn gate_section(cluster: &Cluster, section: &Section<'_>) {
     }
 }
 
+/// Ports of the `\gset` and `\gexec` gates below.
+const GSET_SECTIONS_PORT: u16 = 55_506;
+const GEXEC_SECTIONS_PORT: u16 = 55_507;
+
+/// `-- \gset` up to `-- \gdesc` (`psql.sql:99`-`:140`): a prefix, a bad
+/// name, a specially treated variable, several commands on the `\gset` line,
+/// a NULL, too many and too few rows, `ROW_COUNT` after none, and the same
+/// under `FETCH_COUNT` (which `\gset` leaves unchunked, `common.c:1769`) —
+/// against `psql.out` and C psql.
+#[test]
+fn gset_sections_match_psql_out() {
+    let (sql, expected, first) = joined_sections("-- \\gset", "-- \\gdesc", &[]);
+    let Some(cluster) = Cluster::start(GSET_SECTIONS_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &Section {
+            sql: &sql,
+            expected: &expected,
+            ..first
+        },
+    );
+}
+
+/// `-- \gexec` and `-- \gexec should work in FETCH_COUNT mode too`
+/// (`psql.sql:185`-`:206`): each field of the result run as a query and
+/// echoed, NULLs skipped, a failing one not stopping the rest — against
+/// `psql.out` and C psql.
+///
+/// The second section's queries run under `FETCH_COUNT 1`, which upstream
+/// fetches in chunks and this port does not yet (NAT-402's next slice). Each
+/// chunk's column widths come out as the whole result's here, so the gate
+/// holds; it does not claim chunking is ported.
+#[test]
+fn gexec_sections_match_psql_out() {
+    let (sql, expected, first) = joined_sections("-- \\gexec", "-- \\setenv, \\getenv", &[]);
+    let Some(cluster) = Cluster::start(GEXEC_SECTIONS_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &Section {
+            sql: &sql,
+            expected: &expected,
+            ..first
+        },
+    );
+}
+
 /// `-- show all pset options` (`psql.sql:219`): a bare `\pset` lists every
 /// print option with its startup value.
 #[test]

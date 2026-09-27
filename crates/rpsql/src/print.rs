@@ -219,8 +219,22 @@ impl TableContent<'_> {
     }
 }
 
-/// `printQuery()` (`print.c:3550`) and `printTable()` (`print.c:3444`):
-/// render one result.
+/// A table's content before the print options are applied: the part of
+/// `printTableContent` (`print.h:163`) a caller fills with
+/// `printTableAddHeader` and `printTableAddCell`, or, as `\crosstabview`
+/// does, by writing `cont.cells` directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    /// One header per column.
+    pub headers: Vec<Vec<u8>>,
+    /// One `Vec` per row, one cell per column; a NULL is already the null
+    /// string.
+    pub cells: Vec<Vec<Vec<u8>>>,
+    /// One alignment per column.
+    pub aligns: Vec<Align>,
+}
+
+/// `printQuery()` (`print.c:3550`): render one result.
 ///
 /// # Errors
 /// [`PrintError::Unsupported`] for what NAT-400 still owns.
@@ -233,8 +247,9 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         .iter()
         .map(|f| column_type_alignment(f.typid))
         .collect();
-    // `format_numeric_locale` rewrites right-aligned cells; it is a later
-    // slice's, and a no-op without a right-aligned column.
+    // `printQuery` runs right-aligned cells through `format_numeric_locale`
+    // (`print.c:3591`), and `printTable` does not; that is a later slice's,
+    // and a no-op without a right-aligned column.
     if opt.topt.numeric_locale && aligns.contains(&Align::Right) {
         return Err(PrintError::Unsupported(Unsupported::NumericLocale));
     }
@@ -252,12 +267,28 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
                 .collect()
         })
         .collect();
+    print_table(
+        Table {
+            headers,
+            cells,
+            aligns,
+        },
+        opt,
+    )
+}
+
+/// `printTable()` (`print.c:3444`): render `table` under `opt`'s table
+/// options and title, with the default footer.
+///
+/// # Errors
+/// [`PrintError::Unsupported`] for what NAT-400 still owns.
+pub fn print_table(table: Table, opt: &PrintQueryOpt) -> Result<Vec<u8>, PrintError> {
     let cont = TableContent {
         opt: &opt.topt,
         title: opt.title.as_deref(),
-        headers,
-        cells,
-        aligns,
+        headers: table.headers,
+        cells: table.cells,
+        aligns: table.aligns,
     };
 
     // `printTable()`'s switch (`print.c:3472`). Only `expanded on` (C's `1`)

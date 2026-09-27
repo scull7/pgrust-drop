@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
+use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::print::print_query;
 use crate::settings::{Echo, PsqlSettings};
 
@@ -163,6 +164,10 @@ pub fn clear_or_save_result(result: &QueryResult, pset: &mut PsqlSettings) {
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
 /// `\errverbose`.
+///
+/// A `\crosstabview` request is one-shot: upstream clears it on the way out
+/// whatever happened (`common.c:1341`); here it is taken on the way in, which
+/// nothing between the two can tell apart.
 pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
@@ -170,6 +175,7 @@ pub fn send_query(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
+    let crosstab = pset.crosstab.take();
     if query.iter().all(u8::is_ascii_whitespace) {
         return true;
     }
@@ -188,7 +194,7 @@ pub fn send_query(
     let elapsed_msec = before.elapsed().as_secs_f64() * 1000.0;
 
     let ok = match results {
-        Ok(results) => process_results(&results, pset, stdout, stderr),
+        Ok(results) => process_results(&results, crosstab.as_ref(), pset, stdout, stderr),
         // libpq's message, at info level like the server's errors
         // (`common.c:1834`): `001_basic.pl:147` expects
         // `psql:<stdin>:2: server closed the connection unexpectedly`.
@@ -209,6 +215,7 @@ pub fn send_query(
 /// The printing half of `ExecQueryAndProcessResults()` (`common.c:1581`).
 fn process_results(
     results: &[QueryResult],
+    crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -239,12 +246,19 @@ fn process_results(
             continue;
         }
         if result.status() == ExecStatus::TuplesOk {
-            match print_query(result, &pset.popt) {
+            // `PrintQueryResult()` (`common.c:1043`).
+            let printed = match crosstab {
+                Some(args) if i == last => {
+                    print_result_in_crosstab(result, args, &pset.popt).map_err(|err| err.message())
+                }
+                _ => print_query(result, &pset.popt).map_err(|err| err.to_string().into_bytes()),
+            };
+            match printed {
                 Ok(text) => {
                     let _ = stdout.write_all(&text);
                 }
-                Err(err) => {
-                    crate::logging::error(pset, err.to_string(), stderr);
+                Err(message) => {
+                    crate::logging::error(pset, message, stderr);
                     ok = false;
                 }
             }
@@ -607,5 +621,105 @@ mod tests {
             err,
             "psql:<stdin>:1: ERROR:  column \"error\" does not exist\n"
         );
+    }
+
+    fn three_columns(rows: &[[&str; 3]]) -> Vec<QueryResult> {
+        let field = |name: &str| FieldDescription {
+            name: name.as_bytes().to_vec(),
+            tableid: 0,
+            columnid: 0,
+            typid: 25,
+            typlen: -1,
+            atttypmod: -1,
+            format: 0,
+        };
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(vec![
+                field("x"),
+                field("y"),
+                field("v"),
+            ]))
+            .unwrap();
+        for row in rows {
+            runner
+                .push(Backend::DataRow(
+                    row.iter().map(|c| Some(c.as_bytes().to_vec())).collect(),
+                ))
+                .unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(b"SELECT".to_vec()))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results()
+    }
+
+    #[test]
+    fn a_crosstab_request_pivots_the_next_result_only() {
+        // `common.c:1060`, and the one-shot reset at `common.c:1341`.
+        let mut pset = PsqlSettings {
+            crosstab: Some(crate::crosstab::CtvArgs::default()),
+            ..PsqlSettings::default()
+        };
+        let mut executor = Replay(vec![
+            three_columns(&[["1", "a", "*a"], ["1", "b", "*b"]]),
+            three_columns(&[["1", "a", "*a"]]),
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(send_query(
+            &mut executor,
+            b"q",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            " x | a  | b  \n---+----+----\n 1 | *a | *b\n(1 row)\n\n"
+        );
+        assert_eq!(pset.crosstab, None);
+
+        let mut out = Vec::new();
+        assert!(send_query(
+            &mut executor,
+            b"q",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            " x | y | v  \n---+---+----\n 1 | a | *a\n(1 row)\n\n"
+        );
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_crosstab_that_fails_logs_and_fails_the_query() {
+        let mut pset = PsqlSettings {
+            crosstab: Some(crate::crosstab::CtvArgs::default()),
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut executor = Replay(vec![three_columns(&[["1", "a", "*"], ["1", "a", "*a"]])]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(!send_query(
+            &mut executor,
+            b"q",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "\\crosstabview: query result contains multiple data values for row \"1\", column \"a\"\n"
+        );
+        assert_eq!(pset.crosstab, None);
     }
 }

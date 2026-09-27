@@ -11,3 +11,5 @@ crates/pgdrop/share/timezone/** binary
 # spaces included, so no end-of-line conversion.
 crates/rpsql/tests/regress/psql.sql -text
 crates/rpsql/tests/regress/expected/psql.out -text
+crates/rpsql/tests/regress/psql_crosstab.sql -text
+crates/rpsql/tests/regress/expected/psql_crosstab.out -text

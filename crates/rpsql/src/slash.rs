@@ -32,6 +32,40 @@ impl SlashOption {
     }
 }
 
+/// `dequote_downcase_identifier()` (`psqlscanslash.l:783`): strip the
+/// double quotes from an identifier-ish argument, `""` inside quotes being
+/// one literal quote, and with `downcase` fold the letters outside quotes to
+/// lower case. `FOO"BAR"BAZ` becomes `fooBARbaz`.
+///
+/// Upstream folds with `pg_tolower`, stepping over multibyte characters, and
+/// so under the C locale touches only ASCII `A`-`Z`. This port's arguments
+/// are UTF-8, where every byte of a multibyte character is non-ASCII, so an
+/// ASCII fold byte by byte is the same thing.
+#[must_use]
+pub fn dequote_downcase_identifier(s: &[u8], downcase: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut inquotes = false;
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c == b'"' {
+            if inquotes && s.get(i + 1) == Some(&b'"') {
+                // Keep the first quote, remove the second.
+                out.push(b'"');
+                i += 2;
+                continue;
+            }
+            inquotes = !inquotes;
+        } else if downcase && !inquotes {
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
 impl Scanner {
     /// `psql_scan_slash_command()` (`psqlscanslash.l:480`): the command name,
     /// which ends at whitespace or a backslash.
@@ -364,5 +398,24 @@ mod tests {
     fn a_backquoted_argument_is_flagged_rather_than_run() {
         let (_, options) = slash("\\echo `date`", &NoVariables);
         assert!(options[0].backquote());
+    }
+
+    #[test]
+    fn dequote_downcase_identifier_strips_quotes_and_folds_what_they_do_not_cover() {
+        let d =
+            |s: &str| String::from_utf8(dequote_downcase_identifier(s.as_bytes(), true)).unwrap();
+        // `psqlscanslash.l:776`'s own example.
+        assert_eq!(d("FOO\"BAR\"BAZ"), "fooBARbaz");
+        // `psql_crosstab.sql:38`: a doubled quote inside quotes is one quote.
+        assert_eq!(d("\"\"\"month\"\" name\""), "\"month\" name");
+        assert_eq!(d("\"22\""), "22");
+        assert_eq!(d("B"), "b");
+        assert_eq!(d("\"B\""), "B");
+        // Only ASCII folds; a multibyte character passes through.
+        assert_eq!(d("ÄB"), "Äb");
+        assert_eq!(
+            dequote_downcase_identifier(b"\"A\"B", false),
+            b"AB".to_vec()
+        );
     }
 }

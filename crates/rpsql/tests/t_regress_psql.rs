@@ -30,31 +30,24 @@ use rlibpq::{Backend, FieldDescription, QueryResult, QueryRunner, TransactionSta
 use rpsql::print::{PrintError, print_query};
 use rpsql::pset::do_pset;
 use rpsql::settings::{PrintQueryOpt, PsqlSettings};
-use testkit::reference;
 
-use regress::{Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, split};
+use regress::{
+    Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, sha256_hex, split,
+};
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
-}
 
 #[test]
 fn the_vendored_files_are_the_ones_postgresql_18_6_ships() {
     // ADR-0008: vendored bytes come from the tag or the tarball, and a
     // digest pins them so a local edit cannot pass for upstream.
     assert_eq!(
-        hex(&rlibpq::sha256::sha256(PSQL_SQL.as_bytes())),
+        sha256_hex(PSQL_SQL.as_bytes()),
         regress::PSQL_SQL_SHA256,
         "crates/rpsql/tests/regress/psql.sql is not REL_18_6's src/test/regress/sql/psql.sql"
     );
     assert_eq!(
-        hex(&rlibpq::sha256::sha256(PSQL_OUT.as_bytes())),
+        sha256_hex(PSQL_OUT.as_bytes()),
         regress::PSQL_OUT_SHA256,
         "crates/rpsql/tests/regress/expected/psql.out is not REL_18_6's src/test/regress/expected/psql.out"
     );
@@ -231,25 +224,9 @@ fn startup_popt() -> PrintQueryOpt {
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 
-/// Run `section` through rpsql against `cluster`, and through C psql when this
-/// lane has one, and require both to print exactly `psql.out`'s slice.
+/// [`regress::gate_section`] for rpsql.
 fn gate_section(cluster: &Cluster, section: &Section<'_>) {
-    let ours = cluster.run_script(Path::new(RPSQL), section.sql);
-    if let Some(diff) = first_difference(section.expected.as_bytes(), &ours) {
-        panic!(
-            "rpsql, psql.sql:{} vs psql.out:{} ({}): {diff}",
-            section.sql_line, section.out_line, section.header
-        );
-    }
-    match cluster.reference_psql() {
-        Some(psql) => {
-            let theirs = cluster.run_script(&psql, section.sql);
-            if let Some(diff) = first_difference(&theirs, &ours) {
-                panic!("rpsql vs C psql ({}): {diff}", section.header);
-            }
-        }
-        None => reference::skip("psql"),
-    }
+    regress::gate_section(cluster, Path::new(RPSQL), section);
 }
 
 /// `-- show all pset options` (`psql.sql:219`): a bare `\pset` lists every

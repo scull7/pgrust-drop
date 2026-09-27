@@ -17,7 +17,8 @@
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`
-//! and `\errverbose`. `\d` is NAT-401's and interactive input is NAT-405's.
+//! and `\errverbose`. NAT-404 adds `\crosstabview` ([`crosstab`],
+//! `crosstabview.c`). `\d` is NAT-401's and interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -33,6 +34,7 @@
 
 pub mod command;
 pub mod common;
+pub mod crosstab;
 pub mod help;
 pub mod logging;
 pub mod mainloop;

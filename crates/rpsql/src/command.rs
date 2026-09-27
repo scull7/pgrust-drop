@@ -4,14 +4,16 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
-//! NAT-400 adds `\pset`, and NAT-403 `\timing` and `\errverbose`. Everything
-//! else is [`CommandResult::Unknown`], which renders upstream's
-//! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
+//! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, and NAT-404
+//! `\crosstabview`. Everything else is [`CommandResult::Unknown`], which
+//! renders upstream's `invalid command \%s`; NAT-401 … NAT-403 fill the table
+//! in.
 
 use std::io::Write;
 
 use rlibpq::{ContextVisibility, Verbosity};
 
+use crate::crosstab::CtvArgs;
 use crate::logging;
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::PsqlSettings;
@@ -164,7 +166,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
     let takes = match cmd {
         // `\echo` and friends take everything.
         "echo" | "qecho" | "warn" | "set" => return Vec::new(),
-        "c" | "connect" => 4,
+        "c" | "connect" | "crosstabview" => 4,
         "pset" => 2,
         "unset" | "timing" => 1,
         _ => 0,
@@ -188,6 +190,16 @@ fn exec_command(
         "q" | "quit" => CommandResult::Terminate,
         // `exec_command_connect()` (`command.c:638`).
         "c" | "connect" => CommandResult::Connect(Box::new(ConnectRequest::from_options(options))),
+        // `exec_command_crosstabview()` (`command.c:997`): keep up to four
+        // arguments for the next `SendQuery`, and send.
+        "crosstabview" => {
+            let mut args = CtvArgs::default();
+            for (slot, option) in args.0.iter_mut().zip(options) {
+                *slot = Some(option.value.clone());
+            }
+            ctx.pset.crosstab = Some(args);
+            CommandResult::Send
+        }
         // `exec_command_echo()` (`command.c:1559`).
         "echo" | "qecho" | "warn" => {
             let sink: &mut dyn Write = if cmd == "warn" { stderr } else { stdout };
@@ -497,6 +509,52 @@ mod tests {
             run.stderr,
             "psql: warning: \\q: extra argument \"one\" ignored\n"
         );
+    }
+
+    #[test]
+    fn crosstabview_keeps_four_arguments_for_the_next_query_and_sends() {
+        // `command.c:997`: the arguments are read as OT_NORMAL, so a double-
+        // quoted name keeps its quotes for `dequote_downcase_identifier`.
+        let (status, pset, stderr) = dispatch("\\crosstabview v \"month name\" 4 num extra");
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(
+            pset.crosstab,
+            Some(CtvArgs([
+                Some("v".into()),
+                Some("\"month name\"".into()),
+                Some("4".into()),
+                Some("num".into()),
+            ]))
+        );
+        assert_eq!(
+            stderr,
+            "psql: warning: \\crosstabview: extra argument \"extra\" ignored\n"
+        );
+        let (_, pset, _) = dispatch("\\crosstabview");
+        assert_eq!(pset.crosstab, Some(CtvArgs::default()));
+    }
+
+    #[test]
+    fn under_terse_logging_a_message_has_no_prefix() {
+        // What `pg_regress` sees: psql reading a script from stdin
+        // (`command.c:4970`), e.g. `psql.out:4724`.
+        let mut vars = VariableSpace::new();
+        let mut pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut scanner = Scanner::new();
+        scanner.setup(b"\\lo", true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(String::from_utf8(stderr).unwrap(), "invalid command \\lo\n");
     }
 
     /// Run one backslash command through the whole dispatch sequence, the way

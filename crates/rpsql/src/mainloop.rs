@@ -157,6 +157,13 @@ pub fn main_loop(
 
                 match slash_status {
                     CommandResult::Send => {
+                        // `copy_previous_query()` (`command.c:3850`), which
+                        // `exec_command` applies to every command that sends
+                        // (`command.c:488`): an empty buffer sends the
+                        // previous query again.
+                        if query_buf.is_empty() {
+                            query_buf.clone_from(&previous_buf);
+                        }
                         success = send_query(executor, &query_buf, session.pset, stdout, stderr);
                         std::mem::swap(&mut previous_buf, &mut query_buf);
                         query_buf.clear();
@@ -323,6 +330,17 @@ mod tests {
         let out = run("select 1\n\\echo hi\n;\n", PsqlSettings::default());
         assert_eq!(out.stdout.lines().next(), Some("hi"));
         assert_eq!(out.seen, ["select 1\n;"]);
+    }
+
+    #[test]
+    fn a_sending_command_on_an_empty_buffer_sends_the_previous_query_again() {
+        // `copy_previous_query` (`command.c:3850`), which
+        // `psql_crosstab.sql:24`'s `\crosstabview` on its own line relies on.
+        let out = run(
+            "select 1;\n\\crosstabview\nselect 2 \\crosstabview\n",
+            PsqlSettings::default(),
+        );
+        assert_eq!(out.seen, ["select 1;", "select 1;", "select 2 "]);
     }
 
     #[test]

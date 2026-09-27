@@ -36,6 +36,7 @@ pub mod outcome;
 pub mod pattern;
 pub mod reference;
 pub mod run;
+pub mod tree;
 
 pub use checks::Violation;
 pub use control::{ControlData, XLOG_CONTROL_FILE, control_file_path, read_control_file};

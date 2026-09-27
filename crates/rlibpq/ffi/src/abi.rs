@@ -143,8 +143,24 @@ const fn implemented(name: &'static str, follows: &'static str) -> Shim {
 }
 
 /// Every symbol this crate exports, in `exports.txt` order.
-pub const SHIMS: [Shim; 19] = [
+pub const SHIMS: [Shim; 35] = [
+    implemented("PQconnectdb", "fe-connect.c:820"),
     implemented("PQconndefaults", "fe-connect.c:2193"),
+    implemented("PQfinish", "fe-connect.c:5301"),
+    implemented("PQstatus", "fe-connect.c:7575"),
+    implemented("PQerrorMessage", "fe-connect.c:7638"),
+    implemented("PQexec", "fe-exec.c:2279"),
+    implemented("PQresultStatus", "fe-exec.c:3442"),
+    implemented("PQntuples", "fe-exec.c:3512"),
+    implemented("PQnfields", "fe-exec.c:3520"),
+    implemented("PQfname", "fe-exec.c:3598"),
+    implemented("PQcmdStatus", "fe-exec.c:3783"),
+    implemented("PQgetvalue", "fe-exec.c:3907"),
+    implemented("PQgetlength", "fe-exec.c:3918"),
+    implemented("PQgetisnull", "fe-exec.c:3932"),
+    implemented("PQclear", "fe-exec.c:727"),
+    implemented("PQresultErrorMessage", "fe-exec.c:3458"),
+    implemented("PQresStatus", "fe-exec.c:3450"),
     implemented("PQconninfoFree", "fe-connect.c:7459"),
     implemented("PQfreeNotify", "fe-exec.c:4080"),
     implemented("PQfreemem", "fe-exec.c:4063"),
@@ -331,8 +347,10 @@ mod tests {
     #[test]
     fn every_no_mangle_function_is_a_shim_and_every_shim_is_one() {
         let mut exported: Vec<&str> = [
+            include_str!("conn.rs"),
             include_str!("conninfo.rs"),
             include_str!("misc.rs"),
+            include_str!("result.rs"),
             include_str!("secure.rs"),
         ]
         .into_iter()
@@ -371,7 +389,7 @@ mod tests {
     fn render_matrix_counts_and_lists_every_symbol() {
         let exports = [
             Export {
-                name: "PQconnectdb",
+                name: "PQreset",
                 ordinal: 1,
             },
             Export {
@@ -383,7 +401,7 @@ mod tests {
         assert!(
             matrix.contains("1 of 2 symbols implemented, 0 stubbed with an error, 1 not yet.\n")
         );
-        assert!(matrix.contains("| 1 | `PQconnectdb` | not yet |  |\n"));
+        assert!(matrix.contains("| 1 | `PQreset` | not yet |  |\n"));
         assert!(matrix.contains("| 2 | `PQfreemem` | implemented | fe-exec.c:4063 |\n"));
     }
 }

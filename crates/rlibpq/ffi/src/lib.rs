@@ -16,7 +16,10 @@
 //! `PQconndefaults`, `PQconninfoParse` and `PQconninfoFree` over the public
 //! [`PQconninfoOption`] layout, enough for
 //! `src/interfaces/libpq/test/libpq_uri_regress.c` and `t/001_uri.pl`.
-//! Connections, results and the rest follow in later slices of NAT-395.
+//! Then the opaque [`PGconn`] and [`PGresult`] and the blocking calls over
+//! them — `PQconnectdb`, `PQstatus`, `PQerrorMessage`, `PQexec`, `PQfinish`
+//! and the result accessors — enough for `src/test/examples/testlibpq.c`.
+//! The rest follows in later slices of NAT-395.
 //!
 //! This is the one crate in the workspace that allows `unsafe`: a C ABI is
 //! raw pointers. The pure half ([`abi`]) has none, and every shim is a thin
@@ -29,18 +32,14 @@
 
 pub mod abi;
 mod alloc;
+mod conn;
 mod conninfo;
+mod ctext;
 mod misc;
+mod result;
 mod secure;
 
+pub use conn::PGconn;
 pub use conninfo::PQconninfoOption;
 pub use misc::PG_VERSION_NUM;
-
-/// `PGconn`, opaque to C (`libpq-fe.h:202`: `typedef struct pg_conn PGconn`).
-///
-/// No `PGconn` is ever created yet: `PQconnectdb` and its siblings are later
-/// slices. The shims that take one today answer what C answers for *every*
-/// connection in a build without SSL or GSSAPI, so none of them reads it.
-pub struct PGconn {
-    _unconstructed: [u8; 0],
-}
+pub use result::PGresult;

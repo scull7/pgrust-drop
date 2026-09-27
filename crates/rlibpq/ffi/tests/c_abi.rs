@@ -46,6 +46,12 @@ fn every_shim_in_the_matrix_links_from_c() {
     assert_eq!(outcome.stdout, format!("{}\n", names.len()).into_bytes());
 }
 
+/// Past the probes, the NULL arms of every `PGconn` and `PGresult` shim
+/// (`fe-connect.c:7575`, `:7638`; `fe-exec.c:3442`, `:3450`, `:3458`, `:3512`,
+/// `:3520`, `:3541`, `:3556`, `:3783`), then a conninfo that does not parse:
+/// `PQconnectdb` still returns a `PGconn`, `CONNECTION_BAD` with
+/// `conninfo_parse`'s message (`fe-connect.c:6347`), and `PQexec` on it sends
+/// nothing (`fe-exec.c:1706`).
 #[test]
 fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
     let program = build(
@@ -69,7 +75,22 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQdefaultSSLKeyPassHook_OpenSSL 0\n\
          PQgssEncInUse 0\n\
          PQgetgssctx NULL\n\
-         freed\n"
+         freed\n\
+         PQstatus 1\n\
+         PQerrorMessage connection pointer is NULL\n\
+         PQexec NULL\n\
+         PQresultStatus PGRES_FATAL_ERROR\n\
+         PQresStatus PGRES_EMPTY_QUERY|PGRES_TUPLES_CHUNK|invalid ExecStatusType code\n\
+         PQresultErrorMessage \"\"\n\
+         PQntuples 0 PQnfields 0\n\
+         PQfname NULL\n\
+         PQcmdStatus NULL\n\
+         PQgetvalue NULL PQgetlength 0 PQgetisnull 1\n\
+         PQconnectdb set\n\
+         PQstatus 1\n\
+         PQerrorMessage missing \"=\" after \"bogus\" in connection info string\n\
+         PQexec NULL\n\
+         PQerrorMessage no connection to the server\n"
     );
     assert_eq!(outcome.status, Some(0));
 }

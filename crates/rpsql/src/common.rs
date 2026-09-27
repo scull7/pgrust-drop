@@ -2594,6 +2594,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn g_with_an_empty_name_leaves_stdout_open() {
+        // Divergence (docs/divergences.md): `\g ''` gets stdout from
+        // `openQueryOutputFile` (`common.c:60`-`:64`), and C's
+        // `CloseGOutput` then `fclose`s it (`common.c:122`), so the next
+        // query fails with `could not print result table` (`common.c:789`).
+        // rpsql never closes stdout: both results print.
+        let mut executor = Replay(vec![one_row(), one_row()]);
+        let mut pset = PsqlSettings {
+            gfname: Some(Vec::new()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut output = Output::new(&mut out);
+        for _ in 0..2 {
+            let mut empty: &[u8] = b"";
+            assert!(send_query(
+                &mut executor,
+                b"select 1",
+                &mut Session {
+                    pset: &mut pset,
+                    vars: &mut vars,
+                },
+                &mut CommandSource::file(&mut empty),
+                None,
+                &mut output,
+                &mut err,
+            ));
+        }
+        drop(output);
+        let table = " ?column? \n----------\n        1\n(1 row)\n\n";
+        assert_eq!(String::from_utf8(out).unwrap(), table.repeat(2));
+        assert_eq!(err, b"");
+    }
+
     /// A one-column result of `n` rows, each `width` bytes wide.
     fn many_rows(n: usize, width: usize) -> Vec<QueryResult> {
         let mut runner = QueryRunner::new();

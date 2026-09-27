@@ -152,6 +152,39 @@ pub fn section(header: &str) -> Section<'static> {
         .unwrap_or_else(|| panic!("no section of psql.sql opens with {header:?}"))
 }
 
+/// The run of consecutive sections from the one headed `first` through the
+/// one headed `last`, as one [`Section`] keyed by `first`: for sections that
+/// only pass in order, because each starts from the `\pset` state the one
+/// before it leaves. The sections tile both files, so the run is a slice of
+/// each.
+///
+/// # Panics
+/// As [`section`], or when `last` does not come after `first`.
+pub fn sections(first: &str, last: &str) -> Section<'static> {
+    let all = split(PSQL_SQL, PSQL_OUT).expect("the vendored psql.sql and psql.out split");
+    let at = |header: &str| {
+        all.iter()
+            .position(|s| s.header == header)
+            .unwrap_or_else(|| panic!("no section of psql.sql opens with {header:?}"))
+    };
+    let (from, to) = (at(first), at(last));
+    assert!(from <= to, "{last:?} comes before {first:?}");
+    let offset = |pick: fn(&Section<'static>) -> &'static str| -> (usize, usize) {
+        let start: usize = all[..from].iter().map(|s| pick(s).len()).sum();
+        let len: usize = all[from..=to].iter().map(|s| pick(s).len()).sum();
+        (start, start + len)
+    };
+    let (sql_start, sql_end) = offset(|s| s.sql);
+    let (out_start, out_end) = offset(|s| s.expected);
+    Section {
+        header: all[from].header,
+        sql: &PSQL_SQL[sql_start..sql_end],
+        expected: &PSQL_OUT[out_start..out_end],
+        sql_line: all[from].sql_line,
+        out_line: all[from].out_line,
+    }
+}
+
 /// The C tools a cluster is started with. `psql` is not among them: the
 /// section gate compares rpsql against `psql.out` with only a server, and
 /// against C psql when that is present too.

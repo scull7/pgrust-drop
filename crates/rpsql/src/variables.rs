@@ -638,7 +638,8 @@ fn check_assign(hook: Assign, name: &str, value: Option<&str>) -> Result<(), Ass
 const fn enum_suggestions(field: EnumField) -> &'static str {
     match field {
         EnumField::Echo => "none, errors, queries, all",
-        EnumField::EchoHidden | EnumField::OnErrorRollback => "on, off, noexec",
+        EnumField::EchoHidden => "on, off, noexec",
+        EnumField::OnErrorRollback => "on, off, interactive",
         EnumField::CompCase => "lower, upper, preserve-lower, preserve-upper",
         EnumField::Histcontrol => "none, ignorespace, ignoredups, ignoreboth",
         EnumField::Verbosity => "default, verbose, terse, sqlstate",
@@ -731,7 +732,8 @@ pub fn parse_variable_double(
 }
 
 fn parse_echo(value: &str) -> Option<Echo> {
-    match value {
+    // `pg_strcasecmp` (`startup.c:1001`).
+    match value.to_ascii_lowercase().as_str() {
         "none" => Some(Echo::None),
         "errors" => Some(Echo::Errors),
         "queries" => Some(Echo::Queries),
@@ -741,7 +743,7 @@ fn parse_echo(value: &str) -> Option<Echo> {
 }
 
 fn parse_echo_hidden(value: &str) -> Option<EchoHidden> {
-    if value == "noexec" {
+    if value.eq_ignore_ascii_case("noexec") {
         return Some(EchoHidden::NoExec);
     }
     let mut on = false;
@@ -753,7 +755,7 @@ fn parse_echo_hidden(value: &str) -> Option<EchoHidden> {
 }
 
 fn parse_error_rollback(value: &str) -> Option<ErrorRollback> {
-    if value == "interactive" {
+    if value.eq_ignore_ascii_case("interactive") {
         return Some(ErrorRollback::Interactive);
     }
     let mut on = false;
@@ -765,7 +767,8 @@ fn parse_error_rollback(value: &str) -> Option<ErrorRollback> {
 }
 
 fn parse_comp_case(value: &str) -> Option<CompCase> {
-    match value {
+    // `pg_strcasecmp` (`startup.c:1071`).
+    match value.to_ascii_lowercase().as_str() {
         "lower" => Some(CompCase::Lower),
         "upper" => Some(CompCase::Upper),
         "preserve-lower" => Some(CompCase::PreserveLower),
@@ -775,7 +778,8 @@ fn parse_comp_case(value: &str) -> Option<CompCase> {
 }
 
 fn parse_histcontrol(value: &str) -> Option<HistControl> {
-    match value {
+    // `pg_strcasecmp` (`startup.c:1100`).
+    match value.to_ascii_lowercase().as_str() {
         "none" => Some(HistControl::None),
         "ignorespace" => Some(HistControl::IgnoreSpace),
         "ignoredups" => Some(HistControl::IgnoreDups),
@@ -785,7 +789,8 @@ fn parse_histcontrol(value: &str) -> Option<HistControl> {
 }
 
 fn parse_verbosity(value: &str) -> Option<rlibpq::Verbosity> {
-    match value {
+    // `pg_strcasecmp` (`startup.c:1150`).
+    match value.to_ascii_lowercase().as_str() {
         "default" => Some(rlibpq::Verbosity::Default),
         "verbose" => Some(rlibpq::Verbosity::Verbose),
         "terse" => Some(rlibpq::Verbosity::Terse),
@@ -795,7 +800,8 @@ fn parse_verbosity(value: &str) -> Option<rlibpq::Verbosity> {
 }
 
 fn parse_show_context(value: &str) -> Option<rlibpq::ContextVisibility> {
-    match value {
+    // `pg_strcasecmp` (`startup.c:1187`).
+    match value.to_ascii_lowercase().as_str() {
         "never" => Some(rlibpq::ContextVisibility::Never),
         "errors" => Some(rlibpq::ContextVisibility::Errors),
         "always" => Some(rlibpq::ContextVisibility::Always),
@@ -1029,5 +1035,39 @@ mod tests {
         let view = VarView(&vars);
 
         let _ = view.get_variable("f", QuoteType::ShellArg);
+    }
+
+    #[test]
+    fn enum_values_are_matched_without_regard_to_case() {
+        // `pg_strcasecmp` in every enum hook (`startup.c:1001`-`:1187`).
+        let mut vars = VariableSpace::new();
+        for (name, value) in [
+            ("ECHO", "ALL"),
+            ("ECHO_HIDDEN", "NoExec"),
+            ("ON_ERROR_ROLLBACK", "Interactive"),
+            ("COMP_KEYWORD_CASE", "UPPER"),
+            ("HISTCONTROL", "IgnoreBoth"),
+            ("VERBOSITY", "Terse"),
+            ("SHOW_CONTEXT", "ALWAYS"),
+        ] {
+            vars.set(name, Some(value))
+                .unwrap_or_else(|e| panic!("{name}={value}: {}", e.message));
+        }
+        let pset = vars.settings(&PsqlSettings::default());
+        assert_eq!(pset.echo, Echo::All);
+        assert_eq!(pset.verbosity, rlibpq::Verbosity::Terse);
+        assert_eq!(pset.show_context, rlibpq::ContextVisibility::Always);
+    }
+
+    #[test]
+    fn on_error_rollback_offers_interactive_not_noexec() {
+        // `startup.c:1052`; psql.sql:17 pins the text.
+        let err = VariableSpace::new()
+            .set("ON_ERROR_ROLLBACK", Some("foo"))
+            .unwrap_err();
+        assert_eq!(
+            err.message,
+            "unrecognized value \"foo\" for \"ON_ERROR_ROLLBACK\"\nAvailable values are: on, off, interactive."
+        );
     }
 }

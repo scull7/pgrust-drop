@@ -401,3 +401,67 @@ fn if_begin_end_matching_matches_psql_out_but_for_sf() {
         },
     );
 }
+
+/// Port of the gate below.
+const SHOW_CONTEXT_THROUGH_RESULT_VARIABLES_PORT: u16 = 55_493;
+
+/// The one error cursor in [`show_context_query_buffer_and_result_variables_match_psql_out_but_for_the_cursor`]'s
+/// script, as C libpq draws it, and as rlibpq renders the same position
+/// until `reportErrorPosition` is ported (`docs/divergences.md`).
+const SYNTAX_ERROR_CURSOR: (&str, &str) = (
+    "SELECT 1 UNION;\n\
+     ERROR:  syntax error at or near \";\"\n\
+     LINE 1: SELECT 1 UNION;\n                      ^\n",
+    "SELECT 1 UNION;\n\
+     ERROR:  syntax error at or near \";\" at character 15\n",
+);
+
+/// Replace the cursor C libpq draws with rlibpq's rendering, requiring it
+/// exactly once.
+fn without_the_cursor(output: &str, whose: &str) -> String {
+    let (drawn, rendered) = SYNTAX_ERROR_CURSOR;
+    assert_eq!(output.matches(drawn).count(), 1, "the cursor in {whose}");
+    output.replacen(drawn, rendered, 1)
+}
+
+/// `-- SHOW_CONTEXT`, `-- test printing and clearing the query buffer` and
+/// `-- tests for special result variables` up to `-- working \gdesc`
+/// (`psql.sql:1142`-`:1223`), as the one script they are in `pg_regress`:
+/// notices and errors under each `SHOW_CONTEXT`, `\p` and `\r`, and
+/// `ERROR`, `SQLSTATE`, `ROW_COUNT` and `LAST_ERROR_*` after a working
+/// query, a syntax error, an empty query and another error, at the default,
+/// `terse` and `sqlstate` verbosities — against `psql.out` and C psql.
+///
+/// The syntax error at the default verbosity (`psql.sql:1186`) is where
+/// libpq draws its error cursor, `reportErrorPosition`
+/// (`fe-protocol3.c:1202`), which rlibpq does not port yet: it renders the
+/// position as ` at character 15` instead (`docs/divergences.md`). Exactly
+/// that block is rewritten in the expected output, and in C psql's, and must
+/// occur exactly once in each, so the gate cannot quietly widen. The rest of
+/// the section — `\gdesc` and the chunked `FETCH_COUNT` blocks — is
+/// NAT-402's later slices.
+#[test]
+fn show_context_query_buffer_and_result_variables_match_psql_out_but_for_the_cursor() {
+    let (sql, expected, first) = joined_sections("-- SHOW_CONTEXT", "-- working \\gdesc", &[]);
+    let expected = without_the_cursor(&expected, "psql.out");
+    let Some(cluster) = Cluster::start(SHOW_CONTEXT_THROUGH_RESULT_VARIABLES_PORT) else {
+        return;
+    };
+    let ours = cluster.run_script(Path::new(RPSQL), &sql);
+    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
+        panic!(
+            "rpsql, psql.sql:{} vs psql.out:{}: {diff}",
+            first.sql_line, first.out_line
+        );
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script(&psql, &sql);
+            let theirs = without_the_cursor(&String::from_utf8_lossy(&theirs), "C psql's output");
+            if let Some(diff) = first_difference(theirs.as_bytes(), &ours) {
+                panic!("rpsql vs C psql (-- SHOW_CONTEXT …): {diff}");
+            }
+        }
+        None => reference::skip("psql"),
+    }
+}

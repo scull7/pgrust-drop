@@ -7,7 +7,7 @@
 //! one would: `\w |cmd \else` keeps the `\else`, `\echo x \else` does not.
 //!
 //! Commands ported so far: `\q`, `\c` (refused by [`dispatch_slash`] until
-//! NAT-405), `\echo`/`\qecho`/`\warn`, `\set`, `\unset`, `\pset` (NAT-400),
+//! NAT-405), `\echo`/`\qecho`/`\warn`, `\p`, `\r`, `\set`, `\unset`, `\pset` (NAT-400),
 //! `\if`/`\elif`/`\else`/`\endif` and a bare `\g`. Every other command upstream knows is in
 //! [`unported_shape`]: skipped correctly in an inactive branch, refused with
 //! `\X is not implemented yet` in an active one. Anything else renders
@@ -299,8 +299,9 @@ pub enum ArgShape {
 #[must_use]
 pub fn unported_shape(cmd: &str) -> Option<ArgShape> {
     let shape = match cmd {
-        "a" | "conninfo" | "copyright" | "errverbose" | "gdesc" | "gexec" | "H" | "html" | "p"
-        | "print" | "r" | "reset" => ArgShape::None,
+        "a" | "conninfo" | "copyright" | "errverbose" | "gdesc" | "gexec" | "H" | "html" => {
+            ArgShape::None
+        }
         "o" | "out" | "w" | "write" => ArgShape::FilePipe,
         "ef" | "ev" | "h" | "help" | "sf" | "sf+" | "sv" | "sv+" | "unrestrict" | "!" => {
             ArgShape::WholeLine
@@ -348,10 +349,12 @@ fn exec_command(cmd: &str, c: &mut Cmd<'_, '_>) -> CommandResult {
         "endif" => exec_command_endif(c),
         "g" | "gx" => exec_command_g(c, active_branch, cmd),
         "if" => exec_command_if(c),
+        "p" | "print" => exec_command_print(c, active_branch),
         "pset" => exec_command_pset(c, active_branch),
         // `exec_command_quit()` (`command.c:2750`).
         "q" | "quit" if active_branch => CommandResult::Terminate,
         "q" | "quit" => CommandResult::SkipLine,
+        "r" | "reset" => exec_command_reset(c, active_branch),
         "set" => exec_command_set(c, active_branch),
         "unset" => exec_command_unset(c, active_branch, cmd),
         _ => match unported_shape(cmd) {
@@ -439,6 +442,44 @@ fn exec_command_echo(c: &mut Cmd<'_, '_>, active_branch: bool, cmd: &str) -> Com
         c.ctx.stdout
     };
     let _ = sink.write_all(&text);
+    CommandResult::SkipLine
+}
+
+/// `exec_command_print()` (`command.c:2482`): what `\g` would send, without
+/// touching the buffers.
+fn exec_command_print(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if active_branch {
+        let text = match &c.ctx.buffers {
+            Some(buffers) if !buffers.query.is_empty() => Some(buffers.query.as_slice()),
+            Some(buffers) if !buffers.previous.is_empty() => Some(buffers.previous),
+            _ => None,
+        };
+        // `puts` adds the newline.
+        match text {
+            Some(text) => {
+                let _ = c.ctx.stdout.write_all(text);
+                let _ = c.ctx.stdout.write_all(b"\n");
+            }
+            None if !c.ctx.pset.quiet => {
+                let _ = c.ctx.stdout.write_all(b"Query buffer is empty.\n");
+            }
+            None => {}
+        }
+    }
+    CommandResult::SkipLine
+}
+
+/// `exec_command_reset()` (`command.c:2764`).
+fn exec_command_reset(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if active_branch {
+        if let Some(buffers) = &mut c.ctx.buffers {
+            buffers.query.clear();
+        }
+        c.scanner.reset();
+        if !c.ctx.pset.quiet {
+            let _ = c.ctx.stdout.write_all(b"Query buffer reset (cleared).\n");
+        }
+    }
     CommandResult::SkipLine
 }
 
@@ -1140,6 +1181,15 @@ mod tests {
         })));
         assert_eq!(query, b"select 2");
         assert_eq!(run("\\g").result, CommandResult::Send);
+    }
+
+    #[test]
+    fn print_and_reset_say_so_unless_quiet() {
+        // `command.c:2497` and `:2771`; `-c` has no buffers to print.
+        assert_eq!(run("\\p").stdout, "Query buffer is empty.\n");
+        assert_eq!(run("\\print").result, CommandResult::SkipLine);
+        assert_eq!(run("\\r").stdout, "Query buffer reset (cleared).\n");
+        assert_eq!(run("\\reset").result, CommandResult::SkipLine);
     }
 
     #[test]

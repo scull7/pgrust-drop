@@ -15,9 +15,9 @@
 
 #![allow(clippy::doc_markdown)]
 
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::Path;
-use std::process::{Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,15 +83,50 @@ fn cancel_a_sleep(cluster: &Cluster, psql: &Path) -> Output {
         .expect("kill(1) runs");
     assert!(kill.success(), "SIGINT is delivered");
 
-    // 020_cancel.pl:43.
-    let output = child.wait_with_output().expect("psql exits");
+    // 020_cancel.pl:43. IPC::Run's `finish` waits for the exit; this waits
+    // at most `timeout_default`, so a cancel that regresses — psql still
+    // blocked on the open stdin after the sleep — fails instead of hanging.
+    let output =
+        wait_until(child, sent + Duration::from_secs(TIMEOUT_DEFAULT)).unwrap_or_else(|| {
+            panic!(
+                "{} did not exit within {TIMEOUT_DEFAULT}s of the cancel",
+                psql.display()
+            )
+        });
     drop(stdin);
-    assert!(
-        sent.elapsed() < Duration::from_secs(TIMEOUT_DEFAULT),
-        "{} returned only when the sleep ended, not at the cancel",
-        psql.display()
-    );
     output
+}
+
+/// Collect `child`'s exit status and both streams, or kill it and return
+/// `None` if it has not exited by `deadline`. The streams are drained on
+/// their own threads so a full pipe cannot stall the child.
+fn wait_until(mut child: Child, deadline: Instant) -> Option<Output> {
+    fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("the pipe reads");
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().expect("a stdout pipe"));
+    let stderr = drain(child.stderr.take().expect("a stderr pipe"));
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("psql's status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // Best effort: the test fails either way.
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    Some(Output {
+        status,
+        stdout: stdout.join().expect("the stdout reader"),
+        stderr: stderr.join().expect("the stderr reader"),
+    })
 }
 
 /// 020_cancel.pl:45-:49, both assertions, in upstream order.
@@ -143,9 +178,8 @@ fn query_was_canceled() {
             assert_eq!(ours.stderr, theirs.stderr, "stderr, as bytes");
             assert_eq!(ours.stdout, theirs.stdout, "stdout, as bytes");
         }
-        None => testkit::reference::announce_skip(&format!(
-            "{}: 020_cancel.pl ran against rpsql only; this lane's reference has no psql",
-            testkit::reference::SKIP_FLAG
-        )),
+        // 020_cancel.pl ran against rpsql only; under PGDROP_REQUIRE_REF=1
+        // a lane without C psql fails here rather than dropping the diff.
+        None => testkit::reference::skip("psql"),
     }
 }

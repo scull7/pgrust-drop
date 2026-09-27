@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rinitdb::control::{ControlFile, DataChecksums, SystemIdentifier};
+use testkit::env::Environment;
 use testkit::normalize::EXTRA_VERSION;
 use testkit::{Gate, Pattern, reference};
 
@@ -88,8 +89,13 @@ fn args(list: &[&str]) -> Vec<OsString> {
 
 /// `command_fails(...)` plus the exact stderr C writes for the same line.
 fn fails_with(argv: &[OsString], expected_stderr: &str) {
+    fails_with_in(argv, &Environment::inherited(), expected_stderr);
+}
+
+/// [`fails_with`], in `env`.
+fn fails_with_in(argv: &[OsString], env: &Environment, expected_stderr: &str) {
     testkit::command_fails(Path::new(RINITDB), argv);
-    let outcome = testkit::run(Path::new(RINITDB), argv).expect("run rinitdb");
+    let outcome = testkit::run_in(Path::new(RINITDB), argv, &[], env).expect("run rinitdb");
     assert_eq!(outcome.status, Some(1), "{argv:?}");
     assert_eq!(outcome.stdout, Vec::<u8>::new(), "{argv:?}");
     assert_eq!(
@@ -135,12 +141,39 @@ fn gate_strictly(argv: &[OsString]) {
 /// progress rinitdb does not produce yet; stderr and the exit status are gated
 /// in full and the stdout difference is flagged.
 fn gate_diagnostics(argv: &[OsString]) {
+    gate_diagnostics_in(argv, Environment::inherited());
+}
+
+/// [`gate_diagnostics`], with both binaries run in `env`.
+fn gate_diagnostics_in(argv: &[OsString], env: Environment) {
     let Some(gate) = Gate::for_tool_or_skip("initdb", RINITDB) else {
         return;
     };
     gate.with_args(argv)
+        .with_env(env)
         .stderr_and_status_only(STDOUT_PENDING)
         .assert_clean();
+}
+
+/// The environment of an installed `initdb`, which has a `postgres` beside
+/// it: `setup_bin_paths` (`initdb.c:3472`) looks for one before `--waldir`
+/// is judged, and without `--username` the superuser is the effective user,
+/// which the template's `postgres` is renamed to (`rinitdb::single_user`)
+/// unless they agree. Nothing is beside `rinitdb` in `target/`, so a
+/// stand-in that only answers `-V` is named by `PGDROP_POSTGRES` — which C
+/// `initdb` ignores. The cases that use it fail before any session starts.
+#[cfg(unix)]
+fn installed(tempdir: &TempDir) -> Environment {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = tempdir.join("postgres");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n[ \"$1\" = -V ] && echo 'postgres (PostgreSQL) 18.6' && exit 0\nexit 1\n",
+    )
+    .expect("write the stand-in postgres");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in postgres executable");
+    Environment::inherited().with(rinitdb::single_user::SERVER_ENV, path)
 }
 
 /// `program_help_ok('initdb');`
@@ -230,8 +263,10 @@ fn existing_nonempty_xlog_directory() {
         OsString::from(&datadir),
     ];
 
-    fails_with(
+    let env = installed(&tempdir);
+    fails_with_in(
         &argv,
+        &env,
         &format!(
             "initdb: error: directory \"{}\" exists but is not empty\n\
              initdb: detail: It contains a lost+found directory, perhaps due to it being a \
@@ -244,7 +279,7 @@ fn existing_nonempty_xlog_directory() {
         ),
     );
     assert!(!datadir.exists(), "the data directory was not taken back");
-    gate_diagnostics(&argv);
+    gate_diagnostics_in(&argv, env);
 }
 
 /// `command_fails([ 'initdb', '--waldir' => 'pgxlog', $datadir ],
@@ -263,8 +298,10 @@ fn relative_xlog_directory_not_allowed() {
         OsString::from(&datadir),
     ];
 
-    fails_with(
+    let env = installed(&tempdir);
+    fails_with_in(
         &argv,
+        &env,
         &format!(
             "initdb: error: WAL directory location must be an absolute path\n\
              initdb: removing data directory \"{}\"",
@@ -272,7 +309,7 @@ fn relative_xlog_directory_not_allowed() {
         ),
     );
     assert!(!datadir.exists(), "the data directory was not taken back");
-    gate_diagnostics(&argv);
+    gate_diagnostics_in(&argv, env);
 }
 
 /// `command_fails([ 'initdb', '--username' => 'pg_test', $datadir ],

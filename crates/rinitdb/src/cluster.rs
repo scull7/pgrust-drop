@@ -48,9 +48,10 @@ pub const C_TEXT_SEARCH_CONFIG: &str = "english";
 ///   C writes them to `postgresql.conf` only (`initdb.c:1315`-`:1325`) and
 ///   never into the catalogs, so [`settings`] writes them too;
 /// - `--wal-segsize` other than 16;
-/// - a superuser other than `postgres`, `-W` and `--pwfile`: renaming the
-///   superuser and setting its password happen after expansion, in
-///   single-user mode (NAT-383).
+/// - `-W` and `--pwfile`: setting the superuser's password happens after
+///   expansion, in single-user mode, and is NAT-383's next slice. Another
+///   superuser name is not refused: [`crate::single_user`] renames the
+///   template's.
 ///
 /// # Errors
 /// [`InitdbError::NotSupportedYet`] for the first of those found.
@@ -90,11 +91,6 @@ pub fn check_template_can_make(options: &Options, plan: &CreatePlan) -> Result<(
         && size.parse::<u32>().ok() != Some(pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB)
     {
         return refuse(format!("--wal-segsize={size}"), Unsupported::WalSegmentSize);
-    }
-    if let Some(name) = plan.username.as_deref()
-        && name != TEMPLATE_SUPERUSER
-    {
-        return refuse(format!("superuser name \"{name}\""), Unsupported::Superuser);
     }
     if options.pwprompt {
         return refuse("--pwprompt".to_owned(), Unsupported::Password);
@@ -205,7 +201,7 @@ pub fn musl_setlocale_name(name: &str) -> &str {
 /// and C's line would name it as `setlocale` canonicalizes it and compare
 /// `-T` with whatever `find_matching_ts_config` makes of it, neither of
 /// which this crate reaches. Every other refusal — `-E`, `--locale-provider`,
-/// `--lc-collate`, `-U`, `-W`, `--pwfile`, `--wal-segsize` — leaves
+/// `--lc-collate`, `-W`, `--pwfile`, `--wal-segsize` — leaves
 /// `lc_ctype` alone, so the line is C's whatever else is refused.
 #[must_use]
 pub fn text_search_warning(options: &Options) -> Option<String> {
@@ -382,35 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn the_superuser_is_the_templates_until_it_can_be_changed() {
-        let (options, mut plan) = parsed(&[]);
-        plan.username = Some("alice".to_owned());
-        assert_eq!(
-            check_template_can_make(&options, &plan)
-                .unwrap_err()
-                .render()
-                .lines()
-                .next(),
-            Some(
-                "initdb: error: superuser name \"alice\" is not supported yet: the embedded \
-                 template cluster's superuser is \"postgres\" and renaming it is not implemented"
-            )
-        );
-        // No -U: validate's `username = effective_user` (initdb.c:3475)
-        // reaches the same refusal.
+    fn any_superuser_name_is_made_but_a_password_is_refused() {
+        // single_user::fixup_script renames the template's superuser.
+        assert_eq!(verdict(&["-U", "alice"]), Ok(()));
+        // No -U: validate's `username = effective_user` (initdb.c:3475).
         let (options, plan) = parsed_as("alice", &[]);
-        assert_eq!(options.username, None);
-        assert_eq!(
-            check_template_can_make(&options, &plan)
-                .unwrap_err()
-                .render()
-                .lines()
-                .next(),
-            Some(
-                "initdb: error: superuser name \"alice\" is not supported yet: the embedded \
-                 template cluster's superuser is \"postgres\" and renaming it is not implemented"
-            )
-        );
+        assert_eq!(plan.username.as_deref(), Some("alice"));
+        assert_eq!(check_template_can_make(&options, &plan), Ok(()));
         assert!(
             verdict(&["--pwfile=/nonexistent"])
                 .unwrap_err()

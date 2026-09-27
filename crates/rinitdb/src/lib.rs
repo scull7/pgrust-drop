@@ -17,7 +17,8 @@
 //! `sync_pgdata`, [`control`] parses and rewrites `pg_control` over
 //! [`crc32c`], [`image`] packs and expands the template cluster ADR-0002
 //! builds on, [`wal`] writes a new cluster's first WAL segment, [`cluster`]
-//! says what the template can make and what is written on top of it, [`tz`]
+//! says what the template can make and what is written on top of it,
+//! [`single_user`] applies what it cannot carry in `postgres --single`, [`tz`]
 //! reads the timezone database and [`findtimezone`] picks
 //! the default zone over it, [`help`] is the upstream text, and [`run`] is the
 //! only function that writes to a stream.
@@ -48,6 +49,7 @@ pub mod pg_config;
 /// crate carries its own and why it is not compiled into the binary.
 #[cfg(test)]
 mod sha256;
+pub mod single_user;
 pub mod strerror;
 pub mod sync;
 pub mod tz;
@@ -81,6 +83,17 @@ const EXIT_USAGE: u8 = 2;
 
 /// Perform the invocation `args` describes, writing to the given streams.
 pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
+    run_with(args, None, stdout, stderr)
+}
+
+/// [`run`], in a binary that has a server built in: `embedded` is the last
+/// `postgres` [`single_user::resolve_server`] falls back to (pgdrop).
+pub fn run_with(
+    args: &[OsString],
+    embedded: Option<&single_user::Server>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
     // Writes to a closed stream are not worth a second error message.
     match cli::plan(args) {
         Invocation::PrintHelp => {
@@ -110,7 +123,7 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
                 // initdb.c:3439 — `--sync-only` does its one job and returns 0
                 // before any of the cluster-creation steps.
                 Ok(Plan::Sync(plan)) => sync_only(&plan, stdout, stderr),
-                Ok(Plan::Create(plan)) => create_cluster(&plan, &options, stderr),
+                Ok(Plan::Create(plan)) => create_cluster(&plan, &options, embedded, stderr),
             }
         }
     }
@@ -137,7 +150,30 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
 /// unless `lc_ctype` is not C ([`cluster::text_search_warning`]).
 /// Progress output and the closing
 /// instructions are C's stdout and are not printed yet (NAT-387).
-fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write) -> ExitCode {
+///
+/// Ahead of all of that, as `setup_bin_paths` (`initdb.c:3472`) is ahead of
+/// the `--waldir` failure and the warning in C, the `postgres` for the
+/// single-user session is found — but only when there is a session to run
+/// ([`single_user::fixup_script`] is not empty; `docs/divergences.md`).
+fn create_cluster(
+    plan: &CreatePlan,
+    options: &Options,
+    embedded: Option<&single_user::Server>,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let script = single_user::fixup_script(plan);
+    let server = if script.is_empty() {
+        None
+    } else {
+        match single_user::find_server(embedded) {
+            Ok(server) => Some(server),
+            Err(err) => {
+                let _ = writeln!(stderr, "{}", err.render());
+                return ExitCode::from(EXIT_FAILURE);
+            }
+        }
+    };
+    let session = server.as_ref().map(|server| (server, script.as_slice()));
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
     let can_make = cluster::check_template_can_make(options, plan);
     match can_make {
@@ -154,7 +190,7 @@ fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write)
         }
     }
     let mut progress = Progress::default();
-    let created = initialize_data_directory(plan, options, &mut progress)
+    let created = initialize_data_directory(plan, options, session, &mut progress)
         .and_then(|()| sync_new_cluster(plan, stderr));
     match created {
         // `success = true` (initdb.c:3562): the exit handler has nothing to do.
@@ -174,10 +210,13 @@ fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write)
 /// directory or its symlink (`:2948`), the `subdirs[]` loop (`:3068`), the
 /// top-level `PG_VERSION` (`:3087`), the configuration files (`setup_config`,
 /// `:3094`). Then the image, and the files only a template needs: a
-/// `pg_control` and a first WAL segment of this cluster's own.
+/// `pg_control` and a first WAL segment of this cluster's own. Last the
+/// single-user session, where C runs its own (`:3115`), when `session` has
+/// one to run.
 fn initialize_data_directory(
     plan: &CreatePlan,
     options: &Options,
+    session: Option<(&single_user::Server, &[single_user::SqlStatement])>,
     progress: &mut Progress,
 ) -> Result<(), InitdbError> {
     create_directories(plan, progress)?;
@@ -210,6 +249,9 @@ fn initialize_data_directory(
     image::expand(&entries(config)?, &plan.pgdata, plan.perm)?;
     image::expand(&template, &plan.pgdata, plan.perm)?;
     image::expand(&entries(rest)?, &plan.pgdata, plan.perm)?;
+    if let Some((server, script)) = session {
+        single_user::run(server, &plan.pgdata, script)?;
+    }
     Ok(())
 }
 

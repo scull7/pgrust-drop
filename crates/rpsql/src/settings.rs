@@ -5,8 +5,8 @@
 //! unit-tested with a settings value built in the test.
 //!
 //! Only the fields this port has reached are present; the one-shot `\g`,
-//! `\gdesc`, `\crosstabview` and pipeline fields belong to NAT-402/NAT-403/NAT-404
-//! and are not declared as dead weight here.
+//! `\crosstabview` and pipeline fields belong to NAT-403/NAT-404 and are not
+//! declared as dead weight here.
 
 use rlibpq::{ContextVisibility, Verbosity};
 
@@ -414,6 +414,8 @@ pub struct PsqlSettings {
     /// `gset_prefix`: the one-shot `\gset` trigger and the prefix it puts on
     /// every variable name (`settings.h:117`). `Some("")` is a bare `\gset`.
     pub gset_prefix: Option<String>,
+    /// `gdesc_flag`: the one-shot `\gdesc` trigger (`settings.h:118`).
+    pub gdesc_flag: bool,
     /// `gexec_flag`: the one-shot `\gexec` trigger (`settings.h:119`).
     pub gexec_flag: bool,
 
@@ -483,6 +485,7 @@ impl Default for PsqlSettings {
             stmt_lineno: 1,
             timing: false,
             gset_prefix: None,
+            gdesc_flag: false,
             gexec_flag: false,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,

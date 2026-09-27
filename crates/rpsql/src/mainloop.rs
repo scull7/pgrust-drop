@@ -355,6 +355,22 @@ mod tests {
                 .collect()
         }
 
+        fn prepare(&mut self, query: &[u8]) -> Vec<Reply> {
+            self.seen
+                .push(format!("Parse: {}", String::from_utf8_lossy(query)));
+            vec![Reply::Result(self.answers.remove(0))]
+        }
+
+        fn describe_prepared(&mut self) -> Vec<Reply> {
+            self.seen.push("Describe".to_string());
+            vec![Reply::Result(self.answers.remove(0))]
+        }
+
+        fn escape_literal(&self, value: &[u8]) -> Result<Vec<u8>, crate::common::ErrorMessage> {
+            rlibpq::escape_literal(value, rlibpq::ClientEncoding::Utf8)
+                .map_err(|err| crate::common::ErrorMessage::new(err.message()))
+        }
+
         fn connected(&self) -> bool {
             self.connected
         }
@@ -737,6 +753,96 @@ mod tests {
                 "select 5 as x, 6 as y ",
                 "select 7 as x, 8 as y ",
                 "select 7 as x, 8 as y ",
+            ]
+        );
+    }
+
+    /// `SELECT <x> AS x, 'Hello', <y> AS y, true AS "dirty\name"`'s one row.
+    fn x_hello_y_dirty(x: &str, y: &str) -> rlibpq::QueryResult {
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(gdesc_columns()))
+            .unwrap();
+        runner
+            .push(Backend::DataRow(
+                [x, "Hello", y, "t"]
+                    .map(|v| Some(v.as_bytes().to_vec()))
+                    .to_vec(),
+            ))
+            .unwrap();
+        runner
+            .push(Backend::CommandComplete(b"SELECT 1".to_vec()))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results().remove(0)
+    }
+
+    fn gdesc_columns() -> Vec<rlibpq::FieldDescription> {
+        use crate::common::tests::column;
+        vec![
+            column(b"x", 23, -1),
+            column(b"?column?", 25, -1),
+            column(b"y", 23, -1),
+            column(b"dirty\\name", 16, -1),
+        ]
+    }
+
+    /// The server's answers to one `\gdesc` of [`x_hello_y_dirty`]'s query:
+    /// the Parse, the Describe, and the `format_type` query.
+    fn gdesc_answers() -> Vec<rlibpq::QueryResult> {
+        use crate::common::tests::{described, parsed, rows};
+        vec![
+            parsed(),
+            described(gdesc_columns()),
+            rows(
+                &["Column", "Type"],
+                &[
+                    &[Some("x"), Some("integer")],
+                    &[Some("?column?"), Some("text")],
+                    &[Some("y"), Some("integer")],
+                    &[Some("dirty\\name"), Some("boolean")],
+                ],
+            ),
+        ]
+    }
+
+    /// psql.sql:169-175, `-- query buffer should remain unchanged` and
+    /// `-- all on one line`, against `expected/psql.out` byte for byte, the
+    /// server's answers played back: `\gdesc` prepares and describes the
+    /// buffer without running it, and leaves it for the `\g` after it,
+    /// whether that is on the next line or the same one. The live gate in
+    /// `tests/t_regress_psql.rs` runs the whole `\gdesc` section against a
+    /// server and C psql.
+    #[test]
+    fn gdesc_leaves_the_query_buffer_for_the_g_after_it() {
+        let (from, to) = (
+            "-- query buffer should remain unchanged",
+            "-- test for server bug #17983",
+        );
+        let mut answers = gdesc_answers();
+        answers.push(x_hello_y_dirty("1", "2"));
+        answers.extend(gdesc_answers());
+        answers.push(x_hello_y_dirty("3", "4"));
+        let (out, seen) = run_like_pg_regress_answering(block(PSQL_SQL, from, to), answers);
+        assert_eq!(out, block(PSQL_OUT, from, to));
+        let first = "SELECT 1 AS x, 'Hello', 2 AS y, true AS \"dirty\\name\"";
+        let second = "SELECT 3 AS x, 'Hello', 4 AS y, true AS \"dirty\\name\" ";
+        let seen: Vec<&str> = seen
+            .iter()
+            .map(String::as_str)
+            .filter(|q| !q.starts_with("SELECT name AS \"Column\""))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                format!("Parse: {first}").as_str(),
+                "Describe",
+                first,
+                &format!("Parse: {second}"),
+                "Describe",
+                second,
             ]
         );
     }

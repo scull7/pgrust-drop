@@ -8,7 +8,7 @@
 //!
 //! Commands ported so far: `\q`, `\c` (refused by [`dispatch_slash`] until
 //! NAT-405), `\echo`/`\qecho`/`\warn`, `\p`, `\r`, `\set`, `\unset`, `\pset` (NAT-400),
-//! `\if`/`\elif`/`\else`/`\endif`, a bare `\g`, `\gexec` and `\gset`. Every other command upstream knows is in
+//! `\if`/`\elif`/`\else`/`\endif`, a bare `\g`, `\gdesc`, `\gexec` and `\gset`. Every other command upstream knows is in
 //! [`unported_shape`]: skipped correctly in an inactive branch, refused with
 //! `\X is not implemented yet` in an active one. Anything else renders
 //! upstream's `invalid command \X`.
@@ -299,7 +299,7 @@ pub enum ArgShape {
 #[must_use]
 pub fn unported_shape(cmd: &str) -> Option<ArgShape> {
     let shape = match cmd {
-        "a" | "conninfo" | "copyright" | "errverbose" | "gdesc" | "H" | "html" => ArgShape::None,
+        "a" | "conninfo" | "copyright" | "errverbose" | "H" | "html" => ArgShape::None,
         "o" | "out" | "w" | "write" => ArgShape::FilePipe,
         "ef" | "ev" | "h" | "help" | "sf" | "sf+" | "sv" | "sv+" | "unrestrict" | "!" => {
             ArgShape::WholeLine
@@ -346,6 +346,7 @@ fn exec_command(cmd: &str, c: &mut Cmd<'_, '_>) -> CommandResult {
         "else" => exec_command_else(c),
         "endif" => exec_command_endif(c),
         "g" | "gx" => exec_command_g(c, active_branch, cmd),
+        "gdesc" => exec_command_gdesc(c, active_branch),
         "gexec" => exec_command_gexec(c, active_branch),
         "gset" => exec_command_gset(c, active_branch),
         "if" => exec_command_if(c),
@@ -542,6 +543,16 @@ fn exec_command_g(c: &mut Cmd<'_, '_>, active_branch: bool, cmd: &str) -> Comman
         );
         return CommandResult::Error;
     }
+    CommandResult::Send
+}
+
+/// `exec_command_gdesc()` (`command.c:1875`): send the query to be
+/// described, not run.
+fn exec_command_gdesc(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if !active_branch {
+        return CommandResult::SkipLine;
+    }
+    c.ctx.pset.gdesc_flag = true;
     CommandResult::Send
 }
 
@@ -1068,6 +1079,7 @@ mod tests {
             "\\g arg1",
             "\\g (format=csv) x",
             "\\gset pre_",
+            "\\gdesc",
             "\\gexec",
             "\\dt arg1",
             "\\lo_list",
@@ -1134,6 +1146,7 @@ mod tests {
         assert_eq!(unported_shape("lo_import"), Some(ArgShape::Options));
         assert_eq!(unported_shape("lo"), None);
         assert_eq!(unported_shape("echo"), None, "ported, so not in the table");
+        assert_eq!(unported_shape("gdesc"), None, "ported, so not in the table");
     }
 
     /// Run one backslash command through the whole dispatch sequence, the way
@@ -1163,6 +1176,16 @@ mod tests {
         );
 
         (status, pset, String::from_utf8(stderr).unwrap())
+    }
+
+    /// `exec_command_gdesc()` (`command.c:1875`): an active `\gdesc` sets
+    /// the one-shot trigger and sends the buffer.
+    #[test]
+    fn gdesc_sets_its_trigger_and_sends() {
+        let (status, pset, stderr) = dispatch("\\gdesc");
+        assert_eq!(status, CommandResult::Send);
+        assert!(pset.gdesc_flag);
+        assert_eq!(stderr, "");
     }
 
     #[test]

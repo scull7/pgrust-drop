@@ -27,6 +27,7 @@ use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::cancel::Peer;
 use crate::conninfo::ConnInfo;
 use crate::error::ConnError;
+use crate::escape::{ClientEncoding, EscapeError};
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
@@ -1363,6 +1364,34 @@ impl<S: Read + Write> Connection<S> {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_slice())
+    }
+
+    /// `PQclientEncoding`, `fe-connect.c:7728`: the `client_encoding` the
+    /// server last reported, as `pqSaveParameterStatus` reads it
+    /// (`fe-exec.c:1147`); `PG_SQL_ASCII` until it has reported one
+    /// (`fe-connect.c:679`).
+    #[must_use]
+    pub fn client_encoding(&self) -> ClientEncoding {
+        self.parameter_status(b"client_encoding")
+            .map_or(ClientEncoding::SingleByte, ClientEncoding::from_name)
+    }
+
+    /// `PQescapeLiteral`, `fe-exec.c:4413`, in the connection's client
+    /// encoding.
+    ///
+    /// # Errors
+    /// The input is not valid in the client encoding ([`EscapeError`]).
+    pub fn escape_literal(&self, input: &[u8]) -> Result<Vec<u8>, EscapeError> {
+        crate::escape::escape_literal(input, self.client_encoding())
+    }
+
+    /// `PQescapeIdentifier`, `fe-exec.c:4419`, in the connection's client
+    /// encoding.
+    ///
+    /// # Errors
+    /// As [`Connection::escape_literal`].
+    pub fn escape_identifier(&self, input: &[u8]) -> Result<Vec<u8>, EscapeError> {
+        crate::escape::escape_identifier(input, self.client_encoding())
     }
 
     /// `PQbackendPID`, `fe-connect.c:7674`.

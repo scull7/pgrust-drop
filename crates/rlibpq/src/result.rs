@@ -371,6 +371,13 @@ impl QueryResult {
         self.fields.get(column).map(|f| f.typid)
     }
 
+    /// `PQfmod`, `fe-exec.c:3772` — the column's type modifier, -1 for
+    /// none. Out of range is 0 there and `None` here.
+    #[must_use]
+    pub fn fmod(&self, column: usize) -> Option<i32> {
+        self.fields.get(column).map(|f| f.atttypmod)
+    }
+
     /// `PQnparams`, `fe-exec.c:3946` — how many parameters a described
     /// prepared statement takes.
     #[must_use]

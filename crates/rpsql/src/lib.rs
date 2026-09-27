@@ -50,8 +50,8 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    Connection, ConnectionError, ContextVisibility, Env, ExecStatus, Stream, Verbosity,
-    conndefaults,
+    Connection, ConnectionError, ContextVisibility, Env, ExecStatus, QueryResult, Stream,
+    Verbosity, conndefaults,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
@@ -125,6 +125,24 @@ impl LiveExecutor {
             .into_iter()
             .map(Reply::Notice)
     }
+
+    /// One blocking libpq call's results, after the notices parsed while it
+    /// ran, or the connection's end.
+    fn blocking(
+        &mut self,
+        call: impl FnOnce(&mut Connection<Stream>) -> Result<Vec<QueryResult>, ConnectionError>,
+    ) -> Vec<Reply> {
+        let outcome = call(&mut self.connection);
+        let mut replies: Vec<Reply> = self.notices().collect();
+        match outcome {
+            Ok(results) => replies.extend(results.into_iter().map(Reply::Result)),
+            Err(err) => {
+                self.alive = false;
+                replies.push(Reply::Broken(err.into()));
+            }
+        }
+        replies
+    }
 }
 
 impl Executor for LiveExecutor {
@@ -136,6 +154,23 @@ impl Executor for LiveExecutor {
             replies.push(Reply::Broken(err.into()));
         }
         replies
+    }
+
+    fn prepare(&mut self, query: &[u8]) -> Vec<Reply> {
+        self.blocking(|connection| connection.prepare(b"", query, &[]))
+    }
+
+    fn describe_prepared(&mut self) -> Vec<Reply> {
+        self.blocking(|connection| connection.describe_prepared(b""))
+    }
+
+    fn escape_literal(&self, value: &[u8]) -> Result<Vec<u8>, ErrorMessage> {
+        self.connection.escape_literal(value).map_err(|err| {
+            // `libpq_append_conn_error` ends the buffer with a newline.
+            let mut message = err.message();
+            message.push(b'\n');
+            ErrorMessage::new(message)
+        })
     }
 
     fn connected(&self) -> bool {

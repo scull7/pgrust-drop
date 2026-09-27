@@ -251,8 +251,9 @@ fn gate_section(cluster: &Cluster, section: &Section<'_>) {
     }
 }
 
-/// Ports of the `\gset` and `\gexec` gates below.
+/// Ports of the `\gset`, `\gdesc` and `\gexec` gates below.
 const GSET_SECTIONS_PORT: u16 = 55_506;
+const GDESC_SECTION_PORT: u16 = 55_508;
 const GEXEC_SECTIONS_PORT: u16 = 55_507;
 
 /// `-- \gset` up to `-- \gdesc` (`psql.sql:99`-`:140`): a prefix, a bad
@@ -274,6 +275,52 @@ fn gset_sections_match_psql_out() {
             ..first
         },
     );
+}
+
+/// The three error cursors in [`gdesc_section_matches_psql_out_but_for_the_cursors`]'s
+/// script, as C libpq draws them, and as rlibpq renders the same positions
+/// until `reportErrorPosition` is ported (`docs/divergences.md`).
+const GDESC_SECTION_CURSORS: [(&str, &str); 3] = [
+    (
+        "SELECT 1 + \\gdesc\n\
+         ERROR:  syntax error at end of input\n\
+         LINE 1: SELECT 1 + \n                   ^\n",
+        "SELECT 1 + \\gdesc\n\
+         ERROR:  syntax error at end of input at character 12\n",
+    ),
+    (
+        "TABLE bububu;  -- fail\n\
+         ERROR:  relation \"bububu\" does not exist\n\
+         LINE 1: TABLE bububu;\n              ^\n",
+        "TABLE bububu;  -- fail\n\
+         ERROR:  relation \"bububu\" does not exist at character 7\n",
+    ),
+    (
+        "bogus;\n\
+         ERROR:  syntax error at or near \"bogus\"\n\
+         LINE 1: bogus;\n        ^\n",
+        "bogus;\n\
+         ERROR:  syntax error at or near \"bogus\" at character 1\n",
+    ),
+];
+
+/// `-- \gdesc` (`psql.sql:141`-`:183`): each column's name and type without
+/// running the query, parameters typed by the server, a tuple-returning
+/// utility, a syntax error, statements with no columns (which are not run),
+/// the query buffer kept for the `\g` after it, and an empty statement in an
+/// aborted transaction — against `psql.out` and C psql.
+///
+/// Three of its errors are where libpq draws its error cursor, which
+/// rlibpq does not port yet: exactly those blocks are rewritten, as
+/// [`show_context_query_buffer_and_result_variables_match_psql_out_but_for_the_cursor`]
+/// rewrites its one.
+#[test]
+fn gdesc_section_matches_psql_out_but_for_the_cursors() {
+    let (sql, expected, first) = joined_sections("-- \\gdesc", "-- \\gexec", &[]);
+    let Some(cluster) = Cluster::start(GDESC_SECTION_PORT) else {
+        return;
+    };
+    gate_but_for_cursors(&cluster, &sql, &expected, &first, &GDESC_SECTION_CURSORS);
 }
 
 /// `-- \gexec` and `-- \gexec should work in FETCH_COUNT mode too`
@@ -466,12 +513,53 @@ const SYNTAX_ERROR_CURSOR: (&str, &str) = (
      ERROR:  syntax error at or near \";\" at character 15\n",
 );
 
-/// Replace the cursor C libpq draws with rlibpq's rendering, requiring it
-/// exactly once.
-fn without_the_cursor(output: &str, whose: &str) -> String {
-    let (drawn, rendered) = SYNTAX_ERROR_CURSOR;
-    assert_eq!(output.matches(drawn).count(), 1, "the cursor in {whose}");
-    output.replacen(drawn, rendered, 1)
+/// Replace each cursor C libpq draws with rlibpq's rendering, requiring
+/// each exactly once, so a gate cannot quietly widen.
+fn without_cursors(output: &str, cursors: &[(&str, &str)], whose: &str) -> String {
+    cursors
+        .iter()
+        .fold(output.to_string(), |output, (drawn, rendered)| {
+            assert_eq!(
+                output.matches(drawn).count(),
+                1,
+                "the cursor {drawn:?} in {whose}"
+            );
+            output.replacen(drawn, rendered, 1)
+        })
+}
+
+/// [`gate_section`] for a script whose output has error cursors: `sql`
+/// run through rpsql against `expected` and against C psql, each with
+/// `cursors` rewritten by [`without_cursors`].
+fn gate_but_for_cursors(
+    cluster: &Cluster,
+    sql: &str,
+    expected: &str,
+    first: &Section<'_>,
+    cursors: &[(&str, &str)],
+) {
+    let expected = without_cursors(expected, cursors, "psql.out");
+    let ours = cluster.run_script(Path::new(RPSQL), sql);
+    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
+        panic!(
+            "rpsql, psql.sql:{} vs psql.out:{}: {diff}",
+            first.sql_line, first.out_line
+        );
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script(&psql, sql);
+            let theirs = without_cursors(
+                &String::from_utf8_lossy(&theirs),
+                cursors,
+                "C psql's output",
+            );
+            if let Some(diff) = first_difference(theirs.as_bytes(), &ours) {
+                panic!("rpsql vs C psql ({}): {diff}", first.header);
+            }
+        }
+        None => reference::skip("psql"),
+    }
 }
 
 /// `-- SHOW_CONTEXT`, `-- test printing and clearing the query buffer` and
@@ -488,30 +576,52 @@ fn without_the_cursor(output: &str, whose: &str) -> String {
 /// position as ` at character 15` instead (`docs/divergences.md`). Exactly
 /// that block is rewritten in the expected output, and in C psql's, and must
 /// occur exactly once in each, so the gate cannot quietly widen. The rest of
-/// the section — `\gdesc` and the chunked `FETCH_COUNT` blocks — is
-/// NAT-402's later slices.
+/// the section is [`gdesc_result_variables_match_psql_out_but_for_the_cursor`]
+/// and, for the chunked `FETCH_COUNT` blocks, NAT-402's next slice.
 #[test]
 fn show_context_query_buffer_and_result_variables_match_psql_out_but_for_the_cursor() {
     let (sql, expected, first) = joined_sections("-- SHOW_CONTEXT", "-- working \\gdesc", &[]);
-    let expected = without_the_cursor(&expected, "psql.out");
     let Some(cluster) = Cluster::start(SHOW_CONTEXT_THROUGH_RESULT_VARIABLES_PORT) else {
         return;
     };
-    let ours = cluster.run_script(Path::new(RPSQL), &sql);
-    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
-        panic!(
-            "rpsql, psql.sql:{} vs psql.out:{}: {diff}",
-            first.sql_line, first.out_line
-        );
-    }
-    match cluster.reference_psql() {
-        Some(psql) => {
-            let theirs = cluster.run_script(&psql, &sql);
-            let theirs = without_the_cursor(&String::from_utf8_lossy(&theirs), "C psql's output");
-            if let Some(diff) = first_difference(theirs.as_bytes(), &ours) {
-                panic!("rpsql vs C psql (-- SHOW_CONTEXT …): {diff}");
-            }
-        }
-        None => reference::skip("psql"),
-    }
+    gate_but_for_cursors(&cluster, &sql, &expected, &first, &[SYNTAX_ERROR_CURSOR]);
+}
+
+/// Port of the gate below.
+const GDESC_RESULT_VARIABLES_PORT: u16 = 55_509;
+
+/// The error cursor in [`gdesc_result_variables_match_psql_out_but_for_the_cursor`]'s
+/// script, drawn and as rlibpq renders it.
+const GDESC_WITH_AN_ERROR_CURSOR: (&str, &str) = (
+    "SELECT 4 AS \\gdesc\n\
+     ERROR:  syntax error at end of input\n\
+     LINE 1: SELECT 4 AS \n                    ^\n",
+    "SELECT 4 AS \\gdesc\n\
+     ERROR:  syntax error at end of input at character 13\n",
+);
+
+/// `-- working \gdesc` and `-- \gdesc with an error` (`psql.sql:1225`-
+/// `:1237`): `ERROR`, `SQLSTATE` and `ROW_COUNT` after a `\gdesc` that
+/// worked, and the `LAST_ERROR_*` pair after one whose Parse failed —
+/// against `psql.out` and C psql, but for the one drawn cursor.
+///
+/// The rest of `-- tests for special result variables`, the chunked
+/// `FETCH_COUNT` blocks, is NAT-402's next slice.
+#[test]
+fn gdesc_result_variables_match_psql_out_but_for_the_cursor() {
+    let (sql, expected, first) = joined_sections(
+        "-- working \\gdesc",
+        "-- check row count for a query with chunked results",
+        &[],
+    );
+    let Some(cluster) = Cluster::start(GDESC_RESULT_VARIABLES_PORT) else {
+        return;
+    };
+    gate_but_for_cursors(
+        &cluster,
+        &sql,
+        &expected,
+        &first,
+        &[GDESC_WITH_AN_ERROR_CURSOR],
+    );
 }

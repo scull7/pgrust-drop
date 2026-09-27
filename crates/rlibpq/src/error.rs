@@ -1,5 +1,5 @@
 //! The messages `PQconninfoParse` leaves in its error buffer, and the ones
-//! `PQconnectPoll` appends before it opens anything.
+//! `pqConnectOptions2` and `PQconnectPoll` append before anything is opened.
 //!
 //! Each variant is one `libpq_append_error` / `libpq_append_conn_error` call
 //! site in `fe-connect.c`, and the rendering is that call's format string with
@@ -59,6 +59,28 @@ pub enum ConnError {
         value: RawText,
         option: &'static str,
     },
+    /// `fe-connect.c:1777`, `:1820`, `:1969` — `pqConnectOptions2` knows no
+    /// such value for an enumerated option.
+    InvalidValue {
+        option: &'static str,
+        value: RawText,
+    },
+    /// `fe-connect.c:1758`, `:1797`, `:1829` — a value only a build with
+    /// `USE_SSL` can honour.
+    SslNotCompiledIn {
+        option: &'static str,
+        value: RawText,
+    },
+    /// `fe-connect.c:1849` — `sslnegotiation=direct` with an `sslmode` that
+    /// could fall back to plaintext.
+    WeakSslModeWithDirect(RawText),
+    /// `fe-connect.c:1871` — `sslrootcert=system` without `verify-full`.
+    WeakSslModeWithSystemRoot(RawText),
+    /// `fe-connect.c:1976` — `gssencmode=require` in a build without
+    /// `ENABLE_GSS`.
+    GssNotCompiledIn(RawText),
+    /// `fe-connect.c:4709` — `gssencmode=require` over a Unix socket.
+    GssapiOverLocalSocket,
 }
 
 impl ConnError {
@@ -138,6 +160,32 @@ impl ConnError {
                 value,
                 &format!("\" for connection option \"{option}\""),
             ),
+            ConnError::InvalidValue { option, value } => {
+                wrap(&format!("invalid {option} value: \""), value, "\"")
+            }
+            ConnError::SslNotCompiledIn { option, value } => wrap(
+                &format!("{option} value \""),
+                value,
+                "\" invalid when SSL support is not compiled in",
+            ),
+            ConnError::WeakSslModeWithDirect(sslmode) => wrap(
+                "weak sslmode \"",
+                sslmode,
+                "\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")",
+            ),
+            ConnError::WeakSslModeWithSystemRoot(sslmode) => wrap(
+                "weak sslmode \"",
+                sslmode,
+                "\" may not be used with sslrootcert=system (use \"verify-full\")",
+            ),
+            ConnError::GssNotCompiledIn(gssencmode) => wrap(
+                "gssencmode value \"",
+                gssencmode,
+                "\" invalid when GSSAPI support is not compiled in",
+            ),
+            ConnError::GssapiOverLocalSocket => {
+                b"GSSAPI encryption required but it is not supported over a local socket".to_vec()
+            }
         }
     }
 }

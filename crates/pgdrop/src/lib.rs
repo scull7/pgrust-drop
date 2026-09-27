@@ -11,8 +11,10 @@
 //! [`postgres`] links pgrust's `main_main` (NAT-376) and hands every command
 //! line but `--version` to its `pg_main`, with the share files the server
 //! reads embedded and extracted by [`share`] (NAT-408); the rest of
-//! embedding the server (allocator, stack: NAT-407) and `start` (NAT-409)
-//! are still to come.
+//! embedding the server (allocator, stack: NAT-407) is still to come.
+//!
+//! [`start`] is `pgdrop start` (NAT-409): so far its flags and the pure plan
+//! they become; minting, spawning and `stop` are the next slice.
 //!
 //! [`measure`] is the pure half of `benches/startup.rs`, which times a
 //! throwaway cluster's life and splits the binary's size (NAT-410).
@@ -30,3 +32,4 @@ pub mod install;
 pub mod measure;
 pub mod postgres;
 pub mod share;
+pub mod start;

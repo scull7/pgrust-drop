@@ -11,9 +11,10 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-use usage::{Args, Cli, Subcommands};
+use usage::{Cli, Subcommands};
 
 use crate::install::InstallLinks;
+use crate::start::Start;
 
 /// The tools pgdrop can stand in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,18 +72,6 @@ enum Command {
     Start(Start),
     /// Create initdb, psql and postgres symlinks to this binary in DIR
     InstallLinks(InstallLinks),
-}
-
-/// Options for `pgdrop start` (NAT-409); the shape is declared now so the
-/// help page and the spec are stable.
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct Start {
-    /// TCP port to listen on; 0 means unix socket only
-    #[usage(long, default = "0")]
-    pub port: u16,
-    /// Keep the data directory when the cluster stops
-    #[usage(long)]
-    pub keep: bool,
 }
 
 /// Where a command line goes.
@@ -221,19 +210,38 @@ mod tests {
                 start,
                 Start {
                     port: 5433,
-                    keep: true
+                    keep: true,
+                    ..Start::default()
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&argv(&[
+            "pgdrop",
+            "start",
+            "--datadir",
+            "d",
+            "--foreground",
+            "--json",
+            "--set",
+            "work_mem=1MB",
+            "--set",
+            "jit=off",
+        ])) {
+            Dispatch::Start(start) => assert_eq!(
+                start,
+                Start {
+                    datadir: Some("d".into()),
+                    foreground: true,
+                    json: true,
+                    set: vec!["work_mem=1MB".into(), "jit=off".into()],
+                    ..Start::default()
                 }
             ),
             other => panic!("{other:?}"),
         }
         match dispatch(&argv(&["pgdrop", "start"])) {
-            Dispatch::Start(start) => assert_eq!(
-                start,
-                Start {
-                    port: 0,
-                    keep: false
-                }
-            ),
+            Dispatch::Start(start) => assert_eq!(start, Start::default()),
             other => panic!("{other:?}"),
         }
     }

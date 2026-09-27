@@ -192,6 +192,26 @@ pub fn backend_version_line() -> String {
     format!("postgres (PostgreSQL) {PG_VERSION}\n")
 }
 
+/// Pure: `line` is [`backend_version_line`], or that line with one
+/// parenthesized suffix before its newline — `postgres (PostgreSQL) 18.6
+/// (Ubuntu 18.6-1.pgdg24.04+2)`. `configure.ac:40`'s `--with-extra-version`
+/// appends that suffix to `PG_VERSION`, and Debian, Ubuntu and Homebrew build
+/// PostgreSQL that way. C compares against its own compiled string, so a
+/// distribution's `initdb` expects its own suffix; this port has none, so it
+/// takes a server of its version from any build (`docs/divergences.md`). The
+/// version itself is still compared: `18.6` never takes `17.2` or `18.60`.
+#[must_use]
+pub fn is_backend_version(line: &str) -> bool {
+    let expected = backend_version_line();
+    if line == expected {
+        return true;
+    }
+    line.strip_prefix(expected.trim_end_matches('\n'))
+        .and_then(|rest| rest.strip_prefix(" ("))
+        .and_then(|rest| rest.strip_suffix(")\n"))
+        .is_some_and(|extra| !extra.contains(['(', ')', '\n']))
+}
+
 /// What [`resolve_server`] asks of the filesystem and of a candidate.
 pub trait ServerProbe {
     /// `validate_exec` (`src/common/exec.c`): a regular file this process
@@ -225,14 +245,13 @@ pub fn resolve_server(
 ) -> Result<Server, InitdbError> {
     let full_path =
         || my_exec.map_or_else(|| PROGNAME.to_owned(), |path| path.display().to_string());
-    let expected = backend_version_line();
     if let Some(sibling) = my_exec
         .and_then(Path::parent)
         .map(|dir| dir.join("postgres"))
         .filter(|sibling| probe.is_executable(sibling))
     {
         match probe.version_line(&sibling) {
-            Some(line) if line == expected => return Ok(Server::executable(sibling)),
+            Some(line) if is_backend_version(&line) => return Ok(Server::executable(sibling)),
             Some(_) => {
                 return Err(InitdbError::ServerWrongVersion {
                     full_path: full_path(),
@@ -243,7 +262,11 @@ pub fn resolve_server(
         }
     }
     if let Some(path) = override_path {
-        return if probe.is_executable(path) && probe.version_line(path) == Some(expected) {
+        return if probe.is_executable(path)
+            && probe
+                .version_line(path)
+                .is_some_and(|line| is_backend_version(&line))
+        {
             Ok(Server::executable(path.to_path_buf()))
         } else {
             Err(InitdbError::ServerOverrideUnusable {
@@ -499,6 +522,7 @@ mod tests {
 
     const OURS: Option<&str> = Some("postgres (PostgreSQL) 18.6\n");
     const OLDER: Option<&str> = Some("postgres (PostgreSQL) 17.2\n");
+    const PGDG: Option<&str> = Some("postgres (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)\n");
 
     fn resolve(
         probe: &FakeProbe,
@@ -565,6 +589,43 @@ mod tests {
                  postgres executable of the same version as initdb"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn a_distribution_extra_version_is_still_our_version() {
+        assert!(is_backend_version("postgres (PostgreSQL) 18.6\n"));
+        assert!(is_backend_version(
+            "postgres (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg24.04+2)\n"
+        ));
+        assert!(is_backend_version(
+            "postgres (PostgreSQL) 18.6 (Homebrew)\n"
+        ));
+        for other in [
+            "postgres (PostgreSQL) 17.2\n",
+            "postgres (PostgreSQL) 18.60\n",
+            "postgres (PostgreSQL) 18.6 (Ubuntu)",
+            "postgres (PostgreSQL) 18.6 trailing words\n",
+            "postgres (PostgreSQL) 18.6 (a) (b)\n",
+            "pg_ctl (PostgreSQL) 18.6 (Ubuntu)\n",
+        ] {
+            assert!(!is_backend_version(other), "{other:?}");
+        }
+        let sibling = FakeProbe::new(&[("/opt/pg/bin/postgres", PGDG)]);
+        assert_eq!(
+            resolve(&sibling, None, None),
+            Ok(Server::executable(PathBuf::from("/opt/pg/bin/postgres")))
+        );
+        let elsewhere = FakeProbe::new(&[("/usr/lib/postgresql/18/bin/postgres", PGDG)]);
+        assert_eq!(
+            resolve(
+                &elsewhere,
+                Some("/usr/lib/postgresql/18/bin/postgres"),
+                None
+            ),
+            Ok(Server::executable(PathBuf::from(
+                "/usr/lib/postgresql/18/bin/postgres"
+            )))
         );
     }
 

@@ -305,8 +305,18 @@ jobs:
         run: scripts/check-license-wall.sh
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+      # NAT-394: the preparation 004_load_balance_dns.pl asks of the
+      # administrator (REL_18_6 :21-:27), so t_004's per-host address shuffle
+      # runs live in this lane; musl and apple keep upstream's skip. Three
+      # clusters, a few seconds.
+      - name: hosts file for 004_load_balance_dns
+        run: |
+          printf '127.0.0.1 pg-loadbalancetest\n127.0.0.2 pg-loadbalancetest\n127.0.0.3 pg-loadbalancetest\n' \
+            | sudo tee -a /etc/hosts
       - name: test
         run: cargo test --all-features
+        env:
+          PG_TEST_EXTRA: load_balance
       # NAT-410: startup time (initdb, server ready, first select 1, stop;
       # p50/p95) and the binary's size by embedded asset, printed to the log.
       # It builds only the bench on top of the test step's artifacts and runs

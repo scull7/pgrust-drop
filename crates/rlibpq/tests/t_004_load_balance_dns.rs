@@ -14,6 +14,8 @@
 //! only when the hosts file carries the three lines (`:57`-`:64`), which
 //! needs root to add, so the test never adds them itself. Each of those
 //! skips prints `SKIP (flagged, not silent)` with upstream's reason.
+//! CI's gnu lane prepares the hosts file and sets `PG_TEST_EXTRA`, so it
+//! runs live there; musl and apple keep upstream's skip.
 //! Past the gate, the reference tools are needed as for every live gate.
 //!
 //! `connect_ok` and the log reading are the same as in

@@ -513,34 +513,11 @@ mod tests {
         }
     }
 
-    /// psql.sql's `\if` section and its expected output, vendored from
-    /// REL_18_6 (see `tests/regress/README.md`).
-    const IF_SQL: &str = include_str!("../tests/regress/psql_if.sql");
-    const IF_OUT: &str = include_str!("../tests/regress/psql_if.out");
-
-    #[test]
-    fn each_section_is_the_slice_postgresql_18_6_ships() {
-        // The digests `tests/regress/README.md` records, taken from the
-        // REL_18_6 tag's `psql.sql` and `psql.out` rather than read back out
-        // of the files here.
-        let hex = |data: &str| {
-            rlibpq::sha256::sha256(data.as_bytes())
-                .iter()
-                .fold(String::new(), |mut hex, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(hex, "{b:02x}");
-                    hex
-                })
-        };
-        assert_eq!(
-            hex(IF_SQL),
-            "1d099f8a2847f2bcd4bd652214961c3d2fbf6212fd7dfa19cf91338702befb98"
-        );
-        assert_eq!(
-            hex(IF_OUT),
-            "0710ae643f596e4c8235139923128025a9a309c277c784a83caabf874ced5172"
-        );
-    }
+    /// `psql.sql` and its expected output, vendored from REL_18_6; their
+    /// digests are pinned by `tests/t_regress_psql.rs` (see
+    /// `tests/regress/README.md`).
+    const PSQL_SQL: &str = include_str!("../tests/regress/psql.sql");
+    const PSQL_OUT: &str = include_str!("../tests/regress/expected/psql.out");
 
     /// The lines of `text` from the one starting `from` up to, not including,
     /// the one starting `to`.
@@ -609,8 +586,8 @@ mod tests {
             // psql.sql:1124-1136: `:{?name}` as an `\if` expression.
             ("-- :{?...} defined variable test", "SELECT :{?i}"),
         ] {
-            let (out, seen) = run_like_pg_regress(block(IF_SQL, from, to));
-            assert_eq!(out, block(IF_OUT, from, to), "block {from:?}");
+            let (out, seen) = run_like_pg_regress(block(PSQL_SQL, from, to));
+            assert_eq!(out, block(PSQL_OUT, from, to), "block {from:?}");
             assert!(seen.is_empty(), "block {from:?} sent {seen:?}");
         }
     }

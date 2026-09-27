@@ -7,8 +7,8 @@
 //! one would: `\w |cmd \else` keeps the `\else`, `\echo x \else` does not.
 //!
 //! Commands ported so far: `\q`, `\c` (refused by [`dispatch_slash`] until
-//! NAT-405), `\echo`/`\qecho`/`\warn`, `\set`, `\unset`, `\if`/`\elif`/
-//! `\else`/`\endif` and a bare `\g`. Every other command upstream knows is in
+//! NAT-405), `\echo`/`\qecho`/`\warn`, `\set`, `\unset`, `\pset` (NAT-400),
+//! `\if`/`\elif`/`\else`/`\endif` and a bare `\g`. Every other command upstream knows is in
 //! [`unported_shape`]: skipped correctly in an inactive branch, refused with
 //! `\X is not implemented yet` in an active one. Anything else renders
 //! upstream's `invalid command \X`.
@@ -67,8 +67,8 @@ pub struct QueryBuffers<'a> {
 /// Everything a backslash command may read or write, so the dispatcher stays
 /// one function of its inputs.
 pub struct CommandContext<'a> {
-    /// `pset`, as it stood when the command started.
-    pub pset: &'a PsqlSettings,
+    /// `pset`: the print options `\pset` sets, and what the logger reads.
+    pub pset: &'a mut PsqlSettings,
     /// `pset.vars`.
     pub vars: &'a mut VariableSpace,
     /// The `\if` stack, which is also the lexer's passthrough: variables are
@@ -103,10 +103,10 @@ pub fn dispatch_slash(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> CommandResult {
-    let before = pset.clone();
+    let mut working = pset.clone();
     let status = {
         let mut ctx = CommandContext {
-            pset: &before,
+            pset: &mut working,
             vars,
             cstack,
             buffers,
@@ -117,7 +117,7 @@ pub fn dispatch_slash(
         if matches!(status, CommandResult::Connect(_)) {
             log(
                 ctx.stderr,
-                &before,
+                ctx.pset,
                 Level::Error,
                 "\\connect is not implemented yet (Linear NAT-405)",
             );
@@ -126,7 +126,9 @@ pub fn dispatch_slash(
             status
         }
     };
-    *pset = vars.settings(pset);
+    // `\pset` wrote `working.popt`; a `\set` of a hooked variable wrote the
+    // variable space, whose settings are re-derived on top.
+    *pset = vars.settings(&working);
     status
 }
 
@@ -309,9 +311,9 @@ pub fn unported_shape(cmd: &str) -> Option<ArgShape> {
         | "encoding" | "f" | "flush" | "flushrequest" | "getenv" | "getresults" | "gset" | "i"
         | "include" | "ir" | "include_relative" | "l" | "list" | "lx" | "listx" | "l+"
         | "list+" | "lx+" | "listx+" | "l+x" | "list+x" | "parse" | "password" | "prompt"
-        | "pset" | "restrict" | "s" | "sendpipeline" | "setenv" | "startpipeline"
-        | "syncpipeline" | "endpipeline" | "t" | "T" | "timing" | "watch" | "x" | "z" | "zS"
-        | "zx" | "zSx" | "zxS" | "?" => ArgShape::Options,
+        | "restrict" | "s" | "sendpipeline" | "setenv" | "startpipeline" | "syncpipeline"
+        | "endpipeline" | "t" | "T" | "timing" | "watch" | "x" | "z" | "zS" | "zx" | "zSx"
+        | "zxS" | "?" => ArgShape::Options,
         // `cmd[0] == 'd'` (`command.c:360`) and `strncmp(cmd, "lo_", 3)`
         // (`:417`) are prefixes, not names.
         _ if cmd.starts_with('d') || cmd.starts_with("lo_") => ArgShape::Options,
@@ -346,6 +348,7 @@ fn exec_command(cmd: &str, c: &mut Cmd<'_, '_>) -> CommandResult {
         "endif" => exec_command_endif(c),
         "g" | "gx" => exec_command_g(c, active_branch, cmd),
         "if" => exec_command_if(c),
+        "pset" => exec_command_pset(c, active_branch),
         // `exec_command_quit()` (`command.c:2750`).
         "q" | "quit" if active_branch => CommandResult::Terminate,
         "q" | "quit" => CommandResult::SkipLine,
@@ -599,6 +602,36 @@ fn exec_command_endif(c: &mut Cmd<'_, '_>) -> CommandResult {
     CommandResult::SkipLine
 }
 
+/// `exec_command_pset()` (`command.c:2695`): list every print option, or
+/// `do_pset` the first argument to the second.
+fn exec_command_pset(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if !active_branch {
+        c.ignore_options();
+        return CommandResult::SkipLine;
+    }
+    let param = c.option(OptionType::Normal);
+    let value = c.option(OptionType::Normal);
+    let Some(param) = param else {
+        let listing = crate::pset::list_all(&c.ctx.pset.popt);
+        let _ = c.ctx.stdout.write_all(listing.as_bytes());
+        return CommandResult::SkipLine;
+    };
+    let quiet = c.ctx.pset.quiet;
+    let value = value.as_ref().map(|o| o.value.as_str());
+    match crate::pset::do_pset(&param.value, value, &mut c.ctx.pset.popt, quiet) {
+        Ok(info) => {
+            if let Some(info) = info {
+                let _ = c.ctx.stdout.write_all(info.as_bytes());
+            }
+            CommandResult::SkipLine
+        }
+        Err(err) => {
+            c.log(Level::Error, err.to_string());
+            CommandResult::Error
+        }
+    }
+}
+
 /// `exec_command_set()` (`command.c:2881`).
 fn exec_command_set(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
     if !active_branch {
@@ -665,7 +698,7 @@ mod tests {
 
     fn run_in(line: &str, cstack: &mut ConditionalStack) -> Run {
         let mut vars = VariableSpace::new();
-        let pset = PsqlSettings {
+        let mut pset = PsqlSettings {
             log_terse: true,
             ..PsqlSettings::default()
         };
@@ -678,7 +711,7 @@ mod tests {
         let mut stderr = Vec::new();
         let result = {
             let mut ctx = CommandContext {
-                pset: &pset,
+                pset: &mut pset,
                 vars: &mut vars,
                 cstack,
                 buffers: None,
@@ -792,9 +825,41 @@ mod tests {
 
     #[test]
     fn an_unported_command_is_refused_by_name_not_called_invalid() {
-        let run = run("\\pset fieldsep |");
+        let run = run("\\timing on");
         assert_eq!(run.result, CommandResult::Error);
-        assert_eq!(run.stderr, "\\pset is not implemented yet\n");
+        assert_eq!(run.stderr, "\\timing is not implemented yet\n");
+    }
+
+    #[test]
+    fn pset_sets_a_print_option_and_the_dispatcher_keeps_it() {
+        let (status, pset, stderr) = dispatch("\\pset border 2");
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(stderr, "");
+        assert_eq!(pset.popt.topt.border, 2);
+    }
+
+    #[test]
+    fn pset_reports_the_new_state_and_lists_everything_without_arguments() {
+        assert_eq!(
+            run("\\pset format unaligned").stdout,
+            "Output format is unaligned.\n"
+        );
+        let listing = run("\\pset").stdout;
+        assert!(
+            listing.starts_with("border                   1\n"),
+            "{listing}"
+        );
+        assert_eq!(listing.lines().count(), crate::pset::PSET_LIST.len());
+    }
+
+    #[test]
+    fn a_refused_pset_is_an_error_and_a_third_argument_is_ignored_with_a_warning() {
+        let refused = run("\\pset nosuch");
+        assert_eq!(refused.result, CommandResult::Error);
+        assert_eq!(refused.stderr, "\\pset: unknown option: nosuch\n");
+        let extra = run("\\pset border 0 extra");
+        assert_eq!(extra.result, CommandResult::SkipLine);
+        assert_eq!(extra.stderr, "\\pset: extra argument \"extra\" ignored\n");
     }
 
     #[test]
@@ -959,14 +1024,14 @@ mod tests {
         let mut cstack = ConditionalStack::new();
         cstack.push(IfState::False);
         let mut vars = VariableSpace::new();
-        let pset = PsqlSettings::default();
+        let mut pset = PsqlSettings::default();
         let mut scanner = Scanner::new();
         scanner.setup(line.as_bytes(), true);
         let mut buf = Vec::new();
         scanner.scan(&mut buf, &NoVariables);
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let mut ctx = CommandContext {
-            pset: &pset,
+            pset: &mut pset,
             vars: &mut vars,
             cstack: &mut cstack,
             buffers: None,

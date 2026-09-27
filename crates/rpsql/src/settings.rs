@@ -114,10 +114,11 @@ pub enum Trivalue {
     Yes,
 }
 
-/// `printFormat` (`fe_utils/print.h:28`), as far as this issue reaches.
+/// `printFormat` (`fe_utils/print.h:28`), minus `PRINT_NOTHING`, which
+/// exists only to catch an uninitialized struct and which a Rust value cannot
+/// be.
 ///
-/// NAT-400 owns the rest of the matrix; the variants are declared here so the
-/// option table can record what `-A`, `-H` and `--csv` asked for, and
+/// Every format can be *selected* (`\pset format`, `-A`, `-H`, `--csv`);
 /// [`crate::print`] refuses the ones it cannot yet render rather than
 /// pretending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -125,20 +126,139 @@ pub enum PrintFormat {
     /// `PRINT_ALIGNED`
     #[default]
     Aligned,
+    /// `PRINT_ASCIIDOC`
+    Asciidoc,
+    /// `PRINT_CSV`
+    Csv,
+    /// `PRINT_HTML`
+    Html,
+    /// `PRINT_LATEX`
+    Latex,
+    /// `PRINT_LATEX_LONGTABLE`
+    LatexLongtable,
+    /// `PRINT_TROFF_MS`
+    TroffMs,
     /// `PRINT_UNALIGNED`
     Unaligned,
     /// `PRINT_WRAPPED`
     Wrapped,
-    /// `PRINT_HTML`
-    Html,
-    /// `PRINT_CSV`
-    Csv,
-    /// `PRINT_ASCIIDOC`
-    Asciidoc,
-    /// `PRINT_LATEX`
-    Latex,
-    /// `PRINT_TROFF_MS`
-    TroffMs,
+}
+
+impl PrintFormat {
+    /// `_align2string()` (`command.c:4987`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Aligned => "aligned",
+            Self::Asciidoc => "asciidoc",
+            Self::Csv => "csv",
+            Self::Html => "html",
+            Self::Latex => "latex",
+            Self::LatexLongtable => "latex-longtable",
+            Self::TroffMs => "troff-ms",
+            Self::Unaligned => "unaligned",
+            Self::Wrapped => "wrapped",
+        }
+    }
+}
+
+/// `printTableOpt.expanded` (`fe_utils/print.h:114`): `0=no, 1=yes, 2=auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Expanded {
+    /// `0`
+    #[default]
+    Off,
+    /// `1`
+    On,
+    /// `2`
+    Auto,
+}
+
+/// `printXheaderWidthType` (`fe_utils/print.h:69`), with
+/// `expanded_header_exact_width` folded into the variant that reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XheaderWidth {
+    /// `PRINT_XHEADER_FULL`
+    #[default]
+    Full,
+    /// `PRINT_XHEADER_COLUMN`
+    Column,
+    /// `PRINT_XHEADER_PAGE`
+    Page,
+    /// `PRINT_XHEADER_EXACT_WIDTH`, with `expanded_header_exact_width`.
+    ExactWidth(i32),
+}
+
+/// `printTableOpt.pager` (`fe_utils/print.h:122`): `0=off 1=on 2=always`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pager {
+    /// `0`
+    Off,
+    /// `1`
+    #[default]
+    On,
+    /// `2`
+    Always,
+}
+
+impl Pager {
+    /// The number `pset_value_string` prints with `%d` (`command.c:5764`).
+    #[must_use]
+    pub fn number(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Always => 2,
+        }
+    }
+}
+
+/// Which `printTextFormat` `printTableOpt.line_style` points at
+/// (`fe_utils/print.h:131`): `pg_asciiformat`, `pg_asciiformat_old` or
+/// `pg_utf8format`. `NULL` means ascii (`get_line_style`, `print.c:3678`), so
+/// ascii is the default here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineStyle {
+    /// `&pg_asciiformat`
+    #[default]
+    Ascii,
+    /// `&pg_asciiformat_old`
+    OldAscii,
+    /// `&pg_utf8format`
+    Unicode,
+}
+
+impl LineStyle {
+    /// `printTextFormat.name`, which `\pset linestyle` reports.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ascii => "ascii",
+            Self::OldAscii => "old-ascii",
+            Self::Unicode => "unicode",
+        }
+    }
+}
+
+/// `unicode_linestyle` (`fe_utils/print.h:99`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnicodeLinestyle {
+    /// `UNICODE_LINESTYLE_SINGLE`
+    #[default]
+    Single,
+    /// `UNICODE_LINESTYLE_DOUBLE`
+    Double,
+}
+
+impl UnicodeLinestyle {
+    /// `_unicode_linestyle2string()` (`command.c:5043`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Double => "double",
+        }
+    }
 }
 
 /// A field or record separator: a string, or the zero byte
@@ -163,7 +283,8 @@ impl Separator {
     }
 }
 
-/// `printTableOpt` (`fe_utils/print.h:111`), the fields `main()` initializes.
+/// `printTableOpt` (`fe_utils/print.h:111`), minus `prior_records` and
+/// `encoding`, which nothing here reads yet.
 // One field per C struct member, and upstream's are `bool`; grouping them into
 // an enum here would put this struct out of step with the header it tracks.
 #[allow(clippy::struct_excessive_bools)]
@@ -172,9 +293,15 @@ pub struct TableOpt {
     /// `format`
     pub format: PrintFormat,
     /// `expanded`
-    pub expanded: bool,
-    /// `border`
+    pub expanded: Expanded,
+    /// `expanded_header_width_type` and `expanded_header_exact_width`
+    pub expanded_header_width: XheaderWidth,
+    /// `border`: an `unsigned short`, so `\pset border -1` stores 65535.
     pub border: u16,
+    /// `pager`
+    pub pager: Pager,
+    /// `pager_min_lines`
+    pub pager_min_lines: i32,
     /// `tuples_only`
     pub tuples_only: bool,
     /// `start_table`
@@ -183,16 +310,28 @@ pub struct TableOpt {
     pub stop_table: bool,
     /// `default_footer`
     pub default_footer: bool,
+    /// `line_style`
+    pub line_style: LineStyle,
     /// `fieldSep`
     pub field_sep: Separator,
     /// `recordSep`
     pub record_sep: Separator,
-    /// `csvFieldSep`
+    /// `csvFieldSep`: a single byte, which `do_pset` enforces.
     pub csv_field_sep: char,
+    /// `numericLocale`
+    pub numeric_locale: bool,
     /// `tableAttr`
     pub table_attr: Option<String>,
     /// `env_columns`: `$COLUMNS`, read before readline can change it.
     pub env_columns: i32,
+    /// `columns`: target width for the wrapped format.
+    pub columns: i32,
+    /// `unicode_border_linestyle`
+    pub unicode_border_linestyle: UnicodeLinestyle,
+    /// `unicode_column_linestyle`
+    pub unicode_column_linestyle: UnicodeLinestyle,
+    /// `unicode_header_linestyle`
+    pub unicode_header_linestyle: UnicodeLinestyle,
 }
 
 impl Default for TableOpt {
@@ -201,12 +340,16 @@ impl Default for TableOpt {
     fn default() -> Self {
         Self {
             format: PrintFormat::Aligned,
-            expanded: false,
+            expanded: Expanded::Off,
+            expanded_header_width: XheaderWidth::Full,
             border: 1,
+            pager: Pager::On,
+            pager_min_lines: 0,
             tuples_only: false,
             start_table: true,
             stop_table: true,
             default_footer: true,
+            line_style: LineStyle::Ascii,
             field_sep: Separator {
                 separator: None,
                 separator_zero: false,
@@ -216,8 +359,13 @@ impl Default for TableOpt {
                 separator_zero: false,
             },
             csv_field_sep: DEFAULT_CSV_FIELD_SEP,
+            numeric_locale: false,
             table_attr: None,
             env_columns: 0,
+            columns: 0,
+            unicode_border_linestyle: UnicodeLinestyle::Single,
+            unicode_column_linestyle: UnicodeLinestyle::Single,
+            unicode_header_linestyle: UnicodeLinestyle::Single,
         }
     }
 }
@@ -389,6 +537,8 @@ mod tests {
         let pset = PsqlSettings::default();
         assert_eq!(pset.popt.topt.format, PrintFormat::Aligned);
         assert_eq!(pset.popt.topt.border, 1);
+        assert_eq!(pset.popt.topt.pager, Pager::On);
+        assert_eq!(pset.popt.topt.line_style, LineStyle::Ascii);
         assert!(pset.popt.topt.start_table);
         assert!(pset.popt.topt.stop_table);
         assert!(pset.popt.topt.default_footer);

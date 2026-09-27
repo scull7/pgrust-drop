@@ -5,3 +5,8 @@ crates/rinitdb/image/template.control binary
 # Vendored PostgreSQL share files (NAT-408): byte for byte, never normalised.
 crates/pgdrop/share/timezonesets/** -text
 crates/pgdrop/share/tsearch_data/** -text
+
+# Vendored upstream regression files (NAT-400): byte for byte, trailing
+# spaces included, so no end-of-line conversion.
+crates/rpsql/tests/regress/psql.sql -text
+crates/rpsql/tests/regress/expected/psql.out -text

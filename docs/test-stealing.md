@@ -163,8 +163,8 @@ one case otherwise. Upstream takes `with_icu` from the build under test
 binary has no configuration to read, so `crates/rinitdb/tests/t_001_initdb.rs`
 asks the binary instead. It runs the command line of `fails for encoding not
 supported by ICU` (`:161`), which stops before anything is created in either
-build. A build with ICU fails at the encoding check (`encoding mismatch`,
-`initdb.c:2786`). A build without ICU fails earlier, in `icu_language_tag`
+build. A build with ICU fails at the encoding check (`initdb.c:2786`),
+`check_icu_locale_encoding`'s `encoding mismatch` (`:2304`). A build without ICU fails earlier, in `icu_language_tag`
 (`ICU is not supported in this build`, `:2362`). Any other outcome fails the
 test; the probe never guesses. It runs once per test process.
 

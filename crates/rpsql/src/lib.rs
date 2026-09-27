@@ -49,10 +49,13 @@ use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
-use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
+use rlibpq::{
+    Connection, ConnectionError, ContextVisibility, Env, ExecStatus, Stream, Verbosity,
+    conndefaults,
+};
 
 use crate::command::{CommandResult, dispatch_slash};
-use crate::common::{ErrorMessage, Executor, send_query};
+use crate::common::{ErrorMessage, Executor, Reply, accept_result, notice_processor, send_query};
 use crate::conditional::ConditionalStack;
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
@@ -93,15 +96,46 @@ struct LiveExecutor {
     alive: bool,
 }
 
-impl Executor for LiveExecutor {
-    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
-        match self.connection.exec(query) {
-            Ok(results) => Ok(results),
-            Err(err) => {
-                self.alive = false;
-                Err(err.into())
+impl LiveExecutor {
+    /// `PQsendQuery` and the `PQgetResult` loop (`common.c:1581`-`:2164`),
+    /// taking the notices parsed along the way before each result. It stops
+    /// at a COPY result, whose data this port does not transfer yet; the next
+    /// query's `PQexecStart` ends that COPY.
+    fn replies(&mut self, query: &[u8], replies: &mut Vec<Reply>) -> Result<(), ConnectionError> {
+        self.connection.exec_start()?;
+        self.connection.send_query(query)?;
+        while let Some(result) = self.connection.get_result()? {
+            replies.extend(self.notices());
+            let copy = matches!(
+                result.status(),
+                ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::CopyBoth
+            );
+            replies.push(Reply::Result(result));
+            if copy {
+                break;
             }
         }
+        replies.extend(self.notices());
+        Ok(())
+    }
+
+    fn notices(&mut self) -> impl Iterator<Item = Reply> + use<> {
+        self.connection
+            .take_notices()
+            .into_iter()
+            .map(Reply::Notice)
+    }
+}
+
+impl Executor for LiveExecutor {
+    fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
+        let mut replies = Vec::new();
+        if let Err(err) = self.replies(query, &mut replies) {
+            self.alive = false;
+            replies.extend(self.notices());
+            replies.push(Reply::Broken(err.into()));
+        }
+        replies
     }
 
     fn connected(&self) -> bool {
@@ -213,6 +247,16 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             return ExitCode::from(EXIT_BADCONN);
         }
     };
+    // A notice sent while connecting reached libpq's own
+    // `defaultNoticeProcessor` (`fe-connect.c:7857`), which prints it bare,
+    // before psql installed its `NoticeProcessor` (`startup.c:328`).
+    for notice in executor.connection.take_notices() {
+        let _ = stderr.write_all(&notice.message(
+            ExecStatus::NonfatalError,
+            Verbosity::Default,
+            ContextVisibility::Errors,
+        ));
+    }
 
     // The list is consumed here and never read again, so it moves out rather
     // than being cloned past the `&mut session` the loop needs.
@@ -223,7 +267,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     // `-1`: wrap every action in one transaction (`startup.c:366`). A failed
     // BEGIN only stops the run under ON_ERROR_STOP, and then it skips the
     // actions *and* the COMMIT, which is what upstream's `goto error` does.
-    let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", stderr);
+    let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", &session.pset, stderr);
     if begun || !session.pset.on_error_stop {
         for action in &actions {
             code = run_action(action, &mut session, &mut executor, stdout, stderr);
@@ -236,7 +280,9 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             // wise COMMIT, which the server itself turns into a rollback if
             // the transaction is already aborted (`startup.c:439`).
             let finish = single_txn_finish(code, session.pset.on_error_stop);
-            if !psql_exec(&mut executor, finish, stderr) && session.pset.on_error_stop {
+            if !psql_exec(&mut executor, finish, &session.pset, stderr)
+                && session.pset.on_error_stop
+            {
                 code = EXIT_USER;
             }
         }
@@ -265,34 +311,31 @@ pub fn single_txn_finish(code: u8, on_error_stop: bool) -> &'static [u8] {
 }
 
 /// `PSQLexec()` (`common.c:657`): run a query psql issues for itself, printing
-/// nothing on success and the server's error on failure.
-fn psql_exec(executor: &mut LiveExecutor, query: &[u8], stderr: &mut impl Write) -> bool {
-    match executor.exec(query) {
-        Ok(results) => {
-            let mut ok = true;
-            for result in &results {
-                // `AcceptResult`'s list of statuses that are not a failure
-                // (`common.c:427`-`:435`).
-                let accepted = matches!(
-                    result.status(),
-                    ExecStatus::CommandOk
-                        | ExecStatus::TuplesOk
-                        | ExecStatus::EmptyQuery
-                        | ExecStatus::CopyIn
-                        | ExecStatus::CopyOut
-                );
-                if !accepted {
+/// nothing on success and the server's error on failure. Notices still reach
+/// `NoticeProcessor` (`common.c:281`).
+fn psql_exec(
+    executor: &mut LiveExecutor,
+    query: &[u8],
+    pset: &settings::PsqlSettings,
+    stderr: &mut impl Write,
+) -> bool {
+    let mut ok = true;
+    for reply in executor.exec(query) {
+        match reply {
+            Reply::Notice(notice) => notice_processor(&notice, pset, stderr),
+            Reply::Result(result) => {
+                if !accept_result(&result) {
                     let _ = stderr.write_all(&result.error_message());
                     ok = false;
                 }
             }
-            ok
-        }
-        Err(err) => {
-            let _ = stderr.write_all(&err.rendered());
-            false
+            Reply::Broken(err) => {
+                let _ = stderr.write_all(&err.rendered());
+                ok = false;
+            }
         }
     }
+    ok
 }
 
 fn run_action(
@@ -309,7 +352,14 @@ fn run_action(
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
             }
-            if send_query(executor, sql.as_bytes(), &session.pset, stdout, stderr) {
+            if send_query(
+                executor,
+                sql.as_bytes(),
+                &session.pset,
+                &mut session.vars,
+                stdout,
+                stderr,
+            ) {
                 EXIT_SUCCESS
             } else {
                 EXIT_FAILURE

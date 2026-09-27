@@ -497,6 +497,10 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
     let mut pset = PsqlSettings::default();
     let mut warnings = Vec::new();
 
+    // Initialize variables for last error (`startup.c:197`-`:199`).
+    vars.set("LAST_ERROR_MESSAGE", Some(""))?;
+    vars.set("LAST_ERROR_SQLSTATE", Some("00000"))?;
+
     // `main()` seeds these before the option loop (`startup.c:202`-`:206`).
     for (name, value) in crate::variables::default_prompts() {
         vars.set(name, Some(value))?;
@@ -888,6 +892,15 @@ mod tests {
         assert_eq!(session(&["-e"]).pset.echo, Echo::Queries);
         assert_eq!(session(&["-b"]).pset.echo, Echo::Errors);
         assert_eq!(session(&[]).pset.echo, Echo::None);
+    }
+
+    #[test]
+    fn the_last_error_pair_starts_empty_and_successful() {
+        // `startup.c:197`-`:199`, before any query has failed.
+        let vars = session(&[]).vars;
+        assert_eq!(vars.get("LAST_ERROR_MESSAGE"), Some(""));
+        assert_eq!(vars.get("LAST_ERROR_SQLSTATE"), Some("00000"));
+        assert_eq!(vars.get("ERROR"), None, "set by the first query only");
     }
 
     #[test]

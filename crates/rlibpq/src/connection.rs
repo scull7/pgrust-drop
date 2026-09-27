@@ -744,7 +744,16 @@ impl<S: Read + Write> Connection<S> {
     /// A COPY left running is ended the way `PQexecStart` ends it
     /// (`:2391`-`:2412`): COPY IN with a CopyFail, COPY OUT by dropping the
     /// rest of its data; COPY BOTH is refused.
-    fn exec_start(&mut self) -> Result<(), ConnectionError> {
+    ///
+    /// Public so that a caller which sends with [`Connection::send_query`]
+    /// and collects with [`Connection::get_result`] — to see each notice
+    /// between the results, as psql's `ExecQueryAndProcessResults` does —
+    /// can first clear what an earlier command left, exactly as
+    /// [`Connection::exec`] does.
+    ///
+    /// # Errors
+    /// In pipeline mode, during COPY BOTH, or the connection broke.
+    pub fn exec_start(&mut self) -> Result<(), ConnectionError> {
         self.state.begin_exec()?;
         while let Some(result) = self.get_result()? {
             match result.status() {
@@ -1348,6 +1357,15 @@ impl<S: Read + Write> Connection<S> {
         &self.notices
     }
 
+    /// Hand over the notices collected so far and forget them: what libpq's
+    /// notice receiver sees, one at a time, as each is parsed
+    /// (`fe-protocol3.c:1011`). A caller that drains after every
+    /// [`Connection::get_result`] sees each notice before the result it
+    /// was parsed with, as a notice processor would have printed it.
+    pub fn take_notices(&mut self) -> Vec<ResultError> {
+        std::mem::take(&mut self.notices)
+    }
+
     /// The notifications collected so far, oldest first — what `PQnotifies`
     /// hands out one at a time: pid, channel, payload.
     #[must_use]
@@ -1906,6 +1924,9 @@ mod tests {
             conn.notices()[0].field(diag::MESSAGE_PRIMARY),
             Some(&b"table \"t\" does not exist, skipping"[..])
         );
+        let taken = conn.take_notices();
+        assert_eq!(taken.len(), 1);
+        assert!(conn.notices().is_empty(), "taking a notice forgets it");
     }
 
     /// `PQexecParams` over the wire: the client writes Parse, Bind,

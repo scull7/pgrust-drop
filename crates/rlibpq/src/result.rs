@@ -277,6 +277,11 @@ pub struct QueryResult {
     binary: bool,
 }
 
+/// The tags `PQcmdTuples` reads a bare count from (`fe-exec.c:3871`-`:3880`).
+const COUNTED_TAGS: [&[u8]; 7] = [
+    b"SELECT ", b"DELETE ", b"UPDATE ", b"FETCH ", b"MERGE ", b"MOVE ", b"COPY ",
+];
+
 impl QueryResult {
     /// `PQmakeEmptyPGresult`, `fe-exec.c:160`.
     #[must_use]
@@ -426,6 +431,39 @@ impl QueryResult {
         &self.command_status
     }
 
+    /// `PQcmdTuples`, `fe-exec.c:3853`: the row count at the end of an
+    /// `INSERT`, `SELECT`, `DELETE`, `UPDATE`, `FETCH`, `MERGE`, `MOVE` or
+    /// `COPY` tag, or empty for any other tag.
+    ///
+    /// A tag of one of those commands whose count is not all digits is also
+    /// empty, as upstream returns; upstream additionally reports it through
+    /// the notice hooks (`could not interpret result from server`, `:3896`),
+    /// which a result here does not carry.
+    #[must_use]
+    pub fn cmd_tuples(&self) -> &[u8] {
+        let tag = self.command_status.as_slice();
+        let count = if let Some(rest) = tag.strip_prefix(b"INSERT ") {
+            // INSERT: skip the oid and its space (`:3864`).
+            match rest.iter().position(|&b| b == b' ') {
+                Some(space) => &rest[space + 1..],
+                None => return &[],
+            }
+        } else if let Some(rest) = COUNTED_TAGS
+            .iter()
+            .find_map(|prefix| tag.strip_prefix(*prefix))
+        {
+            rest
+        } else {
+            return &[];
+        };
+        // At least one digit, and nothing else (`:3885`).
+        if !count.is_empty() && count.iter().all(u8::is_ascii_digit) {
+            count
+        } else {
+            &[]
+        }
+    }
+
     pub(crate) fn set_command_status(&mut self, status: Vec<u8>) {
         self.command_status = status;
     }
@@ -453,6 +491,43 @@ impl QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged(tag: &[u8]) -> QueryResult {
+        let mut result = QueryResult::new(ExecStatus::CommandOk);
+        result.set_command_status(tag.to_vec());
+        result
+    }
+
+    /// `PQcmdTuples` (`fe-exec.c:3853`): each counted tag, the oid `INSERT`
+    /// skips, and the tags that have no count.
+    #[test]
+    fn cmd_tuples_reads_the_count_of_every_counted_tag() {
+        for (tag, count) in [
+            (&b"SELECT 2"[..], &b"2"[..]),
+            (b"INSERT 0 3", b"3"),
+            (b"DELETE 10", b"10"),
+            (b"UPDATE 0", b"0"),
+            (b"FETCH 4", b"4"),
+            (b"MERGE 5", b"5"),
+            (b"MOVE 6", b"6"),
+            (b"COPY 7", b"7"),
+            (b"CREATE TABLE", b""),
+            (b"DROP TABLE", b""),
+            (b"", b""),
+            // A counted tag whose count does not parse (`:3895`).
+            (b"INSERT 0", b""),
+            (b"SELECT", b""),
+            (b"SELECT ", b""),
+            (b"SELECT 1x", b""),
+        ] {
+            assert_eq!(
+                tagged(tag).cmd_tuples(),
+                count,
+                "{}",
+                String::from_utf8_lossy(tag)
+            );
+        }
+    }
 
     fn server_error() -> ResultError {
         // The field order a PostgreSQL 18 backend sends for a syntax error.

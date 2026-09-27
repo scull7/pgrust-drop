@@ -146,7 +146,14 @@ pub fn main_loop(
                 // Execute the query unless we're in an inactive `\if`
                 // branch (`mainloop.c:436`).
                 if cond_stack.active() {
-                    success = send_query(executor, &query_buf, session.pset, stdout, stderr);
+                    success = send_query(
+                        executor,
+                        &query_buf,
+                        session.pset,
+                        session.vars,
+                        stdout,
+                        stderr,
+                    );
                     slash_status = if success {
                         CommandResult::Send
                     } else {
@@ -197,7 +204,14 @@ pub fn main_loop(
 
                 match slash_status {
                     CommandResult::Send => {
-                        success = send_query(executor, &query_buf, session.pset, stdout, stderr);
+                        success = send_query(
+                            executor,
+                            &query_buf,
+                            session.pset,
+                            session.vars,
+                            stdout,
+                            stderr,
+                        );
                         std::mem::swap(&mut previous_buf, &mut query_buf);
                         query_buf.clear();
                         scanner.reset();
@@ -233,7 +247,14 @@ pub fn main_loop(
     {
         // Unless we're in an inactive `\if` branch (`mainloop.c:613`).
         let ok = if cond_stack.active() {
-            send_query(executor, &query_buf, session.pset, stdout, stderr)
+            send_query(
+                executor,
+                &query_buf,
+                session.pset,
+                session.vars,
+                stdout,
+                stderr,
+            )
         } else {
             true
         };
@@ -276,8 +297,8 @@ pub fn prompt_status_for(result: ScanResult) -> PromptStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ErrorMessage;
-    use rlibpq::{Backend, QueryResult, QueryRunner, TransactionStatus};
+    use crate::common::Reply;
+    use rlibpq::{Backend, QueryRunner, TransactionStatus};
 
     /// An executor that records the queries it was asked to run and answers
     /// each with a CommandComplete.
@@ -298,7 +319,7 @@ mod tests {
     }
 
     impl Executor for Recorder {
-        fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+        fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
             let fails = self.fail.first().copied().unwrap_or(false);
             if !self.fail.is_empty() {
@@ -320,7 +341,11 @@ mod tests {
             runner
                 .push(Backend::ReadyForQuery(TransactionStatus::Idle))
                 .unwrap();
-            Ok(runner.into_results())
+            runner
+                .into_results()
+                .into_iter()
+                .map(Reply::Result)
+                .collect()
         }
 
         fn connected(&self) -> bool {
@@ -585,6 +610,50 @@ mod tests {
             ),
             // psql.sql:1124-1136: `:{?name}` as an `\if` expression.
             ("-- :{?...} defined variable test", "SELECT :{?i}"),
+        ] {
+            let (out, seen) = run_like_pg_regress(block(PSQL_SQL, from, to));
+            assert_eq!(out, block(PSQL_OUT, from, to), "block {from:?}");
+            assert!(seen.is_empty(), "block {from:?} sent {seen:?}");
+        }
+    }
+
+    /// psql.sql:1165-1175, `-- test printing and clearing the query
+    /// buffer`: `\p` prints the buffer, or the previous one when it is empty,
+    /// and `\r` clears it without touching the previous one. The results the
+    /// server would print are the live gate's; here only what is sent and
+    /// what `\p` shows.
+    #[test]
+    fn print_shows_the_buffer_or_the_previous_one_and_reset_clears() {
+        let (out, seen) = run_like_pg_regress(
+            "SELECT 1;\n\\p\nSELECT 2 \\r\n\\p\nSELECT 3 \\p\nUNION SELECT 4 \\p\n\
+             UNION SELECT 5\nORDER BY 1;\n\\r\n\\p\n",
+        );
+        assert_eq!(
+            seen,
+            [
+                "SELECT 1;",
+                "SELECT 3 \nUNION SELECT 4 \nUNION SELECT 5\nORDER BY 1;"
+            ]
+        );
+        assert_eq!(
+            out,
+            "SELECT 1;\n\\p\nSELECT 1;\nSELECT 2 \\r\n\\p\nSELECT 1;\n\
+             SELECT 3 \\p\nSELECT 3 \nUNION SELECT 4 \\p\nSELECT 3 \nUNION SELECT 4 \n\
+             UNION SELECT 5\nORDER BY 1;\n\\r\n\\p\n\
+             SELECT 3 \nUNION SELECT 4 \nUNION SELECT 5\nORDER BY 1;\n"
+        );
+    }
+
+    /// psql.sql's `-- \set` and `-- \echo and allied features` sections
+    /// (`:6`-`:22`, `:892`-`:906`), which send no query, against
+    /// `expected/psql.out` byte for byte: invalid names and values, a
+    /// boolean variable set, unset and refused, `\echo -n`, `\qecho` and
+    /// `\warn`.
+    #[test]
+    fn the_set_and_echo_sections_match_psql_out() {
+        for (from, to) in [
+            ("-- \\set\n", "-- \\g and \\gx"),
+            ("-- \\echo and allied features", "-- tests for \\if"),
         ] {
             let (out, seen) = run_like_pg_regress(block(PSQL_SQL, from, to));
             assert_eq!(out, block(PSQL_OUT, from, to), "block {from:?}");

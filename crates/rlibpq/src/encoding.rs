@@ -6,9 +6,11 @@
 //! (`fe-exec.c:1145`) so that the escape functions can tell a lead byte from
 //! a quote hidden inside a multibyte character. That needs the name lookup
 //! (`pg_char_to_encoding`), each encoding's length function (`mblen`) and
-//! its validators (`mbverifychar`, `mbverifystr`), and nothing else from the
-//! `pg_wchar_table` (`wchar.c:2086`): no conversion to or from `pg_wchar`,
-//! no display width.
+//! its validators (`mbverifychar`, `mbverifystr`); and the error cursor
+//! (`reportErrorPosition`, `fe-protocol3.c:1202`) needs each encoding's
+//! display width (`dsplen`, over `ucs_wcwidth` for UTF-8). Nothing else from
+//! the `pg_wchar_table` (`wchar.c:2086`) is here: no conversion to or from
+//! `pg_wchar`.
 //!
 //! Every function here is a pure calculation over a byte slice. Where C
 //! reads a NUL-terminated string past the slice's end (GB18030's `mblen`
@@ -254,6 +256,60 @@ impl Encoding {
         Some(self.mblen(s))
     }
 
+    /// `PQmblenBounded`, `fe-misc.c:1410`: [`Encoding::mblen`], cut short at
+    /// the first NUL or the end of `s` (C's `strnlen`). Zero only for an
+    /// empty `s` or one starting with a NUL.
+    #[must_use]
+    pub fn mblen_bounded(self, s: &[u8]) -> usize {
+        if s.is_empty() {
+            return 0;
+        }
+        let len = self.mblen(s).min(s.len());
+        s[..len].iter().position(|&c| c == 0).unwrap_or(len)
+    }
+
+    /// `pg_encoding_dsplen`, `wchar.c:2198`: the screen width of the
+    /// character at `s[0]` — 0 for a NUL, -1 for a control character, and
+    /// otherwise each encoding's `dsplen` from `pg_wchar_table`
+    /// (`wchar.c:2086`). An empty `s` reads as the NUL C would find.
+    #[must_use]
+    pub fn dsplen(self, s: &[u8]) -> i32 {
+        let c = byte_at(s, 0);
+        let wide_or_ascii = |wide: bool| if wide { 2 } else { ascii_dsplen(c) };
+        match self.family() {
+            // pg_ascii_dsplen, wchar.c:94, and pg_latin1_dsplen, :904.
+            Family::Ascii | Family::Latin1 => ascii_dsplen(c),
+            // pg_euc_dsplen, wchar.c:165, for EUC_KR (:227), EUC_TW (:376,
+            // the same body) and JOHAB (:450).
+            Family::EucKr | Family::EucTw | Family::Johab => {
+                wide_or_ascii(c == SS2 || c == SS3 || is_highbit_set(c))
+            }
+            // pg_eucjp_dsplen, wchar.c:196: SS2 is half-width kana.
+            Family::EucJp if c == SS2 => 1,
+            Family::EucJp => wide_or_ascii(c == SS3 || is_highbit_set(c)),
+            // pg_euccn_dsplen, wchar.c:301; pg_big5_dsplen, :956;
+            // pg_gbk_dsplen, :983; pg_uhc_dsplen, :1010; pg_gb18030_dsplen,
+            // :1051.
+            Family::EucCn | Family::Big5 | Family::Gbk | Family::Uhc | Family::Gb18030 => {
+                wide_or_ascii(is_highbit_set(c))
+            }
+            // pg_utf_dsplen, wchar.c:680.
+            Family::Utf8 => crate::wcwidth::ucs_wcwidth(crate::wcwidth::utf8_to_unicode(s)),
+            // pg_mule_dsplen, wchar.c:833: IS_LC2 and IS_LCPRV2 are double
+            // width, everything else — controls included — is 1.
+            Family::Mule => {
+                if (0x90..=0x99).contains(&c) || c == 0x9c || c == 0x9d {
+                    2
+                } else {
+                    1
+                }
+            }
+            // pg_sjis_dsplen, wchar.c:927: 0xa1-0xdf is half-width kana.
+            Family::Sjis if (0xa1..=0xdf).contains(&c) => 1,
+            Family::Sjis => wide_or_ascii(is_highbit_set(c)),
+        }
+    }
+
     /// `pg_encoding_verifymbchar`, `wchar.c:2211`: the length of the validly
     /// encoded character at the start of `s`, `None` (C's `-1`) if it is not
     /// one. `s.len()` is C's `len`, the bytes remaining; `s` must not be
@@ -355,6 +411,15 @@ impl Encoding {
 impl fmt::Display for Encoding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
+    }
+}
+
+/// `pg_ascii_dsplen`, `wchar.c:94`.
+fn ascii_dsplen(c: u8) -> i32 {
+    match c {
+        0 => 0,
+        c if c < 0x20 || c == 0x7f => -1,
+        _ => 1,
     }
 }
 
@@ -676,6 +741,39 @@ mod tests {
         assert_eq!(Encoding::Johab.verify_char(b"\x88\x61"), None);
         assert_eq!(Encoding::Latin1.verify_str(b"\xff\xfe"), 2);
         assert_eq!(Encoding::SqlAscii.verify_str(b"1\xC0'"), 3);
+    }
+
+    /// One character from each `dsplen` arm, and `PQmblenBounded` stopping
+    /// at a NUL and at the end of the slice.
+    #[test]
+    fn each_encoding_measures_its_own_display_width() {
+        assert_eq!(Encoding::SqlAscii.dsplen(b"a"), 1);
+        assert_eq!(Encoding::SqlAscii.dsplen(b"\0"), 0);
+        assert_eq!(Encoding::SqlAscii.dsplen(b""), 0, "the NUL C would find");
+        assert_eq!(Encoding::Latin1.dsplen(b"\x7f"), -1);
+        assert_eq!(Encoding::Latin1.dsplen(b"\xe9"), 1);
+        assert_eq!(Encoding::Utf8.dsplen("\u{4e16}".as_bytes()), 2);
+        assert_eq!(Encoding::Utf8.dsplen("\u{301}".as_bytes()), 0);
+        assert_eq!(Encoding::Utf8.dsplen(b"\t"), -1);
+        assert_eq!(Encoding::EucJp.dsplen(&[SS2, 0xb1]), 1, "half-width kana");
+        assert_eq!(Encoding::EucJp.dsplen(&[SS3, 0xa1, 0xa1]), 2);
+        assert_eq!(Encoding::EucKr.dsplen(&[SS2, 0xa1]), 2);
+        assert_eq!(Encoding::EucCn.dsplen(&[0xb0, 0xa1]), 2);
+        assert_eq!(Encoding::Sjis.dsplen(&[0xb1]), 1, "half-width kana");
+        assert_eq!(Encoding::Sjis.dsplen(&[0x82, 0xa0]), 2);
+        assert_eq!(Encoding::Gb18030.dsplen(b"\x1b"), -1);
+        assert_eq!(Encoding::MuleInternal.dsplen(&[0x81, 0xa1]), 1, "IS_LC1");
+        assert_eq!(
+            Encoding::MuleInternal.dsplen(&[0x92, 0xa1, 0xa1]),
+            2,
+            "IS_LC2"
+        );
+        assert_eq!(Encoding::MuleInternal.dsplen(b"\x01"), 1, "no control arm");
+
+        assert_eq!(Encoding::Utf8.mblen_bounded("\u{4e16}".as_bytes()), 3);
+        assert_eq!(Encoding::Utf8.mblen_bounded(&[0xe4, 0]), 1);
+        assert_eq!(Encoding::Utf8.mblen_bounded(&[0xe4, 0xb8]), 2);
+        assert_eq!(Encoding::Utf8.mblen_bounded(b""), 0);
     }
 
     #[test]

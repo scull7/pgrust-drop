@@ -763,8 +763,9 @@ mod tests {
         let (status, pset, out, err) = run_from("\\errverbose", pset);
         assert_eq!(status, CommandResult::SkipLine);
         assert_eq!(out, "");
-        // `001_basic.pl:178`-`:181`'s shape, less the `LINE 1:` cursor rlibpq
-        // does not draw (docs/divergences.md).
+        // `001_basic.pl:178`-`:181`'s shape, less the `LINE 1:` cursor: a
+        // result replayed without sending a query keeps no `errQuery` to draw
+        // it over. `t_001_basic.rs` runs the case with the cursor, live.
         assert_eq!(
             err,
             "psql:<stdin>:2: error: ERROR:  42703: column \"error\" does not exist\n\

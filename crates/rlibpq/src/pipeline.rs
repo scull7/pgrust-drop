@@ -29,6 +29,7 @@
 
 use std::collections::VecDeque;
 
+use crate::encoding::Encoding;
 use crate::message::{Backend, CopyFormat, ProtocolError, TransactionStatus};
 use crate::result::{ExecStatus, QueryResult, ResultError, diag};
 
@@ -278,6 +279,16 @@ pub enum Next {
     Block,
 }
 
+/// `PGcmdQueueEntry`, `libpq-int.h:343`: what a queued command asked for,
+/// and its text when it had one to keep — a Query's, a Parse's
+/// (`fe-exec.c:1484`, `:1623`, `:1917`), never a Bind of a named statement,
+/// a Describe, a Close or a Sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CmdQueueEntry {
+    class: QueryClass,
+    query: Option<Vec<u8>>,
+}
+
 /// The query-execution part of a `PGconn`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PipelineState {
@@ -285,9 +296,12 @@ pub struct PipelineState {
     status: AsyncStatus,
     /// `conn->pipelineStatus`.
     pipeline: PipelineStatus,
-    /// `conn->cmd_queue_head` … `cmd_queue_tail`: one query class per
-    /// command sent and not yet completed.
-    queue: VecDeque<QueryClass>,
+    /// `conn->cmd_queue_head` … `cmd_queue_tail`: one entry per command
+    /// sent and not yet completed.
+    queue: VecDeque<CmdQueueEntry>,
+    /// `conn->client_encoding`, as `pqSaveParameterStatus` keeps it
+    /// (`fe-exec.c:1145`): stamped on every error and notice result made.
+    client_encoding: Encoding,
     /// `conn->result`: the result being built. `pgHavePendingResult`
     /// (`libpq-int.h:936`) is this being `Some`; `conn->error_result` has no
     /// counterpart, since the libpq-internal errors that set it are
@@ -321,7 +335,41 @@ impl PipelineState {
     /// The query classes still queued, head first.
     #[must_use]
     pub fn queue(&self) -> Vec<QueryClass> {
-        self.queue.iter().copied().collect()
+        self.queue.iter().map(|entry| entry.class).collect()
+    }
+
+    /// `conn->cmd_queue_head->queryclass`.
+    fn head(&self) -> Option<QueryClass> {
+        self.queue.front().map(|entry| entry.class)
+    }
+
+    /// `pqSaveParameterStatus`'s `client_encoding` arm, `fe-exec.c:1145`:
+    /// a name `pg_char_to_encoding` does not know is SQL_ASCII. Any other
+    /// parameter is nothing to this state.
+    pub fn save_parameter_status(&mut self, name: &[u8], value: &[u8]) {
+        if name == b"client_encoding" {
+            self.client_encoding = Encoding::from_name(value).unwrap_or_default();
+        }
+    }
+
+    /// `conn->client_encoding`.
+    #[must_use]
+    pub fn client_encoding(&self) -> Encoding {
+        self.client_encoding
+    }
+
+    /// What `pqGetErrorNotice3` adds to the fields it read (`fe-protocol3.c:966`,
+    /// and `PQmakeEmptyPGresult`'s `fe-exec.c:193`): the text of the command
+    /// at the head of the queue, if there is a statement position to point
+    /// into it, and the connection's client encoding.
+    fn stamp(&self, error: ResultError) -> ResultError {
+        let error = error.with_client_encoding(self.client_encoding);
+        match self.queue.front().and_then(|entry| entry.query.as_ref()) {
+            Some(query) if error.field(diag::STATEMENT_POSITION).is_some() => {
+                error.with_err_query(query.clone())
+            }
+            _ => error,
+        }
     }
 
     /// `PQisBusy`'s answer once input has been parsed (`fe-exec.c:2064`).
@@ -397,9 +445,16 @@ impl PipelineState {
         self.pipeline != PipelineStatus::On || pending >= OUTBUFFER_THRESHOLD
     }
 
-    /// `pqAppendCmdQueueEntry`, `fe-exec.c:1356`: a command has been sent.
+    /// `pqAppendCmdQueueEntry`, `fe-exec.c:1356`: a command that keeps no
+    /// query text has been sent.
     pub fn append(&mut self, class: QueryClass) {
-        self.queue.push_back(class);
+        self.append_command(class, None);
+    }
+
+    /// [`PipelineState::append`] for a command whose text the queue entry
+    /// keeps (`entry->query`), for an error's cursor to point into.
+    pub fn append_command(&mut self, class: QueryClass, query: Option<Vec<u8>>) {
+        self.queue.push_back(CmdQueueEntry { class, query });
         match self.pipeline {
             PipelineStatus::Off | PipelineStatus::On => {
                 if self.status == AsyncStatus::Idle {
@@ -498,10 +553,7 @@ impl PipelineState {
     /// launched and before any of its results arrived.
     fn can_change_result_mode(&self) -> bool {
         self.status == AsyncStatus::Busy
-            && matches!(
-                self.queue.front(),
-                Some(QueryClass::Simple | QueryClass::Extended)
-            )
+            && matches!(self.head(), Some(QueryClass::Simple | QueryClass::Extended))
             && self.result.is_none()
     }
 
@@ -564,7 +616,7 @@ impl PipelineState {
         match &self.result {
             None => false,
             Some(result) if result.status() == ExecStatus::FatalError => false,
-            Some(_) => self.queue.front() != Some(&QueryClass::Describe),
+            Some(_) => self.head() != Some(QueryClass::Describe),
         }
     }
 
@@ -579,6 +631,17 @@ impl PipelineState {
     /// Upstream turns these into an error result and carries on; here they
     /// end the exchange.
     pub fn apply(&mut self, message: Backend) -> Result<Option<Event>, ProtocolError> {
+        let message = match message {
+            // pqGetErrorNotice3, fe-protocol3.c:966 — both kinds keep the
+            // query and the encoding.
+            Backend::ErrorResponse(error) => Backend::ErrorResponse(self.stamp(error)),
+            Backend::NoticeResponse(notice) => Backend::NoticeResponse(self.stamp(notice)),
+            Backend::ParameterStatus { name, value } => {
+                self.save_parameter_status(&name, &value);
+                Backend::ParameterStatus { name, value }
+            }
+            other => other,
+        };
         match message {
             Backend::NotificationResponse {
                 pid,
@@ -614,7 +677,7 @@ impl PipelineState {
 
     /// The BUSY-state switch, `fe-protocol3.c:203`-`:447`.
     fn apply_busy(&mut self, message: Backend) -> Result<Option<Event>, ProtocolError> {
-        let head = self.queue.front().copied();
+        let head = self.head();
         match message {
             Backend::CommandComplete(tag) => {
                 self.result
@@ -764,10 +827,7 @@ impl PipelineState {
     /// No COPY is taking data.
     pub fn put_copy_end(&mut self) -> Result<bool, PipelineError> {
         self.begin_put_copy()?;
-        let sync = self
-            .queue
-            .front()
-            .is_some_and(|class| *class != QueryClass::Simple);
+        let sync = self.head().is_some_and(|class| class != QueryClass::Simple);
         self.status = if self.status == AsyncStatus::CopyBoth {
             AsyncStatus::CopyOut
         } else {
@@ -947,7 +1007,7 @@ impl PipelineState {
 
     /// `pqCommandQueueAdvance`, `fe-exec.c:3173`.
     fn advance(&mut self, is_ready_for_query: bool, got_sync: bool) {
-        match self.queue.front() {
+        match self.head() {
             None => {}
             Some(QueryClass::Simple) if !is_ready_for_query => {}
             Some(QueryClass::Sync) if !got_sync => {}
@@ -971,7 +1031,7 @@ impl PipelineState {
             AsyncStatus::Idle | AsyncStatus::PipelineIdle => {}
         }
         self.row_mode = RowMode::All;
-        let Some(&head) = self.queue.front() else {
+        let Some(head) = self.head() else {
             self.status = AsyncStatus::Idle;
             return;
         };
@@ -2385,5 +2445,90 @@ mod tests {
         let results = runner.into_results();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status(), ExecStatus::CopyOut);
+    }
+
+    /// `pqGetErrorNotice3` keeps the text of the command at the head of
+    /// the queue, and only when there is a statement position to point into
+    /// it (`fe-protocol3.c:966`); every error and notice gets the client
+    /// encoding the last ParameterStatus set (`fe-exec.c:1145`, `:193`). An
+    /// error that arrives while idle has no command to borrow text from.
+    #[test]
+    fn an_error_keeps_the_head_commands_text_and_the_client_encoding() {
+        let positioned = || {
+            ResultError::new(vec![
+                (diag::SEVERITY, b"ERROR".to_vec()),
+                (
+                    diag::MESSAGE_PRIMARY,
+                    b"column \"foo\" does not exist".to_vec(),
+                ),
+                (diag::STATEMENT_POSITION, b"8".to_vec()),
+            ])
+        };
+        let mut state = PipelineState::new();
+        assert_eq!(state.client_encoding(), Encoding::SqlAscii);
+        state
+            .apply(Backend::ParameterStatus {
+                name: b"client_encoding".to_vec(),
+                value: b"UTF8".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(state.client_encoding(), Encoding::Utf8);
+
+        state.begin_send(QueryClass::Extended).unwrap();
+        state.append_command(QueryClass::Extended, Some(b"SELECT foo ".to_vec()));
+        let events = state
+            .apply(Backend::NoticeResponse(error(b"01000")))
+            .unwrap();
+        let Some(Event::Notice(notice)) = events else {
+            panic!("a notice: {events:?}");
+        };
+        assert_eq!(notice.err_query(), None, "no position, nothing kept");
+        assert_eq!(notice.client_encoding(), Encoding::Utf8);
+
+        state.apply(Backend::ErrorResponse(positioned())).unwrap();
+        let Next::Result(result) = state.next_result() else {
+            panic!("the error result");
+        };
+        let error = result.error().expect("an error");
+        assert_eq!(error.err_query(), Some(&b"SELECT foo "[..]));
+        assert_eq!(error.client_encoding(), Encoding::Utf8);
+        // psql.out:216-:219, the `\bind` of a query that fails to parse.
+        assert_eq!(
+            String::from_utf8(result.error_message()).unwrap(),
+            "ERROR:  column \"foo\" does not exist\nLINE 1: SELECT foo \n               ^\n"
+        );
+        state.apply(ready(TransactionStatus::Idle)).unwrap();
+        assert_eq!(state.next_result(), Next::Null);
+
+        // Idle: the error is a notice, and there is no command to point at.
+        let events = state.apply(Backend::ErrorResponse(positioned())).unwrap();
+        let Some(Event::Notice(notice)) = events else {
+            panic!("a notice: {events:?}");
+        };
+        assert_eq!(notice.err_query(), None);
+
+        // A name pg_char_to_encoding does not know is SQL_ASCII.
+        state.save_parameter_status(b"client_encoding", b"KLINGON");
+        assert_eq!(state.client_encoding(), Encoding::SqlAscii);
+    }
+
+    /// A command that keeps no text lends none: `PQsendQueryPrepared`'s
+    /// Bind of a named statement (`fe-exec.c:1916`, `command` NULL).
+    #[test]
+    fn a_command_with_no_text_keeps_none_for_its_error() {
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Extended).unwrap();
+        state.append(QueryClass::Extended);
+        state
+            .apply(Backend::ErrorResponse(ResultError::new(vec![
+                (diag::SEVERITY, b"ERROR".to_vec()),
+                (diag::MESSAGE_PRIMARY, b"boom".to_vec()),
+                (diag::STATEMENT_POSITION, b"1".to_vec()),
+            ])))
+            .unwrap();
+        let Next::Result(result) = state.next_result() else {
+            panic!("the error result");
+        };
+        assert_eq!(result.error_message(), b"ERROR:  boom at character 1\n");
     }
 }

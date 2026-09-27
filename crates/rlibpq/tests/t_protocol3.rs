@@ -23,7 +23,6 @@
 use std::path::{Path, PathBuf};
 
 use rlibpq::{ContextVisibility, ExecStatus, Params, Verbosity};
-use testkit::reference;
 
 mod common;
 
@@ -63,37 +62,107 @@ fn an_error_carries_the_fields_the_reference_reports() {
     let error = results[0].error().expect("an error result");
     assert_eq!(error.sqlstate(), Some(&b"42601"[..]));
 
-    // The comparison is made at VERBOSITY terse, and that is not a
-    // convenience: at every other verbosity C libpq puts the position on a
-    // syntax-cursor display over the query it kept (`res->errQuery`,
-    // `fe-protocol3.c:966`, filled for a simple query at `fe-exec.c:1484`),
-    // printing `LINE 1: selct 1` and a caret line that `reportErrorPosition`
-    // (`fe-protocol3.c:1202`) draws and this port does not — the divergence
-    // `docs/divergences.md` records. Terse is the one verbosity where upstream
-    // renders the position as text (`fe-protocol3.c:1102`), which is exactly
-    // what this port renders, so this is a real byte-for-byte gate over the
-    // same fields rather than a comparison the port is documented to fail.
-    let (_, stderr, code) = cluster.psql("selct 1", "terse");
-    assert_ne!(code, 0);
-    let rendered = error.message(
-        ExecStatus::FatalError,
-        Verbosity::Terse,
-        ContextVisibility::Errors,
-    );
-    assert_eq!(
-        rendered, stderr,
-        "the terse rendering must be psql's, byte for byte"
-    );
-
-    // What is *not* judged, said out loud rather than left out: the default
-    // verbosity, where psql adds the two cursor lines.
-    let (_, default_stderr, _) = cluster.psql("selct 1", "default");
-    if default_stderr != results[0].error_message() {
-        reference::announce_skip(
-            "OUT OF SCOPE (flagged, not silent): the default-verbosity rendering differs by \
-             the syntax-cursor display (reportErrorPosition, fe-protocol3.c:1202); see \
-             docs/divergences.md",
+    // Every verbosity psql can set, byte for byte: terse writes the
+    // position as text, the others draw the cursor over the query kept
+    // (`res->errQuery`, `fe-protocol3.c:966`, filled for a simple query at
+    // `fe-exec.c:1484`) — `LINE 1: selct 1` and its caret.
+    for (verbosity, name) in [
+        (Verbosity::Terse, "terse"),
+        (Verbosity::Default, "default"),
+        (Verbosity::Verbose, "verbose"),
+        (Verbosity::Sqlstate, "sqlstate"),
+    ] {
+        let (_, stderr, code) = cluster.psql("selct 1", name);
+        assert_ne!(code, 0);
+        let rendered = error.message(ExecStatus::FatalError, verbosity, ContextVisibility::Errors);
+        assert_eq!(
+            String::from_utf8_lossy(&rendered),
+            String::from_utf8_lossy(&stderr),
+            "the {name} rendering must be psql's, byte for byte"
         );
+    }
+    // PQresultErrorMessage is the default verbosity's.
+    let (_, stderr, _) = cluster.psql("selct 1", "default");
+    assert_eq!(results[0].error_message(), stderr);
+}
+
+/// The syntax cursor, `reportErrorPosition` (`fe-protocol3.c:1202`), over
+/// shapes that exercise each of its rules, through this crate and through C
+/// psql at the default and verbose verbosities, byte for byte: the second
+/// and third line of a statement, `\r\n` and a lone `\r` as line ends, a
+/// tab, a line cut on the right, on the left and on both sides, a position
+/// one past the end, an internal query's cursor (an error inside PL/pgSQL's
+/// EXECUTE, `fe-protocol3.c:1112`), and — in a UTF8 database over a UTF8
+/// client encoding — wide and combining characters before the caret.
+///
+/// No upstream TAP test drives these through libpq alone; the regression
+/// suite's expected outputs pin the same lines through psql, and
+/// `crates/rlibpq/src/result.rs` replays those as unit tests.
+#[test]
+fn the_syntax_cursor_matches_the_reference_psql() {
+    let Some(cluster) = Cluster::start("trust", 55_435) else {
+        return;
+    };
+    let long = "x".repeat(40);
+    let queries = [
+        "select 1,\n  2 +\n  nosuch".to_owned(),
+        "select 1,\r\n  nosuch".to_owned(),
+        "select 1,\r\r\tnosuch".to_owned(),
+        format!("select nosuch, 1 as {long}, 2 as {long}"),
+        format!("select 1 as {long}, 2 as {long}, nosuch"),
+        format!("select 1 as {long}, nosuch, 2 as {long}"),
+        "select 1 +".to_owned(),
+        "do $$ begin execute 'selct 1'; end $$".to_owned(),
+    ];
+    let mut conn = cluster.connect();
+    gate_cursor(&cluster, &mut conn, &cluster.conninfo(), &queries);
+
+    let created = conn
+        .exec(b"create database u8 encoding 'UTF8' locale 'C' template template0")
+        .expect("the exchange completes");
+    assert_eq!(created[0].status(), ExecStatus::CommandOk);
+    let conninfo = cluster
+        .conninfo()
+        .replace("dbname=postgres", "dbname=u8 client_encoding=UTF8");
+    let mut conn = common::connect_to(&conninfo);
+    assert_eq!(conn.client_encoding(), rlibpq::encoding::Encoding::Utf8);
+    let queries = [
+        "select '\u{4e16}\u{754c}', 'e\u{301}', nosuch".to_owned(),
+        format!("select '{}', nosuch, 1 as {long}", "\u{4e16}".repeat(20)),
+    ];
+    gate_cursor(&cluster, &mut conn, &conninfo, &queries);
+}
+
+/// Each query's error, rendered by this crate at the default and verbose
+/// verbosities, against C psql's stderr for the same query on the same
+/// database.
+fn gate_cursor(
+    cluster: &Cluster,
+    conn: &mut rlibpq::Connection,
+    conninfo: &str,
+    queries: &[String],
+) {
+    for query in queries {
+        let result = only(conn.exec(query.as_bytes()).expect("the exchange completes"));
+        let error = result.error().expect("an error result");
+        for (verbosity, name) in [
+            (Verbosity::Default, "default"),
+            (Verbosity::Verbose, "verbose"),
+        ] {
+            let (_, stderr, code) = cluster.psql_at(conninfo, query, name);
+            assert_ne!(code, 0, "{query:?} fails through psql too");
+            let rendered =
+                error.message(ExecStatus::FatalError, verbosity, ContextVisibility::Errors);
+            assert!(
+                rendered.windows(5).any(|w| w == b"LINE "),
+                "{query:?} draws a cursor at all"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rendered),
+                String::from_utf8_lossy(&stderr),
+                "{query:?} at {name} must be psql's, byte for byte"
+            );
+        }
     }
 }
 

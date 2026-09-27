@@ -69,6 +69,7 @@ pub mod sha256;
 mod text;
 pub mod trace;
 pub mod uri;
+pub mod wcwidth;
 
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
 pub use cancel::{Cancel, CancelConn, CancelError, CancelStatus, CancelStep, Peer};

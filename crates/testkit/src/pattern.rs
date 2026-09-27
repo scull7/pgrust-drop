@@ -13,7 +13,7 @@
 //! literals and escapes, `.`, character classes with ranges and negation, the
 //! perl classes `\d \D \w \W \s \S`, groups (capturing and `(?:)`, both plain
 //! grouping here), alternation, the quantifiers `* + ? {n} {n,} {n,m}` with an
-//! optional lazy `?`, and the anchors `^` and `$` with Perl's semantics. Perl
+//! optional lazy `?`, and the anchors `^`, `$` and `\A` with Perl's semantics. Perl
 //! writes its flags after the pattern (`qr/^2$/m`); Rust has no such syntax, so
 //! they are written as a leading inline group instead, `(?m)^2$`. Anything
 //! outside the subset — backreferences, lookaround, `\b`, named groups, `/x` —
@@ -133,6 +133,8 @@ enum Node {
     Start,
     /// `$`
     End,
+    /// `\A`
+    TextStart,
     Concat(Vec<Node>),
     Alternate(Vec<Node>),
     Repeat {
@@ -155,6 +157,8 @@ enum Inst {
     Start,
     /// Zero-width `$`.
     End,
+    /// Zero-width `\A`: the start of the text, whatever the flags.
+    TextStart,
     Split(usize, usize),
     Jump(usize),
     Match,
@@ -242,7 +246,9 @@ impl Pattern {
                     Inst::AnyChar => pos < chars.len(),
                     // Already followed by add_thread; they are in the list
                     // only so the same state is never expanded twice.
-                    Inst::Split(..) | Inst::Jump(_) | Inst::Start | Inst::End => false,
+                    Inst::Split(..) | Inst::Jump(_) | Inst::Start | Inst::End | Inst::TextStart => {
+                        false
+                    }
                 };
                 if consumed {
                     self.add_thread(&mut next, pc + 1, pos + 1, &chars);
@@ -276,6 +282,7 @@ impl Pattern {
                 // in the list, so it is never expanded again at this position.
                 Inst::Start if self.at_start(pos, chars) => stack.push(pc + 1),
                 Inst::End if self.at_end(pos, chars) => stack.push(pc + 1),
+                Inst::TextStart if pos == 0 => stack.push(pc + 1),
                 _ => {}
             }
         }
@@ -354,6 +361,7 @@ fn compile(node: &Node, flags: Flags, program: &mut Vec<Inst>) -> Result<(), Pat
         Node::Class(class) => program.push(Inst::Class(class.clone())),
         Node::Start => program.push(Inst::Start),
         Node::End => program.push(Inst::End),
+        Node::TextStart => program.push(Inst::TextStart),
         Node::Concat(nodes) => {
             for node in nodes {
                 compile(node, flags, program)?;
@@ -559,15 +567,13 @@ impl Parser {
             },
             _ => return Ok(atom),
         };
-        if matches!(atom, Node::Start | Node::End) {
+        if matches!(atom, Node::Start | Node::End | Node::TextStart) {
             // `^*` is a Perl warning and a nonsense assertion; refuse it.
-            return Err(PatternError::NothingToRepeat(
-                if matches!(atom, Node::Start) {
-                    '^'
-                } else {
-                    '$'
-                },
-            ));
+            return Err(PatternError::NothingToRepeat(match atom {
+                Node::Start => '^',
+                Node::End => '$',
+                _ => 'A',
+            }));
         }
         // A lazy or possessive marker changes which match is found, never
         // whether one exists, and only the latter is asked here.
@@ -726,6 +732,7 @@ impl Parser {
             return Err(PatternError::UnexpectedEnd(self.consumed()));
         };
         let item = match c {
+            'A' => return Ok(Node::TextStart),
             'd' => ClassItem::Digit(true),
             'D' => ClassItem::Digit(false),
             'w' => ClassItem::Word(true),
@@ -886,6 +893,19 @@ mod tests {
         assert!(matches("(?m)^a", "a\n"));
         // Without /m the empty pattern still matches at position 0.
         assert!(matches("^$", "\n"));
+    }
+
+    #[test]
+    fn text_start_anchors_the_text_even_under_multiline() {
+        // 001_basic.pl's `qr/\A^psql:<stdin>:1: ERROR:  .*$/m`: `\A` is the
+        // start of the whole text, which `/m` does not move.
+        assert!(matches(r"(?m)\A^b", "b\n"));
+        assert!(!matches(r"(?m)\A^b", "a\nb\n"));
+        assert!(matches(r"(?m)^b", "a\nb\n"));
+        assert_eq!(
+            Pattern::new(r"\A*").unwrap_err(),
+            PatternError::NothingToRepeat('A')
+        );
     }
 
     #[test]

@@ -32,7 +32,8 @@
 //! over it (`lo_open` … `lo_import`, `lo_export`), proved against
 //! `src/test/examples/testlo.c` and `testlo64.c`; and the host list —
 //! `host`, `hostaddr` and `port` lists walked in order or shuffled by
-//! `load_balance_hosts=random` over `pg_prng`'s generator. The
+//! `load_balance_hosts=random` over `pg_prng`'s generator, each server
+//! checked against `target_session_attrs`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -69,6 +70,7 @@ pub mod result;
 pub mod scram;
 pub mod service;
 pub mod sha256;
+pub mod target;
 mod text;
 pub mod trace;
 pub mod uri;
@@ -108,6 +110,7 @@ pub use result::{
 };
 pub use scram::{Mechanism, ScramClient, ScramError};
 pub use service::{Files, Filesystem, parse_service_file, parse_service_info};
+pub use target::{CheckQuery, PgBool, ServerState, TargetCheck, TargetRejection, check_target};
 pub use text::RawText;
 pub use trace::{AuthResponse, Origin, TraceFlags};
 pub use uri::{parse_uri, uri_decode};

@@ -153,10 +153,10 @@ pub fn conn_hosts(conninfo: &ConnInfo) -> Result<Vec<ConnHost>, ConnError> {
 }
 
 /// `target_server_type`, `libpq-int.h`: what `target_session_attrs` asks
-/// the server to be.
+/// the server to be. [`crate::target::check_target`] holds a server to it.
 ///
-/// Only the parsing is here so far; nothing checks a server against it yet
-/// (`CONNECTION_CHECK_TARGET`, `fe-connect.c:4380`).
+/// `SERVER_TYPE_PREFER_STANDBY_PASS2` is not a value here: it is the second
+/// pass `Connection::connect` makes for `PreferStandby`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetServerType {
     /// `SERVER_TYPE_ANY`.

@@ -13,8 +13,12 @@
 //! and `\dt`, `\di`, `\dv`, `\dm`, `\ds` and `\dE`; and slice 2's
 //! `listPartitionedTables` ([`list_partitioned_tables_query`], `\dP`) and the
 //! access-method listings ([`describe_access_methods_query`], `\dA`, and
-//! [`OperatorListing`], `\dAc`, `\dAf`, `\dAo`, `\dAp`). Every other command
-//! the switch recognizes is refused by name until its slice lands.
+//! [`OperatorListing`], `\dAc`, `\dAf`, `\dAo`, `\dAp`); and slice 3's
+//! functions, operators and types ([`describe_aggregates_query`], `\da`;
+//! [`describe_functions_query`], `\df`; [`describe_types_query`], `\dT`;
+//! [`describe_operators_query`], `\do`) and
+//! [`describe_configuration_parameters_query`], `\dconfig`. Every other
+//! command the switch recognizes is refused by name until its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -40,6 +44,17 @@ pub enum DescribeCommand {
     /// One of the `\dA` listings that take an access-method pattern and a
     /// second one (`command.c:1061`-`:1092`).
     OperatorListing(OperatorListing),
+    /// `describeAggregates()` (`describe.c:78`): `\da`.
+    Aggregates,
+    /// `describeFunctions()` (`describe.c:295`), with the letters after
+    /// `\df` (`&cmd[2]`).
+    Functions(String),
+    /// `describeTypes()` (`describe.c:639`): `\dT`.
+    Types,
+    /// `describeOperators()` (`describe.c:794`): `\do`.
+    Operators,
+    /// `describeConfigurationParameters()` (`describe.c:4715`): `\dconfig`.
+    ConfigurationParameters,
     /// A command the switch recognizes whose port has not landed yet; the
     /// name is its `describe.c` function.
     NotYet(&'static str),
@@ -92,9 +107,9 @@ impl DescribeCommand {
                 b'p' => Some(Self::OperatorListing(OperatorListing::Functions)),
                 _ => None,
             },
-            b'a' => not_yet("describeAggregates"),
+            b'a' => Some(Self::Aggregates),
             b'b' => not_yet("describeTablespaces"),
-            b'c' if cmd.starts_with("dconfig") => not_yet("describeConfigurationParameters"),
+            b'c' if cmd.starts_with("dconfig") => Some(Self::ConfigurationParameters),
             b'c' => not_yet("listConversions"),
             b'C' => not_yet("listCasts"),
             b'd' if cmd.starts_with("ddp") => not_yet("listDefaultACLs"),
@@ -102,7 +117,7 @@ impl DescribeCommand {
             b'D' => not_yet("listDomains"),
             b'f' => match at(2) {
                 0 | b'+' | b'S' | b'a' | b'n' | b'p' | b't' | b'w' | b'x' => {
-                    not_yet("describeFunctions")
+                    Some(Self::Functions(cmd[2..].to_string()))
                 }
                 _ => None,
             },
@@ -110,7 +125,7 @@ impl DescribeCommand {
             b'l' => not_yet("listLargeObjects"),
             b'L' => not_yet("listLanguages"),
             b'n' => not_yet("listSchemas"),
-            b'o' => not_yet("describeOperators"),
+            b'o' => Some(Self::Operators),
             b'O' => not_yet("listCollations"),
             b'p' => not_yet("permissionsList"),
             b'P' => match at(2) {
@@ -119,7 +134,7 @@ impl DescribeCommand {
                 }
                 _ => None,
             },
-            b'T' => not_yet("describeTypes"),
+            b'T' => Some(Self::Types),
             b't' | b'v' | b'm' | b'i' | b's' | b'E' => Some(Self::ListTables(cmd[1..].to_string())),
             b'r' => match (at(2), at(3)) {
                 (b'd', b's') => not_yet("listDbRoleSettings"),
@@ -154,12 +169,15 @@ impl DescribeCommand {
 
     /// How many patterns `exec_command_d()` reads for `cmd`: a second one only
     /// for `\dAc`, `\dAf`, `\dAo` and `\dAp`, and only after a first
-    /// (`command.c:1065`). Any argument past them draws the "extra argument"
+    /// (`command.c:1065`); for `\df` and `\do`, after a first, up to
+    /// [`FUNC_MAX_ARGS`] argument types (`exec_command_dfo()`,
+    /// `command.c:1313`). Any argument past them draws the "extra argument"
     /// warning.
     #[must_use]
     pub fn patterns_read(cmd: &str, has_pattern: bool) -> usize {
         match Self::parse(cmd, has_pattern) {
             Some(Self::OperatorListing(_)) if has_pattern => 2,
+            Some(Self::Functions(_) | Self::Operators) if has_pattern => 1 + FUNC_MAX_ARGS,
             _ => 1,
         }
     }
@@ -757,6 +775,9 @@ pub enum Refusal {
     /// The server predates the feature. Upstream logs the message and still
     /// reports success (`describe.c:155`-`:163`, `:4282`-`:4290`).
     ServerTooOld(String),
+    /// The command's letters are not all ones it takes. Upstream logs the
+    /// message and still reports success (`describe.c:314`-`:318`).
+    InvalidOptions(String),
 }
 
 impl From<PatternError> for Refusal {
@@ -1249,6 +1270,648 @@ pub fn list_partitioned_tables_query(
     Ok(buf)
 }
 
+/// `printACLColumn()` (`describe.c:6880`): an ACL column as one grant per
+/// line, `(none)` for an empty one.
+fn push_acl_column(buf: &mut String, colname: &str) {
+    let _ = write!(
+        buf,
+        "CASE WHEN pg_catalog.array_length({colname}, 1) = 0 THEN '(none)' \
+         ELSE pg_catalog.array_to_string({colname}, E'\\n') END AS \"Access privileges\""
+    );
+}
+
+/// The query half of `describeAggregates()` (`describe.c:78`-`:127`), whose
+/// title is "List of aggregate functions".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn describe_aggregates_query(
+    pattern: Option<&str>,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "  p.proname AS \"Name\",\n",
+        "  pg_catalog.format_type(p.prorettype, NULL) AS \"Result data type\",\n",
+        "  CASE WHEN p.pronargs = 0\n",
+        "    THEN CAST('*' AS pg_catalog.text)\n",
+        "    ELSE pg_catalog.pg_get_function_arguments(p.oid)\n",
+        "  END AS \"Argument data types\",\n",
+        "  pg_catalog.obj_description(p.oid, 'pg_proc') as \"Description\"\n",
+        "FROM pg_catalog.pg_proc p\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\n",
+    ));
+    // `prokind` replaced `proisagg` in PostgreSQL 11.
+    buf.push_str(if server.sversion >= 110_000 {
+        "WHERE p.prokind = 'a'\n"
+    } else {
+        "WHERE p.proisagg\n"
+    });
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("p.proname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_function_is_visible(p.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2, 4;");
+    Ok(buf)
+}
+
+/// The `\df` letters `describeFunctions()` accepts after `\df`
+/// (`describe.c:299`).
+pub const DF_OPTIONS: &str = "anptwSx+";
+
+/// `FUNC_MAX_ARGS` (`pg_config_manual.h:43`): how many argument-type
+/// patterns `exec_command_dfo()` reads after a `\df` or `\do` pattern
+/// (`command.c:1313`-`:1325`).
+pub const FUNC_MAX_ARGS: usize = 100;
+
+/// The function kinds `describeFunctions()` was asked for
+/// (`describe.c:300`-`:304`, `:331`-`:336`).
+// One flag per letter of `functypes`, as upstream has them.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionTypes {
+    /// `a`
+    pub aggregate: bool,
+    /// `n`
+    pub normal: bool,
+    /// `p`
+    pub procedure: bool,
+    /// `t`
+    pub trigger: bool,
+    /// `w`
+    pub window: bool,
+}
+
+impl FunctionTypes {
+    /// Each letter anywhere in `functypes`, and none meaning all of them —
+    /// procedures only from PostgreSQL 11, which has them.
+    ///
+    /// # Errors
+    /// The messages `describeFunctions()` logs before it returns `true`
+    /// (`describe.c:314`-`:329`): a letter outside [`DF_OPTIONS`], or `p`
+    /// for a server before 11.
+    pub fn parse(functypes: &str, sversion: i32) -> Result<Self, Refusal> {
+        if !functypes.chars().all(|c| DF_OPTIONS.contains(c)) {
+            return Err(Refusal::InvalidOptions(format!(
+                "\\df only takes [{DF_OPTIONS}] as options"
+            )));
+        }
+        let has = |c| functypes.contains(c);
+        let mut t = Self {
+            aggregate: has('a'),
+            normal: has('n'),
+            procedure: has('p'),
+            trigger: has('t'),
+            window: has('w'),
+        };
+        if t.procedure && sversion < 110_000 {
+            return Err(Refusal::ServerTooOld(format!(
+                "\\df does not take a \"p\" option with server version {}",
+                format_pg_version_number(sversion, false)
+            )));
+        }
+        if !(t.aggregate || t.normal || t.procedure || t.trigger || t.window) {
+            t = Self {
+                aggregate: true,
+                normal: true,
+                procedure: sversion >= 110_000,
+                trigger: true,
+                window: true,
+            };
+        }
+        Ok(t)
+    }
+
+    /// Every kind: no filter at all.
+    fn all(self) -> bool {
+        self.aggregate && self.normal && self.procedure && self.trigger && self.window
+    }
+}
+
+/// The `WHERE` / `AND` clauses that match the argument-type patterns of
+/// `\df` and `\do` (`describe.c:564`-`:596`, `:883`-`:915`): each against
+/// the type's internal or external name, as `\dT` does, or `-` for "no such
+/// argument".
+fn push_arg_type_patterns(
+    buf: &mut String,
+    arg_patterns: &[&str],
+    server: ServerContext<'_>,
+) -> Result<(), PatternError> {
+    for (i, &arg) in arg_patterns.iter().enumerate() {
+        if arg == "-" {
+            let _ = writeln!(buf, "  AND t{i}.typname IS NULL");
+            continue;
+        }
+        let nspname = format!("nt{i}.nspname");
+        let typname = format!("t{i}.typname");
+        let ft = format!("pg_catalog.format_type(t{i}.oid, NULL)");
+        let tiv = format!("pg_catalog.pg_type_is_visible(t{i}.oid)");
+        validate_sql_name_pattern(
+            buf,
+            map_typename_pattern(Some(arg)),
+            true,
+            false,
+            PatternVars {
+                schemavar: Some(&nspname),
+                namevar: Some(&typname),
+                altnamevar: Some(&ft),
+                visibilityrule: Some(&tiv),
+            },
+            3,
+            server.sversion,
+            server.db,
+        )?;
+    }
+    Ok(())
+}
+
+/// Append `clause` after `WHERE` or `AND`, as each of `describeFunctions()`'s
+/// kind filters does (`describe.c:459`-`:512`).
+fn push_where_and(buf: &mut String, have_where: &mut bool, clause: &str) {
+    buf.push_str(if *have_where { "      AND " } else { "WHERE " });
+    *have_where = true;
+    buf.push_str(clause);
+}
+
+/// The query half of `describeFunctions()` (`describe.c:295`-`:602`), whose
+/// title is "List of functions".
+///
+/// # Errors
+/// [`FunctionTypes::parse`]'s refusals, or a pattern that failed
+/// `validateSQLNamePattern`.
+// One upstream function, kept in its order so it reads against its C.
+#[allow(clippy::too_many_lines)]
+pub fn describe_functions_query(
+    functypes: &str,
+    pattern: Option<&str>,
+    arg_patterns: &[&str],
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    let types = FunctionTypes::parse(functypes, server.sversion)?;
+    let v11 = server.sversion >= 110_000;
+
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "  p.proname as \"Name\",\n",
+        "  pg_catalog.pg_get_function_result(p.oid) as \"Result data type\",\n",
+        "  pg_catalog.pg_get_function_arguments(p.oid) as \"Argument data types\",\n",
+    ));
+    buf.push_str(if v11 {
+        concat!(
+            " CASE p.prokind\n",
+            "  WHEN 'a' THEN 'agg'\n",
+            "  WHEN 'w' THEN 'window'\n",
+            "  WHEN 'p' THEN 'proc'\n",
+            "  ELSE 'func'\n",
+            " END as \"Type\"",
+        )
+    } else {
+        concat!(
+            " CASE\n",
+            "  WHEN p.proisagg THEN 'agg'\n",
+            "  WHEN p.proiswindow THEN 'window'\n",
+            "  WHEN p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype THEN 'trigger'\n",
+            "  ELSE 'func'\n",
+            " END as \"Type\"",
+        )
+    });
+    if verbose {
+        buf.push_str(concat!(
+            ",\n CASE\n",
+            "  WHEN p.provolatile = 'i' THEN 'immutable'\n",
+            "  WHEN p.provolatile = 's' THEN 'stable'\n",
+            "  WHEN p.provolatile = 'v' THEN 'volatile'\n",
+            " END as \"Volatility\"",
+        ));
+        // No "Parallel" column before 9.6.
+        if server.sversion >= 90_600 {
+            buf.push_str(concat!(
+                ",\n CASE\n",
+                "  WHEN p.proparallel = 'r' THEN 'restricted'\n",
+                "  WHEN p.proparallel = 's' THEN 'safe'\n",
+                "  WHEN p.proparallel = 'u' THEN 'unsafe'\n",
+                " END as \"Parallel\"",
+            ));
+        }
+        buf.push_str(concat!(
+            ",\n pg_catalog.pg_get_userbyid(p.proowner) as \"Owner\"",
+            ",\n CASE WHEN prosecdef THEN 'definer' ELSE 'invoker' END AS \"Security\"",
+            ",\n CASE WHEN p.proleakproof THEN 'yes' ELSE 'no' END as \"Leakproof?\"",
+            ",\n ",
+        ));
+        push_acl_column(&mut buf, "p.proacl");
+        buf.push_str(concat!(
+            ",\n l.lanname as \"Language\"",
+            ",\n CASE WHEN l.lanname IN ('internal', 'c') THEN p.prosrc END as \"Internal name\"",
+            ",\n pg_catalog.obj_description(p.oid, 'pg_proc') as \"Description\"",
+        ));
+    }
+
+    buf.push_str(
+        "\nFROM pg_catalog.pg_proc p\
+         \n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\n",
+    );
+    for i in 0..arg_patterns.len() {
+        let _ = writeln!(
+            buf,
+            "     LEFT JOIN pg_catalog.pg_type t{i} ON t{i}.oid = p.proargtypes[{i}]"
+        );
+        let _ = writeln!(
+            buf,
+            "     LEFT JOIN pg_catalog.pg_namespace nt{i} ON nt{i}.oid = t{i}.typnamespace"
+        );
+    }
+    if verbose {
+        buf.push_str("     LEFT JOIN pg_catalog.pg_language l ON l.oid = p.prolang\n");
+    }
+
+    // Filter by function type, if requested.
+    let mut have_where = false;
+    if types.all() {
+        // Do nothing.
+    } else if types.normal {
+        if !types.aggregate {
+            push_where_and(
+                &mut buf,
+                &mut have_where,
+                if v11 {
+                    "p.prokind <> 'a'\n"
+                } else {
+                    "NOT p.proisagg\n"
+                },
+            );
+        }
+        if !types.procedure && v11 {
+            push_where_and(&mut buf, &mut have_where, "p.prokind <> 'p'\n");
+        }
+        if !types.trigger {
+            push_where_and(
+                &mut buf,
+                &mut have_where,
+                "p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype\n",
+            );
+        }
+        if !types.window {
+            push_where_and(
+                &mut buf,
+                &mut have_where,
+                if v11 {
+                    "p.prokind <> 'w'\n"
+                } else {
+                    "NOT p.proiswindow\n"
+                },
+            );
+        }
+    } else {
+        // At least one of these is true.
+        buf.push_str("WHERE (\n       ");
+        have_where = true;
+        let mut needs_or = false;
+        let mut or = |buf: &mut String, clause: &str| {
+            if needs_or {
+                buf.push_str("       OR ");
+            }
+            buf.push_str(clause);
+            needs_or = true;
+        };
+        if types.aggregate {
+            or(
+                &mut buf,
+                if v11 {
+                    "p.prokind = 'a'\n"
+                } else {
+                    "p.proisagg\n"
+                },
+            );
+        }
+        if types.trigger {
+            or(
+                &mut buf,
+                "p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype\n",
+            );
+        }
+        if types.procedure {
+            or(&mut buf, "p.prokind = 'p'\n");
+        }
+        if types.window {
+            or(
+                &mut buf,
+                if v11 {
+                    "p.prokind = 'w'\n"
+                } else {
+                    "p.proiswindow\n"
+                },
+            );
+        }
+        buf.push_str("      )\n");
+    }
+
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        have_where,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("p.proname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_function_is_visible(p.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    push_arg_type_patterns(&mut buf, arg_patterns, server)?;
+
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    buf.push_str("ORDER BY 1, 2, 4;");
+    Ok(buf)
+}
+
+/// `map_typename_pattern()` (`describe.c:744`): a type name the grammar
+/// accepts but neither `pg_type` nor `format_type()` uses, as the canonical
+/// name, compared case-insensitively; any other pattern as it is.
+#[must_use]
+pub fn map_typename_pattern(pattern: Option<&str>) -> Option<&str> {
+    const TYPENAME_MAP: [(&str, &str); 18] = [
+        // Accepted by gram.y, though neither the "real" name seen in pg_type
+        // nor the canonical name printed by format_type().
+        ("decimal", "numeric"),
+        ("float", "double precision"),
+        ("int", "integer"),
+        // Array names whose canonical name differs from what pg_type says.
+        ("bool[]", "boolean[]"),
+        ("decimal[]", "numeric[]"),
+        ("float[]", "double precision[]"),
+        ("float4[]", "real[]"),
+        ("float8[]", "double precision[]"),
+        ("int[]", "integer[]"),
+        ("int2[]", "smallint[]"),
+        ("int4[]", "integer[]"),
+        ("int8[]", "bigint[]"),
+        ("time[]", "time without time zone[]"),
+        ("timetz[]", "time with time zone[]"),
+        ("timestamp[]", "timestamp without time zone[]"),
+        ("timestamptz[]", "timestamp with time zone[]"),
+        ("varbit[]", "bit varying[]"),
+        ("varchar[]", "character varying[]"),
+    ];
+    let pattern = pattern?;
+    Some(
+        TYPENAME_MAP
+            .iter()
+            .find(|(from, _)| pattern.eq_ignore_ascii_case(from))
+            .map_or(pattern, |&(_, to)| to),
+    )
+}
+
+/// The query half of `describeTypes()` (`describe.c:639`-`:718`), whose
+/// title is "List of data types".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn describe_types_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "  pg_catalog.format_type(t.oid, NULL) AS \"Name\",\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "  t.typname AS \"Internal name\",\n",
+            "  CASE WHEN t.typrelid != 0\n",
+            "      THEN CAST('tuple' AS pg_catalog.text)\n",
+            "    WHEN t.typlen < 0\n",
+            "      THEN CAST('var' AS pg_catalog.text)\n",
+            "    ELSE CAST(t.typlen AS pg_catalog.text)\n",
+            "  END AS \"Size\",\n",
+            "  pg_catalog.array_to_string(\n",
+            "      ARRAY(\n",
+            "          SELECT e.enumlabel\n",
+            "          FROM pg_catalog.pg_enum e\n",
+            "          WHERE e.enumtypid = t.oid\n",
+            "          ORDER BY e.enumsortorder\n",
+            "      ),\n",
+            "      E'\\n'\n",
+            "  ) AS \"Elements\",\n",
+            "  pg_catalog.pg_get_userbyid(t.typowner) AS \"Owner\",\n",
+        ));
+        push_acl_column(&mut buf, "t.typacl");
+        buf.push_str(",\n  ");
+    }
+    buf.push_str(concat!(
+        "  pg_catalog.obj_description(t.oid, 'pg_type') as \"Description\"\n",
+        "FROM pg_catalog.pg_type t\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\n",
+        // Complex types only when they are standalone composite types.
+        "WHERE (t.typrelid = 0 ",
+        "OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c ",
+        "WHERE c.oid = t.typrelid))\n",
+    ));
+    // Array types only when the pattern asks for them.
+    if !pattern.is_some_and(|p| p.contains("[]")) {
+        buf.push_str(
+            "  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el \
+             WHERE el.oid = t.typelem AND el.typarray = t.oid)\n",
+        );
+    }
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    // Match the name pattern against either the internal or external name.
+    validate_sql_name_pattern(
+        &mut buf,
+        map_typename_pattern(pattern),
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("t.typname"),
+            altnamevar: Some("pg_catalog.format_type(t.oid, NULL)"),
+            visibilityrule: Some("pg_catalog.pg_type_is_visible(t.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `describeOperators()` (`describe.c:794`-`:917`), whose
+/// title is "List of operators". One argument-type pattern matches the right
+/// argument of a prefix operator; two match the left and right ones; any
+/// more are read and ignored.
+///
+/// # Errors
+/// A pattern failed `validateSQLNamePattern`.
+pub fn describe_operators_query(
+    pattern: Option<&str>,
+    arg_patterns: &[&str],
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    // The support for postfix operators is dead code as of PostgreSQL 14,
+    // kept for older servers; the coalesce() for third-party operators whose
+    // comment is on their function.
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "  o.oprname AS \"Name\",\n",
+        "  CASE WHEN o.oprkind='l' THEN NULL ELSE pg_catalog.format_type(o.oprleft, NULL) END AS \"Left arg type\",\n",
+        "  CASE WHEN o.oprkind='r' THEN NULL ELSE pg_catalog.format_type(o.oprright, NULL) END AS \"Right arg type\",\n",
+        "  pg_catalog.format_type(o.oprresult, NULL) AS \"Result type\",\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "  o.oprcode AS \"Function\",\n",
+            "  CASE WHEN p.proleakproof THEN 'yes' ELSE 'no' END AS \"Leakproof?\",\n",
+        ));
+    }
+    buf.push_str(concat!(
+        "  coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'),\n",
+        "           pg_catalog.obj_description(o.oprcode, 'pg_proc')) AS \"Description\"\n",
+        "FROM pg_catalog.pg_operator o\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace\n",
+    ));
+
+    let arg_patterns = &arg_patterns[..arg_patterns.len().min(2)];
+    match arg_patterns.len() {
+        2 => buf.push_str(concat!(
+            "     LEFT JOIN pg_catalog.pg_type t0 ON t0.oid = o.oprleft\n",
+            "     LEFT JOIN pg_catalog.pg_namespace nt0 ON nt0.oid = t0.typnamespace\n",
+            "     LEFT JOIN pg_catalog.pg_type t1 ON t1.oid = o.oprright\n",
+            "     LEFT JOIN pg_catalog.pg_namespace nt1 ON nt1.oid = t1.typnamespace\n",
+        )),
+        1 => buf.push_str(concat!(
+            "     LEFT JOIN pg_catalog.pg_type t0 ON t0.oid = o.oprright\n",
+            "     LEFT JOIN pg_catalog.pg_namespace nt0 ON nt0.oid = t0.typnamespace\n",
+        )),
+        _ => {}
+    }
+    if verbose {
+        buf.push_str("     LEFT JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode\n");
+    }
+
+    let not_system = !show_system && pattern.is_none();
+    if not_system {
+        buf.push_str(
+            "WHERE n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        not_system,
+        true,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("o.oprname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_operator_is_visible(o.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    if arg_patterns.len() == 1 {
+        buf.push_str("  AND o.oprleft = 0\n");
+    }
+    push_arg_type_patterns(&mut buf, arg_patterns, server)?;
+    buf.push_str("ORDER BY 1, 2, 3, 4;");
+    Ok(buf)
+}
+
+/// The query half of `describeConfigurationParameters()`
+/// (`describe.c:4715`-`:4758`), and its title (`:4765`-`:4768`). A pattern
+/// is matched against the lower-cased name and never refused; without one,
+/// only parameters set away from their defaults are listed.
+#[must_use]
+pub fn describe_configuration_parameters_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> (String, &'static str) {
+    let mut buf = String::from(
+        "SELECT s.name AS \"Parameter\", pg_catalog.current_setting(s.name) AS \"Value\"",
+    );
+    // pg_parameter_acl arrived in PostgreSQL 15.
+    let v15 = server.sversion >= 150_000;
+    if verbose {
+        buf.push_str(", s.vartype AS \"Type\", s.context AS \"Context\", ");
+        if v15 {
+            push_acl_column(&mut buf, "p.paracl");
+        } else {
+            buf.push_str("NULL AS \"Access privileges\"");
+        }
+    }
+    buf.push_str("\nFROM pg_catalog.pg_settings s\n");
+    if verbose && v15 {
+        buf.push_str(concat!(
+            "  LEFT JOIN pg_catalog.pg_parameter_acl p\n",
+            "  ON pg_catalog.lower(s.name) = p.parname\n",
+        ));
+    }
+    if pattern.is_some() {
+        process_sql_name_pattern(
+            &mut buf,
+            pattern,
+            false,
+            false,
+            PatternVars {
+                namevar: Some("pg_catalog.lower(s.name)"),
+                ..PatternVars::default()
+            },
+            server.sversion,
+        );
+    } else {
+        buf.push_str(concat!(
+            "WHERE s.source <> 'default' AND\n",
+            "      s.setting IS DISTINCT FROM s.boot_val\n",
+        ));
+    }
+    buf.push_str("ORDER BY 1;");
+    let title = if pattern.is_some() {
+        "List of configuration parameters"
+    } else {
+        "List of non-default configuration parameters"
+    };
+    (buf, title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,9 +2121,25 @@ mod tests {
             Some(DescribeCommand::ListTables("E".into()))
         );
         assert_eq!(
-            p("dconfig", false),
-            Some(DescribeCommand::NotYet("describeConfigurationParameters"))
+            p("dconfig+", false),
+            Some(DescribeCommand::ConfigurationParameters)
         );
+        assert_eq!(p("daS", true), Some(DescribeCommand::Aggregates));
+        assert_eq!(
+            p("dfn+", true),
+            Some(DescribeCommand::Functions("n+".into()))
+        );
+        assert_eq!(
+            p("df", false),
+            Some(DescribeCommand::Functions(String::new()))
+        );
+        // Only `cmd[2]` is checked here; `describeFunctions` refuses the rest.
+        assert_eq!(
+            p("dfnq", false),
+            Some(DescribeCommand::Functions("nq".into()))
+        );
+        assert_eq!(p("dT+", true), Some(DescribeCommand::Types));
+        assert_eq!(p("doS", true), Some(DescribeCommand::Operators));
         assert_eq!(
             p("dc", false),
             Some(DescribeCommand::NotYet("listConversions"))
@@ -1507,6 +2186,314 @@ mod tests {
         assert_eq!(n("dAx", true), 1);
         assert_eq!(n("dt", true), 1);
         assert_eq!(n("dAz", true), 1);
+    }
+
+    #[test]
+    fn df_and_do_read_up_to_func_max_args_argument_types_after_a_pattern() {
+        // `command.c:1313`-`:1325`.
+        let n = DescribeCommand::patterns_read;
+        assert_eq!(n("df", true), 101);
+        assert_eq!(n("dfa+", true), 101);
+        assert_eq!(n("do", true), 101);
+        assert_eq!(n("df", false), 1);
+        assert_eq!(n("da", true), 1);
+        assert_eq!(n("dT", true), 1);
+    }
+
+    #[test]
+    fn the_da_query_is_upstreams_on_both_sides_of_11() {
+        assert_eq!(
+            describe_aggregates_query(None, false, PG18).unwrap(),
+            "SELECT n.nspname as \"Schema\",\n  \
+             p.proname AS \"Name\",\n  \
+             pg_catalog.format_type(p.prorettype, NULL) AS \"Result data type\",\n  \
+             CASE WHEN p.pronargs = 0\n    \
+             THEN CAST('*' AS pg_catalog.text)\n    \
+             ELSE pg_catalog.pg_get_function_arguments(p.oid)\n  \
+             END AS \"Argument data types\",\n  \
+             pg_catalog.obj_description(p.oid, 'pg_proc') as \"Description\"\n\
+             FROM pg_catalog.pg_proc p\n     \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\n\
+             WHERE p.prokind = 'a'\n      \
+             AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n  \
+             AND pg_catalog.pg_function_is_visible(p.oid)\n\
+             ORDER BY 1, 2, 4;"
+        );
+        let v10 = ServerContext {
+            sversion: 100_023,
+            ..PG18
+        };
+        let q = describe_aggregates_query(Some("sum"), true, v10).unwrap();
+        assert!(q.contains("WHERE p.proisagg\n  AND p.proname"), "{q}");
+        assert!(!q.contains("COLLATE"), "{q}");
+    }
+
+    #[test]
+    fn df_refuses_letters_it_does_not_take_and_p_before_11() {
+        assert_eq!(
+            FunctionTypes::parse("nq", 180_006),
+            Err(Refusal::InvalidOptions(
+                "\\df only takes [anptwSx+] as options".into()
+            ))
+        );
+        assert_eq!(
+            FunctionTypes::parse("p", 100_023),
+            Err(Refusal::ServerTooOld(
+                "\\df does not take a \"p\" option with server version 10".into()
+            ))
+        );
+        // No kind letter is every kind, procedures only from 11.
+        let all = FunctionTypes::parse("S+x", 180_006).unwrap();
+        assert!(all.all());
+        let old = FunctionTypes::parse("", 100_023).unwrap();
+        assert!(!old.procedure && old.normal && old.aggregate);
+    }
+
+    #[test]
+    fn df_kind_letters_become_upstreams_filters() {
+        let q =
+            |types| describe_functions_query(types, Some("f"), &[], false, false, PG18).unwrap();
+        // `n` alone excludes the others, each on its own line.
+        assert!(
+            q("n").contains(
+                "WHERE p.prokind <> 'a'\n      \
+                 AND p.prokind <> 'p'\n      \
+                 AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype\n      \
+                 AND p.prokind <> 'w'\n  \
+                 AND p.proname"
+            ),
+            "{}",
+            q("n")
+        );
+        // Without `n`, the kinds asked for are ORed, in upstream's order.
+        assert!(
+            q("wat").contains(
+                "WHERE (\n       p.prokind = 'a'\n       \
+                 OR p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype\n       \
+                 OR p.prokind = 'w'\n      )\n  \
+                 AND p.proname"
+            ),
+            "{}",
+            q("wat")
+        );
+        // Every kind is no filter at all.
+        assert!(q("anptw").contains(
+            "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace\nWHERE p.proname"
+        ));
+        // Before 11 there is no prokind, and no procedure filter.
+        let v10 = ServerContext {
+            sversion: 100_023,
+            ..PG18
+        };
+        let old = describe_functions_query("n", None, &[], false, false, v10).unwrap();
+        assert!(
+            old.contains("WHERE NOT p.proisagg\n      AND p.prorettype <> "),
+            "{old}"
+        );
+        assert!(
+            old.contains("  WHEN p.proiswindow THEN 'window'\n"),
+            "{old}"
+        );
+    }
+
+    #[test]
+    fn df_argument_patterns_join_a_type_each_and_dash_means_none() {
+        let q = describe_functions_query("", Some("f"), &["int", "-"], false, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "     LEFT JOIN pg_catalog.pg_type t1 ON t1.oid = p.proargtypes[1]\n     \
+                 LEFT JOIN pg_catalog.pg_namespace nt1 ON nt1.oid = t1.typnamespace\n"
+            ),
+            "{q}"
+        );
+        // `int` is looked up as `integer`, by either name.
+        assert!(
+            q.contains(
+                "  AND (t0.typname OPERATOR(pg_catalog.~) '^(integer)$' COLLATE pg_catalog.default\n        \
+                 OR pg_catalog.format_type(t0.oid, NULL) OPERATOR(pg_catalog.~) '^(integer)$' COLLATE pg_catalog.default)\n  \
+                 AND pg_catalog.pg_type_is_visible(t0.oid)\n  \
+                 AND t1.typname IS NULL\n\
+                 ORDER BY 1, 2, 4;"
+            ),
+            "{q}"
+        );
+        let refused = describe_functions_query("", Some("f"), &["a.b.c.d"], false, false, PG18);
+        assert_eq!(
+            refused,
+            Err(Refusal::Pattern(PatternError(
+                "improper qualified name (too many dotted names): a.b.c.d".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn df_plus_adds_upstreams_columns_and_the_language_join() {
+        let q = describe_functions_query("", None, &[], true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                ",\n CASE WHEN p.proleakproof THEN 'yes' ELSE 'no' END as \"Leakproof?\",\n \
+                 CASE WHEN pg_catalog.array_length(p.proacl, 1) = 0 THEN '(none)' \
+                 ELSE pg_catalog.array_to_string(p.proacl, E'\\n') END AS \"Access privileges\",\n \
+                 l.lanname as \"Language\""
+            ),
+            "{q}"
+        );
+        assert!(
+            q.contains("     LEFT JOIN pg_catalog.pg_language l ON l.oid = p.prolang\n"),
+            "{q}"
+        );
+        // No "Parallel" column before 9.6.
+        let v95 = ServerContext {
+            sversion: 90_524,
+            ..PG18
+        };
+        let old = describe_functions_query("", None, &[], true, false, v95).unwrap();
+        assert!(!old.contains("Parallel"), "{old}");
+        assert!(
+            old.contains(" END as \"Volatility\",\n pg_catalog.pg_get_userbyid"),
+            "{old}"
+        );
+    }
+
+    #[test]
+    fn typename_patterns_map_grammar_names_case_insensitively() {
+        assert_eq!(map_typename_pattern(Some("DECIMAL")), Some("numeric"));
+        assert_eq!(map_typename_pattern(Some("int4[]")), Some("integer[]"));
+        assert_eq!(
+            map_typename_pattern(Some("varchar[]")),
+            Some("character varying[]")
+        );
+        assert_eq!(map_typename_pattern(Some("int4")), Some("int4"));
+        assert_eq!(map_typename_pattern(Some("int*")), Some("int*"));
+        assert_eq!(map_typename_pattern(None), None);
+    }
+
+    #[test]
+    fn dt_hides_arrays_unless_the_pattern_asks_for_them() {
+        let hides = "  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el \
+                     WHERE el.oid = t.typelem AND el.typarray = t.oid)\n";
+        let q = describe_types_query(None, false, false, PG18).unwrap();
+        assert!(
+            q.contains(&format!(
+                "WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c \
+                 WHERE c.oid = t.typrelid))\n{hides}      AND n.nspname <> 'pg_catalog'\n"
+            )),
+            "{q}"
+        );
+        let arrays = describe_types_query(Some("int4[]"), false, false, PG18).unwrap();
+        assert!(!arrays.contains(hides), "{arrays}");
+        // The pattern is mapped, and `[]` escaped as an array tail.
+        assert!(arrays.contains("E'^(integer\\\\[])$'"), "{arrays}");
+    }
+
+    #[test]
+    fn dt_plus_lists_enum_elements_one_per_line() {
+        let q = describe_types_query(None, true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "          ORDER BY e.enumsortorder\n      ),\n      E'\\n'\n  ) AS \"Elements\",\n"
+            ),
+            "{q}"
+        );
+        // `printACLColumn`, then upstream's `",\n  "` before the description.
+        assert!(
+            q.contains(
+                "END AS \"Access privileges\",\n    pg_catalog.obj_description(t.oid, 'pg_type')"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn do_argument_patterns_match_the_right_argument_or_both() {
+        let q =
+            |args: &[&str]| describe_operators_query(Some("+"), args, false, false, PG18).unwrap();
+        let one = q(&["int4"]);
+        assert!(
+            one.contains("pg_catalog.pg_type t0 ON t0.oid = o.oprright\n"),
+            "{one}"
+        );
+        assert!(
+            one.contains("  AND o.oprleft = 0\n  AND (t0.typname"),
+            "{one}"
+        );
+        // `force_escape`: `+` is an operator character, not a quantifier.
+        assert!(
+            one.contains("o.oprname OPERATOR(pg_catalog.~) E'^(\\\\+)$'"),
+            "{one}"
+        );
+        let three = q(&["int4", "-", "text"]);
+        assert!(three.contains("t0 ON t0.oid = o.oprleft\n"), "{three}");
+        assert!(three.contains("t1 ON t1.oid = o.oprright\n"), "{three}");
+        assert!(
+            three.contains("  AND t1.typname IS NULL\nORDER BY 1, 2, 3, 4;"),
+            "{three}"
+        );
+        assert!(!three.contains("t2") && !three.contains("text"), "{three}");
+    }
+
+    #[test]
+    fn do_without_a_pattern_starts_the_where_with_the_system_filter() {
+        let q = describe_operators_query(None, &[], true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "     LEFT JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode\n\
+                 WHERE n.nspname <> 'pg_catalog'\n      \
+                 AND n.nspname <> 'information_schema'\n  \
+                 AND pg_catalog.pg_operator_is_visible(o.oid)\n\
+                 ORDER BY 1, 2, 3, 4;"
+            ),
+            "{q}"
+        );
+        let system = describe_operators_query(None, &[], false, true, PG18).unwrap();
+        assert!(
+            system.contains("\nWHERE pg_catalog.pg_operator_is_visible(o.oid)\n"),
+            "{system}"
+        );
+    }
+
+    #[test]
+    fn dconfig_lists_non_defaults_or_matches_the_lower_cased_name() {
+        let (q, title) = describe_configuration_parameters_query(None, false, PG18);
+        assert_eq!(title, "List of non-default configuration parameters");
+        assert_eq!(
+            q,
+            "SELECT s.name AS \"Parameter\", pg_catalog.current_setting(s.name) AS \"Value\"\n\
+             FROM pg_catalog.pg_settings s\n\
+             WHERE s.source <> 'default' AND\n      \
+             s.setting IS DISTINCT FROM s.boot_val\n\
+             ORDER BY 1;"
+        );
+        let (q, title) = describe_configuration_parameters_query(Some("Work*"), true, PG18);
+        assert_eq!(title, "List of configuration parameters");
+        assert!(
+            q.contains(
+                ", s.vartype AS \"Type\", s.context AS \"Context\", CASE WHEN pg_catalog.array_length(p.paracl, 1)"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "  LEFT JOIN pg_catalog.pg_parameter_acl p\n  \
+                 ON pg_catalog.lower(s.name) = p.parname\n\
+                 WHERE pg_catalog.lower(s.name) OPERATOR(pg_catalog.~) '^(work.*)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1;"
+            ),
+            "{q}"
+        );
+        // Before 15 there is no pg_parameter_acl.
+        let v14 = ServerContext {
+            sversion: 140_019,
+            ..PG18
+        };
+        let (old, _) = describe_configuration_parameters_query(Some("a.b"), true, v14);
+        assert!(
+            old.contains(", NULL AS \"Access privileges\"\nFROM"),
+            "{old}"
+        );
+        // No schema: a dot is part of the name, never refused.
+        assert!(old.contains("'^(a.b)$'"), "{old}");
     }
 
     #[test]

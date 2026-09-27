@@ -14,8 +14,10 @@ use rlibpq::QueryResult;
 
 use crate::common::{Executor, LogLevel, log_prefix, psql_exec};
 use crate::describe::{
-    DescribeCommand, DescribeFlags, PartitionTypes, Refusal, ServerContext, TableTypes,
-    describe_access_methods_query, list_partitioned_tables_query, list_tables_query,
+    DescribeCommand, DescribeFlags, FUNC_MAX_ARGS, PartitionTypes, Refusal, ServerContext,
+    TableTypes, describe_access_methods_query, describe_aggregates_query,
+    describe_configuration_parameters_query, describe_functions_query, describe_operators_query,
+    describe_types_query, list_partitioned_tables_query, list_tables_query,
 };
 use crate::print::print_query;
 use crate::scan::{Scanner, VariableSource};
@@ -276,9 +278,6 @@ fn exec_command_d(
         hide_tableam: pset.hide_tableam,
         db: db.as_deref(),
     };
-    let mut listing = |query: Result<String, Refusal>, title: &str| {
-        run_listing(query, title, &pset, ctx.executor, stdout, stderr)
-    };
     let success = match command {
         DescribeCommand::ListTables(tabtypes) => list_tables(
             &tabtypes,
@@ -290,14 +289,47 @@ fn exec_command_d(
             stdout,
             stderr,
         ),
+        DescribeCommand::TableDetails => {
+            not_yet(&pset, cmd, "describeTableDetails", stderr);
+            false
+        }
+        DescribeCommand::NotYet(function) => {
+            not_yet(&pset, cmd, function, stderr);
+            false
+        }
+        listing => {
+            let (query, title) = listing_query(&listing, pattern, options, flags, server);
+            run_listing(query, title, &pset, ctx.executor, stdout, stderr)
+        }
+    };
+    if success {
+        CommandResult::SkipLine
+    } else {
+        CommandResult::Error
+    }
+}
+
+/// The query and title of a `\d` command that is a plain listing: one query,
+/// printed under its title, with no message of its own for an empty result.
+fn listing_query(
+    command: &DescribeCommand,
+    pattern: Option<&str>,
+    options: &[SlashOption],
+    flags: DescribeFlags,
+    server: ServerContext<'_>,
+) -> (Result<String, Refusal>, &'static str) {
+    // `\df` and `\do` read argument-type patterns after the first.
+    let arg_patterns = arg_patterns(pattern, options);
+    let arg_patterns: Vec<&str> = arg_patterns.iter().map(String::as_str).collect();
+    match command {
         DescribeCommand::ListPartitionedTables(reltypes) => {
-            let types = PartitionTypes::parse(&reltypes);
-            listing(
+            let types = PartitionTypes::parse(reltypes);
+            (
                 list_partitioned_tables_query(types, pattern, flags.verbose, server),
                 types.title(),
             )
         }
-        DescribeCommand::AccessMethods => listing(
+        DescribeCommand::AccessMethods => (
             describe_access_methods_query(pattern, flags.verbose, server),
             "List of access methods",
         ),
@@ -307,27 +339,64 @@ fn exec_command_d(
                 .get(1)
                 .filter(|_| pattern.is_some())
                 .map(SlashOption::without_trailing_semicolons);
-            listing(
+            (
                 which
                     .query(pattern, second.as_deref(), flags.verbose, server)
                     .map_err(Refusal::from),
                 which.title(),
             )
         }
-        DescribeCommand::TableDetails => {
-            not_yet(&pset, cmd, "describeTableDetails", stderr);
-            false
+        DescribeCommand::Aggregates => (
+            describe_aggregates_query(pattern, flags.system, server).map_err(Refusal::from),
+            "List of aggregate functions",
+        ),
+        DescribeCommand::Functions(functypes) => (
+            describe_functions_query(
+                functypes,
+                pattern,
+                &arg_patterns,
+                flags.verbose,
+                flags.system,
+                server,
+            ),
+            "List of functions",
+        ),
+        DescribeCommand::Types => (
+            describe_types_query(pattern, flags.verbose, flags.system, server)
+                .map_err(Refusal::from),
+            "List of data types",
+        ),
+        DescribeCommand::Operators => (
+            describe_operators_query(pattern, &arg_patterns, flags.verbose, flags.system, server)
+                .map_err(Refusal::from),
+            "List of operators",
+        ),
+        DescribeCommand::ConfigurationParameters => {
+            let (query, title) =
+                describe_configuration_parameters_query(pattern, flags.verbose, server);
+            (Ok(query), title)
         }
-        DescribeCommand::NotYet(function) => {
-            not_yet(&pset, cmd, function, stderr);
-            false
+        DescribeCommand::ListTables(_)
+        | DescribeCommand::TableDetails
+        | DescribeCommand::NotYet(_) => {
+            unreachable!("exec_command_d handles {command:?} itself")
         }
-    };
-    if success {
-        CommandResult::SkipLine
-    } else {
-        CommandResult::Error
     }
+}
+
+/// `exec_command_dfo()`'s argument-type patterns (`command.c:1313`-`:1325`):
+/// only after a first pattern, each without its unquoted trailing
+/// semicolons, and at most [`FUNC_MAX_ARGS`] of them.
+fn arg_patterns(pattern: Option<&str>, options: &[SlashOption]) -> Vec<String> {
+    if pattern.is_none() {
+        return Vec::new();
+    }
+    options
+        .iter()
+        .skip(1)
+        .take(FUNC_MAX_ARGS)
+        .map(SlashOption::without_trailing_semicolons)
+        .collect()
 }
 
 /// Refuse a `\d` command whose `describe.c` function has not been ported,
@@ -343,9 +412,10 @@ fn not_yet(pset: &PsqlSettings, cmd: &str, function: &str, stderr: &mut dyn Writ
 /// The shape most `describe.c` listings share: build the query, run it
 /// through `PSQLexec`, and print the result under `title`.
 ///
-/// A refused pattern fails the command. A server too old for the feature is
-/// logged as an error, yet the command succeeds, as upstream returns `true`
-/// there (`describe.c:155`-`:163`).
+/// A refused pattern fails the command. A server too old for the feature,
+/// or letters the command does not take, are logged as an error, yet the
+/// command succeeds, as upstream returns `true` there (`describe.c:155`-`:163`,
+/// `:314`-`:318`).
 fn run_listing(
     query: Result<String, Refusal>,
     title: &str,
@@ -359,7 +429,9 @@ fn run_listing(
         Err(refusal) => {
             let (message, success) = match refusal {
                 Refusal::Pattern(err) => (err.0, false),
-                Refusal::ServerTooOld(message) => (message, true),
+                Refusal::ServerTooOld(message) | Refusal::InvalidOptions(message) => {
+                    (message, true)
+                }
             };
             let _ = writeln!(stderr, "{}{message}", log_prefix(pset, LogLevel::Error));
             return success;
@@ -1058,6 +1130,80 @@ mod tests {
             run.stderr,
             "psql: error: improper qualified name (too many dotted names): regression.brin\n"
         );
+    }
+
+    #[test]
+    fn df_reads_every_argument_type_and_warns_about_none() {
+        // `\\df has_database_privilege oid text -` (`psql.sql:1364`).
+        let answer = relations(&["Schema", "Name"], &[]);
+        let (run, seen) = run_with(
+            "\\df has_database_privilege oid text -",
+            pg18(),
+            Some(vec![answer]),
+        );
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert!(
+            seen[0].contains("  AND t2.typname IS NULL\n"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            run.stdout.starts_with("List of functions\n"),
+            "{}",
+            run.stdout
+        );
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn df_past_func_max_args_warns_about_the_rest() {
+        let args = vec!["int"; 102].join(" ");
+        let answer = relations(&["Schema", "Name"], &[]);
+        let (run, seen) = run_with(&format!("\\df f {args}"), pg18(), Some(vec![answer]));
+        assert!(seen[0].contains("t99.typname"), "{}", seen[0]);
+        assert!(!seen[0].contains("t100"), "{}", seen[0]);
+        assert_eq!(
+            run.stderr,
+            "psql: warning: \\df: extra argument \"int\" ignored\n\
+             psql: warning: \\df: extra argument \"int\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn a_letter_df_does_not_take_is_an_error_message_yet_the_command_succeeds() {
+        // `describe.c:314`-`:318`: `pg_log_error`, then `return true`.
+        let (run, seen) = run_with("\\dfnq", pg18(), Some(vec![]));
+        assert!(seen.is_empty());
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(
+            run.stderr,
+            "psql: error: \\df only takes [anptwSx+] as options\n"
+        );
+    }
+
+    #[test]
+    fn do_da_dt_and_dconfig_print_under_their_titles() {
+        for (cmd, title) in [
+            ("\\do - int4", "List of operators"),
+            ("\\da", "List of aggregate functions"),
+            ("\\dT+ mood", "List of data types"),
+            ("\\dconfig", "List of non-default configuration parameters"),
+            ("\\dconfig+ work_mem;", "List of configuration parameters"),
+        ] {
+            let answer = relations(&["Name"], &[]);
+            let (run, seen) = run_with(cmd, pg18(), Some(vec![answer]));
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert_eq!(seen.len(), 1, "{cmd}");
+            assert!(run.stdout.starts_with(title), "{cmd}: {}", run.stdout);
+            assert_eq!(run.stderr, "", "{cmd}");
+        }
+        // `\\dconfig`'s pattern loses its trailing semicolon too.
+        let (_, seen) = run_with(
+            "\\dconfig work_mem;",
+            pg18(),
+            Some(vec![relations(&["Name"], &[])]),
+        );
+        assert!(seen[0].contains("'^(work_mem)$'"), "{}", seen[0]);
     }
 
     #[test]

@@ -125,6 +125,12 @@ jobs:
           done
           "$PGDROP_REF_BIN_MUSL/initdb" --version
           "$PGDROP_REF_BIN_MUSL/psql" --version
+      # Its own step so the run's timings show the network apart from the
+      # checks: cold, this clones the 727 MB pgrust repository (30-110 s, which
+      # used to be billed to the license wall); warm, ~/.cargo/git is restored
+      # and it fetches nothing.
+      - name: fetch dependencies
+        run: su -c 'cargo fetch --locked' ci
       - name: fmt
         run: su -c 'cargo fmt --all --check' ci
       - name: license wall (no pgrust crate reachable from an MIT crate)
@@ -158,6 +164,8 @@ jobs:
           done
           "$PGDROP_REF_BIN_APPLE/initdb" --version
           "$PGDROP_REF_BIN_APPLE/psql" --version
+      - name: fetch dependencies
+        run: cargo fetch --locked
       - name: license wall (no pgrust crate reachable from an MIT crate)
         run: scripts/check-license-wall.sh
       - name: clippy
@@ -202,6 +210,8 @@ jobs:
           done
           "$PGDROP_REF_BIN_GNU/initdb" --version
           "$PGDROP_REF_BIN_GNU/psql" --version
+      - name: fetch dependencies
+        run: cargo fetch --locked
       - name: fmt
         run: cargo fmt --all --check
       - name: license wall (no pgrust crate reachable from an MIT crate)

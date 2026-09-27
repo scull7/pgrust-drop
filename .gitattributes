@@ -2,3 +2,6 @@
 # normalised. See crates/rinitdb/image/README.md.
 crates/rinitdb/image/template.img binary
 crates/rinitdb/image/template.control binary
+# Vendored PostgreSQL share files (NAT-408): byte for byte, never normalised.
+crates/pgdrop/share/timezonesets/** -text
+crates/pgdrop/share/tsearch_data/** -text

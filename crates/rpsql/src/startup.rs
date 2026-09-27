@@ -4,11 +4,12 @@
 //! parsed by usage-rs (ADR-0004). [`actions`] is the other half of
 //! `parse_psql_options`: `-c` and `-f` build a `SimpleActionList` *in argv
 //! order* (`startup.c:550`-`:573`), which a declarative option table cannot express,
-//! so it is its own pure walk over argv driven by [`SHORT_OPTIONS`] — the
-//! getopt string upstream passes on the same line.
+//! so it is its own pure walk over argv driven by [`SHORT_OPTIONS`] and
+//! `LONG_OPTIONS`, the getopt tables upstream passes on the same line.
 //!
-//! `--help`, `--help=…` and `--version` are NAT-399's; the `argv[1]` fast path
-//! at `startup.c:138` is here because it decides what an invocation *is*.
+//! The `argv[1]` fast path at `startup.c:138` and the `--help=topic` arm at
+//! `startup.c:704` are here because they decide what an invocation *is*; the
+//! text they print is [`crate::help`].
 
 use std::ffi::{OsStr, OsString};
 
@@ -162,10 +163,12 @@ pub enum Action {
 // No `Eq`: a `Session` carries `watch_interval`, which is a float.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Invocation {
-    /// `usage(NOPAGER)` — `-?`, or `--help` as the only argument
-    /// (`startup.c:140`).
+    /// `usage(NOPAGER)`, `slashUsage(NOPAGER)` or `helpVariables(NOPAGER)`:
+    /// the `argv[1]` fast path (`startup.c:140`), or `-?` / `--help[=topic]`
+    /// met in the option loop (`startup.c:690`, `:704`).
     PrintHelp(HelpTopic),
-    /// `showVersion()` — `--version`/`-V` as `argv[1]` (`startup.c:145`).
+    /// `showVersion()`: `--version`/`-V` as `argv[1]` (`startup.c:145`), or
+    /// met in the option loop (`startup.c:666`).
     PrintVersion,
     /// usage-rs rejected the command line; the rendering is its own.
     Unparsable(String),
@@ -178,10 +181,97 @@ pub enum Invocation {
 pub enum HelpTopic {
     /// `--help`, `--help=options`, `-?`
     Options,
-    /// `--help=commands`
-    Commands,
+    /// `--help=commands`, with the switches the option loop had already set
+    /// when it got there: `slashUsage()` reports them as `(currently …)`.
+    Commands(Switches),
     /// `--help=variables`
     Variables,
+}
+
+/// The `pset` fields `slashUsage()` reports that an option can have set before
+/// `--help=commands` is reached. `\timing` has no command-line switch, and
+/// there is no connection yet, so neither is here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Switches {
+    /// `pset.popt.topt.format == PRINT_HTML`: `-H` sets it, a later `-A` or
+    /// `--csv` replaces it (`startup.c:544`, `:581`, `:718`).
+    pub html: bool,
+    /// `-t` (`startup.c:635`).
+    pub tuples_only: bool,
+    /// `-x` (`startup.c:675`).
+    pub expanded: bool,
+}
+
+/// Whether a `long_options[]` row takes a value (`struct option.has_arg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HasArg {
+    No,
+    Required,
+    Optional,
+}
+
+/// What `getopt_long` returns for a row: its short letter, or upstream's
+/// numeric code for the two rows that have none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Short(char),
+    /// `{"help", optional_argument, NULL, 1}`
+    Help,
+    /// `{"csv", no_argument, NULL, 2}`
+    Csv,
+}
+
+/// `long_options[]` (`startup.c:490`-`:529`), in its order.
+const LONG_OPTIONS: [(&str, HasArg, Key); 36] = [
+    ("echo-all", HasArg::No, Key::Short('a')),
+    ("no-align", HasArg::No, Key::Short('A')),
+    ("command", HasArg::Required, Key::Short('c')),
+    ("dbname", HasArg::Required, Key::Short('d')),
+    ("echo-queries", HasArg::No, Key::Short('e')),
+    ("echo-errors", HasArg::No, Key::Short('b')),
+    ("echo-hidden", HasArg::No, Key::Short('E')),
+    ("file", HasArg::Required, Key::Short('f')),
+    ("field-separator", HasArg::Required, Key::Short('F')),
+    ("field-separator-zero", HasArg::No, Key::Short('z')),
+    ("host", HasArg::Required, Key::Short('h')),
+    ("html", HasArg::No, Key::Short('H')),
+    ("list", HasArg::No, Key::Short('l')),
+    ("log-file", HasArg::Required, Key::Short('L')),
+    ("no-readline", HasArg::No, Key::Short('n')),
+    ("single-transaction", HasArg::No, Key::Short('1')),
+    ("output", HasArg::Required, Key::Short('o')),
+    ("port", HasArg::Required, Key::Short('p')),
+    ("pset", HasArg::Required, Key::Short('P')),
+    ("quiet", HasArg::No, Key::Short('q')),
+    ("record-separator", HasArg::Required, Key::Short('R')),
+    ("record-separator-zero", HasArg::No, Key::Short('0')),
+    ("single-step", HasArg::No, Key::Short('s')),
+    ("single-line", HasArg::No, Key::Short('S')),
+    ("tuples-only", HasArg::No, Key::Short('t')),
+    ("table-attr", HasArg::Required, Key::Short('T')),
+    ("username", HasArg::Required, Key::Short('U')),
+    ("set", HasArg::Required, Key::Short('v')),
+    ("variable", HasArg::Required, Key::Short('v')),
+    ("version", HasArg::No, Key::Short('V')),
+    ("no-password", HasArg::No, Key::Short('w')),
+    ("password", HasArg::No, Key::Short('W')),
+    ("expanded", HasArg::No, Key::Short('x')),
+    ("no-psqlrc", HasArg::No, Key::Short('X')),
+    ("help", HasArg::Optional, Key::Help),
+    ("csv", HasArg::No, Key::Csv),
+];
+
+/// One step of the option loop: what `getopt_long` returned, and `optarg`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Option(Key, Option<String>),
+    /// A standalone `-?` word, the one `?` upstream treats as a help request
+    /// (`startup.c:690`-`:692`).
+    HelpQuestion,
+    /// getopt's complaint: an unknown option, a missing value, or a value
+    /// given to a switch. Upstream exits here (`unknown_option`,
+    /// `startup.c:722`); the walk stops, and usage-rs renders the refusal.
+    Refused,
 }
 
 /// `struct adhoc_opts` (`startup.c:66`) plus everything the option loop wrote
@@ -236,71 +326,150 @@ pub fn fast_path(args: &[OsString]) -> Option<Invocation> {
     None
 }
 
-/// The ordered `-c`/`-f` action list (`startup.c:550`-`:573`).
+/// The option loop's walk over argv, in getopt order (`startup.c:536`).
 ///
-/// Walks argv the way getopt does, using [`SHORT_OPTIONS`] to know which short
-/// options swallow the next word. It answers one question — in what order did
-/// `-c` and `-f` appear — and leaves every other judgement to usage-rs.
-#[must_use]
-pub fn actions(args: &[OsString]) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut iter = args.iter().peekable();
-    let mut only_operands = false;
+/// It answers what `getopt_long` would return, one option at a time, using
+/// [`SHORT_OPTIONS`] and [`LONG_OPTIONS`] to know which options swallow a
+/// value; turning the options into settings is usage-rs's and [`apply`]'s.
+/// Long options must be spelled out: getopt's unique-prefix abbreviation is a
+/// documented divergence (ADR-0004).
+fn getopt_steps(args: &[OsString]) -> Vec<Step> {
+    let mut steps = Vec::new();
+    let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
         let Some(text) = arg.to_str() else { continue };
-        if only_operands || text == "-" || !text.starts_with('-') {
-            continue;
-        }
         if text == "--" {
-            only_operands = true;
+            break;
+        }
+        if text == "-" || !text.starts_with('-') {
             continue;
         }
-        if let Some(long) = text.strip_prefix("--") {
-            let (name, inline) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value.to_string())),
-                None => (long, None),
-            };
-            let kind = match name {
-                "command" => Some(false),
-                "file" => Some(true),
-                _ => None,
-            };
-            if let Some(is_file) = kind {
-                let value = inline.or_else(|| next_value(&mut iter));
-                push_action(&mut actions, is_file, value);
-            }
-            continue;
+        let step = if let Some(long) = text.strip_prefix("--") {
+            long_step(long, &mut iter)
+        } else if text == "-?" {
+            Step::HelpQuestion
+        } else {
+            short_steps(&text[1..], &mut iter, &mut steps)
+        };
+        let refused = step == Step::Refused;
+        steps.push(step);
+        if refused {
+            break;
         }
+    }
+    steps
+}
 
-        // A short-option cluster: `-Xc 'select 1'` is `-X` then `-c …`.
-        let mut chars = text[1..].chars();
-        while let Some(c) = chars.next() {
-            let takes_value = SHORT_OPTIONS.contains(&format!("{c}:"));
-            if !takes_value {
-                continue;
-            }
-            let rest: String = chars.by_ref().collect();
+fn long_step<'a>(long: &str, iter: &mut impl Iterator<Item = &'a OsString>) -> Step {
+    let (name, inline) = match long.split_once('=') {
+        Some((name, value)) => (name, Some(value.to_string())),
+        None => (long, None),
+    };
+    let Some(&(_, has_arg, key)) = LONG_OPTIONS.iter().find(|row| row.0 == name) else {
+        return Step::Refused;
+    };
+    match (has_arg, inline) {
+        (HasArg::No, Some(_)) => Step::Refused,
+        (HasArg::No | HasArg::Optional, None) => Step::Option(key, None),
+        (HasArg::Required | HasArg::Optional, Some(value)) => Step::Option(key, Some(value)),
+        (HasArg::Required, None) => match next_value(iter) {
+            Some(value) => Step::Option(key, Some(value)),
+            None => Step::Refused,
+        },
+    }
+}
+
+/// A short-option cluster: `-Xc 'select 1'` is `-X` then `-c …`. Every option
+/// but the last is pushed onto `steps`; the last is returned.
+fn short_steps<'a>(
+    cluster: &str,
+    iter: &mut impl Iterator<Item = &'a OsString>,
+    steps: &mut Vec<Step>,
+) -> Step {
+    let mut chars = cluster.chars().peekable();
+    while let Some(c) = chars.next() {
+        // `?` is in the option string, but inside a cluster upstream treats
+        // it as getopt's own error return (`startup.c:690`).
+        if c == '?' || c == ':' || !SHORT_OPTIONS.contains(c) {
+            return Step::Refused;
+        }
+        if SHORT_OPTIONS.contains(&format!("{c}:")) {
+            let rest: String = chars.collect();
             let value = if rest.is_empty() {
-                next_value(&mut iter)
+                next_value(iter)
             } else {
                 Some(rest)
             };
-            match c {
-                'c' => push_action(&mut actions, false, value),
-                'f' => push_action(&mut actions, true, value),
-                _ => {}
-            }
-            break;
+            return match value {
+                Some(value) => Step::Option(Key::Short(c), Some(value)),
+                None => Step::Refused,
+            };
+        }
+        let step = Step::Option(Key::Short(c), None);
+        if chars.peek().is_none() {
+            return step;
+        }
+        steps.push(step);
+    }
+    Step::Refused
+}
+
+fn next_value<'a>(iter: &mut impl Iterator<Item = &'a OsString>) -> Option<String> {
+    iter.next().and_then(|v| v.to_str().map(str::to_string))
+}
+
+/// The ordered `-c`/`-f` action list (`startup.c:550`-`:573`).
+///
+/// A declarative option table cannot keep `-c` and `-f` in argv order, so
+/// this reads them off [`getopt_steps`] and leaves every other judgement to
+/// usage-rs.
+#[must_use]
+pub fn actions(args: &[OsString]) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for step in getopt_steps(args) {
+        match step {
+            Step::Option(Key::Short('c'), value) => push_action(&mut actions, false, value),
+            Step::Option(Key::Short('f'), value) => push_action(&mut actions, true, value),
+            _ => {}
         }
     }
     actions
 }
 
-fn next_value<'a>(
-    iter: &mut std::iter::Peekable<impl Iterator<Item = &'a OsString>>,
-) -> Option<String> {
-    iter.next().and_then(|v| v.to_str().map(str::to_string))
+/// The option loop's early exits (`startup.c:666`, `:690`, `:704`): the first
+/// `-V`/`--version`, `-?` or `--help[=topic]` in getopt order, before any
+/// option getopt would refuse.
+///
+/// `--help=commands` carries the [`Switches`] the loop had set on its way
+/// there, since `slashUsage()` reads them from `pset`. `-P` can set the same
+/// fields through `do_pset` and is not followed here (`docs/divergences.md`).
+#[must_use]
+pub fn help_or_version(args: &[OsString]) -> Option<Invocation> {
+    let mut switches = Switches::default();
+    for step in getopt_steps(args) {
+        match step {
+            Step::Refused => return None,
+            Step::HelpQuestion => return Some(Invocation::PrintHelp(HelpTopic::Options)),
+            Step::Option(Key::Short('V'), _) => return Some(Invocation::PrintVersion),
+            Step::Option(Key::Short('H'), _) => switches.html = true,
+            Step::Option(Key::Short('A') | Key::Csv, _) => switches.html = false,
+            Step::Option(Key::Short('t'), _) => switches.tuples_only = true,
+            Step::Option(Key::Short('x'), _) => switches.expanded = true,
+            Step::Option(Key::Help, topic) => {
+                return Some(match topic.as_deref() {
+                    None | Some("options") => Invocation::PrintHelp(HelpTopic::Options),
+                    Some("commands") => Invocation::PrintHelp(HelpTopic::Commands(switches)),
+                    Some("variables") => Invocation::PrintHelp(HelpTopic::Variables),
+                    Some(topic) => Invocation::Unparsable(format!(
+                        "psql: error: unrecognized value \"{topic}\" for \"--help\"\n"
+                    )),
+                });
+            }
+            Step::Option(..) => {}
+        }
+    }
+    None
 }
 
 fn push_action(actions: &mut Vec<Action>, is_file: bool, value: Option<String>) {
@@ -439,25 +608,16 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
 }
 
 /// The whole of "what does this command line mean": [`fast_path`], then
-/// usage-rs, then [`apply`].
+/// [`help_or_version`], then usage-rs, then [`apply`].
 #[must_use]
 pub fn plan(args: &[OsString]) -> Invocation {
     if let Some(fast) = fast_path(args) {
         return fast;
     }
-    // `--help=topic` (`startup.c:704`). usage-rs owns `--help` itself, so the
-    // topic form is recognized here before the parser sees it.
-    for arg in args {
-        if let Some(topic) = arg.to_str().and_then(|a| a.strip_prefix("--help=")) {
-            return match topic {
-                "options" => Invocation::PrintHelp(HelpTopic::Options),
-                "commands" => Invocation::PrintHelp(HelpTopic::Commands),
-                "variables" => Invocation::PrintHelp(HelpTopic::Variables),
-                _ => Invocation::Unparsable(format!(
-                    "psql: error: unrecognized value \"{topic}\" for \"--help\"\n"
-                )),
-            };
-        }
+    // usage-rs has its help and version flags disabled, so the option loop's
+    // early exits are recognized here before the parser sees them.
+    if let Some(early) = help_or_version(args) {
+        return early;
     }
 
     let words: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
@@ -510,7 +670,7 @@ mod tests {
     fn help_topics_are_recognized() {
         assert_eq!(
             plan(&args(&["--help=commands"])),
-            Invocation::PrintHelp(HelpTopic::Commands)
+            Invocation::PrintHelp(HelpTopic::Commands(Switches::default()))
         );
         assert_eq!(
             plan(&args(&["--help=variables"])),
@@ -520,6 +680,97 @@ mod tests {
             plan(&args(&["--help=options"])),
             Invocation::PrintHelp(HelpTopic::Options)
         );
+    }
+
+    #[test]
+    fn help_and_version_are_met_anywhere_in_the_option_loop() {
+        // `startup.c:666`, `:704`: not only as `argv[1]`.
+        assert_eq!(
+            plan(&args(&["-X", "--help"])),
+            Invocation::PrintHelp(HelpTopic::Options)
+        );
+        assert_eq!(
+            plan(&args(&["-X", "--help=variables"])),
+            Invocation::PrintHelp(HelpTopic::Variables)
+        );
+        assert_eq!(plan(&args(&["-X", "-V"])), Invocation::PrintVersion);
+        assert_eq!(plan(&args(&["-XV"])), Invocation::PrintVersion);
+        assert_eq!(plan(&args(&["-q", "--version"])), Invocation::PrintVersion);
+        // A standalone `-?` is help; the first early exit wins.
+        assert_eq!(
+            plan(&args(&["-X", "-?", "-V"])),
+            Invocation::PrintHelp(HelpTopic::Options)
+        );
+    }
+
+    #[test]
+    fn a_value_spelled_like_help_is_a_value() {
+        // getopt gives `-c` the next word whatever it looks like, so neither
+        // line below is a help or version request. (usage-rs then refuses a
+        // value that starts with `--`; that is its own parse, not this walk.)
+        assert_eq!(help_or_version(&args(&["-c", "--help"])), None);
+        assert_eq!(
+            actions(&args(&["-c", "--help"])),
+            vec![Action::SingleQuery("--help".into())]
+        );
+        assert_eq!(help_or_version(&args(&["-v", "X", "-cV"])), None);
+    }
+
+    #[test]
+    fn a_refused_option_ahead_of_help_is_refused() {
+        // Upstream's loop exits at the first bad option (`startup.c:722`).
+        assert!(matches!(
+            plan(&args(&["--nosuchoption", "--help"])),
+            Invocation::Unparsable(_)
+        ));
+        // `?` inside a cluster is getopt's error return, not a help request
+        // (`startup.c:690`).
+        assert!(matches!(plan(&args(&["-X?"])), Invocation::Unparsable(_)));
+    }
+
+    #[test]
+    fn help_commands_reports_the_switches_set_before_it() {
+        // `slashUsage()` reads `pset` as the loop left it.
+        assert_eq!(
+            plan(&args(&["-H", "-t", "-x", "--help=commands"])),
+            Invocation::PrintHelp(HelpTopic::Commands(Switches {
+                html: true,
+                tuples_only: true,
+                expanded: true,
+            }))
+        );
+        // A later format switch replaces `-H`; a switch after the help
+        // request is never reached.
+        assert_eq!(
+            plan(&args(&["-H", "--csv", "--help=commands", "-t"])),
+            Invocation::PrintHelp(HelpTopic::Commands(Switches::default()))
+        );
+        assert_eq!(
+            plan(&args(&["--html", "-A", "--help=commands"])),
+            Invocation::PrintHelp(HelpTopic::Commands(Switches::default()))
+        );
+        // `-P` reaches the same fields through `do_pset`, which is not
+        // followed here: the divergence `docs/divergences.md` records.
+        assert_eq!(
+            plan(&args(&["-P", "format=html", "--help=commands"])),
+            Invocation::PrintHelp(HelpTopic::Commands(Switches::default()))
+        );
+    }
+
+    #[test]
+    fn the_long_option_table_and_the_short_option_string_agree() {
+        // Every row with a letter names a letter of `SHORT_OPTIONS`, with the
+        // same need for a value (`startup.c:490`, `:536`).
+        for (name, has_arg, key) in LONG_OPTIONS {
+            if let Key::Short(c) = key {
+                assert!(SHORT_OPTIONS.contains(c), "--{name}");
+                assert_eq!(
+                    SHORT_OPTIONS.contains(&format!("{c}:")),
+                    has_arg == HasArg::Required,
+                    "--{name}"
+                );
+            }
+        }
     }
 
     #[test]

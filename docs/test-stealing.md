@@ -154,3 +154,39 @@ exercised without a reference by
 by `the_tree_allowances_explain_only_what_they_name`. Two changes would make
 the catalog half run live, and both are owner decisions: moving the musl
 container to `alpine:3.24` (the mint host), or re-minting on `alpine:3.23`.
+
+## The ICU branch (NAT-386)
+
+`001_initdb.pl:114` runs one block of cases when `$ENV{with_icu} eq 'yes'` and
+one case otherwise. Upstream takes `with_icu` from the build under test
+(`src/bin/initdb/Makefile:64`, `src/bin/initdb/meson.build:34`). A reference
+binary has no configuration to read, so `crates/rinitdb/tests/t_001_initdb.rs`
+asks the binary instead. It runs the command line of `fails for encoding not
+supported by ICU` (`:161`), which stops before anything is created in either
+build. A build with ICU fails at the encoding check (`encoding mismatch`,
+`initdb.c:2786`). A build without ICU fails earlier, in `icu_language_tag`
+(`ICU is not supported in this build`, `:2362`). Any other outcome fails the
+test; the probe never guesses. It runs once per test process.
+
+rinitdb is a build without ICU (`rinitdb_is_a_build_without_icu`, and a row in
+`docs/divergences.md`), so for ours the `else` case applies. That case is
+`locale_provider_icu_fails_since_no_icu_support`. Each of the seven ICU-block
+cases is still ported, under its upstream name and in order, and does three
+things:
+
+1. Ours must fail with exactly what a C build without ICU writes for the same
+   command line: `locale must be specified if provider is icu` for `:116`,
+   `ICU is not supported in this build` for the other six.
+2. When the reference is built with ICU, the upstream assertion runs against
+   it: `command_ok`, `command_like` or `command_fails_like`, with upstream's
+   pattern.
+3. Ours and the reference are byte-diffed (stderr and exit status) when they
+   must agree: when the line fails before ICU is reached (`:116`), or when the
+   reference is built without ICU as well. Otherwise the two builds are on
+   different sides of `:114`, and the narrowing is printed
+   `SKIP (flagged, not silent)`.
+
+All three CI lanes' references are built with ICU, so step 2 runs live on every
+lane and step 3 runs only for `:116`. The case of a reference built without ICU
+is exercised without one by
+`the_icu_probe_and_the_byte_diff_rule_read_both_builds`.

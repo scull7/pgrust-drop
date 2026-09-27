@@ -143,12 +143,15 @@ const fn implemented(name: &'static str, follows: &'static str) -> Shim {
 }
 
 /// Every symbol this crate exports, in `exports.txt` order.
-pub const SHIMS: [Shim; 16] = [
+pub const SHIMS: [Shim; 19] = [
+    implemented("PQconndefaults", "fe-connect.c:2193"),
+    implemented("PQconninfoFree", "fe-connect.c:7459"),
     implemented("PQfreeNotify", "fe-exec.c:4080"),
     implemented("PQfreemem", "fe-exec.c:4063"),
     implemented("PQgetssl", "fe-secure.c:452, without SSL"),
     implemented("PQinitSSL", "fe-secure.c:117"),
     implemented("PQisthreadsafe", "fe-exec.c:4023"),
+    implemented("PQconninfoParse", "fe-connect.c:6175"),
     implemented("PQinitOpenSSL", "fe-secure.c:129"),
     implemented("PQlibVersion", "fe-misc.c:65"),
     implemented("PQsslInUse", "fe-secure.c:103, without SSL"),
@@ -327,10 +330,14 @@ mod tests {
     /// to be added, and the `#[no_mangle]` count below catches forgetting.
     #[test]
     fn every_no_mangle_function_is_a_shim_and_every_shim_is_one() {
-        let mut exported: Vec<&str> = [include_str!("misc.rs"), include_str!("secure.rs")]
-            .into_iter()
-            .flat_map(no_mangle_functions)
-            .collect();
+        let mut exported: Vec<&str> = [
+            include_str!("conninfo.rs"),
+            include_str!("misc.rs"),
+            include_str!("secure.rs"),
+        ]
+        .into_iter()
+        .flat_map(no_mangle_functions)
+        .collect();
         exported.sort_unstable();
         let mut shims: Vec<&str> = SHIMS.iter().map(|shim| shim.name).collect();
         shims.sort_unstable();

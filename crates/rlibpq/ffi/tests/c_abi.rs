@@ -1,13 +1,19 @@
 //! The C ABI seen from C: every symbol `abi::SHIMS` lists links from a C
 //! program, and each answers through the vendored `libpq-fe.h` what C libpq
-//! built without SSL, OpenSSL or GSSAPI answers with no connection.
+//! built without SSL, OpenSSL or GSSAPI answers with no connection, and
+//! `PQconninfoOption` arrays reach C field by field as `PQconninfoOptions[]`
+//! (`fe-connect.c:200`) defines them.
 
 mod common;
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use common::{build, crate_dir, newest_archive, run};
 use pq::abi::SHIMS;
+use rlibpq::CONNINFO_OPTIONS;
+use testkit::{CommandOutcome, Environment, run_in};
 
 /// Calculation: a C program that takes the address of every symbol in
 /// `names` and prints how many it took. It declares them itself rather than
@@ -65,6 +71,121 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQgetgssctx NULL\n\
          freed\n"
     );
+    assert_eq!(outcome.status, Some(0));
+}
+
+/// Action: `tests/c/conninfo.c`, built once for every test that runs it —
+/// tests run in parallel, and two compilers writing one output would race.
+fn conninfo_program() -> &'static Path {
+    static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        build(
+            "conninfo",
+            &[crate_dir().join("tests/c/conninfo.c")],
+            &["-Wall", "-Werror"],
+        )
+    })
+}
+
+/// Action: run `program` with `args` in the scrubbed TAP environment plus
+/// `env`, so no `PG*` variable of the caller's leaks into the defaults.
+fn run_scrubbed(program: &Path, args: &[&str], env: &[(&str, &str)]) -> CommandOutcome {
+    let mut environment = Environment::postgres_test("c_abi");
+    for (key, value) in env {
+        environment = environment.with(*key, *value);
+    }
+    run_in(program, args, &[], &environment).expect("the program runs")
+}
+
+/// Calculation: the row `conninfo.c` prints for option `index` holding `val`.
+fn expected_row(index: usize, val: Option<&str>) -> String {
+    let def = &CONNINFO_OPTIONS[index];
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        def.keyword,
+        def.envvar.unwrap_or("(null)"),
+        def.compiled.unwrap_or("(null)"),
+        val.unwrap_or("(null)"),
+        def.label,
+        def.dispchar.as_str(),
+        def.dispsize
+    )
+}
+
+/// `PQconninfoParse` fills only what the string sets (`use_defaults` false,
+/// `fe-connect.c:6185`); every other field of every row is the static
+/// table's, and the array ends at the table's end.
+#[test]
+fn pq_conninfo_parse_lays_every_row_out_as_the_table() {
+    let outcome = run_scrubbed(
+        conninfo_program(),
+        &["host=h port=5433 user='a b'"],
+        &[("PGDATABASE", "ignored")],
+    );
+
+    let mut expected = String::from("errmsg: (null)\n");
+    for (index, def) in CONNINFO_OPTIONS.iter().enumerate() {
+        let val = match def.keyword {
+            "host" => Some("h"),
+            "port" => Some("5433"),
+            "user" => Some("a b"),
+            _ => None,
+        };
+        expected.push_str(&expected_row(index, val));
+        expected.push('\n');
+    }
+    expected.push_str("freed\n");
+
+    assert_eq!(String::from_utf8_lossy(&outcome.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&outcome.stdout), expected);
+    assert_eq!(outcome.status, Some(0));
+}
+
+/// `PQconninfoParse`'s failure: null, and a `malloc`'d message ending in the
+/// newline `libpq_append_error` adds (`fe-connect.c:6186`-`:6187`,
+/// `fe-misc.c:1539`), which `PQfreemem` releases; with a null `errmsg`, null
+/// and nothing else.
+#[test]
+fn pq_conninfo_parse_reports_an_error_through_errmsg() {
+    let outcome = run_scrubbed(conninfo_program(), &["host"], &[]);
+
+    assert_eq!(String::from_utf8_lossy(&outcome.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&outcome.stdout),
+        "error: missing \"=\" after \"host\" in connection info string\n\
+         without errmsg: NULL\n"
+    );
+    assert_eq!(outcome.status, Some(1));
+}
+
+/// `PQconndefaults` fills defaults from the environment and the compiled-in
+/// values (`conninfo_add_defaults`, `fe-connect.c:6624`). The values are
+/// rlibpq's and are tested there; this pins that they reach C in the rows
+/// `PQconninfoOptions[]` defines.
+#[test]
+fn pq_conndefaults_fills_rows_from_the_environment() {
+    let outcome = run_scrubbed(conninfo_program(), &[], &[("PGHOST", "envhost")]);
+    let stdout = String::from_utf8_lossy(&outcome.stdout);
+    let rows: Vec<&str> = stdout.lines().collect();
+
+    assert_eq!(rows.len(), CONNINFO_OPTIONS.len() + 1, "{stdout}");
+    assert_eq!(rows.last(), Some(&"freed"));
+    for (index, (row, def)) in rows.iter().zip(&CONNINFO_OPTIONS).enumerate() {
+        match def.keyword {
+            "host" => assert_eq!(*row, expected_row(index, Some("envhost"))),
+            // A value it had no default for stays NULL.
+            "password" => assert_eq!(*row, expected_row(index, None)),
+            _ => {
+                let fields: Vec<&str> = row.split('|').collect();
+                let want = expected_row(index, None);
+                let want: Vec<&str> = want.split('|').collect();
+                assert_eq!(fields.len(), want.len(), "{row}");
+                // Every field but `val` is the table's.
+                assert_eq!(fields[..3], want[..3], "{row}");
+                assert_eq!(fields[4..], want[4..], "{row}");
+            }
+        }
+    }
     assert_eq!(outcome.status, Some(0));
 }
 

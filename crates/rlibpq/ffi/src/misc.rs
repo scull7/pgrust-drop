@@ -2,6 +2,8 @@
 
 use std::ffi::{c_int, c_void};
 
+use crate::alloc::free;
+
 /// `PG_VERSION_NUM` for 18.6: `configure.ac:2475`-`:2477` prints the major
 /// version and the minor version zero-padded to four digits (`%d%04d`) from
 /// `AC_INIT`'s `18.6` (`configure.ac:20`; `meson.build:11` agrees).

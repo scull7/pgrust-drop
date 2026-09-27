@@ -12,6 +12,10 @@
 //! safety probe, `PQfreemem`, and the `#ifndef USE_SSL`, `#ifndef
 //! USE_OPENSSL` and `#ifndef ENABLE_GSS` arms of `fe-secure.c`. That is enough
 //! for `src/interfaces/libpq/test/libpq_testclient.c` and `t/002_api.pl`.
+//! Then the connection-free half of `fe-connect.c`'s option handling:
+//! `PQconndefaults`, `PQconninfoParse` and `PQconninfoFree` over the public
+//! [`PQconninfoOption`] layout, enough for
+//! `src/interfaces/libpq/test/libpq_uri_regress.c` and `t/001_uri.pl`.
 //! Connections, results and the rest follow in later slices of NAT-395.
 //!
 //! This is the one crate in the workspace that allows `unsafe`: a C ABI is
@@ -24,9 +28,12 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod abi;
+mod alloc;
+mod conninfo;
 mod misc;
 mod secure;
 
+pub use conninfo::PQconninfoOption;
 pub use misc::PG_VERSION_NUM;
 
 /// `PGconn`, opaque to C (`libpq-fe.h:202`: `typedef struct pg_conn PGconn`).

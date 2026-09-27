@@ -108,7 +108,9 @@ fn values<'a>(stdout: &'a str, column: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// `pgdrop initdb -U postgres --no-sync <pgdata>`: exit 0, nothing on stderr.
+/// `pgdrop initdb -U postgres --no-sync <pgdata>`: exit 0, and on stderr only
+/// the `trust` warning C initdb prints for a command line without `-A`
+/// (`initdb.c:3521`).
 fn pgdrop_initdb(pgdata: &Path) {
     let argv = [
         OsString::from("initdb"),
@@ -119,7 +121,10 @@ fn pgdrop_initdb(pgdata: &Path) {
     ];
     let outcome = testkit::run(Path::new(PGDROP), &argv).expect("run pgdrop initdb");
     assert_eq!(outcome.status, Some(0), "stderr: {}", outcome.stderr_text());
-    assert_eq!(outcome.stderr_text(), "");
+    assert_eq!(
+        outcome.stderr_text(),
+        format!("{}\n", rinitdb::report::trust_warning())
+    );
 }
 
 /// `<postgres> --single -D <pgdata> postgres` with `select 1`: exit 0, and

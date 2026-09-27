@@ -52,9 +52,10 @@ fn args(list: &[&str]) -> Vec<OsString> {
     list.iter().map(OsString::from).collect()
 }
 
-/// `rinitdb <args> <pgdata>`: exit 0, nothing on stderr, and nothing on
-/// stdout yet — C's progress lines, sync note and instructions are NAT-387's
-/// (`docs/divergences.md`).
+/// `rinitdb <args> <pgdata>`: exit 0, the closing instructions at the end of
+/// stdout, and on stderr only the `trust` warning (`initdb.c:3521`), which
+/// `-A` silences by filling in both sides. The whole of stdout is gated
+/// against C initdb in `tests/success_output.rs` (NAT-387).
 fn rinitdb_ok(before: &[&str], pgdata: &Path, env: &Environment) {
     let mut argv = args(before);
     argv.push(pgdata.into());
@@ -65,8 +66,20 @@ fn rinitdb_ok(before: &[&str], pgdata: &Path, env: &Environment) {
         "{argv:?}\nstderr: {}",
         outcome.stderr_text()
     );
-    assert_eq!(outcome.stderr_text(), "", "{argv:?}");
-    assert_eq!(outcome.stdout_text(), "", "{argv:?}");
+    let warned = !before.iter().any(|arg| matches!(*arg, "-A" | "--auth"));
+    let expected_stderr = if warned {
+        format!("{}\n", rinitdb::report::trust_warning())
+    } else {
+        String::new()
+    };
+    assert_eq!(outcome.stderr_text(), expected_stderr, "{argv:?}");
+    assert!(
+        outcome
+            .stdout_text()
+            .ends_with(&format!(" -D {} -l logfile start\n\n", pgdata.display())),
+        "{argv:?}: {}",
+        outcome.stdout_text()
+    );
 }
 
 /// The reference `postgres --single -D <pgdata> postgres` fed `sql`, or
@@ -294,8 +307,11 @@ fn a_text_search_config_that_does_not_match_locale_c_warns() {
     assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
     assert_eq!(
         outcome.stderr_text(),
-        "initdb: warning: specified text search configuration \"simple\" might not match \
-         locale \"C\"\n"
+        format!(
+            "initdb: warning: specified text search configuration \"simple\" might not match \
+             locale \"C\"\n{}\n",
+            rinitdb::report::trust_warning()
+        )
     );
     let conf = std::fs::read_to_string(pgdata.join("postgresql.conf")).expect("postgresql.conf");
     assert!(

@@ -20,8 +20,9 @@
 //! says what the template can make and what is written on top of it, [`guc`]
 //! is the server's check on the names `postgresql.conf` assigns, [`tz`]
 //! reads the timezone database and [`findtimezone`] picks
-//! the default zone over it, [`help`] is the upstream text, and [`run`] is the
-//! only function that writes to a stream.
+//! the default zone over it, [`help`] is the upstream text, [`report`] is
+//! what a successful run prints over [`path`]'s `src/port/path.c`, and [`run`]
+//! is the only function that writes to a stream.
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -45,7 +46,9 @@ pub mod guc;
 pub mod help;
 pub mod image;
 pub mod layout;
+pub mod path;
 pub mod pg_config;
+pub mod report;
 /// SHA-256 for the provenance tests only; see the module header for why this
 /// crate carries its own and why it is not compiled into the binary.
 #[cfg(test)]
@@ -56,7 +59,7 @@ pub mod tz;
 pub mod validate;
 pub mod wal;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -82,7 +85,15 @@ const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 
 /// Perform the invocation `args` describes, writing to the given streams.
-pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
+///
+/// `argv0` is the name this process was started as; the closing instructions
+/// name the `pg_ctl` beside it (`initdb.c:3533`).
+pub fn run(
+    argv0: &OsStr,
+    args: &[OsString],
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
     // Writes to a closed stream are not worth a second error message.
     match cli::plan(args) {
         Invocation::PrintHelp => {
@@ -104,7 +115,8 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
         // Everything C decides between the getopt loop and the first `mkdir`
         // is one pure calculation; only its inputs are read from the process.
         Invocation::Init(options) => {
-            match validate(&options, &Environment::from_process(), &RealFs) {
+            let env = Environment::from_process();
+            match validate(&options, &env, &RealFs) {
                 Err(err) => {
                     let _ = writeln!(stderr, "{}", err.render());
                     ExitCode::from(EXIT_FAILURE)
@@ -112,15 +124,32 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
                 // initdb.c:3439 — `--sync-only` does its one job and returns 0
                 // before any of the cluster-creation steps.
                 Ok(Plan::Sync(plan)) => sync_only(&plan, stdout, stderr),
-                Ok(Plan::Create(plan)) => create_cluster(&plan, &options, stderr),
+                Ok(Plan::Create(plan)) => {
+                    let run = Run {
+                        options: &options,
+                        env: &env,
+                        argv0,
+                    };
+                    create_cluster(&plan, &run, stdout, stderr)
+                }
             }
         }
     }
 }
 
-/// `initialize_data_directory` (`initdb.c:3044`) and the sync after it, over
-/// the embedded template (ADR-0002), with `cleanup_directories_atexit`
-/// (`:762`) behind them.
+/// What [`create_cluster`] needs besides the plan: the command line, the
+/// environment it was validated in, and the name the process was started as.
+struct Run<'a> {
+    options: &'a Options,
+    env: &'a Environment,
+    argv0: &'a OsStr,
+}
+
+/// `main` from the ownership line (`initdb.c:3481`) to `success = true`
+/// (`:3562`): the preamble, `initialize_data_directory` (`:3044`) over the
+/// embedded template (ADR-0002), the sync, the `trust` warning and the
+/// closing instructions, with `cleanup_directories_atexit` (`:762`) behind
+/// them.
 ///
 /// Action, and the reason it is one function: C's exit handler reports the
 /// directories the creation sequence had already made, so every failure from
@@ -135,38 +164,120 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
 /// sequence below fails where C's does. The refusal is evaluated again once
 /// the directories exist, so a `--waldir` that fails here and passes there
 /// cannot skip it. `setup_text_search`'s warning (`initdb.c:3492`) comes
-/// next, before the first `mkdir` as in C — also ahead of a waiting refusal,
-/// unless `lc_ctype` is not C ([`cluster::text_search_warning`]).
-/// Progress output and the closing
-/// instructions are C's stdout and are not printed yet (NAT-387).
-fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write) -> ExitCode {
+/// within the preamble, before the first `mkdir` as in C — also ahead of a
+/// waiting refusal, unless `lc_ctype` is not C
+/// ([`cluster::text_search_warning`]).
+fn create_cluster(
+    plan: &CreatePlan,
+    run: &Run<'_>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let options = run.options;
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
-    let can_make = cluster::check_template_can_make(options, plan);
-    match can_make {
-        Err(err) if !waldir_will_fail => {
-            let _ = writeln!(stderr, "{}", err.render());
-            return ExitCode::from(EXIT_FAILURE);
-        }
-        // Behind a failing `--waldir`, C writes the warning first whatever
-        // is refused; text_search_warning is None when `lc_ctype` is not C.
-        _ => {
-            if let Some(warning) = cluster::text_search_warning(options) {
-                let _ = writeln!(stderr, "{warning}");
+    if let Err(err) = cluster::check_template_can_make(options, plan)
+        && !waldir_will_fail
+    {
+        let _ = writeln!(stderr, "{}", err.render());
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    // `select_default_timezone` only reads; C asks it once the directories
+    // exist (initdb.c:3091), and announces the answer there too.
+    let default_timezone = RealTzSource::from_env().and_then(|src| select_default_timezone(&src));
+    let settings = cluster::settings(options, plan, default_timezone);
+    preamble(run, &settings, stdout, stderr);
+
+    let mut progress = Progress::default();
+    let created = initialize_data_directory(plan, options, &settings, &mut progress, stdout)
+        .and_then(|()| sync_new_cluster(plan, stdout, stderr));
+    if let Err(err) = created {
+        let _ = writeln!(stderr, "{}", err.render());
+        return clean_up_and_fail(&progress, options, stderr);
+    }
+
+    if report::needs_trust_warning(
+        options.auth.as_deref(),
+        options.auth_local.as_deref(),
+        options.auth_host.as_deref(),
+    ) {
+        let _ = stdout.write_all(report::TRUST_WARNING_STDOUT.as_bytes());
+        let _ = stdout.flush();
+        let _ = writeln!(stderr, "{}", report::trust_warning());
+    }
+
+    if !options.no_instructions {
+        let start =
+            report::start_command(&run.argv0.to_string_lossy(), &plan.pgdata.to_string_lossy());
+        match start {
+            Ok(command) => {
+                let _ = stdout.write_all(report::success(&command).as_bytes());
+            }
+            // appendShellString's exit(EXIT_FAILURE) (string_utils.c:589)
+            // comes before `success = true`, so the exit handler still runs.
+            Err(err) => {
+                let _ = stdout.flush();
+                let _ = writeln!(stderr, "{}", err.render());
+                return clean_up_and_fail(&progress, options, stderr);
             }
         }
     }
-    let mut progress = Progress::default();
-    let created = initialize_data_directory(plan, options, &mut progress)
-        .and_then(|()| sync_new_cluster(plan, stderr));
-    match created {
-        // `success = true` (initdb.c:3562): the exit handler has nothing to do.
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            let _ = writeln!(stderr, "{}", err.render());
-            cleanup::apply(&cleanup::plan(&progress, options.no_clean), stderr);
-            ExitCode::from(EXIT_FAILURE)
-        }
+    // `success = true` (initdb.c:3562): the exit handler has nothing to do.
+    ExitCode::SUCCESS
+}
+
+/// `cleanup_directories_atexit` (`initdb.c:762`) after a failure, and the
+/// exit status of the `pg_fatal` or `exit(1)` that got it there.
+fn clean_up_and_fail(progress: &Progress, options: &Options, stderr: &mut impl Write) -> ExitCode {
+    cleanup::apply(&cleanup::plan(progress, options.no_clean), stderr);
+    ExitCode::from(EXIT_FAILURE)
+}
+
+/// Action: what `main` prints between the `pg_` check and
+/// `initialize_data_directory` — the ownership lines (`initdb.c:3481`),
+/// `setup_locale_encoding`'s report (`:2689`, `:2765`), `setup_text_search`
+/// (`:2850`-`:2865`) and the checksum line (`:3494`-`:3504`).
+///
+/// The ownership lines need the effective user, which this port reads from
+/// `USER`/`LOGNAME`; when neither is set they are left out rather than name
+/// someone (`docs/divergences.md`). The encoding line is printed when `-E`
+/// was not given, as in C, and names the encoding the cluster gets.
+fn preamble(run: &Run<'_>, settings: &Settings, stdout: &mut impl Write, stderr: &mut impl Write) {
+    let mut text = String::new();
+    if let Some(user) = run.env.effective_user.as_deref() {
+        text.push_str(&report::owned_by(user));
     }
+    text.push_str(&report::locale_configuration(
+        &report::Locales::of_template(settings),
+    ));
+    if run.options.encoding.is_none() {
+        text.push_str(&report::default_encoding(cluster::TEMPLATE_ENCODING));
+    }
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
+    // Behind a failing `--waldir`, C writes the warning first whatever is
+    // refused; text_search_warning is None when `lc_ctype` is not C.
+    if let Some(warning) = cluster::text_search_warning(run.options) {
+        let _ = writeln!(stderr, "{warning}");
+    }
+    let mut text = report::text_search_configuration(&settings.default_text_search_config);
+    text.push_str(report::data_checksums(cluster::checksums(run.options)));
+    let _ = stdout.write_all(text.as_bytes());
+}
+
+/// Action: one progress step — C's `printf` and `fflush(stdout)`, the step,
+/// then `check_ok()` (`initdb.c:2109`) only if it succeeded, so a failure
+/// leaves the line unfinished as C's `pg_fatal` does.
+fn step<T>(
+    stdout: &mut impl Write,
+    announce: &str,
+    work: impl FnOnce() -> Result<T, InitdbError>,
+) -> Result<T, InitdbError> {
+    let _ = stdout.write_all(announce.as_bytes());
+    let _ = stdout.flush();
+    let done = work()?;
+    let _ = stdout.write_all(sync::CHECK_OK.as_bytes());
+    let _ = stdout.flush();
+    Ok(done)
 }
 
 /// Action: `initialize_data_directory` (`initdb.c:3044`) with the template
@@ -174,15 +285,25 @@ fn create_cluster(plan: &CreatePlan, options: &Options, stderr: &mut impl Write)
 ///
 /// C's order where the two overlap: the data directory (`:2890`), the WAL
 /// directory or its symlink (`:2948`), the `subdirs[]` loop (`:3068`), the
-/// top-level `PG_VERSION` (`:3087`), the configuration files (`setup_config`,
+/// top-level `PG_VERSION` (`:3087`), the probe lines of
+/// `test_config_settings` (`:3091`), the configuration files (`setup_config`,
 /// `:3094`). Then the image, and the files only a template needs: a
-/// `pg_control` and a first WAL segment of this cluster's own.
+/// `pg_control` and a first WAL segment of this cluster's own. Those are
+/// what `bootstrap_template1` (`:3097`) makes in C, so they are its
+/// progress line; the template already carries everything the post-bootstrap
+/// session (`:3108`) adds, so its line has no work of its own.
 fn initialize_data_directory(
     plan: &CreatePlan,
     options: &Options,
+    settings: &Settings,
     progress: &mut Progress,
+    stdout: &mut impl Write,
 ) -> Result<(), InitdbError> {
-    create_directories(plan, progress)?;
+    create_directories(plan, progress, stdout)?;
+    // test_config_settings (initdb.c:1118) is not run; these are the values
+    // it would try first (docs/divergences.md).
+    let _ = stdout.write_all(report::config_settings(settings).as_bytes());
+    let _ = stdout.flush();
     // Again, on the path that writes the image: create_cluster's check is
     // skipped when its `--waldir` probe fails, and that probe is not this one.
     cluster::check_template_can_make(options, plan)?;
@@ -202,20 +323,22 @@ fn initialize_data_directory(
             .map_err(|_| InitdbError::CouldNotGenerateSecretToken)?,
         now: unix_now(),
     };
-    let default_timezone = RealTzSource::from_env().and_then(|src| select_default_timezone(&src));
-    let settings = cluster::settings(options, plan, default_timezone);
-    let generated = cluster::generated_files(&settings, &template_control, &new);
+    let generated = cluster::generated_files(settings, &template_control, &new);
 
     // The configuration files first, as setup_config writes them before the
     // catalogs exist; then the catalogs; then pg_control and the WAL.
     let (config, rest) = generated.split_at(conf::CONF_FILES.len());
-    image::expand(&entries(config)?, &plan.pgdata, plan.perm)?;
-    // bootstrap_template1 (initdb.c:3097): the first thing its backend does
-    // is read the file just written, and refuse it over an unknown name.
-    check_postgresql_conf(config, &plan.pgdata)?;
-    image::expand(&template, &plan.pgdata, plan.perm)?;
-    image::expand(&entries(rest)?, &plan.pgdata, plan.perm)?;
-    Ok(())
+    step(stdout, report::CREATING_CONFIGURATION_FILES, || {
+        image::expand(&entries(config)?, &plan.pgdata, plan.perm)
+    })?;
+    step(stdout, report::RUNNING_BOOTSTRAP_SCRIPT, || {
+        // The first thing the bootstrap backend does is read the file just
+        // written, and refuse it over an unknown name.
+        check_postgresql_conf(config, &plan.pgdata)?;
+        image::expand(&template, &plan.pgdata, plan.perm)?;
+        image::expand(&entries(rest)?, &plan.pgdata, plan.perm)
+    })?;
+    step(stdout, report::PERFORMING_POST_BOOTSTRAP, || Ok(()))
 }
 
 /// Action at the edge of [`guc::unrecognized_parameters`]: the names in the
@@ -269,43 +392,77 @@ fn unix_now() -> i64 {
 
 /// Action: `create_data_directory` (`initdb.c:2890`), `create_xlog_or_symlink`
 /// (`:2948`), the `subdirs[]` loop (`:3068`) and `write_version_file(NULL)`
-/// (`:3087`), in C's order.
+/// (`:3087`), in C's order and with C's progress lines.
 ///
 /// The order is the whole point. C judges `--waldir` only once PGDATA exists,
 /// which is why both of its `--waldir` refusals are followed by `removing data
 /// directory`; `progress` records the data directory the moment the `mkdir`
 /// succeeds, exactly where `initdb.c:2907` sets `made_new_pgdata`, and the WAL
 /// directory where `:2979` sets `made_new_xlogdir`.
-fn create_directories(plan: &CreatePlan, progress: &mut Progress) -> Result<(), InitdbError> {
-    layout::apply(std::slice::from_ref(&layout::data_directory_op(plan)))?;
+fn create_directories(
+    plan: &CreatePlan,
+    progress: &mut Progress,
+    stdout: &mut impl Write,
+) -> Result<(), InitdbError> {
+    let announce = directory_progress(&plan.pgdata, plan.pgdata_action);
+    step(stdout, &announce, || {
+        layout::apply(std::slice::from_ref(&layout::data_directory_op(plan)))
+    })?;
     progress.pgdata = Some((plan.pgdata.clone(), plan.pgdata_action));
 
     let waldir = classify_waldir(plan.waldir.as_deref(), &RealFs)?;
     let ops = layout::wal_directory_and_below(plan, waldir.as_ref());
-    // With --waldir the first op makes (or adopts) that directory.
-    let (wal_directory, below) = match &waldir {
-        Some(_) => ops.split_at(1),
-        None => ops.split_at(0),
-    };
-    layout::apply(wal_directory)?;
+    // With --waldir the first op makes (or adopts) that directory, and the
+    // next one is the symlink to it; without, the first op is `pg_wal`. The
+    // `subdirs[]` loop follows, and the top-level PG_VERSION is last.
+    let (wal_directory, below) = ops.split_at(usize::from(waldir.is_some()));
+    if let Some((path, action)) = &waldir {
+        step(stdout, &directory_progress(path, *action), || {
+            layout::apply(wal_directory)
+        })?;
+    }
     progress.waldir.clone_from(&waldir);
-    layout::apply(below)?;
+    let (pg_wal, below) = below.split_at(1);
+    layout::apply(pg_wal)?;
+    let (subdirs, version_file) = below.split_at(below.len() - 1);
+    step(stdout, report::CREATING_SUBDIRECTORIES, || {
+        layout::apply(subdirs)
+    })?;
+    layout::apply(version_file)?;
     Ok(())
 }
 
+/// `initdb.c:2898` / `:2912` (and `:2969` / `:2984` for the WAL directory):
+/// which line announces what is about to be done to `path`.
+fn directory_progress(path: &std::path::Path, action: DirAction) -> String {
+    let path = path.to_string_lossy();
+    match action {
+        DirAction::Create => report::creating_directory(&path),
+        DirAction::ReuseEmpty => report::fixing_permissions(&path),
+    }
+}
+
 /// The `do_sync` block at the end of `main` (`initdb.c:3508`): `sync_pgdata`
-/// over the new cluster, or nothing under `--no-sync`.
-fn sync_new_cluster(plan: &CreatePlan, stderr: &mut impl Write) -> Result<(), InitdbError> {
+/// over the new cluster with its progress line, or the note at `:3516` under
+/// `--no-sync`.
+fn sync_new_cluster(
+    plan: &CreatePlan,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), InitdbError> {
     if !plan.do_sync {
+        let _ = stdout.write_all(sync::SYNC_SKIPPED_NOTE.as_bytes());
         return Ok(());
     }
-    let ops = sync::plan(
-        &plan.pgdata,
-        plan.sync_method,
-        plan.sync_data_files,
-        &sync::RealFs,
-    );
-    sync::apply(&ops, stderr)
+    step(stdout, sync::SYNCING_PROGRESS, || {
+        let ops = sync::plan(
+            &plan.pgdata,
+            plan.sync_method,
+            plan.sync_data_files,
+            &sync::RealFs,
+        );
+        sync::apply(&ops, stderr)
+    })
 }
 
 /// `initdb.c:3439`: the whole of the `--sync-only` path.

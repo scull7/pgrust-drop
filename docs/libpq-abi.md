@@ -23,13 +23,13 @@ a `cdylib` crate type, and musl is the lane CI gates first (ADR-0007).
 is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 `rlibpq` has none of the three yet.
 
-16 of 210 symbols implemented, 0 stubbed with an error, 194 not yet.
+19 of 210 symbols implemented, 0 stubbed with an error, 191 not yet.
 
 | ordinal | symbol | coverage | follows |
 |--:|---|---|---|
 | 1 | `PQconnectdb` | not yet |  |
 | 2 | `PQsetdbLogin` | not yet |  |
-| 3 | `PQconndefaults` | not yet |  |
+| 3 | `PQconndefaults` | implemented | fe-connect.c:2193 |
 | 4 | `PQfinish` | not yet |  |
 | 5 | `PQreset` | not yet |  |
 | 6 | `PQrequestCancel` | not yet |  |
@@ -104,7 +104,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 75 | `appendPQExpBufferStr` | not yet |  |
 | 76 | `destroyPQExpBuffer` | not yet |  |
 | 77 | `createPQExpBuffer` | not yet |  |
-| 78 | `PQconninfoFree` | not yet |  |
+| 78 | `PQconninfoFree` | implemented | fe-connect.c:7459 |
 | 79 | `PQconnectPoll` | not yet |  |
 | 80 | `PQconnectStart` | not yet |  |
 | 81 | `PQflush` | not yet |  |
@@ -178,7 +178,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 149 | `PQresultInstanceData` | not yet |  |
 | 150 | `PQresultSetInstanceData` | not yet |  |
 | 151 | `PQfireResultCreateEvents` | not yet |  |
-| 152 | `PQconninfoParse` | not yet |  |
+| 152 | `PQconninfoParse` | implemented | fe-connect.c:6175 |
 | 153 | `PQinitOpenSSL` | implemented | fe-secure.c:129 |
 | 154 | `PQescapeLiteral` | not yet |  |
 | 155 | `PQescapeIdentifier` | not yet |  |

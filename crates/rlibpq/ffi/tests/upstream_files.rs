@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use rlibpq::sha256::sha256;
 
 /// `(vendored path, bytes, upstream path, upstream sha256)`.
-const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 5] = [
+const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 6] = [
     (
         "include/libpq-fe.h",
         include_bytes!("../include/libpq-fe.h"),
@@ -44,6 +44,12 @@ const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 5] = [
         include_bytes!("c/libpq_testclient.c"),
         "src/interfaces/libpq/test/libpq_testclient.c",
         "e3f1c7320a0bafe6d6355e090427c3e7b9e4a2044e3a25a85bb0a14edb8d79fa",
+    ),
+    (
+        "tests/c/libpq_uri_regress.c",
+        include_bytes!("c/libpq_uri_regress.c"),
+        "src/interfaces/libpq/test/libpq_uri_regress.c",
+        "dec61536820b560c9d2ff2b761fb0fc99b01d921a662f9de6c4e0062d9f20bce",
     ),
 ];
 

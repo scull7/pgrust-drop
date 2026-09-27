@@ -61,6 +61,19 @@ impl Cluster {
     /// [`Cluster::start`], also listening on TCP at `listen_addresses`
     /// (`127.0.0.1` for a loopback gate).
     pub fn start_listening(auth_method: &str, port: u16, listen_addresses: &str) -> Option<Self> {
+        Cluster::start_configured(auth_method, port, listen_addresses, "")
+    }
+
+    /// [`Cluster::start_listening`], with `conf` appended to
+    /// `postgresql.conf` before the server starts — for settings such as
+    /// `trace_connection_negotiation` that only take effect at postmaster
+    /// start (`PGC_POSTMASTER`).
+    pub fn start_configured(
+        auth_method: &str,
+        port: u16,
+        listen_addresses: &str,
+        conf: &str,
+    ) -> Option<Self> {
         let Some(initdb) = reference::find(TOOLS[0]) else {
             reference::skip(TOOLS[0]);
             return None;
@@ -103,6 +116,14 @@ impl Cluster {
             .output()
             .ok()?;
         assert!(status.status.success(), "reference initdb failed");
+        if !conf.is_empty() {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(data.join("postgresql.conf"))
+                .and_then(|mut file| file.write_all(conf.as_bytes()))
+                .expect("postgresql.conf is appended to");
+        }
 
         let socket_dir = dir.clone();
         let start = Command::new(bin.join("pg_ctl"))

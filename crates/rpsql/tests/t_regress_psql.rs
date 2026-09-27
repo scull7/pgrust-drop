@@ -306,6 +306,7 @@ const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 const DOCUMENT_FORMAT_SECTIONS_PORT: u16 = 55_492;
 const NUMERICLOCALE_PORT: u16 = 55_493;
 const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
+const DISPLAY_WIDTH_PORT: u16 = 55_495;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -546,6 +547,46 @@ fn the_unicode_line_style_matches_c_psql() {
             }
         }
     }
+}
+
+/// Display width, which no upstream test exercises: `psql.sql`'s results are
+/// all ASCII. Cells and headers with wide (CJK, fullwidth, emoji), combining
+/// and zero-width characters, measured by `ucs_wcwidth` (`wchar.c:646`)
+/// through `pg_wcssize` / `pg_wcsformat` (`mbprint.c:211`, `:294`) and cut by
+/// `strlen_max_width` (`print.c:3747`), against C psql. That is aligned,
+/// wrapped and unaligned, normal and expanded, at borders 0, 1 and 2, in the
+/// ascii and unicode line styles, under `\pset columns` targets narrow
+/// enough to break a line inside a run of wide characters and to leave a
+/// column narrower than one of them. The cluster is UTF8, so the client
+/// encoding is too.
+#[test]
+fn display_width_matches_c_psql() {
+    let Some(cluster) = Cluster::start(DISPLAY_WIDTH_PORT) else {
+        return;
+    };
+    let mut script = String::from(
+        "\\pset title '表 title'\n\
+         prepare q as select '中文字符ab'::text as w, 'e' || U&'\\0301' || 'x' as c, \
+         '🎉ok１２' as \"é列\", E'ab\\n中x\\nzz中' as m, \
+         'x中' || U&'\\200D' || 'y' as z, 12 as \"数\";\n",
+    );
+    for linestyle in ["ascii", "unicode"] {
+        for format in ["aligned", "wrapped", "unaligned"] {
+            for border in 0..=2 {
+                for expanded in ["off", "on"] {
+                    for columns in [8, 14, 40] {
+                        let _ = writeln!(
+                            script,
+                            "\\pset linestyle {linestyle}\n\\pset format {format}\n\
+                             \\pset border {border}\n\\pset expanded {expanded}\n\
+                             \\pset columns {columns}\nexecute q;"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    diff_against_c_psql(&cluster, "display width", &script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

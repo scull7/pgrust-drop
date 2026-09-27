@@ -114,6 +114,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # v1 (NAT-603): the v0 caches carry pgrust's fuzz/; see below.
+          prefix-key: v1-rust
       # The container's steps run as root, and C initdb and postgres refuse to
       # run as root ("cannot be run as root"), so every gate that creates a
       # cluster would compare two refusals. The checks run as an ordinary user;
@@ -139,6 +141,14 @@ jobs:
       # and it fetches nothing.
       - name: fetch dependencies
         run: su -c 'cargo fetch --locked' ci
+      # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
+      # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
+      # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
+      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # the checks walk it, so the post step never saves it.
+      # As root, which only deletes: ci still owns everything that remains.
+      - name: drop pgrust's fuzz corpora
+        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
       - name: fmt
         run: su -c 'cargo fmt --all --check' ci
       - name: license wall (no pgrust crate reachable from an MIT crate)
@@ -169,6 +179,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # v1 (NAT-603): the v0 caches carry pgrust's fuzz/; see below.
+          prefix-key: v1-rust
       - name: Install the PostgreSQL 18 reference (Homebrew)
         run: brew install postgresql@18
       - name: verify the reference binaries are where the gates look
@@ -181,6 +193,13 @@ jobs:
           "$PGDROP_REF_BIN_APPLE/psql" --version
       - name: fetch dependencies
         run: cargo fetch --locked
+      # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
+      # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
+      # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
+      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # the checks walk it, so the post step never saves it.
+      - name: drop pgrust's fuzz corpora
+        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
       - name: license wall (no pgrust crate reachable from an MIT crate)
         run: scripts/check-license-wall.sh
       - name: clippy
@@ -209,6 +228,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # v1 (NAT-603): the v0 caches carry pgrust's fuzz/; see below.
+          prefix-key: v1-rust
       # postgresql-18 + postgresql-client-18 put these under
       # /usr/lib/postgresql/18/bin (PGDG's Debian/Ubuntu layout -- versioned
       # bindir, with /usr/bin holding only pg_wrapper symlinks):
@@ -234,6 +255,13 @@ jobs:
           "$PGDROP_REF_BIN_GNU/psql" --version
       - name: fetch dependencies
         run: cargo fetch --locked
+      # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
+      # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
+      # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
+      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # the checks walk it, so the post step never saves it.
+      - name: drop pgrust's fuzz corpora
+        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
       - name: fmt
         run: cargo fmt --all --check
       - name: license wall (no pgrust crate reachable from an MIT crate)

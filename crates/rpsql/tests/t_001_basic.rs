@@ -11,8 +11,7 @@
 //! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367) and
 //! `\g` output piped into a program (457-486). The `\copyright`, `\help`,
 //! `ENCODING`, notification, crash and remaining `\errverbose` cases, and the
-//! rest of the file, land with Linear
-//! NAT-400 … NAT-405.
+//! rest of the file, land with Linear NAT-400 … NAT-405.
 //!
 //! The byte-diff gate NAT-398's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the

@@ -180,7 +180,6 @@ impl Scanner {
                         quote = Some(':');
                         unquoted = 0;
                     }
-                    VariableRule::Unset => unquoted = 0,
                     VariableRule::Tested => {}
                     VariableRule::Colon => unquoted += 1,
                 },
@@ -374,7 +373,7 @@ impl Scanner {
             // The value is emitted as typed when the variable is unset.
             out.push(b':');
             out.extend_from_slice(name.as_bytes());
-            VariableRule::Unset
+            VariableRule::Substituted
         }
     }
 }
@@ -382,10 +381,10 @@ impl Scanner {
 /// Which `:` rule of `<xslasharg>` matched, for the argument's quote mark
 /// and its count of unquoted trailing bytes.
 enum VariableRule {
-    /// `:name` set, or `:'name'` / `:"name"`: the quote mark becomes `:`.
+    /// `:name`, `:'name'` or `:"name"`, set or not — an unset one is echoed
+    /// as typed: the quote mark becomes `:` either way
+    /// (`psqlscanslash.l:262`, `:269`, `:277`).
     Substituted,
-    /// `:name` unset: echoed as typed, but counted as quoted.
-    Unset,
     /// `:{?name}`, which touches neither.
     Tested,
     /// A lone `:`, thrown back as an ordinary character.
@@ -471,9 +470,11 @@ mod tests {
 
     #[test]
     fn an_unset_variable_argument_is_left_as_typed() {
+        // Still marked `:`: `*option_quote = ':'` follows the `ECHO`
+        // (`psqlscanslash.l:262`).
         let (_, options) = slash("\\echo :x", &NoVariables);
         assert_eq!(values(&options), [":x"]);
-        assert_eq!(options[0].quote, None);
+        assert_eq!(options[0].quote, Some(':'));
     }
 
     #[test]

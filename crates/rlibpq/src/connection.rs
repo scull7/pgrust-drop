@@ -19,7 +19,7 @@
 //! below replay a whole authenticated session over a scripted stream.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -30,13 +30,13 @@ use crate::encoding::Encoding;
 use crate::error::ConnError;
 use crate::escape::{self, EscapeError, EscapedString};
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
+use crate::hosts::{ConnHost, HostType, LoadBalance, Prng, TargetServerType, conn_hosts};
 use crate::lobj::LoFuncs;
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
     next_copy_frame, next_frame,
 };
 use crate::negotiate::{Build, EncMethod, EncryptionOptions, Negotiation};
-use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::pipeline::{
     Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
     message_id,
@@ -241,39 +241,74 @@ pub fn parse_port(raw: Option<&[u8]>) -> Result<u16, ConnError> {
     }
 }
 
-/// Which socket a `ConnInfo` names — `pqConnectOptions2`'s host
-/// classification at `fe-connect.c:1315`-`:1352` over the port
+/// Which socket a `ConnInfo`'s first host names — `pqConnectOptions2`'s host
+/// classification at `fe-connect.c:1319`-`:1352` over the port
 /// [`parse_port`] settles, as a pure function.
 ///
 /// # Errors
-/// The `port` is not one `PQconnectPoll` would use; see [`parse_port`].
+/// The host list does not match (see [`conn_hosts`]), or the first `port`
+/// is not one `PQconnectPoll` would use (see [`parse_port`]).
 pub fn socket_address(conninfo: &ConnInfo) -> Result<Address, ConnError> {
-    let port = parse_port(conninfo.get("port"))?;
-
-    let host = conninfo.get("host").unwrap_or_default();
-    if host.is_empty() {
-        // fe-connect.c:1339 — the compiled-in socket directory wins when it
-        // is not empty; only a build without one falls back to DefaultHost.
-        if DEFAULT_PGSOCKET_DIR.is_empty() {
-            return Ok(Address::Tcp {
-                host: "localhost".to_string(),
-                port,
-            });
-        }
-        return Ok(Address::Unix(unix_socket_path(DEFAULT_PGSOCKET_DIR, port)));
-    }
-
-    if is_unixsock_path(host) {
-        return Ok(Address::Unix(unix_socket_path(
-            &String::from_utf8_lossy(host),
-            port,
-        )));
-    }
-    Ok(Address::Tcp {
-        host: String::from_utf8_lossy(host).into_owned(),
-        port,
-    })
+    let hosts = conn_hosts(conninfo)?;
+    let first = &hosts[0];
+    Ok(host_address(first, parse_port(first.port.as_deref())?))
 }
+
+/// The socket one host entry names on `port`: `hostaddr` when it was given
+/// (`CHT_HOST_ADDRESS`, dialled without a lookup), else the host name or
+/// socket directory.
+#[must_use]
+pub fn host_address(host: &ConnHost, port: u16) -> Address {
+    let text = |value: &Option<Vec<u8>>| {
+        String::from_utf8_lossy(value.as_deref().unwrap_or_default()).into_owned()
+    };
+    match host.kind {
+        HostType::HostAddress => Address::Tcp {
+            host: text(&host.hostaddr),
+            port,
+        },
+        HostType::HostName => Address::Tcp {
+            host: text(&host.host),
+            port,
+        },
+        HostType::UnixSocket => Address::Unix(unix_socket_path(&text(&host.host), port)),
+    }
+}
+
+/// Action: `pg_getaddrinfo_all` (`fe-connect.c:3053`-`:3104`) — every
+/// address a host resolves to, in the resolver's order. A socket path is
+/// its own single address.
+///
+/// # Errors
+/// The name did not resolve.
+pub fn resolve(address: &Address) -> io::Result<Vec<Peer>> {
+    match address {
+        Address::Tcp { host, port } => Ok((host.as_str(), *port)
+            .to_socket_addrs()?
+            .map(Peer::Tcp)
+            .collect()),
+        Address::Unix(path) => Ok(vec![Peer::Unix(path.clone())]),
+    }
+}
+
+/// `libpq_prng_init`, `fe-connect.c:1169`: sixteen strong random bytes, or
+/// when those cannot be had a seed from the time and the pid. C also mixes
+/// in the `PGconn` pointer, which has no counterpart here.
+fn libpq_prng_init() -> Prng {
+    if let Ok(bytes) = strong_random(16)
+        && let Ok(bytes) = <[u8; 16]>::try_from(bytes)
+    {
+        return Prng::strong_seed(bytes);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Prng::seed(u64::from(std::process::id()) ^ u64::from(now.subsec_micros()) ^ now.as_secs())
+}
+
+/// `ERRCODE_CANNOT_CONNECT_NOW`, `57P03`: a server still starting up, or a
+/// standby not yet accepting connections.
+const ERRCODE_CANNOT_CONNECT_NOW: &[u8] = b"57P03";
 
 /// `UNIXSOCK_PATH`, `pqcomm.h:44`.
 #[must_use]
@@ -506,42 +541,109 @@ pub struct Connection<S = Stream> {
 }
 
 impl Connection<Stream> {
-    /// `PQconnectdb`: open the socket the `ConnInfo` names, send the startup
-    /// packet, authenticate, and return once ReadyForQuery arrives.
+    /// `PQconnectdb`: walk the host list the `ConnInfo` names until one
+    /// server accepts, send it the startup packet, authenticate, and return
+    /// once ReadyForQuery arrives.
+    ///
+    /// The list is [`conn_hosts`]'s, shuffled when `load_balance_hosts` is
+    /// `random` (`fe-connect.c:2085`); each host's addresses are shuffled
+    /// the same way (`:3116`). A host is left for the next one when its port
+    /// is out of range (`:3044`), its name does not resolve (`:3060`), no
+    /// address accepts the socket, or the server answers "cannot connect
+    /// now" (`:4136`); anything else ends the attempt, as `error_return`
+    /// does.
     ///
     /// The caller is expected to have run `ConnInfo::add_defaults` already —
     /// `add_defaults(&Env::from_process(), &Filesystem)` is what
     /// `PQconnectdb` does with the environment and the service files.
     ///
     /// # Errors
-    /// An encryption option this build refuses (`sslmode=require` without
-    /// TLS, say), the `port` is not one `PQconnectPoll` would use, the socket could not
-    /// be opened, the nonce could not be drawn, the server refused the
-    /// connection, or authentication failed.
+    /// A `host`, `hostaddr` or `port` list that does not match, an option
+    /// this build refuses (`sslmode=require` without TLS, say) or does not
+    /// know, a `port` that is not an integer, the nonce could not be drawn,
+    /// a server refused the connection or authentication failed — or every
+    /// host was left, and then the reason the last one was.
+    ///
+    /// # Panics
+    /// Never: [`conn_hosts`] always names at least one host, and every host
+    /// that is left records why.
     pub fn connect(conninfo: &ConnInfo) -> Result<Self, ConnectionError> {
-        // fe-connect.c:1747-:1987 — `pqConnectOptions2` runs at
-        // `PQconnectStart`, before `PQconnectPoll` looks at the port.
+        // `pqConnectOptions2`, in its order: the host list (fe-connect.c:1256),
+        // the encryption options (:1747-:1987), target_session_attrs (:1992)
+        // and load_balance_hosts (:2067). All of it runs at `PQconnectStart`,
+        // before `PQconnectPoll` reads a port or opens a socket.
+        let mut hosts = conn_hosts(conninfo)?;
         let options = EncryptionOptions::from_conninfo(conninfo, Build::THIS)?;
-        // fe-connect.c:3036 — `PQconnectPoll` settles the port, and refuses a
-        // value that is not one, before it resolves an address or opens a
-        // socket. Doing it here keeps that order: nothing is opened for a
-        // conninfo C would have rejected.
-        let address = socket_address(conninfo)?;
-        // fe-connect.c:3285 — the first method is chosen before the socket
-        // is opened, so a combination with none fails without connecting.
-        let negotiation =
-            Negotiation::start(&options, Build::THIS, matches!(address, Address::Unix(_)))?;
-        // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is ever
-        // allowed (`fe-connect.c:4721`-`:4741`; pinned by
-        // `negotiate::tests::this_build_only_ever_negotiates_plaintext`), so
-        // there is no SSLRequest to send and no method to fall back to.
-        debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
-        let stream = Stream::connect(&address)?;
-        let raddr = stream.raddr(&address);
-        let nonce = strong_random(RAW_NONCE_LEN)?;
-        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
-        conn.raddr = raddr;
-        Ok(conn)
+        TargetServerType::from_conninfo(conninfo)?;
+        let mut prng = match LoadBalance::from_conninfo(conninfo)? {
+            LoadBalance::Disable => None,
+            LoadBalance::Random => Some(libpq_prng_init()),
+        };
+        if let Some(prng) = prng.as_mut() {
+            prng.shuffle(&mut hosts);
+        }
+
+        let mut last_error = None;
+        for host in &hosts {
+            // fe-connect.c:3036 — a port that is not an integer is
+            // `error_return`; one out of range moves on (`goto keep_going`).
+            let port = match parse_port(host.port.as_deref()) {
+                Ok(port) => port,
+                Err(err @ ConnError::InvalidPortNumber(_)) => {
+                    last_error = Some(err.into());
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let mut peers = match resolve(&host_address(host, port)) {
+                Ok(peers) => peers,
+                Err(err) => {
+                    last_error = Some(err.into());
+                    continue;
+                }
+            };
+            if let Some(prng) = prng.as_mut() {
+                prng.shuffle(&mut peers);
+            }
+            for peer in peers {
+                // fe-connect.c:3285 — the first method is chosen before the
+                // socket is opened, so a combination with none fails without
+                // connecting.
+                let negotiation =
+                    Negotiation::start(&options, Build::THIS, matches!(peer, Peer::Unix(_)))?;
+                // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is
+                // ever allowed (`fe-connect.c:4721`-`:4741`; pinned by
+                // `negotiate::tests::this_build_only_ever_negotiates_plaintext`),
+                // so there is no SSLRequest to send and no method to fall
+                // back to.
+                debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
+                let stream = match peer.connect() {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        // fe-connect.c:3516 — try the next address.
+                        last_error = Some(err.into());
+                        continue;
+                    }
+                };
+                let nonce = strong_random(RAW_NONCE_LEN)?;
+                match Connection::start_up(stream, conninfo, &nonce) {
+                    Ok(mut conn) => {
+                        // fe-connect.c:3249 — the address it was dialled at.
+                        conn.raddr = Some(peer);
+                        return Ok(conn);
+                    }
+                    // fe-connect.c:4136 — the next host, not the next address.
+                    Err(ConnectionError::Server(err))
+                        if err.sqlstate() == Some(ERRCODE_CANNOT_CONNECT_NOW) =>
+                    {
+                        last_error = Some(ConnectionError::Server(err));
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Err(last_error.expect("conn_hosts names at least one host"))
     }
 
     /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
@@ -1935,6 +2037,44 @@ mod tests {
         assert_eq!(
             error.message(),
             b"sslmode value \"require\" invalid when SSL support is not compiled in".to_vec()
+        );
+    }
+
+    /// fe-connect.c:3044 — a port out of range leaves that host for the
+    /// next one (`goto keep_going`), and the attempt ends with the last
+    /// host's reason; `:3041` — one that is not an integer at all ends the
+    /// attempt there (`goto error_return`), whatever hosts are left.
+    #[test]
+    fn a_port_out_of_range_moves_on_and_one_that_is_not_an_integer_stops() {
+        let info = conninfo("host=/nonexistent-a,/nonexistent-b port=99999,5432");
+        let error = Connection::connect(&info).unwrap_err();
+        assert!(matches!(error, ConnectionError::Io(_)), "{error:?}");
+
+        let info = conninfo("host=/nonexistent-a,/nonexistent-b port=5432,abc");
+        let error = Connection::connect(&info).unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"invalid integer value \"abc\" for connection option \"port\"".to_vec()
+        );
+    }
+
+    /// The host list is the first thing `pqConnectOptions2` settles
+    /// (`fe-connect.c:1256`), ahead of the encryption options and
+    /// `load_balance_hosts`.
+    #[test]
+    fn a_mismatched_host_list_is_reported_before_the_other_options() {
+        let info = conninfo("host=/a,/b port=1,2,3 sslmode=require load_balance_hosts=x");
+        let error = Connection::connect(&info).unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"could not match 3 port numbers to 2 hosts".to_vec()
+        );
+
+        let info = conninfo("host=/a,/b load_balance_hosts=x");
+        let error = Connection::connect(&info).unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"invalid load_balance_hosts value: \"x\"".to_vec()
         );
     }
 

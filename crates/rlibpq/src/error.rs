@@ -92,6 +92,12 @@ pub enum ConnError {
     ServiceFileSyntaxError { file: RawText, line: usize },
     /// `fe-connect.c:6109` — `service=` inside a service group.
     NestedServiceSpecification { file: RawText, line: usize },
+    /// `fe-connect.c:1309` — a `host` list whose length is not the
+    /// `hostaddr` list's.
+    HostCountMismatch { hosts: usize, hostaddrs: usize },
+    /// `fe-connect.c:1389` — a `port` list with neither one element nor one
+    /// per host.
+    PortCountMismatch { ports: usize, hosts: usize },
 }
 
 impl ConnError {
@@ -219,6 +225,13 @@ impl ConnError {
                 file,
                 &format!("\", line {line}"),
             ),
+            ConnError::HostCountMismatch { hosts, hostaddrs } => {
+                format!("could not match {hosts} host names to {hostaddrs} hostaddr values")
+                    .into_bytes()
+            }
+            ConnError::PortCountMismatch { ports, hosts } => {
+                format!("could not match {ports} port numbers to {hosts} hosts").into_bytes()
+            }
         }
     }
 }

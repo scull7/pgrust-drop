@@ -30,7 +30,9 @@
 //! server reports, proved against `test_escape.c`; and the fast-path
 //! function call (`PQfn`) with the large object interface of `fe-lobj.c`
 //! over it (`lo_open` … `lo_import`, `lo_export`), proved against
-//! `src/test/examples/testlo.c` and `testlo64.c`. The
+//! `src/test/examples/testlo.c` and `testlo64.c`; and the host list —
+//! `host`, `hostaddr` and `port` lists walked in order or shuffled by
+//! `load_balance_hosts=random` over `pg_prng`'s generator. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -55,6 +57,7 @@ pub mod error;
 pub mod escape;
 pub mod extended;
 pub mod hmac;
+pub mod hosts;
 pub mod lobj;
 pub mod md5;
 pub mod message;
@@ -84,6 +87,7 @@ pub use encoding::Encoding;
 pub use error::ConnError;
 pub use escape::{EscapeError, EscapedString, escape_bytea, escape_string, unescape_bytea};
 pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
+pub use hosts::{ConnHost, HostType, LoadBalance, Prng, TargetServerType, conn_hosts};
 pub use lobj::{LoError, LoFuncs};
 pub use message::{
     Backend, CopyFormat, Frame, Frontend, ProtocolError, Target, TransactionStatus,

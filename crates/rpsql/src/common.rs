@@ -9,6 +9,7 @@ use std::io::Write;
 
 use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
+use crate::logging::{Level, log};
 use crate::print::print_query;
 use crate::settings::{Echo, PsqlSettings};
 
@@ -151,7 +152,7 @@ pub fn send_query(
                         let _ = stdout.write_all(&text);
                     }
                     Err(err) => {
-                        let _ = writeln!(stderr, "psql: error: {err}");
+                        log(stderr, pset, Level::Error, err.to_string());
                         ok = false;
                     }
                 }
@@ -174,7 +175,8 @@ pub fn send_query(
                     }
                     None => result.error_message(),
                 };
-                let _ = stderr.write_all(&message);
+                // `pg_log_info("%s", error)` (`common.c:457`).
+                log(stderr, pset, Level::Info, &message);
                 ok = false;
             }
         }
@@ -305,10 +307,27 @@ mod tests {
         runner
             .push(Backend::ReadyForQuery(TransactionStatus::Idle))
             .unwrap();
-        let (ok, out, err) = run(runner.into_results(), &PsqlSettings::default());
+        let results = runner.into_results();
+        // Terse, as under `-c` or a pipe: the server's text alone.
+        let terse = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let (ok, out, err) = run(results.clone(), &terse);
         assert!(!ok);
         assert_eq!(out, "");
         assert_eq!(err, "ERROR:  syntax error at or near \"selec\"\n");
+        // Under `-f`, `pg_log_info` names the file and line (`common.c:457`).
+        let file = PsqlSettings {
+            inputfile: Some("x.sql".into()),
+            lineno: 4,
+            ..PsqlSettings::default()
+        };
+        let (_, _, err) = run(results, &file);
+        assert_eq!(
+            err,
+            "psql:x.sql:4: ERROR:  syntax error at or near \"selec\"\n"
+        );
     }
 
     #[test]

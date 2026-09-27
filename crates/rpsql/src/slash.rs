@@ -4,11 +4,25 @@
 //! `psqlscan.l` (`psqlscan.h:9` calls it "a compatible add-on lexer"), so
 //! this module extends [`Scanner`] rather than owning a buffer of its own. It
 //! covers `<xslashcmd>`, `<xslashargstart>`, `<xslasharg>`, `<xslashquote>`,
-//! `<xslashdquote>` and `<xslashend>`; `<xslashbackquote>` runs a shell and is
-//! an action, so it stops at [`SlashOption::backquote`] for the caller to
-//! decide about.
+//! `<xslashdquote>`, `<xslashwholeline>` and `<xslashend>`;
+//! `<xslashbackquote>` runs a shell and is an action, so it stops at
+//! [`SlashOption::backquote`] for the caller to decide about.
 
-use crate::scan::{QuoteType, Scanner, VariableSource, is_variable_char};
+use crate::scan::{QuoteType, Scanner, VariableSource, is_space, is_variable_char};
+
+/// `enum slash_option_type` (`psqlscanslash.h:15`), for the three kinds this
+/// port reads. `OT_SQLID` and `OT_SQLIDHACK` only post-process an `OT_NORMAL`
+/// argument, and no command ported so far asks for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionType {
+    /// `OT_NORMAL`: normal case.
+    Normal,
+    /// `OT_FILEPIPE`: it's a filename or pipe: a leading `|` takes the rest
+    /// of the line (`psqlscanslash.l:164`).
+    FilePipe,
+    /// `OT_WHOLE_LINE`: just snarf the rest of the line.
+    WholeLine,
+}
 
 /// One argument, with the quoting mark that produced it.
 ///
@@ -32,67 +46,89 @@ impl SlashOption {
     }
 }
 
+/// End of input inside a quoted argument: `psql_scan_slash_option` logs
+/// `unterminated quoted string` and returns NULL (`psqlscanslash.l:628`-`:634`).
+///
+/// The lexer stays pure, so the caller does the logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnterminatedQuote;
+
 impl Scanner {
     /// `psql_scan_slash_command()` (`psqlscanslash.l:480`): the command name,
-    /// which ends at whitespace or a backslash.
+    /// which ends at whitespace or a backslash (`:145`).
     pub fn slash_command(&mut self) -> String {
         let rest = self.rest();
         let n = rest
             .iter()
-            .take_while(|&&c| !c.is_ascii_whitespace() && c != b'\\')
+            .take_while(|&&c| !is_space(c) && c != b'\\')
             .count();
         let name = String::from_utf8_lossy(&rest[..n]).into_owned();
         self.skip(n);
         name
     }
 
-    /// `psql_scan_slash_option(OT_NORMAL)` (`psqlscanslash.l:539`): the next
-    /// argument, or `None` at end of command.
-    pub fn slash_option(&mut self, vars: &dyn VariableSource) -> Option<SlashOption> {
+    /// `psql_scan_slash_option()` (`psqlscanslash.l:539`) with a NULL
+    /// `semicolon`: the next argument, `Ok(None)` at end of command.
+    ///
+    /// # Errors
+    /// [`UnterminatedQuote`] when the input ends inside a quote; the argument
+    /// is consumed and thrown away, as upstream does.
+    pub fn slash_option(
+        &mut self,
+        vars: &dyn VariableSource,
+        option_type: OptionType,
+    ) -> Result<Option<SlashOption>, UnterminatedQuote> {
+        if option_type == OptionType::WholeLine {
+            return Ok(self.whole_line(Vec::new()));
+        }
+
         // <xslashargstart>: discard whitespace before the argument.
-        let skip = self
-            .rest()
-            .iter()
-            .take_while(|c| c.is_ascii_whitespace())
-            .count();
+        let skip = self.rest().iter().take_while(|&&c| is_space(c)).count();
         self.skip(skip);
 
-        let rest = self.rest();
-        if rest.is_empty() || rest[0] == b'\\' {
-            return None;
+        // "|" is only special at the start of an OT_FILEPIPE argument,
+        // where it is kept and takes the rest of the line (`:164`).
+        if option_type == OptionType::FilePipe && self.rest().first() == Some(&b'|') {
+            self.skip(1);
+            return Ok(self.whole_line(vec![b'|']));
         }
 
         let mut out = Vec::new();
         let mut quote: Option<char> = None;
         loop {
             let rest = self.rest().to_vec();
-            if rest.is_empty() {
-                break;
-            }
-            let c = rest[0];
+            let Some(&c) = rest.first() else { break };
             // <xslasharg>{space}|"\\": unquoted space or backslash ends the
             // argument and is not eaten (`psqlscanslash.l:195`).
-            if c.is_ascii_whitespace() || c == b'\\' {
+            if is_space(c) || c == b'\\' {
                 break;
             }
             match c {
                 b'\'' => {
                     quote = Some('\'');
                     self.skip(1);
-                    self.read_single_quoted(&mut out);
+                    if !self.read_single_quoted(&mut out) {
+                        return Err(UnterminatedQuote);
+                    }
                 }
                 b'"' => {
                     quote = Some('"');
                     self.skip(1);
                     out.push(b'"');
-                    self.read_double_quoted(&mut out);
+                    if !self.read_double_quoted(&mut out) {
+                        return Err(UnterminatedQuote);
+                    }
                 }
                 b'`' => {
                     quote = Some('`');
                     self.skip(1);
                     let n = self.rest().iter().take_while(|&&b| b != b'`').count();
                     out.extend_from_slice(&self.rest()[..n]);
-                    self.skip(n + usize::from(self.rest().len() > n));
+                    if self.rest().len() == n {
+                        self.skip(n);
+                        return Err(UnterminatedQuote);
+                    }
+                    self.skip(n + 1);
                 }
                 b':' => {
                     if self.read_variable(&mut out, vars) {
@@ -106,42 +142,57 @@ impl Scanner {
             }
         }
 
-        Some(SlashOption {
+        // An unquoted empty argument means end of command (`:664`).
+        if out.is_empty() && quote.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(SlashOption {
             value: String::from_utf8_lossy(&out).into_owned(),
             quote,
-        })
-    }
-
-    /// Every remaining argument, which is how `HandleSlashCmds` eats the tail
-    /// of a command line (`command.c:278`).
-    pub fn slash_options(&mut self, vars: &dyn VariableSource) -> Vec<SlashOption> {
-        let mut all = Vec::new();
-        while let Some(option) = self.slash_option(vars) {
-            all.push(option);
-        }
-        all
+        }))
     }
 
     /// `psql_scan_slash_command_end()` (`psqlscanslash.l:678`): swallow a
-    /// trailing `\\`, which separates one backslash command from the next.
+    /// trailing `\\`, which separates one backslash command from the next,
+    /// and nothing else (`<xslashend>`, `:436`).
     pub fn slash_command_end(&mut self) {
-        let skip = self
-            .rest()
-            .iter()
-            .take_while(|c| c.is_ascii_whitespace())
-            .count();
-        self.skip(skip);
         if self.rest().starts_with(b"\\\\") {
             self.skip(2);
         }
     }
 
-    /// `<xslashquote>` (`psqlscanslash.l:321`): `''` is a quote, and the
-    /// backslash escapes `\n`, `\t`, `\b`, `\r`, `\f`, `\digits`, `\xhex`.
-    fn read_single_quoted(&mut self, out: &mut Vec<u8>) {
+    /// `<xslashwholeline>` (`psqlscanslash.l:423`): everything to the end of
+    /// the line, with only the whitespace before the first character dropped.
+    fn whole_line(&mut self, mut out: Vec<u8>) -> Option<SlashOption> {
+        let rest = self.rest().to_vec();
+        self.skip(rest.len());
+        let mut i = 0;
+        while i < rest.len() {
+            let run = rest[i..].iter().take_while(|&&c| is_space(c)).count();
+            if run > 0 {
+                if !out.is_empty() {
+                    out.extend_from_slice(&rest[i..i + run]);
+                }
+                i += run;
+            } else {
+                out.push(rest[i]);
+                i += 1;
+            }
+        }
+        (!out.is_empty()).then(|| SlashOption {
+            value: String::from_utf8_lossy(&out).into_owned(),
+            quote: None,
+        })
+    }
+
+    /// `<xslashquote>` (`psqlscanslash.l:321`-`:351`): `''` is a quote, and a
+    /// backslash escapes `\n`, `\t`, `\b`, `\r`, `\f`, one to three octal
+    /// digits, `x` and one or two hex digits, or any other character.
+    /// Returns false if the input ended before the closing quote.
+    fn read_single_quoted(&mut self, out: &mut Vec<u8>) -> bool {
         loop {
             let rest = self.rest().to_vec();
-            let Some(&c) = rest.first() else { return };
+            let Some(&c) = rest.first() else { return false };
             match c {
                 b'\'' if rest.get(1) == Some(&b'\'') => {
                     self.skip(2);
@@ -149,23 +200,14 @@ impl Scanner {
                 }
                 b'\'' => {
                     self.skip(1);
-                    return;
+                    return true;
                 }
-                b'\\' => {
-                    let Some(&escape) = rest.get(1) else {
-                        self.skip(1);
-                        return;
-                    };
-                    self.skip(2);
-                    match escape {
-                        b'n' => out.push(b'\n'),
-                        b't' => out.push(b'\t'),
-                        b'b' => out.push(0x08),
-                        b'r' => out.push(b'\r'),
-                        b'f' => out.push(0x0c),
-                        other => out.push(other),
-                    }
+                b'\\' if rest.len() > 1 => {
+                    let (byte, len) = single_quote_escape(&rest[1..]);
+                    self.skip(1 + len);
+                    out.push(byte);
                 }
+                // A lone backslash at the end is `{other}` (`:351`).
                 _ => {
                     self.skip(1);
                     out.push(c);
@@ -175,8 +217,9 @@ impl Scanner {
     }
 
     /// `<xslashdquote>` (`psqlscanslash.l:411`): everything up to the closing
-    /// double quote, which stays in the value.
-    fn read_double_quoted(&mut self, out: &mut Vec<u8>) {
+    /// double quote, which stays in the value. Returns false if the input
+    /// ended first.
+    fn read_double_quoted(&mut self, out: &mut Vec<u8>) -> bool {
         let rest = self.rest().to_vec();
         let n = rest.iter().take_while(|&&c| c != b'"').count();
         out.extend_from_slice(&rest[..n]);
@@ -184,11 +227,15 @@ impl Scanner {
         if rest.len() > n {
             self.skip(1);
             out.push(b'"');
+            true
+        } else {
+            false
         }
     }
 
     /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`).
-    /// Returns whether a substitution actually happened.
+    /// Returns whether the rule marks the argument as `:`-quoted, which every
+    /// substitution rule does whether or not the variable is set.
     fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> bool {
         let rest = self.rest().to_vec();
 
@@ -204,15 +251,13 @@ impl Scanner {
                 } else {
                     QuoteType::SqlIdent
                 };
-                let value = vars.get_variable(&name, quote).unwrap_or_else(|| {
-                    if delim == b'\'' {
-                        crate::variables::escape_literal("")
-                    } else {
-                        crate::variables::escape_identifier(&name)
-                    }
-                });
+                // `psqlscan_escape_variable`: the value, or the token as
+                // typed when unset (`psqlscan.l:1727`-`:1737`).
+                match vars.get_variable(&name, quote) {
+                    Some(value) => out.extend_from_slice(value.as_bytes()),
+                    None => out.extend_from_slice(&rest[..3 + len]),
+                }
                 self.skip(3 + len);
-                out.extend_from_slice(value.as_bytes());
                 return true;
             }
             // Throw back everything but the colon.
@@ -249,16 +294,56 @@ impl Scanner {
         }
         let name = String::from_utf8_lossy(&rest[1..=len]).into_owned();
         self.skip(1 + len);
-        if let Some(value) = vars.get_variable(&name, QuoteType::Plain) {
-            out.extend_from_slice(value.as_bytes());
-            true
-        } else {
-            // The value is emitted as typed when the variable is unset.
-            out.push(b':');
-            out.extend_from_slice(name.as_bytes());
-            false
+        match vars.get_variable(&name, QuoteType::Plain) {
+            Some(value) => out.extend_from_slice(value.as_bytes()),
+            // The text is emitted as typed when the variable is unset.
+            None => out.extend_from_slice(&rest[..=len]),
+        }
+        // `*option_quote = ':'` whether or not a value was found (`:262`).
+        true
+    }
+}
+
+/// The escape after a backslash inside `<xslashquote>`, given the bytes after
+/// the backslash (at least one): the byte it stands for and how many bytes of
+/// `after` it consumed.
+///
+/// Flex takes the longest match, so `{xeoctesc}` (`[\\][0-7]{1,3}`) and
+/// `{xehexesc}` (`[\\]x[0-9A-Fa-f]{1,2}`) beat `"\\".`; `(char) strtol(…)`
+/// keeps the low byte of an octal value above `\377` (`:337`-`:347`).
+fn single_quote_escape(after: &[u8]) -> (u8, usize) {
+    let octal = after
+        .iter()
+        .take(3)
+        .take_while(|c| (b'0'..=b'7').contains(c))
+        .count();
+    if octal > 0 {
+        let value = after[..octal]
+            .iter()
+            .fold(0u32, |acc, &d| acc * 8 + u32::from(d - b'0'));
+        return (value.to_le_bytes()[0], octal);
+    }
+    if after[0] == b'x' {
+        let hex = after[1..]
+            .iter()
+            .take(2)
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        if hex > 0 {
+            let digits = std::str::from_utf8(&after[1..=hex]).expect("hex digits are ASCII");
+            let value = u8::from_str_radix(digits, 16).expect("at most two hex digits");
+            return (value, 1 + hex);
         }
     }
+    let byte = match after[0] {
+        b'n' => b'\n',
+        b't' => b'\t',
+        b'b' => 0x08,
+        b'r' => b'\r',
+        b'f' => 0x0c,
+        other => other,
+    };
+    (byte, 1)
 }
 
 #[cfg(test)]
@@ -274,8 +359,31 @@ mod tests {
         let (res, _) = scanner.scan(&mut buf, vars);
         assert_eq!(res, ScanResult::Backslash);
         let cmd = scanner.slash_command();
-        let options = scanner.slash_options(vars);
+        let options = all_options(&mut scanner, vars);
         (cmd, options)
+    }
+
+    /// Every remaining `OT_NORMAL` argument.
+    fn all_options(scanner: &mut Scanner, vars: &dyn VariableSource) -> Vec<SlashOption> {
+        let mut all = Vec::new();
+        while let Some(option) = scanner.slash_option(vars, OptionType::Normal).unwrap() {
+            all.push(option);
+        }
+        all
+    }
+
+    /// Drive the SQL lexer to the backslash and read the command name, leaving
+    /// the scanner positioned at its first argument.
+    fn at_arguments(line: &str) -> Scanner {
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        scanner.slash_command();
+        scanner
     }
 
     fn values(options: &[SlashOption]) -> Vec<&str> {
@@ -339,10 +447,134 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_variable_argument_is_left_as_typed() {
+    fn an_unset_variable_argument_is_left_as_typed_but_still_marked() {
+        // `*option_quote = ':'` is set whether or not the variable is
+        // (`psqlscanslash.l:262`), so an unset `:x` is not an unquoted word.
         let (_, options) = slash("\\echo :x", &NoVariables);
         assert_eq!(values(&options), [":x"]);
-        assert_eq!(options[0].quote, None);
+        assert_eq!(options[0].quote, Some(':'));
+    }
+
+    #[test]
+    fn unset_quoted_variable_arguments_are_left_as_typed() {
+        // `psqlscan_escape_variable` emits the token itself when the callback
+        // returns NULL (`psqlscan.l:1733`-`:1737`); this is what
+        // `\echo :foo :'foo' :"foo"` prints in an inactive branch.
+        let (_, options) = slash("\\echo :'x' :\"x\"", &NoVariables);
+        assert_eq!(values(&options), [":'x'", ":\"x\""]);
+        assert!(options.iter().all(|o| o.quote == Some(':')));
+    }
+
+    #[test]
+    fn every_interpolation_form_substitutes_in_an_argument() {
+        struct V;
+        impl VariableSource for V {
+            fn get_variable(&self, name: &str, quote: QuoteType) -> Option<String> {
+                (name == "foo").then(|| match quote {
+                    QuoteType::Plain => "b'r".to_string(),
+                    QuoteType::SqlLiteral => crate::variables::escape_literal("b'r"),
+                    QuoteType::SqlIdent => crate::variables::escape_identifier("b'r"),
+                    QuoteType::ShellArg => unreachable!("no backquote here"),
+                })
+            }
+        }
+        let (_, options) = slash("\\echo :foo :'foo' :\"foo\" :{?foo} :{?bar}", &V);
+        assert_eq!(
+            values(&options),
+            ["b'r", "'b''r'", "\"b'r\"", "TRUE", "FALSE"]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_interpolation_keeps_only_the_colon_special() {
+        // The no-backup rules throw back everything but the colon
+        // (`psqlscanslash.l:286`-`:312`); what follows is lexed afresh, so
+        // the quote opens an ordinary quoted argument.
+        let (_, options) = slash("\\echo :'foo x' :{ :{?a", &NoVariables);
+        assert_eq!(values(&options), [":foo x", ":{", ":{?a"]);
+    }
+
+    #[test]
+    fn octal_and_hex_escapes_inside_single_quotes_are_expanded() {
+        // `{xeoctesc}` and `{xehexesc}` (`psqlscanslash.l:337`-`:347`).
+        let (_, options) = slash("\\echo '\\101\\x42\\x4a3\\q'", &NoVariables);
+        assert_eq!(values(&options), ["ABJ3q"]);
+    }
+
+    #[test]
+    fn an_unterminated_quote_is_an_error_not_an_argument() {
+        for line in ["\\echo 'abc", "\\echo \"abc", "\\echo `abc", "\\echo 'a\\"] {
+            let mut scanner = at_arguments(line);
+            assert_eq!(
+                scanner.slash_option(&NoVariables, OptionType::Normal),
+                Err(UnterminatedQuote),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_line_argument_takes_everything_but_its_leading_space() {
+        // `<xslashwholeline>` (`psqlscanslash.l:423`-`:434`), backslashes and
+        // all.
+        let mut scanner = at_arguments("\\! \t whole  line \\endif ");
+        let option = scanner
+            .slash_option(&NoVariables, OptionType::WholeLine)
+            .unwrap()
+            .unwrap();
+        assert_eq!(option.value, "whole  line \\endif ");
+        assert_eq!(
+            scanner.slash_option(&NoVariables, OptionType::Normal),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_filepipe_argument_starting_with_a_bar_takes_the_whole_line() {
+        // `psqlscanslash.l:164`-`:175`.
+        let mut scanner = at_arguments("\\w |/no/such/file \\else");
+        let option = scanner
+            .slash_option(&NoVariables, OptionType::FilePipe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(option.value, "|/no/such/file \\else");
+
+        // Anywhere else a bar is ordinary, and without OT_FILEPIPE it is
+        // ordinary even at the start.
+        let mut scanner = at_arguments("\\w a|b \\else");
+        let option = scanner
+            .slash_option(&NoVariables, OptionType::FilePipe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(option.value, "a|b");
+        let mut scanner = at_arguments("\\echo |x y");
+        let option = scanner
+            .slash_option(&NoVariables, OptionType::Normal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(option.value, "|x");
+    }
+
+    #[test]
+    fn arguments_stop_at_the_end_of_a_variables_value() {
+        // A divergence (docs/divergences.md): upstream would pop back to the
+        // line at the value's end and read `b` too (`psqlscanslash.l:452`).
+        struct V;
+        impl VariableSource for V {
+            fn get_variable(&self, name: &str, _quote: QuoteType) -> Option<String> {
+                (name == "x").then(|| "\\echo a".to_string())
+            }
+        }
+        let (cmd, options) = slash(":x b", &V);
+        assert_eq!(cmd, "echo");
+        assert_eq!(values(&options), ["a"]);
+    }
+
+    #[test]
+    fn a_quoted_empty_argument_is_an_argument() {
+        // Only an *unquoted* empty argument means end of command (`:664`).
+        let (_, options) = slash("\\echo '' x", &NoVariables);
+        assert_eq!(values(&options), ["", "x"]);
     }
 
     #[test]
@@ -352,12 +584,12 @@ mod tests {
         let mut buf = Vec::new();
         scanner.scan(&mut buf, &NoVariables);
         assert_eq!(scanner.slash_command(), "echo");
-        assert_eq!(values(&scanner.slash_options(&NoVariables)), ["a"]);
+        assert_eq!(values(&all_options(&mut scanner, &NoVariables)), ["a"]);
         scanner.slash_command_end();
         let (res, _) = scanner.scan(&mut buf, &NoVariables);
         assert_eq!(res, ScanResult::Backslash);
         assert_eq!(scanner.slash_command(), "echo");
-        assert_eq!(values(&scanner.slash_options(&NoVariables)), ["b"]);
+        assert_eq!(values(&all_options(&mut scanner, &NoVariables)), ["b"]);
     }
 
     #[test]

@@ -253,6 +253,10 @@ pub struct PsqlSettings {
     pub progname: String,
     /// `inputfile`: file being currently processed, if any.
     pub inputfile: Option<String>,
+    /// `PG_LOG_FLAG_TERSE` in `pg_logging_config`, which psql turns on and
+    /// off as it moves between actions (`startup.c:384`, `command.c:4970`);
+    /// [`crate::logging`] reads it.
+    pub log_terse: bool,
     /// `lineno`
     pub lineno: u64,
     /// `stmt_lineno`: line number inside the current statement.
@@ -321,6 +325,7 @@ impl Default for PsqlSettings {
             sversion: 0,
             progname: "psql".to_string(),
             inputfile: None,
+            log_terse: false,
             lineno: 0,
             stmt_lineno: 1,
             timing: false,

@@ -337,6 +337,7 @@ const SINGLE_QUERY_LISTINGS_PORT: u16 = 55_505;
 const INVALID_MULTIPART_NAMES_PORT: u16 = 55_506;
 const TEXT_SEARCH_AND_SQL_MED_PORT: u16 = 55_507;
 const TABLE_DETAILS_PORT: u16 = 55_508;
+const DATABASE_LISTING_PORT: u16 = 55_509;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -2112,6 +2113,148 @@ const TABLE_DETAILS_FOOTERS: [&str; 65] = [
     "Owned by: s8.rin.a\n",
     "Sequence for identity column: s8.t.g\n",
     "-[ RECORD 1 ]",
+];
+
+/// `\l` and `-l`, `listAllDbs()` (`describe.c:946`). `psql.sql` runs `\l`
+/// only inside an `\if false` block (`:1076`), where it is skipped, so
+/// there is no `psql.out` slice: the gate is C psql.
+///
+/// The databases cover every locale provider a stock build has (`builtin`
+/// and `libc`; ICU is optional in a build, so it is not relied on), an ACL
+/// of several lines, a comment, a tablespace of their own, and one the
+/// reading role may not connect to, whose size `\l+` then hides as
+/// `No Access`. Autovacuum is off and the setup ends in a checkpoint, so
+/// that no size moves between the two runs.
+#[test]
+fn the_database_listing_matches_c_psql() {
+    let Some(cluster) = Cluster::start(DATABASE_LISTING_PORT) else {
+        return;
+    };
+    let out = cluster.run_script(Path::new(RPSQL), DATABASE_LISTING_SETUP);
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+
+    let ours = diff_against_c_psql(&cluster, "database listing", DATABASE_LISTING_COMMANDS);
+    let text = String::from_utf8_lossy(&ours);
+    for marker in DATABASE_LISTING_MARKERS {
+        assert!(text.contains(marker), "no {marker:?} in:\n{text}");
+    }
+
+    // `-l` (`startup.c:332`): the listing, then exit, whatever else was asked.
+    let reference = cluster.reference_psql();
+    if reference.is_none() {
+        reference::skip("psql");
+    }
+    for (args, env) in DATABASE_LISTING_INVOCATIONS {
+        let (ours, code) = cluster.run_args(Path::new(RPSQL), args, env);
+        let text = String::from_utf8_lossy(&ours);
+        assert!(
+            !text.contains("not implemented yet"),
+            "rpsql {args:?}:\n{text}"
+        );
+        if let Some(psql) = &reference {
+            let (theirs, their_code) = cluster.run_args(psql, args, env);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql ({args:?} {env:?}): {diff}");
+            }
+            assert_eq!(code, their_code, "exit code of {args:?} {env:?}");
+        }
+    }
+}
+
+const DATABASE_LISTING_SETUP: &str = "set client_min_messages = error;\n\
+    alter system set autovacuum = off;\n\
+    select pg_reload_conf();\n\
+    create role regress_s9_owner;\n\
+    create role regress_s9_reader;\n\
+    set allow_in_place_tablespaces = on;\n\
+    create tablespace regress_s9_spc location '';\n\
+    create database s9_builtin locale_provider builtin builtin_locale 'C.UTF-8' \
+      template template0 owner regress_s9_owner;\n\
+    create database s9_libc encoding 'SQL_ASCII' locale 'C' template template0;\n\
+    create database \"s9 Quoted\" tablespace regress_s9_spc;\n\
+    comment on database s9_libc is 'a database comment';\n\
+    revoke connect, temporary on database s9_libc from public;\n\
+    grant connect on database s9_libc to regress_s9_owner;\n\
+    grant create on database s9_libc to regress_s9_owner with grant option;\n\
+    grant temporary on database s9_builtin to regress_s9_reader;\n\
+    checkpoint;\n";
+
+/// Every `\l` spelling with and without a pattern, under `ECHO_HIDDEN` so
+/// the query text is diffed too, then `noexec`, a role that cannot connect
+/// to one database, and the listing in the other formats.
+const DATABASE_LISTING_COMMANDS: &str = "\\set ECHO_HIDDEN on\n\
+    \\l\n\
+    \\list s9*\n\
+    \\l+ s9*\n\
+    \\list+ s9*;\n\
+    \\lx s9_libc\n\
+    \\listx s9_b*\n\
+    \\lx+ \"s9 Quoted\"\n\
+    \\listx+ s9*\n\
+    \\l+x s9_libc\n\
+    \\list+x s9_builtin extra\n\
+    \\l \"S9*\"\n\
+    \\l nosuch\n\
+    \\l a.b\n\
+    \\l a.b.c\n\
+    \\l++\n\
+    \\lS\n\
+    \\set ECHO_HIDDEN noexec\n\
+    \\l+ s9*\n\
+    \\set ECHO_HIDDEN off\n\
+    set role regress_s9_reader;\n\
+    \\l+ s9*\n\
+    reset role;\n\
+    \\pset format unaligned\n\
+    \\l s9*\n\
+    \\pset format csv\n\
+    \\l+ s9_libc\n\
+    \\pset format html\n\
+    \\l s9_libc\n\
+    \\pset format wrapped\n\
+    \\pset columns 60\n\
+    \\l+ s9*\n\
+    \\pset format aligned\n\
+    \\pset border 2\n\
+    \\l s9*\n\
+    \\pset border 0\n\
+    \\pset tuples_only on\n\
+    \\l s9*\n\
+    \\pset tuples_only off\n\
+    \\pset footer off\n\
+    \\lx s9*\n";
+
+/// What [`the_database_listing_matches_c_psql`] must print at least once.
+const DATABASE_LISTING_MARKERS: [&str; 9] = [
+    "List of databases",
+    "| builtin ",
+    "| libc ",
+    "| SQL_ASCII ",
+    "| No Access ",
+    "| regress_s9_spc ",
+    "| a database comment",
+    "regress_s9_owner=C*c/regress",
+    "-[ RECORD 1 ]",
+];
+
+/// A command line and the environment variables added to it.
+type Invocation = (
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+);
+
+/// `-l` with the options that shape its output, `-E`, a database named on
+/// the command line (by `-d` and positionally), and `PGDATABASE`, which the
+/// `postgres` default outranks (`startup.c:267`).
+const DATABASE_LISTING_INVOCATIONS: [Invocation; 7] = [
+    (&["-X", "-l"], &[]),
+    (&["-X", "-l", "-x"], &[]),
+    (&["-X", "-l", "-A", "-t"], &[]),
+    (&["-X", "-l", "-E"], &[]),
+    (&["-X", "-l", "-d", "s9_builtin"], &[]),
+    (&["-X", "--list", "s9_builtin"], &[]),
+    (&["-X", "-l"], &[("PGDATABASE", "no_such_database")]),
 ];
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

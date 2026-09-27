@@ -470,6 +470,39 @@ impl Cluster {
         output
     }
 
+    /// Action: run `psql` with `args` and no script, the server named through
+    /// the environment as [`Cluster::run_script`] names it, plus `env`; return
+    /// stdout and stderr as one stream, and the exit code.
+    ///
+    /// # Panics
+    /// When `psql` cannot be started or its output read.
+    pub fn run_args(&self, psql: &Path, args: &[&str], env: &[(&str, &str)]) -> (Vec<u8>, i32) {
+        let (mut reader, writer) = std::io::pipe().expect("a pipe for 2>&1");
+        let mut command = Command::new(psql);
+        command
+            .args(args)
+            .env("PGHOST", &self.dir)
+            .env("PGPORT", self.port.to_string())
+            .env("PGUSER", "regress")
+            .env("LC_ALL", "C")
+            .env_remove("PGDATABASE")
+            .env_remove("PGOPTIONS")
+            .env_remove("PGSERVICE")
+            .env_remove("PSQLRC")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(writer.try_clone().expect("the pipe's write end clones"))
+            .stderr(writer);
+        let mut child = command.spawn().expect("psql starts");
+        drop(command);
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .expect("psql's output is read");
+        let status = child.wait().expect("psql exits");
+        (output, status.code().unwrap_or(-1))
+    }
+
     /// The reference `psql` beside `initdb`, if this lane's installation has
     /// one (the Maven bundles `scripts/fetch-ref-binaries.sh` fetches do not).
     pub fn reference_psql(&self) -> Option<PathBuf> {

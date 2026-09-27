@@ -5,9 +5,10 @@
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
 //! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, and NAT-404
-//! `\crosstabview`. Everything else is [`CommandResult::Unknown`], which
-//! renders upstream's `invalid command \%s`; NAT-401 … NAT-403 fill the table
-//! in.
+//! `\crosstabview`, `\g`, `\gx` and the extended-query commands `\parse`,
+//! `\bind`, `\bind_named` and `\close_prepared`. Everything else is
+//! [`CommandResult::Unknown`], which renders upstream's `invalid command \%s`;
+//! NAT-401 … NAT-403 fill the table in.
 
 use std::io::Write;
 
@@ -16,7 +17,7 @@ use rlibpq::{ContextVisibility, Verbosity};
 use crate::crosstab::CtvArgs;
 use crate::logging;
 use crate::scan::{Scanner, VariableSource};
-use crate::settings::PsqlSettings;
+use crate::settings::{Expanded, PsqlSettings, SendMode};
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
@@ -164,11 +165,13 @@ pub fn handle_slash_cmds(
 /// upstream's "extra argument … ignored" warning.
 fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
     let takes = match cmd {
-        // `\echo` and friends take everything.
-        "echo" | "qecho" | "warn" | "set" => return Vec::new(),
+        // `\echo` and friends take everything, and so do `\bind` and
+        // `\bind_named`, whose parameters run to the end of the command.
+        "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" => return Vec::new(),
         "c" | "connect" | "crosstabview" => 4,
         "pset" => 2,
-        "unset" | "timing" => 1,
+        "unset" | "timing" | "parse" | "close_prepared" => 1,
+        "g" | "gx" => GArgs::split(options).consumed,
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -188,6 +191,48 @@ fn exec_command(
     match cmd {
         // `exec_command_quit()` (`command.c:2750`).
         "q" | "quit" => CommandResult::Terminate,
+        // `exec_command_bind()` (`command.c:520`): every argument is a text
+        // parameter for the next query, which goes out through
+        // `PQsendQueryParams`; nothing is sent yet.
+        "bind" => {
+            ctx.pset.send_mode = SendMode::ExtendedQueryParams {
+                params: options.iter().map(|o| o.value.clone()).collect(),
+            };
+            CommandResult::SkipLine
+        }
+        // `exec_command_bind_named()` (`command.c:556`): the same, for a
+        // statement `\parse` prepared.
+        "bind_named" => {
+            // `clean_extended_state()` first (`command.c:567`), so a failed
+            // call also forgets what an earlier one set.
+            ctx.pset.send_mode = SendMode::Query;
+            let Some((name, params)) = options.split_first() else {
+                return missing_required_argument(cmd, ctx.pset, stderr);
+            };
+            ctx.pset.send_mode = SendMode::ExtendedQueryPrepared {
+                statement: name.value.clone(),
+                params: params.iter().map(|o| o.value.clone()).collect(),
+            };
+            CommandResult::SkipLine
+        }
+        // `exec_command_close_prepared()` (`command.c:755`) and
+        // `exec_command_parse()` (`command.c:2508`): name the statement,
+        // and send.
+        "close_prepared" | "parse" => {
+            ctx.pset.send_mode = SendMode::Query;
+            let Some(name) = options.first() else {
+                return missing_required_argument(cmd, ctx.pset, stderr);
+            };
+            let statement = name.value.clone();
+            ctx.pset.send_mode = if cmd == "parse" {
+                SendMode::ExtendedParse { statement }
+            } else {
+                SendMode::ExtendedClose { statement }
+            };
+            CommandResult::Send
+        }
+        // `exec_command_g()` (`command.c:1739`).
+        "g" | "gx" => exec_command_g(cmd, options, ctx, stderr),
         // `exec_command_connect()` (`command.c:638`).
         "c" | "connect" => CommandResult::Connect(Box::new(ConnectRequest::from_options(options))),
         // `exec_command_crosstabview()` (`command.c:997`): keep up to four
@@ -233,6 +278,138 @@ fn exec_command(
         }
         _ => CommandResult::Unknown,
     }
+}
+
+/// `pg_log_error("\\%s: missing required argument", cmd)`, the refusal every
+/// command with a mandatory argument shares.
+fn missing_required_argument(
+    cmd: &str,
+    pset: &PsqlSettings,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    logging::error(pset, format!("\\{cmd}: missing required argument"), stderr);
+    CommandResult::Error
+}
+
+/// `\g`'s arguments, `[(pset-option[=pset-value] ...)] [filename]`, as
+/// `exec_command_g` (`command.c:1739`) and `process_command_g_options`
+/// (`command.c:1800`) read them.
+#[derive(Debug, PartialEq, Eq)]
+struct GArgs<'a> {
+    /// The parenthesized print options, each `name` or `name=value`, with
+    /// the parentheses stripped. An empty one (`(` or `)` standing alone)
+    /// is not here, as upstream skips it (`command.c:1837`).
+    psets: Vec<&'a str>,
+    /// An opening `(` was never closed (`command.c:1822`).
+    unclosed: bool,
+    /// The file name or `|command` after them.
+    fname: Option<&'a str>,
+    /// How many arguments `\g` consumed; the rest draw the "extra argument"
+    /// warning.
+    consumed: usize,
+}
+
+impl<'a> GArgs<'a> {
+    /// The pure half of `exec_command_g`: split the arguments into print
+    /// options and a file name.
+    fn split(options: &'a [SlashOption]) -> Self {
+        let mut args = GArgs {
+            psets: Vec::new(),
+            unclosed: false,
+            fname: None,
+            consumed: 0,
+        };
+        let mut next = options.iter().map(|o| o.value.as_str());
+        let mut first = next.next();
+        if let Some(open) = first.and_then(|f| f.strip_prefix('(')) {
+            args.consumed += 1;
+            let mut option = Some(open);
+            loop {
+                let Some(o) = option else {
+                    args.unclosed = true;
+                    break;
+                };
+                let (o, closed) = match o.strip_suffix(')') {
+                    Some(o) => (o, true),
+                    None => (o, false),
+                };
+                if !o.is_empty() {
+                    args.psets.push(o);
+                }
+                if closed {
+                    break;
+                }
+                option = next.next();
+                if option.is_some() {
+                    args.consumed += 1;
+                }
+            }
+            first = next.next();
+        }
+        if let Some(fname) = first {
+            args.fname = Some(fname);
+            args.consumed += 1;
+        }
+        args
+    }
+}
+
+/// `exec_command_g()` (`command.c:1739`): send the query buffer, with the
+/// parenthesized print options in force for this one query and, for `\gx`,
+/// expanded output on.
+///
+/// Sending the output to a file or a pipe instead (`pset.gfname`) is
+/// NAT-403's, and a file name is refused rather than ignored.
+fn exec_command_g(
+    cmd: &str,
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let args = GArgs::split(options);
+
+    // `process_command_g_options()` (`command.c:1800`): save the settings
+    // once, apply every option quietly, and put them back if any failed.
+    let mut success = true;
+    for option in &args.psets {
+        let (name, value) = match option.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (*option, None),
+        };
+        if ctx.pset.gsavepopt.is_none() {
+            ctx.pset.gsavepopt = Some(ctx.pset.popt.clone());
+        }
+        if let Err(err) = crate::pset::do_pset(name, value, &mut ctx.pset.popt, true) {
+            let message = err.to_string();
+            logging::error(ctx.pset, message, stderr);
+            success = false;
+        }
+    }
+    if args.unclosed {
+        let message = format!("\\{cmd}: missing right parenthesis");
+        logging::error(ctx.pset, message, stderr);
+        success = false;
+    }
+    if args.fname.is_some() && success {
+        let message = format!("\\{cmd} to a file or pipe is not implemented yet (Linear NAT-403)");
+        logging::error(ctx.pset, message, stderr);
+        success = false;
+    }
+    if !success {
+        if let Some(saved) = ctx.pset.gsavepopt.take() {
+            ctx.pset.popt = saved;
+        }
+        return CommandResult::Error;
+    }
+    if cmd == "gx" {
+        // Save the settings if not done already, then force expanded=on
+        // (`command.c:1779`).
+        if ctx.pset.gsavepopt.is_none() {
+            ctx.pset.gsavepopt = Some(ctx.pset.popt.clone());
+        }
+        ctx.pset.popt.topt.expanded = Expanded::On;
+    }
+    CommandResult::Send
 }
 
 /// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
@@ -639,6 +816,210 @@ mod tests {
     #[test]
     fn a_quit_still_reaches_the_caller_as_terminate() {
         assert_eq!(dispatch("\\q").0, CommandResult::Terminate);
+    }
+
+    /// [`dispatch`] on settings a test sets up, and keeps: the extended-query
+    /// commands leave their state for the next query to take.
+    fn dispatch_on(pset: &mut PsqlSettings, line: &str) -> (CommandResult, String) {
+        let mut vars = VariableSpace::new();
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = dispatch_slash(&mut scanner, pset, &mut vars, &mut stdout, &mut stderr);
+        (status, String::from_utf8(stderr).unwrap())
+    }
+
+    fn terse() -> PsqlSettings {
+        PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        }
+    }
+
+    #[test]
+    fn bind_keeps_every_argument_as_a_text_parameter_and_sends_nothing() {
+        // `command.c:520`: `\bind` only sets the mode; `\g` sends.
+        let mut pset = terse();
+        let (status, stderr) = dispatch_on(&mut pset, "\\bind 'foo' 2 ''");
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(stderr, "");
+        assert_eq!(
+            pset.send_mode,
+            SendMode::ExtendedQueryParams {
+                params: vec!["foo".into(), "2".into(), String::new()]
+            }
+        );
+        // `psql.sql:84`: the last `\bind` wins.
+        dispatch_on(&mut pset, "\\bind 2");
+        assert_eq!(
+            pset.send_mode,
+            SendMode::ExtendedQueryParams {
+                params: vec!["2".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn bind_named_takes_a_statement_and_its_parameters() {
+        let mut pset = terse();
+        let (status, _) = dispatch_on(&mut pset, "\\bind_named stmt3 'foo' 'bar'");
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(
+            pset.send_mode,
+            SendMode::ExtendedQueryPrepared {
+                statement: "stmt3".into(),
+                params: vec!["foo".into(), "bar".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_bind_named_forgets_what_an_earlier_one_set() {
+        // `psql.sql:61`-`:65`: "The second call generates an error, cleaning
+        // up the statement name set by the first call."
+        let mut pset = terse();
+        dispatch_on(&mut pset, "\\bind_named stmt4");
+        let (status, stderr) = dispatch_on(&mut pset, "\\bind_named");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(stderr, "\\bind_named: missing required argument\n");
+        assert_eq!(pset.send_mode, SendMode::Query);
+    }
+
+    #[test]
+    fn parse_and_close_prepared_name_a_statement_and_send() {
+        let mut pset = terse();
+        assert_eq!(dispatch_on(&mut pset, "\\parse ''").0, CommandResult::Send);
+        assert_eq!(
+            pset.send_mode,
+            SendMode::ExtendedParse {
+                statement: String::new()
+            }
+        );
+        let (status, stderr) = dispatch_on(&mut pset, "\\close_prepared stmt2 extra");
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(
+            pset.send_mode,
+            SendMode::ExtendedClose {
+                statement: "stmt2".into()
+            }
+        );
+        assert_eq!(
+            stderr,
+            "\\close_prepared: extra argument \"extra\" ignored\n"
+        );
+        for cmd in ["parse", "close_prepared"] {
+            let (status, stderr) = dispatch_on(&mut pset, &format!("\\{cmd}"));
+            assert_eq!(status, CommandResult::Error);
+            assert_eq!(stderr, format!("\\{cmd}: missing required argument\n"));
+            assert_eq!(pset.send_mode, SendMode::Query);
+        }
+    }
+
+    fn opts(values: &[&str]) -> Vec<SlashOption> {
+        values
+            .iter()
+            .map(|v| SlashOption {
+                value: (*v).to_string(),
+                quote: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn g_arguments_are_parenthesized_options_then_a_file_name() {
+        // `process_command_g_options` (`command.c:1800`): the parentheses
+        // are stripped, and one standing alone is no option at all.
+        let options = opts(&["(format=csv", "csv_fieldsep=\t)"]);
+        assert_eq!(
+            GArgs::split(&options),
+            GArgs {
+                psets: vec!["format=csv", "csv_fieldsep=\t"],
+                unclosed: false,
+                fname: None,
+                consumed: 2,
+            }
+        );
+        let options = opts(&["(", "title=x", ")", "out.txt", "extra"]);
+        assert_eq!(
+            GArgs::split(&options),
+            GArgs {
+                psets: vec!["title=x"],
+                unclosed: false,
+                fname: Some("out.txt"),
+                consumed: 4,
+            }
+        );
+        let options = opts(&["(expanded", "border=2"]);
+        let args = GArgs::split(&options);
+        assert!(args.unclosed);
+        assert_eq!(args.consumed, 2);
+        assert_eq!(GArgs::split(&opts(&[])).consumed, 0);
+        assert_eq!(GArgs::split(&opts(&["file", "x"])).consumed, 1);
+    }
+
+    #[test]
+    fn g_options_hold_for_one_query_and_are_saved_for_restoring() {
+        let mut pset = terse();
+        let before = pset.popt.clone();
+        let (status, stderr) = dispatch_on(&mut pset, "\\g (format=unaligned border=2)");
+        assert_eq!((status, stderr.as_str()), (CommandResult::Send, ""));
+        assert_eq!(
+            pset.popt.topt.format,
+            crate::settings::PrintFormat::Unaligned
+        );
+        assert_eq!(pset.popt.topt.border, 2);
+        assert_eq!(pset.gsavepopt, Some(before));
+    }
+
+    #[test]
+    fn a_bad_g_option_is_refused_and_every_option_undone() {
+        // `command.c:1861`: "If we failed after already changing some
+        // options, undo side-effects".
+        let mut pset = terse();
+        let before = pset.popt.clone();
+        let (status, stderr) = dispatch_on(&mut pset, "\\g (border=2 nosuch)");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(stderr, "\\pset: unknown option: nosuch\n");
+        assert_eq!(pset.popt, before);
+        assert_eq!(pset.gsavepopt, None);
+
+        let (status, stderr) = dispatch_on(&mut pset, "\\gx (border=2");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(stderr, "\\gx: missing right parenthesis\n");
+        assert_eq!(pset.popt, before);
+        assert_eq!(pset.gsavepopt, None);
+    }
+
+    #[test]
+    fn gx_turns_expanded_on_for_one_query() {
+        // `command.c:1779`.
+        let mut pset = terse();
+        let before = pset.popt.clone();
+        let (status, _) = dispatch_on(&mut pset, "\\gx (title='foo bar')");
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(pset.popt.topt.expanded, Expanded::On);
+        assert_eq!(pset.popt.title.as_deref(), Some("foo bar"));
+        assert_eq!(pset.gsavepopt, Some(before));
+    }
+
+    #[test]
+    fn g_to_a_file_is_refused_not_ignored() {
+        let mut pset = terse();
+        let before = pset.popt.clone();
+        let (status, stderr) = dispatch_on(&mut pset, "\\g (border=2) out.txt");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            stderr,
+            "\\g to a file or pipe is not implemented yet (Linear NAT-403)\n"
+        );
+        assert_eq!(pset.popt, before);
+        assert_eq!(pset.gsavepopt, None);
     }
 
     #[test]

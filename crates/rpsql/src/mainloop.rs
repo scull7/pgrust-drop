@@ -301,7 +301,11 @@ mod tests {
     }
 
     impl Executor for Recorder {
-        fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            _mode: &crate::settings::SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
             let fails = self.fail.first().copied().unwrap_or(false);
             if !self.fail.is_empty() {

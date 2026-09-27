@@ -381,6 +381,42 @@ pub struct PrintQueryOpt {
     pub title: Option<String>,
 }
 
+/// `PSQL_SEND_MODE` (`settings.h:71`), for the modes this port has, each
+/// carrying the `stmtName` and `bind_params` it reads, so a mode cannot be
+/// set without its arguments or keep a stale one.
+///
+/// The pipeline modes (`PSQL_SEND_PIPELINE_SYNC` … `PSQL_SEND_GET_RESULTS`)
+/// come with the pipeline commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SendMode {
+    /// `PSQL_SEND_QUERY`: the simple query protocol.
+    #[default]
+    Query,
+    /// `PSQL_SEND_EXTENDED_CLOSE`: `\close_prepared`, `PQsendClosePrepared`.
+    ExtendedClose {
+        /// `stmtName`
+        statement: String,
+    },
+    /// `PSQL_SEND_EXTENDED_PARSE`: `\parse`, `PQsendPrepare`.
+    ExtendedParse {
+        /// `stmtName`
+        statement: String,
+    },
+    /// `PSQL_SEND_EXTENDED_QUERY_PARAMS`: `\bind`, `PQsendQueryParams`.
+    ExtendedQueryParams {
+        /// `bind_params`, each a text parameter.
+        params: Vec<String>,
+    },
+    /// `PSQL_SEND_EXTENDED_QUERY_PREPARED`: `\bind_named`,
+    /// `PQsendQueryPrepared`.
+    ExtendedQueryPrepared {
+        /// `stmtName`
+        statement: String,
+        /// `bind_params`
+        params: Vec<String>,
+    },
+}
+
 /// `PsqlSettings` (`settings.h:101`), minus the fields this port has not
 /// reached and minus the ones that are C file handles.
 // As `TableOpt`: these are upstream's `bool` members, one for one.
@@ -418,6 +454,14 @@ pub struct PsqlSettings {
     /// `crosstab_flag` and `ctv_args` (`settings.h:132`-`:133`): the one-shot
     /// request `\crosstabview` leaves for the next `SendQuery`, which takes it.
     pub crosstab: Option<crate::crosstab::CtvArgs>,
+    /// `gsavepopt` (`settings.h:115`): the print options as they were before
+    /// `\g (…)` or `\gx` changed them for one query, which `SendQuery` puts
+    /// back (`common.c:1319`).
+    pub gsavepopt: Option<PrintQueryOpt>,
+    /// `send_mode`, `bind_nparams`, `bind_params` and `stmtName`
+    /// (`settings.h:120`-`:124`): how the next `SendQuery` sends its query,
+    /// which it resets (`clean_extended_state`, `common.c:2781`).
+    pub send_mode: SendMode,
 
     // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
@@ -487,6 +531,8 @@ impl Default for PsqlSettings {
             // `log_flags` starts at 0 (`logging.c:24`).
             log_terse: false,
             crosstab: None,
+            gsavepopt: None,
+            send_mode: SendMode::Query,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,

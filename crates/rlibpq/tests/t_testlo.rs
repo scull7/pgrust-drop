@@ -19,7 +19,13 @@
 //! One substitution, in `testlo64`: its two `lo_export`s would each write a
 //! file of over 3 GiB (the object is sparse at 4294967000), so they are
 //! replaced by the server's `lo_get` of the regions the program touched and
-//! `lo_lseek64(…, SEEK_END)` for the size. Everything else runs as written.
+//! `lo_lseek64(…, SEEK_END)` for the size. Everything else runs as written:
+//! `testlo` seeks with `lo_lseek` and ignores its result, `testlo64` with
+//! `lo_lseek64` and checks it with `lo_tell64`.
+//!
+//! Neither program calls `lo_tell` or `lo_truncate`, and `testlo` drops
+//! `lo_lseek`'s result, so after `main` `testlo` drives those three on the
+//! same object and checks each against the server's view.
 //!
 //! The helpers `importFile` and `exportFile`, commented out of both `main`s
 //! in favour of `lo_import` / `lo_export`, are ported too and run after
@@ -37,7 +43,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 
-use rlibpq::lobj::{INV_READ, INV_WRITE, SEEK_END, SEEK_SET};
+use rlibpq::lobj::{INV_READ, INV_WRITE, SEEK_CUR, SEEK_END, SEEK_SET};
 use rlibpq::{Connection, ExecStatus};
 
 mod common;
@@ -80,21 +86,60 @@ fn import_file(conn: &mut Connection, out: &mut Output, filename: &Path) -> u32 
     lobj_id
 }
 
+/// Which of the two programs a shared helper is: they differ only in how
+/// `pickout` and `overwrite` seek.
+#[derive(Clone, Copy)]
+enum Program {
+    /// `testlo.c`: `lo_lseek`, its result ignored.
+    Testlo,
+    /// `testlo64.c`: `lo_lseek64`, checked, and in `pickout` `lo_tell64`.
+    Testlo64,
+}
+
+/// The seek at the top of `pickout` and `overwrite`: `testlo.c:89`/`:120`
+/// ignore `lo_lseek`'s result; `testlo64.c:90`/`:126` report `lo_lseek64`'s
+/// error.
+fn seek(conn: &mut Connection, out: &mut Output, program: Program, lobj_fd: i32, start: i64) {
+    match program {
+        Program::Testlo => {
+            let start = i32::try_from(start).expect("testlo.c's start is an int");
+            let _ = conn.lo_lseek(lobj_fd, start, SEEK_SET);
+        }
+        Program::Testlo64 => {
+            if let Err(err) = conn.lo_lseek64(lobj_fd, start, SEEK_SET) {
+                out.stderr.extend_from_slice(b"error in lo_lseek64: ");
+                out.stderr.extend_from_slice(&err.message());
+            }
+        }
+    }
+}
+
 /// `pickout`, `testlo.c:78` and `testlo64.c:79`: seek to `start`, then
 /// `lo_read` until `len` bytes, each printed as a C string.
-fn pickout(conn: &mut Connection, out: &mut Output, lobj_id: u32, start: i64, len: usize) {
+fn pickout(
+    conn: &mut Connection,
+    out: &mut Output,
+    program: Program,
+    lobj_id: u32,
+    start: i64,
+    len: usize,
+) {
     let lobj_fd = conn.lo_open(lobj_id, INV_READ).unwrap_or(-1);
     if lobj_fd < 0 {
         let _ = write!(out.stderr, "cannot open large object {lobj_id}");
     }
-    // testlo64.c:90 — testlo.c:89 is the same call through lo_lseek, whose
-    // error it ignores.
-    if let Err(err) = conn.lo_lseek64(lobj_fd, start, SEEK_SET) {
-        out.stderr.extend_from_slice(b"error in lo_lseek64: ");
-        out.stderr.extend_from_slice(&err.message());
-    }
-    if conn.lo_tell64(lobj_fd).ok() != Some(start) {
-        out.stderr.extend_from_slice(b"error in lo_tell64: ");
+    seek(conn, out, program, lobj_fd, start);
+    // testlo64.c:93 only.
+    if let Program::Testlo64 = program {
+        match conn.lo_tell64(lobj_fd) {
+            Ok(pos) if pos == start => {}
+            // A -1 with nothing new in PQerrorMessage prints the prefix alone.
+            Ok(_) => out.stderr.extend_from_slice(b"error in lo_tell64: "),
+            Err(err) => {
+                out.stderr.extend_from_slice(b"error in lo_tell64: ");
+                out.stderr.extend_from_slice(&err.message());
+            }
+        }
     }
     let mut buf = vec![0u8; len];
     let mut nread = 0;
@@ -114,15 +159,19 @@ fn pickout(conn: &mut Connection, out: &mut Output, lobj_id: u32, start: i64, le
 }
 
 /// `overwrite`, `testlo.c:108` and `testlo64.c:114`: `len` X's at `start`.
-fn overwrite(conn: &mut Connection, out: &mut Output, lobj_id: u32, start: i64, len: usize) {
+fn overwrite(
+    conn: &mut Connection,
+    out: &mut Output,
+    program: Program,
+    lobj_id: u32,
+    start: i64,
+    len: usize,
+) {
     let lobj_fd = conn.lo_open(lobj_id, INV_WRITE).unwrap_or(-1);
     if lobj_fd < 0 {
         let _ = write!(out.stderr, "cannot open large object {lobj_id}");
     }
-    if let Err(err) = conn.lo_lseek64(lobj_fd, start, SEEK_SET) {
-        out.stderr.extend_from_slice(b"error in lo_lseek64: ");
-        out.stderr.extend_from_slice(&err.message());
-    }
+    seek(conn, out, program, lobj_fd, start);
     let buf = vec![b'X'; len];
     let mut nwritten = 0;
     while len - nwritten > 0 {
@@ -242,6 +291,39 @@ fn size64(conn: &mut Connection, oid: u32) -> i64 {
     size
 }
 
+/// `lo_lseek`, `lo_tell` and `lo_truncate`, which `testlo.c` does not check,
+/// on the object `oid` holding `input`: positions as the server keeps them,
+/// and a truncation it agrees with.
+fn seek_tell_truncate(conn: &mut Connection, oid: u32, input: &[u8]) {
+    begin(conn);
+    let fd = conn.lo_open(oid, INV_READ | INV_WRITE).expect("lo_open");
+    assert_eq!(conn.lo_tell(fd).expect("lo_tell"), 0);
+    assert_eq!(conn.lo_lseek(fd, 1000, SEEK_SET).expect("lo_lseek"), 1000);
+    assert_eq!(conn.lo_tell(fd).expect("lo_tell"), 1000);
+    let mut buf = [0u8; 24];
+    assert_eq!(conn.lo_read(fd, &mut buf).expect("lo_read"), buf.len());
+    assert_eq!(buf[..], input[1000..1024]);
+    assert_eq!(conn.lo_tell(fd).expect("lo_tell"), 1024);
+    assert_eq!(conn.lo_lseek(fd, -24, SEEK_CUR).expect("lo_lseek"), 1000);
+    let size = i32::try_from(input.len()).unwrap();
+    assert_eq!(conn.lo_lseek(fd, 0, SEEK_END).expect("lo_lseek"), size);
+    assert_eq!(conn.lo_truncate(fd, 1500).expect("lo_truncate"), 0);
+    assert_eq!(conn.lo_lseek(fd, 0, SEEK_END).expect("lo_lseek"), 1500);
+    assert_eq!(conn.lo_tell(fd).expect("lo_tell"), 1500);
+    // A negative target is the server's error, `inv_api.c:429`.
+    let err = conn.lo_lseek(fd, -1, SEEK_SET).unwrap_err();
+    assert_eq!(
+        String::from_utf8_lossy(&err.message()),
+        "ERROR:  invalid large object seek target: -1\n"
+    );
+    conn.exec(b"rollback").expect("PQexec");
+    begin(conn);
+    let fd = conn.lo_open(oid, INV_READ | INV_WRITE).expect("lo_open");
+    assert_eq!(conn.lo_truncate(fd, 1500).expect("lo_truncate"), 0);
+    conn.exec(b"end").expect("PQexec");
+    assert_eq!(server_lo_get(conn, oid, 0, input.len()), input[..1500]);
+}
+
 /// `testlo.c`'s `main`, then the gates described in the module comment.
 #[test]
 fn testlo() {
@@ -260,10 +342,10 @@ fn testlo() {
     assert_ne!(lobj_oid, 0, "{}", String::from_utf8_lossy(&out.stderr));
     out.stdout
         .push_str("picking out bytes 1000-2000 of the large object\n");
-    pickout(&mut conn, &mut out, lobj_oid, 1000, 1000);
+    pickout(&mut conn, &mut out, Program::Testlo, lobj_oid, 1000, 1000);
     out.stdout
         .push_str("overwriting bytes 1000-2000 of the large object with X's\n");
-    overwrite(&mut conn, &mut out, lobj_oid, 1000, 1000);
+    overwrite(&mut conn, &mut out, Program::Testlo, lobj_oid, 1000, 1000);
     export(&mut conn, &mut out, lobj_oid, &out_filename);
 
     // The two streams, exactly as the C program prints them.
@@ -319,6 +401,8 @@ fn testlo() {
     assert_eq!(std::fs::read(&helper_file).unwrap(), input);
     assert_eq!(server_lo_get(&mut conn, by_helper, 0, input.len()), input);
 
+    seek_tell_truncate(&mut conn, by_helper, &input);
+
     // C libpq, through the reference psql: its lo_import of the same file
     // holds the same bytes, and its lo_export of rlibpq's object writes the
     // same file.
@@ -356,10 +440,24 @@ fn testlo64() {
     assert_ne!(lobj_oid, 0, "{}", String::from_utf8_lossy(&out.stderr));
     out.stdout
         .push_str("picking out bytes 4294967000-4294968000 of the large object\n");
-    pickout(&mut conn, &mut out, lobj_oid, START, 1000);
+    pickout(
+        &mut conn,
+        &mut out,
+        Program::Testlo64,
+        lobj_oid,
+        START,
+        1000,
+    );
     out.stdout
         .push_str("overwriting bytes 4294967000-4294968000 of the large object with X's\n");
-    overwrite(&mut conn, &mut out, lobj_oid, START, 1000);
+    overwrite(
+        &mut conn,
+        &mut out,
+        Program::Testlo64,
+        lobj_oid,
+        START,
+        1000,
+    );
 
     // In place of the first lo_export: the object now ends after the X's,
     // which are where the program wrote them, after a hole of zeros.

@@ -19,16 +19,20 @@ use crate::describe::{
     describe_aggregates_query, describe_configuration_parameters_query, describe_functions_query,
     describe_operators_query, describe_publication_table, describe_publications_query,
     describe_role_grants_query, describe_roles_headers, describe_roles_query, describe_roles_row,
-    describe_subscriptions_query, describe_types_query, extension_contents_title,
-    extensions_not_found, list_db_role_settings_query, list_default_acls_query, list_domains_query,
-    list_extension_contents_query, list_extensions_query, list_one_extension_contents_query,
-    list_partitioned_tables_query, list_publications_query, list_tables_query,
+    describe_subscriptions_query, describe_tablespaces_query, describe_types_query,
+    extension_contents_title, extensions_not_found, list_casts_query, list_collations_query,
+    list_conversions_query, list_db_role_settings_query, list_default_acls_query,
+    list_domains_query, list_event_triggers_query, list_extended_stats_query,
+    list_extension_contents_query, list_extensions_query, list_languages_query,
+    list_large_objects_query, list_one_extension_contents_query, list_partitioned_tables_query,
+    list_publications_query, list_schemas_query, list_tables_query, object_description_query,
     permissions_list_query, publication_footers, publication_schemas_query,
-    publication_tables_query, publications_not_found,
+    publication_tables_query, publications_not_found, schema_publication_footers,
+    schema_publications_query,
 };
 use crate::print::{Align, print_query, print_table};
 use crate::scan::{Scanner, VariableSource};
-use crate::settings::{Expanded, PsqlSettings};
+use crate::settings::{Expanded, PrintQueryOpt, PsqlSettings};
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
@@ -334,6 +338,9 @@ fn exec_command_d(
         DescribeCommand::Extensions if flags.verbose => {
             list_extension_contents(pattern, server, &pset, ctx.executor, stdout, stderr)
         }
+        DescribeCommand::Schemas => {
+            list_schemas(pattern, flags, server, &pset, ctx.executor, stdout, stderr)
+        }
         listing => {
             let (query, title) = listing_query(&listing, pattern, options, flags, server);
             run_listing(query, title, &pset, ctx.executor, stdout, stderr)
@@ -447,14 +454,63 @@ fn listing_query(
             list_extensions_query(pattern, server).map_err(Refusal::from),
             "List of installed extensions",
         ),
-        DescribeCommand::ListTables(_)
-        | DescribeCommand::TableDetails
-        | DescribeCommand::Roles
-        | DescribeCommand::DbRoleSettings
-        | DescribeCommand::NotYet(_) => {
-            unreachable!("exec_command_d handles {command:?} itself")
-        }
+        // [`exec_command_d`] takes the rest itself.
+        _ => catalog_listing_query(command, pattern, flags, server)
+            .unwrap_or_else(|| unreachable!("exec_command_d handles {command:?} itself")),
     }
+}
+
+/// [`listing_query`] of the listings NAT-401's sixth slice brings, whose
+/// query takes no more than the pattern and the flags; `None` for any other
+/// command.
+fn catalog_listing_query(
+    command: &DescribeCommand,
+    pattern: Option<&str>,
+    flags: DescribeFlags,
+    server: ServerContext<'_>,
+) -> Option<(Result<String, Refusal>, &'static str)> {
+    Some(match command {
+        DescribeCommand::Tablespaces => (
+            describe_tablespaces_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of tablespaces",
+        ),
+        DescribeCommand::Conversions => (
+            list_conversions_query(pattern, flags.verbose, flags.system, server)
+                .map_err(Refusal::from),
+            "List of conversions",
+        ),
+        DescribeCommand::Casts => (
+            list_casts_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of casts",
+        ),
+        DescribeCommand::ObjectDescriptions => (
+            object_description_query(pattern, flags.system, server).map_err(Refusal::from),
+            "Object descriptions",
+        ),
+        // `command.c:1148`: the pattern is read, and ignored.
+        DescribeCommand::LargeObjects => {
+            (Ok(list_large_objects_query(flags.verbose)), "Large objects")
+        }
+        DescribeCommand::Languages => (
+            list_languages_query(pattern, flags.verbose, flags.system, server)
+                .map_err(Refusal::from),
+            "List of languages",
+        ),
+        DescribeCommand::Collations => (
+            list_collations_query(pattern, flags.verbose, flags.system, server)
+                .map_err(Refusal::from),
+            "List of collations",
+        ),
+        DescribeCommand::ExtendedStats => (
+            list_extended_stats_query(pattern, server),
+            "List of extended statistics",
+        ),
+        DescribeCommand::EventTriggers => (
+            list_event_triggers_query(pattern, flags.verbose, server),
+            "List of event triggers",
+        ),
+        _ => return None,
+    })
 }
 
 /// `exec_command_dfo()`'s argument-type patterns (`command.c:1313`-`:1325`):
@@ -665,6 +721,39 @@ fn list_extension_contents(
     true
 }
 
+/// `listSchemas()` (`describe.c:5206`): the schemas, and from 15, for a
+/// pattern, the publications that publish the schema it names as footers
+/// (`:5253`-`:5292`).
+fn list_schemas(
+    pattern: Option<&str>,
+    flags: DescribeFlags,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match list_schemas_query(pattern, flags.verbose, flags.system, server) {
+        Ok(query) => query,
+        Err(err) => return refuse(Refusal::Pattern(err), pset, stderr),
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    let mut opt = pset.popt.clone();
+    if let Some(query) = schema_publications_query(pattern, server.sversion) {
+        let Some(pubs) = psql_exec(executor, &query, pset, stdout, stderr) else {
+            return false;
+        };
+        let names: Vec<&[u8]> = (0..pubs.ntuples())
+            .map(|r| pubs.value(r, 0).unwrap_or_default())
+            .collect();
+        opt.footers = schema_publication_footers(&names);
+    }
+    opt.title = Some("List of schemas".to_string());
+    print_with(&result, &opt, pset, stdout, stderr)
+}
+
 /// `printQuery()` of a listing under its title.
 fn print_titled(
     result: &QueryResult,
@@ -675,7 +764,18 @@ fn print_titled(
 ) -> bool {
     let mut opt = pset.popt.clone();
     opt.title = Some(title.to_string());
-    match print_query(result, &opt) {
+    print_with(result, &opt, pset, stdout, stderr)
+}
+
+/// `printQuery()` of `result` with `opt`, a failure logged.
+fn print_with(
+    result: &QueryResult,
+    opt: &PrintQueryOpt,
+    pset: &PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    match print_query(result, opt) {
         Ok(text) => {
             let _ = stdout.write_all(&text);
             true
@@ -1705,11 +1805,11 @@ mod tests {
 
     #[test]
     fn an_unported_d_command_is_refused_by_name_and_an_unknown_one_is_invalid() {
-        let refused = run("\\dn");
+        let refused = run("\\dFp");
         assert_eq!(refused.result, CommandResult::Error);
         assert_eq!(
             refused.stderr,
-            "psql: error: \\dn: listSchemas is not implemented yet (Linear NAT-401)\n"
+            "psql: error: \\dFp: listTSParsers is not implemented yet (Linear NAT-401)\n"
         );
         let details = run("\\d t");
         assert_eq!(

@@ -434,7 +434,7 @@ struct TableContent<'a> {
     cells: Vec<Vec<Vec<u8>>>,
     aligns: Vec<Align>,
     /// `cont->footers`, in `printTableAddFooter` order: empty is `NULL`,
-    /// as `printQuery` leaves it.
+    /// as `printQuery` leaves it unless `opt->footers` has some.
     footers: Vec<Vec<u8>>,
 }
 
@@ -509,7 +509,7 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         headers,
         cells,
         aligns,
-        footers: Vec::new(),
+        footers: opt.footers.clone(),
     })
 }
 
@@ -1170,8 +1170,9 @@ fn print_aligned_vertical_line(
 /// `print_aligned_vertical()` (`print.c:1324`): expanded output, one
 /// `header | value` line per cell, each record under a `[ RECORD n ]` rule.
 ///
-/// It prints `cont->footers`, which `printQuery` leaves `NULL`, so a query
-/// result has no footer but the `(0 rows)` of an empty one. Record numbers
+/// It prints `cont->footers`, which `printQuery` leaves `NULL` unless
+/// `opt->footers` has some, so a query result has no footer but those and
+/// the `(0 rows)` of an empty one. Record numbers
 /// start at 1: `prior_records` belongs to `FETCH_COUNT`, which is not ported.
 #[allow(clippy::too_many_lines)]
 fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
@@ -1545,7 +1546,7 @@ fn print_unaligned_text(cont: &TableContent<'_>) -> Vec<u8> {
 /// per cell, records apart by two record separators. Cells are written raw.
 ///
 /// It prints `cont->footers`, not `footers_with_default()`, so a query
-/// result has no footer, not even the default one.
+/// result has no footer but `opt->footers`, not even the default one.
 fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
     let opt = cont.opt;
     let mut out = Vec::new();
@@ -2088,7 +2089,7 @@ mod tests {
     #[test]
     fn expanded_prints_a_record_per_row_and_no_row_count() {
         // `print_aligned_vertical` (`print.c:1324`) prints `cont->footers`,
-        // which `printQuery` leaves empty, so there is no `(n rows)`.
+        // which `printQuery` leaves empty here, so there is no `(n rows)`.
         let res = result(
             vec![int4_field("n"), text_field("s")],
             vec![vec![Some("1"), Some("a")], vec![Some("2"), Some("b")]],

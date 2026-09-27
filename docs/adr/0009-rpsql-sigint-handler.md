@@ -56,7 +56,8 @@ mutex around `cancelConn` — the shape of the Windows arm of `cancel.c`
   tree through `termion`; that does not approve `libc` as a direct dependency,
   and this module does not need it.
 - The cancel is sent a thread hop after the signal, not inside it; the window
-  that opens is recorded in `docs/divergences.md` and pinned there.
+  that opens is recorded in `docs/divergences.md`; it is timing-only and no
+  test pins it.
 - Interactive mode's `siglongjmp` out of waiting for input
   (`common.c:315`-`:319`) has no Rust equivalent; NAT-405's line-editor slice
   handles SIGINT at the prompt through the editor instead.

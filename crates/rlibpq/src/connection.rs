@@ -32,6 +32,7 @@ use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
     next_copy_frame, next_frame,
 };
+use crate::negotiate::{Build, EncMethod, EncryptionOptions, Negotiation};
 use crate::pg_config::DEFAULT_PGSOCKET_DIR;
 use crate::pipeline::{
     Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
@@ -58,8 +59,9 @@ pub enum ConnectionError {
     /// A message that is well-formed but cannot appear here
     /// (`fe-protocol3.c:447`).
     UnexpectedMessage(u8),
-    /// A conninfo value `PQconnectPoll` refuses before it opens anything —
-    /// today the `port` alone (`fe-connect.c:3036`-`:3049`).
+    /// A conninfo value refused before anything is opened: the encryption
+    /// options `pqConnectOptions2` validates (`fe-connect.c:1747`-`:1987`),
+    /// and the `port` `PQconnectPoll` reads (`:3036`-`:3049`).
     Conninfo(ConnError),
     /// An extended-query argument refused before anything was sent
     /// (`PQsendQueryParams` and its siblings, `fe-exec.c:1509`).
@@ -506,15 +508,28 @@ impl Connection<Stream> {
     /// the environment.
     ///
     /// # Errors
-    /// The `port` is not one `PQconnectPoll` would use, the socket could not
+    /// An encryption option this build refuses (`sslmode=require` without
+    /// TLS, say), the `port` is not one `PQconnectPoll` would use, the socket could not
     /// be opened, the nonce could not be drawn, the server refused the
     /// connection, or authentication failed.
     pub fn connect(conninfo: &ConnInfo) -> Result<Self, ConnectionError> {
+        // fe-connect.c:1747-:1987 — `pqConnectOptions2` runs at
+        // `PQconnectStart`, before `PQconnectPoll` looks at the port.
+        let options = EncryptionOptions::from_conninfo(conninfo, Build::THIS)?;
         // fe-connect.c:3036 — `PQconnectPoll` settles the port, and refuses a
         // value that is not one, before it resolves an address or opens a
         // socket. Doing it here keeps that order: nothing is opened for a
         // conninfo C would have rejected.
         let address = socket_address(conninfo)?;
+        // fe-connect.c:3285 — the first method is chosen before the socket
+        // is opened, so a combination with none fails without connecting.
+        let negotiation =
+            Negotiation::start(&options, Build::THIS, matches!(address, Address::Unix(_)))?;
+        // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is ever
+        // allowed (`fe-connect.c:4721`-`:4741`; pinned by
+        // `negotiate::tests::this_build_only_ever_negotiates_plaintext`), so
+        // there is no SSLRequest to send and no method to fall back to.
+        debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
         let stream = Stream::connect(&address)?;
         let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
@@ -1648,6 +1663,20 @@ mod tests {
         let info = conninfo("host=/nonexistent-socket-dir port=99999");
         let error = Connection::connect(&info).unwrap_err();
         assert_eq!(error.message(), b"invalid port number: \"99999\"".to_vec());
+    }
+
+    /// `pqConnectOptions2` runs before `PQconnectPoll`, so a refused
+    /// encryption option is reported ahead of a bad port, and nothing is
+    /// opened — `005_negotiate_encryption.pl`'s `- -> fail` rows, which
+    /// show no `connection received` in the server log.
+    #[test]
+    fn a_refused_encryption_option_stops_a_connection_before_the_port_is_read() {
+        let info = conninfo("host=/nonexistent-socket-dir port=99999 sslmode=require");
+        let error = Connection::connect(&info).unwrap_err();
+        assert_eq!(
+            error.message(),
+            b"sslmode value \"require\" invalid when SSL support is not compiled in".to_vec()
+        );
     }
 
     /// A trust connection and one `select version()`, replayed end to end:

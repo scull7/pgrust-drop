@@ -19,7 +19,11 @@
 //! directions (`PQputCopyData`, `PQputCopyEnd`, `PQgetCopyData`); the
 //! blocking query cancel calls (`PQgetCancel`, `PQcancel`, `PQrequestCancel`,
 //! `PQcancelCreate`, `PQcancelBlocking`); and the
-//! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
+//! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`; and
+//! the encryption negotiation (`sslmode`, `sslnegotiation`, `gssencmode`) as
+//! a pure state machine, run today with no TLS backend, so every connection
+//! is plaintext and a mode that needs TLS is refused as a C libpq built
+//! without SSL refuses it. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -44,6 +48,7 @@ pub mod extended;
 pub mod hmac;
 pub mod md5;
 pub mod message;
+pub mod negotiate;
 pub mod pg_config;
 pub mod pipeline;
 pub mod regress;
@@ -69,6 +74,10 @@ pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
 pub use message::{
     Backend, CopyFormat, Frame, Frontend, ProtocolError, Target, TransactionStatus,
     next_copy_frame, next_frame,
+};
+pub use negotiate::{
+    AfterRefusal, Build, EncMethod, EncryptionOptions, GssEncMode, Negotiation, SslMode,
+    SslNegotiation,
 };
 pub use pipeline::{
     AsyncStatus, CopyStep, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass,

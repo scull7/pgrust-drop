@@ -77,9 +77,15 @@ jobs:
     # 3.23 is the first Alpine release whose community repository carries
     # postgresql18.
     container: alpine:3.23
+    # Rust lives under /__w, the runner's work directory, which GitHub
+    # bind-mounts into the container, and not in the container's own overlay
+    # layer (NAT-598). CARGO_HOME holds the restored registry and the pgrust git
+    # database: written into the overlay layer, unpacking the cache took twice
+    # as long as on gnu, and `docker rm` at the end of the job then spent
+    # 37-55 s deleting it all again.
     env:
-      RUSTUP_HOME: /usr/local/rustup
-      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /__w/_rust/rustup
+      CARGO_HOME: /__w/_rust/cargo
       PGDROP_REF_BIN_MUSL: /usr/libexec/postgresql18
     steps:
       # zstd is for Swatinem/rust-cache, not the build: actions/cache compresses
@@ -91,8 +97,9 @@ jobs:
           apk add --no-cache bash build-base curl git libstdc++ linux-headers musl-dev \
             perl tar unzip xz zstd postgresql18 postgresql18-client
       - uses: actions/checkout@v4
-      # Toolchain in a shared, world-writable prefix (the layout the official
-      # rust image uses) so the unprivileged user below can run cargo.
+      # Toolchain in a shared, world-writable prefix (as the official rust
+      # image does under /usr/local) so the unprivileged user below can run
+      # cargo.
       - name: Install Rust
         run: |
           curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup-init.sh

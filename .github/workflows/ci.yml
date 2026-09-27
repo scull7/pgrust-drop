@@ -144,11 +144,24 @@ jobs:
       # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
       # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
       # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
-      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # same 581 MB archive and pushed warm runs to 5.18 min. Moved out before
       # the checks walk it, so the post step never saves it.
-      # As root, which only deletes: ci still owns everything that remains.
+      # Moved, not deleted: `rm -rf` cost 49 s cold. rename(2) is O(1)
+      # only within one mount, and $RUNNER_TEMP is not one: /__w/_temp is its
+      # own bind mount, so mv would copy. /__w/_rust is on /__w with CARGO_HOME
+      # and outside the cached paths. As root, which only moves: ci still owns
+      # everything that remains.
       - name: drop pgrust's fuzz corpora
-        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
+        run: |
+          aside=/__w/_rust/fuzz-aside
+          mkdir -p "$aside"
+          for d in "$CARGO_HOME"/git/checkouts/pgrust-*/*/fuzz; do
+            [ -d "$d" ] || continue
+            rev=${d%/fuzz}
+            repo=${rev%/*}
+            mv "$d" "$aside/${repo##*/}-${rev##*/}"
+          done
+          df -P "$CARGO_HOME" "$aside"
       - name: fmt
         run: su -c 'cargo fmt --all --check' ci
       - name: license wall (no pgrust crate reachable from an MIT crate)
@@ -196,10 +209,22 @@ jobs:
       # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
       # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
       # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
-      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # same 581 MB archive and pushed warm runs to 5.18 min. Moved out before
       # the checks walk it, so the post step never saves it.
+      # Moved, not deleted: `rm -rf` cost 18-27 s cold. $RUNNER_TEMP is on
+      # $HOME's volume (df below), so mv is one rename(2), and the runner
+      # empties it after the job.
       - name: drop pgrust's fuzz corpora
-        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
+        run: |
+          aside="$RUNNER_TEMP/fuzz-aside"
+          mkdir -p "$aside"
+          for d in "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz; do
+            [ -d "$d" ] || continue
+            rev=${d%/fuzz}
+            repo=${rev%/*}
+            mv "$d" "$aside/${repo##*/}-${rev##*/}"
+          done
+          df -P "${CARGO_HOME:-$HOME/.cargo}" "$aside"
       - name: license wall (no pgrust crate reachable from an MIT crate)
         run: scripts/check-license-wall.sh
       - name: clippy
@@ -258,10 +283,22 @@ jobs:
       # NAT-603: pgrust's fuzz/ is corpora, outside its workspace and never
       # built here, yet it was 1.6 GB and 390,225 of the checkout's 403,826
       # files. Cached, it made apple's restore 39-89 s of `gtar -xf` for the
-      # same 581 MB archive and pushed warm runs to 5.18 min. Deleted before
+      # same 581 MB archive and pushed warm runs to 5.18 min. Moved out before
       # the checks walk it, so the post step never saves it.
+      # Moved, not deleted: `rm -rf` cost 18-27 s cold. $RUNNER_TEMP is on
+      # $HOME's volume (df below), so mv is one rename(2), and the runner
+      # empties it after the job.
       - name: drop pgrust's fuzz corpora
-        run: rm -rf "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz
+        run: |
+          aside="$RUNNER_TEMP/fuzz-aside"
+          mkdir -p "$aside"
+          for d in "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/pgrust-*/*/fuzz; do
+            [ -d "$d" ] || continue
+            rev=${d%/fuzz}
+            repo=${rev%/*}
+            mv "$d" "$aside/${repo##*/}-${rev##*/}"
+          done
+          df -P "${CARGO_HOME:-$HOME/.cargo}" "$aside"
       - name: fmt
         run: cargo fmt --all --check
       - name: license wall (no pgrust crate reachable from an MIT crate)

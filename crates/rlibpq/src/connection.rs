@@ -26,7 +26,9 @@ use std::path::PathBuf;
 use crate::auth::{AuthError, AuthStep, Authenticator, ChannelBinding};
 use crate::cancel::Peer;
 use crate::conninfo::ConnInfo;
+use crate::encoding::Encoding;
 use crate::error::ConnError;
+use crate::escape::{self, EscapeError, EscapedString};
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
@@ -1369,6 +1371,144 @@ impl<S: Read + Write> Connection<S> {
     pub fn notifications(&self) -> &[(i32, Vec<u8>, Vec<u8>)] {
         &self.notifications
     }
+
+    /// `PQclientEncoding`, `fe-connect.c:7728`: `conn->client_encoding`,
+    /// which `pqSaveParameterStatus` sets from each `client_encoding` the
+    /// server reports, falling back to SQL_ASCII for a name it does not know
+    /// (`fe-exec.c:1145`-`:1151`). SQL_ASCII before any report
+    /// (`pqMakeEmptyPGconn`, `fe-connect.c:4985`).
+    #[must_use]
+    pub fn client_encoding(&self) -> Encoding {
+        self.parameter_status(b"client_encoding")
+            .and_then(Encoding::from_name)
+            .unwrap_or_default()
+    }
+
+    /// `conn->std_strings`, `fe-exec.c:1155`: did the server last report
+    /// `standard_conforming_strings` as exactly `on`?
+    #[must_use]
+    pub fn std_strings(&self) -> bool {
+        self.parameter_status(b"standard_conforming_strings") == Some(b"on")
+    }
+
+    /// `PQserverVersion`, `fe-connect.c:7628`: `conn->sversion`, which
+    /// `pqSaveParameterStatus` computes from `server_version`
+    /// (`fe-exec.c:1158`-`:1192`); 0 when unknown.
+    #[must_use]
+    pub fn server_version(&self) -> i32 {
+        self.parameter_status(b"server_version")
+            .map_or(0, server_version_number)
+    }
+
+    /// `PQescapeStringConn`, `fe-exec.c:4208`, under this connection's
+    /// client encoding and `standard_conforming_strings`.
+    #[must_use]
+    pub fn escape_string_conn(&self, from: &[u8]) -> EscapedString {
+        escape::escape_string(from, self.client_encoding(), self.std_strings())
+    }
+
+    /// `PQescapeLiteral`, `fe-exec.c:4413`.
+    ///
+    /// # Errors
+    /// The input is not valid in the client encoding.
+    pub fn escape_literal(&self, from: &[u8]) -> Result<Vec<u8>, EscapeError> {
+        escape::escape_internal(from, self.client_encoding(), false)
+    }
+
+    /// `PQescapeIdentifier`, `fe-exec.c:4419`.
+    ///
+    /// # Errors
+    /// The input is not valid in the client encoding.
+    pub fn escape_identifier(&self, from: &[u8]) -> Result<Vec<u8>, EscapeError> {
+        escape::escape_internal(from, self.client_encoding(), true)
+    }
+
+    /// `PQescapeByteaConn`, `fe-exec.c:4590`: hex format for a 9.0 or later
+    /// server, the escape format before it.
+    #[must_use]
+    pub fn escape_bytea_conn(&self, from: &[u8]) -> Vec<u8> {
+        escape::escape_bytea(from, self.std_strings(), self.server_version() >= 90000)
+    }
+}
+
+/// `pqSaveParameterStatus`'s `server_version` arm, `fe-exec.c:1158`: C's
+/// `sscanf(value, "%d.%d.%d", …)` and what it makes of one, two or three
+/// numbers.
+fn server_version_number(value: &[u8]) -> i32 {
+    let mut numbers = Vec::with_capacity(3);
+    let mut rest = value;
+    while numbers.len() < 3 {
+        // %d skips leading white space and takes an optional sign.
+        let start = rest
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let body = &rest[start..];
+        let sign_len = usize::from(matches!(body.first(), Some(b'+' | b'-')));
+        let digits = body[sign_len..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            break;
+        }
+        let token = &body[..sign_len + digits];
+        let Some(n) = std::str::from_utf8(token)
+            .ok()
+            .and_then(|t| t.parse::<i32>().ok())
+        else {
+            break;
+        };
+        numbers.push(n);
+        rest = &body[sign_len + digits..];
+        // The literal '.' between conversions.
+        match rest.split_first() {
+            Some((b'.', tail)) => rest = tail,
+            _ => break,
+        }
+    }
+    match numbers[..] {
+        // Old style, e.g. 9.6.1.
+        [vmaj, vmin, vrev] => (100 * vmaj + vmin) * 100 + vrev,
+        // New style, e.g. 10.1; old style without minor version, e.g. 9.6devel.
+        [vmaj, vmin] if vmaj >= 10 => 100 * 100 * vmaj + vmin,
+        [vmaj, vmin] => (100 * vmaj + vmin) * 100,
+        // New style without minor version, e.g. 10devel.
+        [vmaj] => 100 * 100 * vmaj,
+        _ => 0,
+    }
+}
+
+impl<S: Read + Write> Connection<S> {
+    /// `PQsetClientEncoding`, `fe-connect.c:7736`: send
+    /// `set client_encoding to '<encoding>'` and return its result. The new
+    /// encoding takes effect when the server reports it, which it does
+    /// before the command completes, so [`Connection::client_encoding`]
+    /// reads it as soon as this returns.
+    ///
+    /// `None` is C's `-1` without a query: an encoding name too long for
+    /// upstream's 128-byte buffer (`:7754`), or `auto`, which C resolves from
+    /// the locale's `nl_langinfo(CODESET)` (`:7750`) and this crate cannot
+    /// reach (see `docs/divergences.md`). `Some` carries the command's
+    /// result; C's `0` is [`ExecStatus::CommandOk`].
+    ///
+    /// # Errors
+    /// As [`Connection::exec`].
+    pub fn set_client_encoding(
+        &mut self,
+        encoding: &[u8],
+    ) -> Result<Option<QueryResult>, ConnectionError> {
+        const QUERY: &[u8] = b"set client_encoding to '%s'";
+        // sizeof(qbuf) < sizeof(query) + strlen(encoding): sizeof counts the
+        // query's NUL, and the %s it replaces stays in the sum.
+        if encoding == b"auto" || 128 < QUERY.len() + 1 + encoding.len() {
+            return Ok(None);
+        }
+        let mut query = b"set client_encoding to '".to_vec();
+        query.extend_from_slice(encoding);
+        query.push(b'\'');
+        Ok(self.exec(&query)?.pop())
+    }
 }
 
 /// A `FieldDescription` for a text column, which the tests below build often.
@@ -2558,5 +2698,74 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, 1000);
+    }
+
+    #[test]
+    fn server_version_is_what_sscanf_makes_of_the_reported_string() {
+        assert_eq!(server_version_number(b"18.6"), 180_006);
+        assert_eq!(server_version_number(b"10.1"), 100_001);
+        assert_eq!(server_version_number(b"9.6.1"), 90_601);
+        assert_eq!(server_version_number(b"9.6devel"), 90_600);
+        assert_eq!(server_version_number(b"19devel"), 190_000);
+        assert_eq!(server_version_number(b"18beta1"), 180_000);
+        assert_eq!(server_version_number(b" 18.6 (Debian 18.6-1)"), 180_006);
+        assert_eq!(server_version_number(b"devel"), 0);
+        assert_eq!(server_version_number(b""), 0);
+    }
+
+    /// Before any report the encoding is SQL_ASCII and strings are not
+    /// standard-conforming; each ParameterStatus then moves the state, an
+    /// unknown encoding name falling back to SQL_ASCII (`fe-exec.c:1150`).
+    #[test]
+    fn the_escape_settings_follow_parameter_status() {
+        let mut conn = replayed(&[]);
+        assert_eq!(conn.client_encoding(), Encoding::SqlAscii);
+        assert!(!conn.std_strings());
+        assert_eq!(conn.server_version(), 0);
+
+        let mut replies = message(b'S', b"client_encoding\0GB18030\0");
+        replies.extend(message(b'S', b"standard_conforming_strings\0on\0"));
+        replies.extend(message(b'S', b"server_version\x0018.6\0"));
+        replies.extend(message(b'C', b"SET\0"));
+        replies.extend(ready(b'I'));
+        conn = replayed(&replies);
+        let result = conn.set_client_encoding(b"GB18030").unwrap().unwrap();
+        assert_eq!(result.status(), ExecStatus::CommandOk);
+        assert_eq!(conn.client_encoding(), Encoding::Gb18030);
+        assert!(conn.std_strings());
+        assert_eq!(conn.server_version(), 180_006);
+        let query = b"set client_encoding to 'GB18030'\0";
+        assert!(
+            conn.stream
+                .to_server
+                .windows(query.len())
+                .any(|w| w == query)
+        );
+        // GB18030 now governs escaping: 0x81 0x5c is one character.
+        assert_eq!(conn.escape_literal(b"\x81\\").unwrap(), b"'\x81\\'");
+        assert_eq!(conn.escape_bytea_conn(b"\x01"), b"\\x01");
+
+        let mut replies = message(b'S', b"client_encoding\0KLINGON\0");
+        replies.extend(message(b'S', b"standard_conforming_strings\0off\0"));
+        replies.extend(message(b'C', b"SET\0"));
+        replies.extend(ready(b'I'));
+        conn = replayed(&replies);
+        conn.exec(b"select 1").unwrap();
+        assert_eq!(conn.client_encoding(), Encoding::SqlAscii);
+        assert!(!conn.std_strings());
+        // No server_version, so the escape format, backslashes doubled.
+        assert_eq!(conn.escape_bytea_conn(b"\x01"), b"\\\\001");
+    }
+
+    /// `auto` and an over-long name are refused before anything is sent
+    /// (`fe-connect.c:7750`, `:7754`).
+    #[test]
+    fn set_client_encoding_sends_nothing_it_cannot_fit_or_resolve() {
+        let mut conn = replayed(&[]);
+        let sent = conn.stream.to_server.len();
+        assert!(conn.set_client_encoding(b"auto").unwrap().is_none());
+        // 128 < 28 + 101: one byte too many for qbuf.
+        assert!(conn.set_client_encoding(&[b'x'; 101]).unwrap().is_none());
+        assert_eq!(conn.stream.to_server.len(), sent);
     }
 }

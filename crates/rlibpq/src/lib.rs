@@ -24,7 +24,10 @@
 //! the encryption negotiation (`sslmode`, `sslnegotiation`, `gssencmode`) as
 //! a pure state machine, run today with no TLS backend, so every connection
 //! is plaintext and a mode that needs TLS is refused as a C libpq built
-//! without SSL refuses it. The
+//! without SSL refuses it; and the encoding-aware escaping of `fe-exec.c`
+//! (`PQescapeLiteral`, `PQescapeIdentifier`, `PQescapeStringConn`,
+//! `PQescapeByteaConn`, `PQunescapeBytea`) over the client encoding the
+//! server reports, proved against `test_escape.c`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -44,7 +47,9 @@ pub mod cancel;
 pub mod connection;
 pub mod conninfo;
 mod cstr;
+pub mod encoding;
 pub mod error;
+pub mod escape;
 pub mod extended;
 pub mod hmac;
 pub mod md5;
@@ -71,7 +76,9 @@ pub use conninfo::{
     conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,
     uri_prefix_length,
 };
+pub use encoding::Encoding;
 pub use error::ConnError;
+pub use escape::{EscapeError, EscapedString, escape_bytea, escape_string, unescape_bytea};
 pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
 pub use message::{
     Backend, CopyFormat, Frame, Frontend, ProtocolError, Target, TransactionStatus,

@@ -315,6 +315,7 @@ const ACCESS_METHODS_PORT: u16 = 55_499;
 const PARTITION_AND_AM_LISTINGS_PORT: u16 = 55_500;
 const FUNCTIONS_AND_OPERATORS_PORT: u16 = 55_501;
 const FUNCTION_TYPE_OPERATOR_LISTINGS_PORT: u16 = 55_502;
+const ROLES_AND_PRIVILEGES_PORT: u16 = 55_503;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -943,6 +944,150 @@ fn the_function_type_and_operator_listings_match_c_psql() {
         set client_min_messages = warning;\n\
         drop schema s3 cascade;\n";
     diff_against_c_psql(&cluster, "function, type and operator listings", script);
+}
+
+/// Every line of `psql.sql`'s invalid-name sections (`:1679`-`:1919`) that
+/// names `\dD`, `\ddp`, `\dg`, `\dp` or `\drds`, verbatim and in order.
+const INVALID_ROLE_AND_PRIVILEGE_NAMES: &str = "\\dD host.regression.public.gtestdomain1\n\
+    \\dD ].public.gtestdomain1\n\
+    \\dD nonesuch.public.gtestdomain1\n\
+    \\ddp host.regression.pg_catalog.pg_class\n\
+    \\ddp {.pg_catalog.pg_class\n\
+    \\ddp nonesuch.pg_catalog.pg_class\n\
+    \\dg nonesuch.pg_database_owner\n\
+    \\dg regression.pg_database_owner\n\
+    \\dp host.regression.public.a_star\n\
+    \\dp \"regres+ion\".public.a_star\n\
+    \\dp nonesuch.public.a_star\n\
+    \\drds nonesuch.lc_messages\n\
+    \\drds regression.lc_messages\n\
+    \\dD \"no.such.domain\"\n\
+    \\ddp \"no.such.default.access.privilege\"\n\
+    \\dg \"no.such.role\"\n\
+    \\dp \"no.such.access.privilege\"\n\
+    \\drds \"no.such.setting\"\n\
+    \\dD \"no.such.schema\".\"no.such.domain\"\n\
+    \\ddp \"no.such.schema\".\"no.such.default.access.privilege\"\n\
+    \\dg \"no.such.schema\".\"no.such.role\"\n\
+    \\dp \"no.such.schema\".\"no.such.access.privilege\"\n\
+    \\drds \"no.such.schema\".\"no.such.setting\"\n\
+    \\dD regression.\"no.such.schema\".\"no.such.domain\"\n\
+    \\dp regression.\"no.such.schema\".\"no.such.access.privilege\"\n\
+    \\dD \"no.such.database\".\"no.such.schema\".\"no.such.domain\"\n\
+    \\ddp \"no.such.database\".\"no.such.schema\".\"no.such.default.access.privilege\"\n\
+    \\dp \"no.such.database\".\"no.such.schema\".\"no.such.access.privilege\"\n";
+
+/// `-- check \drg and \du`, `-- Test display of empty privileges.` and
+/// `-- Test display of default privileges with \pset null.`
+/// (`psql.sql:1921`, `:1947`, `:1971`), the last three sections of the file,
+/// live and whole: `\drg` over grants with every mix of ADMIN, INHERIT and
+/// SET, `\du` folding a role's attributes, `\dD+`, `\df+`, `\dp` and `\dT+`
+/// over objects whose privileges were all revoked, and `\z` and `\zx` under
+/// `\pset null`. Each section cleans up after itself, so the cluster is then
+/// reused for the roles and privileges commands beyond what `psql.sql`
+/// exercises, against C psql, with `ECHO_HIDDEN` on so each catalog query is
+/// compared byte for byte:
+///
+/// - `\du` and `\dg` with `S`, `+` and `x`, over roles with every attribute,
+///   a connection limit of 0, 1 and more, and an expiry;
+/// - `\drg` with and without `S` and a pattern;
+/// - `\drds` with no, one and two patterns, a third, and nothing found;
+/// - `\dp` and every spelling of `\z` over column privileges and permissive
+///   and restrictive policies;
+/// - `\ddp` over default privileges for each kind of object, matched by
+///   schema and by owner;
+/// - `\dD` with a collation, `NOT NULL`, a default, two checks and a comment;
+/// - and, verbatim, every line of `psql.sql`'s invalid-name sections
+///   (`:1679`-`:1919`) that names one of these commands.
+#[test]
+fn the_roles_and_privileges_sections_run_live() {
+    let Some(cluster) = Cluster::start(ROLES_AND_PRIVILEGES_PORT) else {
+        return;
+    };
+    // `test_setup.sql:24`, which the regression database has by the time
+    // `psql.sql` runs: a fresh role may create in `public`.
+    gate_script(
+        &cluster,
+        &sections(
+            "-- check \\drg and \\du",
+            "-- Test display of default privileges with \\pset null.",
+        ),
+        "GRANT ALL ON SCHEMA public TO public;\n",
+    );
+
+    let script = format!(
+        "\\set QUIET off\n\
+        create role s4_all superuser createdb createrole replication bypassrls \
+        connection limit 1 valid until 'infinity';\n\
+        create role s4_a login connection limit 0;\n\
+        create role s4_b noinherit connection limit 5;\n\
+        comment on role s4_b is 'the second';\n\
+        grant s4_a to s4_b with admin true, inherit false;\n\
+        grant s4_b to s4_all;\n\
+        alter role s4_a set work_mem = '1MB';\n\
+        alter role s4_a in database postgres set search_path = s4;\n\
+        create schema s4;\n\
+        create table s4.t (a int, b int);\n\
+        create view s4.v as select a from s4.t;\n\
+        create sequence s4.s;\n\
+        grant select on s4.t to s4_a;\n\
+        grant update (b), insert (a, b) on s4.t to s4_b;\n\
+        create policy p on s4.t for select to s4_a, s4_b using (a > 0);\n\
+        create policy q on s4.t as restrictive using (true) with check (b > 0);\n\
+        alter default privileges for role s4_a in schema s4 grant select on tables to s4_b;\n\
+        alter default privileges for role s4_a grant usage on sequences to s4_b;\n\
+        alter default privileges for role s4_a revoke execute on functions from public;\n\
+        alter default privileges for role s4_b grant usage on types to s4_a;\n\
+        alter default privileges for role s4_b grant create on schemas to s4_a;\n\
+        alter default privileges for role s4_b grant select on large objects to s4_a;\n\
+        create domain s4.d as text collate \"C\" not null default 'x' \
+        check (value <> '') check (length(value) < 9);\n\
+        comment on domain s4.d is 'short text';\n\
+        create domain s4.i as int;\n\
+        \\set ECHO_HIDDEN on\n\
+        \\du\n\
+        \\du+ s4_*\n\
+        \\duS pg_read_all_*\n\
+        \\dg s4_?\n\
+        \\du+x s4_all\n\
+        \\drg\n\
+        \\drgS pg_*\n\
+        \\drg s4_*\n\
+        \\drds\n\
+        \\drds s4_a\n\
+        \\drds s4_a postgres\n\
+        \\drds * postgres\n\
+        \\drds nonesuch\n\
+        \\drds nonesuch nodb\n\
+        \\drds s4_a postgres extra\n\
+        \\dp\n\
+        \\dp s4.*\n\
+        \\dpS pg_catalog.pg_class\n\
+        \\z s4.t\n\
+        \\zS s4.v\n\
+        \\zx s4.t\n\
+        \\zSx s4.s\n\
+        \\zxS s4.s\n\
+        \\ddp\n\
+        \\ddp s4\n\
+        \\ddp s4_b\n\
+        \\dD\n\
+        \\dD+ s4.*\n\
+        \\dDS pg_catalog.*\n\
+        \\dD+x s4.d\n\
+        \\set ECHO_HIDDEN off\n\
+        {INVALID_ROLE_AND_PRIVILEGE_NAMES}\
+        \\drg a.b\n\
+        \\du a.b\n\
+        \\drds a b.c\n\
+        \\z+\n\
+        set client_min_messages = warning;\n\
+        drop schema s4 cascade;\n\
+        drop owned by s4_a;\n\
+        drop owned by s4_b;\n\
+        drop role s4_all, s4_a, s4_b;\n"
+    );
+    diff_against_c_psql(&cluster, "roles and privileges listings", &script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

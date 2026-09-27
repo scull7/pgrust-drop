@@ -17,8 +17,13 @@
 //! functions, operators and types ([`describe_aggregates_query`], `\da`;
 //! [`describe_functions_query`], `\df`; [`describe_types_query`], `\dT`;
 //! [`describe_operators_query`], `\do`) and
-//! [`describe_configuration_parameters_query`], `\dconfig`. Every other
-//! command the switch recognizes is refused by name until its slice lands.
+//! [`describe_configuration_parameters_query`], `\dconfig`; and slice 4's
+//! roles and privileges ([`permissions_list_query`], `\dp` and `\z`;
+//! [`list_default_acls_query`], `\ddp`; [`describe_roles_query`], `\du` and
+//! `\dg`; [`list_db_role_settings_query`], `\drds`;
+//! [`describe_role_grants_query`], `\drg`) and [`list_domains_query`],
+//! `\dD`. Every other command the switch recognizes is refused by name until
+//! its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -55,6 +60,21 @@ pub enum DescribeCommand {
     Operators,
     /// `describeConfigurationParameters()` (`describe.c:4715`): `\dconfig`.
     ConfigurationParameters,
+    /// `permissionsList()` (`describe.c:1054`): `\dp`, and `\z` from
+    /// `exec_command_z()`.
+    Permissions,
+    /// `listDefaultACLs()` (`describe.c:1218`): `\ddp`.
+    DefaultAcls,
+    /// `describeRoles()` (`describe.c:3716`): `\du`, and `\dg`, "no longer
+    /// distinct from `\du`".
+    Roles,
+    /// `listDbRoleSettings()` (`describe.c:3863`): `\drds`, with a second
+    /// pattern.
+    DbRoleSettings,
+    /// `describeRoleGrants()` (`describe.c:3932`): `\drg`.
+    RoleGrants,
+    /// `listDomains()` (`describe.c:4552`): `\dD`.
+    Domains,
     /// A command the switch recognizes whose port has not landed yet; the
     /// name is its `describe.c` function.
     NotYet(&'static str),
@@ -112,22 +132,22 @@ impl DescribeCommand {
             b'c' if cmd.starts_with("dconfig") => Some(Self::ConfigurationParameters),
             b'c' => not_yet("listConversions"),
             b'C' => not_yet("listCasts"),
-            b'd' if cmd.starts_with("ddp") => not_yet("listDefaultACLs"),
+            b'd' if cmd.starts_with("ddp") => Some(Self::DefaultAcls),
             b'd' => not_yet("objectDescription"),
-            b'D' => not_yet("listDomains"),
+            b'D' => Some(Self::Domains),
             b'f' => match at(2) {
                 0 | b'+' | b'S' | b'a' | b'n' | b'p' | b't' | b'w' | b'x' => {
                     Some(Self::Functions(cmd[2..].to_string()))
                 }
                 _ => None,
             },
-            b'g' | b'u' => not_yet("describeRoles"),
+            b'g' | b'u' => Some(Self::Roles),
             b'l' => not_yet("listLargeObjects"),
             b'L' => not_yet("listLanguages"),
             b'n' => not_yet("listSchemas"),
             b'o' => Some(Self::Operators),
             b'O' => not_yet("listCollations"),
-            b'p' => not_yet("permissionsList"),
+            b'p' => Some(Self::Permissions),
             b'P' => match at(2) {
                 0 | b'+' | b't' | b'i' | b'n' | b'x' => {
                     Some(Self::ListPartitionedTables(cmd[2..].to_string()))
@@ -137,8 +157,8 @@ impl DescribeCommand {
             b'T' => Some(Self::Types),
             b't' | b'v' | b'm' | b'i' | b's' | b'E' => Some(Self::ListTables(cmd[1..].to_string())),
             b'r' => match (at(2), at(3)) {
-                (b'd', b's') => not_yet("listDbRoleSettings"),
-                (b'g', _) => not_yet("describeRoleGrants"),
+                (b'd', b's') => Some(Self::DbRoleSettings),
+                (b'g', _) => Some(Self::RoleGrants),
                 _ => None,
             },
             b'R' => match at(2) {
@@ -168,15 +188,15 @@ impl DescribeCommand {
     }
 
     /// How many patterns `exec_command_d()` reads for `cmd`: a second one only
-    /// for `\dAc`, `\dAf`, `\dAo` and `\dAp`, and only after a first
-    /// (`command.c:1065`); for `\df` and `\do`, after a first, up to
+    /// for `\dAc`, `\dAf`, `\dAo`, `\dAp` and `\drds`, and only after a
+    /// first (`command.c:1065`, `:1200`); for `\df` and `\do`, after a first, up to
     /// [`FUNC_MAX_ARGS`] argument types (`exec_command_dfo()`,
     /// `command.c:1313`). Any argument past them draws the "extra argument"
     /// warning.
     #[must_use]
     pub fn patterns_read(cmd: &str, has_pattern: bool) -> usize {
         match Self::parse(cmd, has_pattern) {
-            Some(Self::OperatorListing(_)) if has_pattern => 2,
+            Some(Self::OperatorListing(_) | Self::DbRoleSettings) if has_pattern => 2,
             Some(Self::Functions(_) | Self::Operators) if has_pattern => 1 + FUNC_MAX_ARGS,
             _ => 1,
         }
@@ -1912,6 +1932,492 @@ pub fn describe_configuration_parameters_query(
     (buf, title)
 }
 
+/// The query half of `permissionsList()` (`describe.c:1054`-`:1188`), for
+/// `\dp` and `\z`, whose title is "Access privileges". Indexes and TOAST
+/// tables are left out, as they have no meaningful rights.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+// One upstream function, kept in its order so it reads against its C.
+#[allow(clippy::too_many_lines)]
+pub fn permissions_list_query(
+    pattern: Option<&str>,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "  c.relname as \"Name\",\n",
+        "  CASE c.relkind",
+        " WHEN 'r' THEN 'table'",
+        " WHEN 'v' THEN 'view'",
+        " WHEN 'm' THEN 'materialized view'",
+        " WHEN 'S' THEN 'sequence'",
+        " WHEN 'f' THEN 'foreign table'",
+        " WHEN 'p' THEN 'partitioned table'",
+        " END as \"Type\",\n",
+        "  ",
+    ));
+    push_acl_column(&mut buf, "c.relacl");
+
+    // Formatted as printACLColumn() does, but with no case for an empty
+    // attacl: the backend always turns one back into NULL.
+    buf.push_str(concat!(
+        ",\n  pg_catalog.array_to_string(ARRAY(\n",
+        "    SELECT attname || E':\\n  ' || pg_catalog.array_to_string(attacl, E'\\n  ')\n",
+        "    FROM pg_catalog.pg_attribute a\n",
+        "    WHERE attrelid = c.oid AND NOT attisdropped AND attacl IS NOT NULL\n",
+        "  ), E'\\n') AS \"Column privileges\"",
+    ));
+
+    // Row security policies arrived in 9.5; RESTRICTIVE ones in 10.
+    if server.sversion >= 90_500 {
+        buf.push_str(concat!(
+            ",\n  pg_catalog.array_to_string(ARRAY(\n",
+            "    SELECT polname\n",
+        ));
+        if server.sversion >= 100_000 {
+            buf.push_str(concat!(
+                "    || CASE WHEN NOT polpermissive THEN\n",
+                "       E' (RESTRICTIVE)'\n",
+                "       ELSE '' END\n",
+            ));
+        }
+        buf.push_str(concat!(
+            "    || CASE WHEN polcmd != '*' THEN\n",
+            "           E' (' || polcmd::pg_catalog.text || E'):'\n",
+            "       ELSE E':'\n",
+            "       END\n",
+            "    || CASE WHEN polqual IS NOT NULL THEN\n",
+            "           E'\\n  (u): ' || pg_catalog.pg_get_expr(polqual, polrelid)\n",
+            "       ELSE E''\n",
+            "       END\n",
+            "    || CASE WHEN polwithcheck IS NOT NULL THEN\n",
+            "           E'\\n  (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid)\n",
+            "       ELSE E''\n",
+            "       END",
+            "    || CASE WHEN polroles <> '{0}' THEN\n",
+            "           E'\\n  to: ' || pg_catalog.array_to_string(\n",
+            "               ARRAY(\n",
+            "                   SELECT rolname\n",
+            "                   FROM pg_catalog.pg_roles\n",
+            "                   WHERE oid = ANY (polroles)\n",
+            "                   ORDER BY 1\n",
+            "               ), E', ')\n",
+            "       ELSE E''\n",
+            "       END\n",
+            "    FROM pg_catalog.pg_policy pol\n",
+            "    WHERE polrelid = c.oid), E'\\n')\n",
+            "    AS \"Policies\"",
+        ));
+    }
+
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_class c\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n",
+        "WHERE c.relkind IN ('r','v','m','S','f','p')\n",
+    ));
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("c.relname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_table_is_visible(c.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listDefaultACLs()` (`describe.c:1218`-`:1263`), for
+/// `\ddp`, whose title is "Default access privileges". The pattern matches
+/// the schema's name or the owning role's.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_default_acls_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT pg_catalog.pg_get_userbyid(d.defaclrole) AS \"Owner\",\n",
+        "  n.nspname AS \"Schema\",\n",
+        "  CASE d.defaclobjtype ",
+        "    WHEN 'r' THEN 'table' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'function'",
+        "    WHEN 'T' THEN 'type' WHEN 'n' THEN 'schema' WHEN 'L' THEN 'large object' END AS \"Type\",\n",
+        "  ",
+    ));
+    push_acl_column(&mut buf, "d.defaclacl");
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_default_acl d\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace\n",
+    ));
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            schemavar: None,
+            namevar: Some("n.nspname"),
+            altnamevar: Some("pg_catalog.pg_get_userbyid(d.defaclrole)"),
+            visibilityrule: None,
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2, 3;");
+    Ok(buf)
+}
+
+/// The query half of `describeRoles()` (`describe.c:3716`-`:3763`), for `\du`
+/// and `\dg`. Only a role's name is matched: any dot makes the pattern
+/// "improper". The result is not printed as it comes but folded into
+/// "Attributes" cells ([`role_attributes`]).
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn describe_roles_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT r.rolname, r.rolsuper, r.rolinherit,\n",
+        "  r.rolcreaterole, r.rolcreatedb, r.rolcanlogin,\n",
+        "  r.rolconnlimit, r.rolvaliduntil",
+    ));
+    if verbose {
+        buf.push_str("\n, pg_catalog.shobj_description(r.oid, 'pg_authid') AS description");
+    }
+    buf.push_str("\n, r.rolreplication");
+    if server.sversion >= 90_500 {
+        buf.push_str("\n, r.rolbypassrls");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_roles r\n");
+    if !show_system && pattern.is_none() {
+        buf.push_str("WHERE r.rolname !~ '^pg_'\n");
+    }
+    // `have_where` is false even after the WHERE above, which is only added
+    // when there is no pattern, and so no clause to join to it.
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("r.rolname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The column headers `describeRoles()` prints (`describe.c:3774`-`:3778`),
+/// all left-aligned.
+#[must_use]
+pub fn describe_roles_headers(verbose: bool) -> &'static [&'static str] {
+    if verbose {
+        &["Role name", "Attributes", "Description"]
+    } else {
+        &["Role name", "Attributes"]
+    }
+}
+
+/// One row of `describeRoles()`'s table (`describe.c:3780`-`:3835`): the
+/// role's name, its attributes folded into one cell — flags joined with `, `
+/// ([`add_role_attribute`], `:3851`), then the connection limit and the
+/// password's expiry each on a line of its own — and, when `verbose`, its
+/// description.
+///
+/// `row` is the query's row as text, a NULL as the empty string, the way
+/// `PQgetvalue` hands it out.
+#[must_use]
+pub fn describe_roles_row(row: &[&[u8]], verbose: bool, sversion: i32) -> Vec<Vec<u8>> {
+    let col = |i: usize| row.get(i).copied().unwrap_or_default();
+    let is_true = |i: usize| col(i) == b"t";
+    let mut buf: Vec<u8> = Vec::new();
+    if is_true(1) {
+        add_role_attribute(&mut buf, b"Superuser");
+    }
+    if !is_true(2) {
+        add_role_attribute(&mut buf, b"No inheritance");
+    }
+    if is_true(3) {
+        add_role_attribute(&mut buf, b"Create role");
+    }
+    if is_true(4) {
+        add_role_attribute(&mut buf, b"Create DB");
+    }
+    if !is_true(5) {
+        add_role_attribute(&mut buf, b"Cannot login");
+    }
+    if is_true(if verbose { 9 } else { 8 }) {
+        add_role_attribute(&mut buf, b"Replication");
+    }
+    if sversion >= 90_500 && is_true(if verbose { 10 } else { 9 }) {
+        add_role_attribute(&mut buf, b"Bypass RLS");
+    }
+
+    let conns = atoi(col(6));
+    if conns >= 0 {
+        if !buf.is_empty() {
+            buf.push(b'\n');
+        }
+        if conns == 0 {
+            buf.extend_from_slice(b"No connections");
+        } else if conns == 1 {
+            buf.extend_from_slice(b"1 connection");
+        } else {
+            buf.extend_from_slice(format!("{conns} connections").as_bytes());
+        }
+    }
+
+    if !col(7).is_empty() {
+        if !buf.is_empty() {
+            buf.push(b'\n');
+        }
+        buf.extend_from_slice(b"Password valid until ");
+        buf.extend_from_slice(col(7));
+    }
+
+    let mut cells = vec![col(0).to_vec(), buf];
+    if verbose {
+        cells.push(col(8).to_vec());
+    }
+    cells
+}
+
+/// `add_role_attribute()` (`describe.c:3851`).
+fn add_role_attribute(buf: &mut Vec<u8>, attribute: &[u8]) {
+    if !buf.is_empty() {
+        buf.extend_from_slice(b", ");
+    }
+    buf.extend_from_slice(attribute);
+}
+
+/// `atoi()`: optional leading whitespace and sign, then as many digits as
+/// there are; 0 when there are none. (Overflow is undefined in C; a
+/// `rolconnlimit` is an `int4`, so it never arises.)
+fn atoi(bytes: &[u8]) -> i64 {
+    let s = bytes.trim_ascii_start();
+    let (negative, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let n = digits
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .fold(0_i64, |n, &d| {
+            n.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+        });
+    if negative { -n } else { n }
+}
+
+/// The query half of `listDbRoleSettings()` (`describe.c:3863`-`:3887`), for
+/// `\drds`, whose title is "List of settings": a role pattern, then a
+/// database pattern, each a bare name.
+///
+/// # Errors
+/// Either pattern failed `validateSQLNamePattern`.
+pub fn list_db_role_settings_query(
+    pattern: Option<&str>,
+    pattern2: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT rolname AS \"Role\", datname AS \"Database\",\n",
+        "pg_catalog.array_to_string(setconfig, E'\\n') AS \"Settings\"\n",
+        "FROM pg_catalog.pg_db_role_setting s\n",
+        "LEFT JOIN pg_catalog.pg_database d ON d.oid = setdatabase\n",
+        "LEFT JOIN pg_catalog.pg_roles r ON r.oid = setrole\n",
+    ));
+    let havewhere = validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("r.rolname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern2,
+        havewhere,
+        false,
+        PatternVars {
+            namevar: Some("d.datname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// What `listDbRoleSettings()` logs instead of an empty table when not quiet
+/// (`describe.c:3900`-`:3909`), since the user may have mixed up what its
+/// two patterns mean.
+#[must_use]
+pub fn db_role_settings_not_found(pattern: Option<&str>, pattern2: Option<&str>) -> String {
+    match (pattern, pattern2) {
+        (Some(role), Some(db)) => {
+            format!("Did not find any settings for role \"{role}\" and database \"{db}\".")
+        }
+        (Some(role), None) => format!("Did not find any settings for role \"{role}\"."),
+        (None, _) => "Did not find any settings.".to_string(),
+    }
+}
+
+/// The query half of `describeRoleGrants()` (`describe.c:3932`-`:3979`), for
+/// `\drg`, whose title is "List of role grants". Before 16 a grant had no
+/// INHERIT or SET option of its own, so the member's `rolinherit` and a
+/// constant `SET` stand in.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn describe_role_grants_query(
+    pattern: Option<&str>,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT m.rolname AS \"Role name\", r.rolname AS \"Member of\",\n",
+        "  pg_catalog.concat_ws(', ',\n",
+    ));
+    buf.push_str(if server.sversion >= 160_000 {
+        concat!(
+            "    CASE WHEN pam.admin_option THEN 'ADMIN' END,\n",
+            "    CASE WHEN pam.inherit_option THEN 'INHERIT' END,\n",
+            "    CASE WHEN pam.set_option THEN 'SET' END\n",
+        )
+    } else {
+        concat!(
+            "    CASE WHEN pam.admin_option THEN 'ADMIN' END,\n",
+            "    CASE WHEN m.rolinherit THEN 'INHERIT' END,\n",
+            "    'SET'\n",
+        )
+    });
+    buf.push_str(concat!(
+        "  ) AS \"Options\",\n",
+        "  g.rolname AS \"Grantor\"\n",
+        "FROM pg_catalog.pg_roles m\n",
+        "     JOIN pg_catalog.pg_auth_members pam ON (pam.member = m.oid)\n",
+        "     LEFT JOIN pg_catalog.pg_roles r ON (pam.roleid = r.oid)\n",
+        "     LEFT JOIN pg_catalog.pg_roles g ON (pam.grantor = g.oid)\n",
+    ));
+    if !show_system && pattern.is_none() {
+        buf.push_str("WHERE m.rolname !~ '^pg_'\n");
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("m.rolname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2, 4;\n");
+    Ok(buf)
+}
+
+/// The query half of `listDomains()` (`describe.c:4552`-`:4613`), for `\dD`,
+/// whose title is "List of domains".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_domains_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname as \"Schema\",\n",
+        "       t.typname as \"Name\",\n",
+        "       pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"Type\",\n",
+        "       (SELECT c.collname FROM pg_catalog.pg_collation c, pg_catalog.pg_type bt\n",
+        "        WHERE c.oid = t.typcollation AND bt.oid = t.typbasetype AND t.typcollation <> bt.typcollation) as \"Collation\",\n",
+        "       CASE WHEN t.typnotnull THEN 'not null' END as \"Nullable\",\n",
+        "       t.typdefault as \"Default\",\n",
+        "       pg_catalog.array_to_string(ARRAY(\n",
+        "         SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE t.oid = r.contypid AND r.contype = 'c' ORDER BY r.conname\n",
+        "       ), ' ') as \"Check\"",
+    ));
+    if verbose {
+        buf.push_str(",\n  ");
+        push_acl_column(&mut buf, "t.typacl");
+        buf.push_str(",\n       d.description as \"Description\"");
+    }
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_type t\n",
+        "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\n",
+    ));
+    if verbose {
+        buf.push_str(
+            "     LEFT JOIN pg_catalog.pg_description d \
+             ON d.classoid = t.tableoid AND d.objoid = t.oid \
+             AND d.objsubid = 0\n",
+        );
+    }
+    buf.push_str("WHERE t.typtype = 'd'\n");
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("t.typname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_type_is_visible(t.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2903,6 +3409,395 @@ mod tests {
                  \x20                      pg_catalog.pg_size_pretty(sum(\n\
                  \x20            CASE WHEN d.level = 1 THEN pg_catalog.pg_table_size(d.oid) ELSE 0 END)) AS dps\n\
                  \x20              FROM d) s\n"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn the_roles_and_privileges_commands_parse_to_their_functions() {
+        for (cmd, expected) in [
+            ("dp", DescribeCommand::Permissions),
+            ("dpS", DescribeCommand::Permissions),
+            ("ddp", DescribeCommand::DefaultAcls),
+            ("du", DescribeCommand::Roles),
+            ("dg+", DescribeCommand::Roles),
+            ("duSx", DescribeCommand::Roles),
+            ("drds", DescribeCommand::DbRoleSettings),
+            ("drg", DescribeCommand::RoleGrants),
+            ("drgS", DescribeCommand::RoleGrants),
+            ("dD", DescribeCommand::Domains),
+            ("dD+", DescribeCommand::Domains),
+        ] {
+            assert_eq!(DescribeCommand::parse(cmd, true), Some(expected), "{cmd}");
+        }
+        // `\dd` without `p` is `objectDescription`; `\dr` needs `ds` or `g`.
+        assert_eq!(
+            DescribeCommand::parse("dd", false),
+            Some(DescribeCommand::NotYet("objectDescription"))
+        );
+        assert_eq!(DescribeCommand::parse("drd", true), None);
+        assert_eq!(DescribeCommand::parse("dr", true), None);
+        // `\drds` reads a second pattern, and only after a first.
+        assert_eq!(DescribeCommand::patterns_read("drds", true), 2);
+        assert_eq!(DescribeCommand::patterns_read("drds", false), 1);
+        assert_eq!(DescribeCommand::patterns_read("drg", true), 1);
+    }
+
+    #[test]
+    fn permissions_list_has_policies_from_9_5_and_restrictive_ones_from_10() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        let q18 = permissions_list_query(None, false, PG18).unwrap();
+        assert!(
+            q18.starts_with(
+                "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  CASE c.relkind \
+                 WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
+                 WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' \
+                 WHEN 'p' THEN 'partitioned table' END as \"Type\",\n  \
+                 CASE WHEN pg_catalog.array_length(c.relacl, 1) = 0 THEN '(none)' \
+                 ELSE pg_catalog.array_to_string(c.relacl, E'\\n') END AS \"Access privileges\",\n"
+            ),
+            "{q18}"
+        );
+        assert!(
+            q18.contains("    SELECT polname\n    || CASE WHEN NOT polpermissive THEN\n"),
+            "{q18}"
+        );
+        // Upstream has no newline between these two lines.
+        assert!(
+            q18.contains("       END    || CASE WHEN polroles <> '{0}' THEN\n"),
+            "{q18}"
+        );
+        assert!(
+            q18.ends_with(
+                "    AS \"Policies\"\nFROM pg_catalog.pg_class c\n     \
+                 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n\
+                 WHERE c.relkind IN ('r','v','m','S','f','p')\n      \
+                 AND n.nspname <> 'pg_catalog'\n      \
+                 AND n.nspname <> 'information_schema'\n  \
+                 AND pg_catalog.pg_table_is_visible(c.oid)\nORDER BY 1, 2;"
+            ),
+            "{q18}"
+        );
+
+        let q95 = permissions_list_query(None, false, at(90_526)).unwrap();
+        assert!(
+            q95.contains("    SELECT polname\n    || CASE WHEN polcmd != '*' THEN\n"),
+            "{q95}"
+        );
+        assert!(!q95.contains("RESTRICTIVE"), "{q95}");
+        // Otherwise the two are the same text.
+        assert_eq!(
+            q18.replace(
+                "    || CASE WHEN NOT polpermissive THEN\n       E' (RESTRICTIVE)'\n       ELSE '' END\n",
+                ""
+            ),
+            q95
+        );
+
+        let q94 = permissions_list_query(None, false, at(90_424)).unwrap();
+        assert!(!q94.contains("Policies"), "{q94}");
+        assert!(
+            q94.contains("AS \"Column privileges\"\nFROM pg_catalog.pg_class c\n"),
+            "{q94}"
+        );
+    }
+
+    #[test]
+    fn permissions_list_with_s_or_a_pattern_keeps_the_system_schemas() {
+        let q = permissions_list_query(None, true, PG18).unwrap();
+        assert!(!q.contains("<> 'pg_catalog'"), "{q}");
+        let q = permissions_list_query(Some("public.t*"), false, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "WHERE c.relkind IN ('r','v','m','S','f','p')\n  \
+                 AND c.relname OPERATOR(pg_catalog.~) '^(t.*)$' COLLATE pg_catalog.default\n  \
+                 AND n.nspname OPERATOR(pg_catalog.~) '^(public)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+        // `psql.sql:1768`-`:1770`.
+        assert_eq!(
+            permissions_list_query(Some("host.regression.public.a_star"), false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): host.regression.public.a_star"
+                    .to_string()
+            ))
+        );
+        assert!(permissions_list_query(Some("regression.public.a_star"), false, PG18).is_ok());
+    }
+
+    #[test]
+    fn default_acls_match_the_schema_or_the_owner_and_never_split_the_name() {
+        let q = list_default_acls_query(None, PG18).unwrap();
+        assert!(
+            q.contains(
+                "  CASE d.defaclobjtype     WHEN 'r' THEN 'table' WHEN 'S' THEN 'sequence' \
+                 WHEN 'f' THEN 'function'    WHEN 'T' THEN 'type' WHEN 'n' THEN 'schema' \
+                 WHEN 'L' THEN 'large object' END AS \"Type\",\n  CASE WHEN"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace\n\
+                 ORDER BY 1, 2, 3;"
+            ),
+            "{q}"
+        );
+        let q = list_default_acls_query(Some("Me"), PG18).unwrap();
+        assert!(
+            q.contains(
+                "WHERE (n.nspname OPERATOR(pg_catalog.~) '^(me)$' COLLATE pg_catalog.default\n        \
+                 OR pg_catalog.pg_get_userbyid(d.defaclrole) OPERATOR(pg_catalog.~) '^(me)$' \
+                 COLLATE pg_catalog.default)\nORDER BY"
+            ),
+            "{q}"
+        );
+        // One dot stays in the name; two draw the database check with no
+        // database part to match, and three are too many (`psql.sql:1710`).
+        let q = list_default_acls_query(Some("a.b"), PG18).unwrap();
+        assert!(q.contains("'^(a.b)$'"), "{q}");
+        assert_eq!(
+            list_default_acls_query(Some("{.pg_catalog.pg_class"), PG18),
+            Err(PatternError(
+                "cross-database references are not implemented: {.pg_catalog.pg_class".to_string()
+            ))
+        );
+        assert_eq!(
+            list_default_acls_query(Some("host.regression.pg_catalog.pg_class"), PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): host.regression.pg_catalog.pg_class"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn describe_roles_hides_pg_roles_unless_asked_and_takes_no_dot() {
+        let q = describe_roles_query(None, false, false, PG18).unwrap();
+        assert_eq!(
+            q,
+            "SELECT r.rolname, r.rolsuper, r.rolinherit,\n  \
+             r.rolcreaterole, r.rolcreatedb, r.rolcanlogin,\n  \
+             r.rolconnlimit, r.rolvaliduntil\n, r.rolreplication\n, r.rolbypassrls\n\
+             FROM pg_catalog.pg_roles r\nWHERE r.rolname !~ '^pg_'\nORDER BY 1;"
+        );
+        let q = describe_roles_query(Some("regress_*"), true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "r.rolvaliduntil\n, pg_catalog.shobj_description(r.oid, 'pg_authid') AS description\n\
+                 , r.rolreplication"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "FROM pg_catalog.pg_roles r\n\
+                 WHERE r.rolname OPERATOR(pg_catalog.~) '^(regress_.*)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1;"
+            ),
+            "{q}"
+        );
+        let q = describe_roles_query(None, false, true, PG18).unwrap();
+        assert!(
+            q.ends_with("FROM pg_catalog.pg_roles r\nORDER BY 1;"),
+            "{q}"
+        );
+        // No `rolbypassrls` before 9.5.
+        let v94 = ServerContext {
+            sversion: 90_424,
+            ..PG18
+        };
+        let q = describe_roles_query(None, false, false, v94).unwrap();
+        assert!(!q.contains("rolbypassrls"), "{q}");
+        // `psql.sql:1755`.
+        assert_eq!(
+            describe_roles_query(Some("regression.pg_database_owner"), false, false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): regression.pg_database_owner"
+                    .to_string()
+            ))
+        );
+    }
+
+    /// A `describeRoles()` row: name, super, inherit, createrole, createdb,
+    /// canlogin, connlimit, validuntil, [description,] replication, bypassrls.
+    fn role(fields: &[&'static str]) -> Vec<&'static [u8]> {
+        fields.iter().map(|f| f.as_bytes()).collect()
+    }
+
+    #[test]
+    fn a_role_s_attributes_fold_into_one_cell() {
+        let cells = |fields: &[&'static str], verbose| {
+            describe_roles_row(&role(fields), verbose, 180_006)
+                .into_iter()
+                .map(|c| String::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+        };
+        // `psql.out`'s `\du regress_du_role*`.
+        assert_eq!(
+            cells(&["r0", "f", "t", "f", "f", "f", "-1", "", "f", "f"], false),
+            ["r0", "Cannot login"]
+        );
+        // Everything at once, in upstream's order.
+        assert_eq!(
+            cells(
+                &[
+                    "su",
+                    "t",
+                    "f",
+                    "t",
+                    "t",
+                    "f",
+                    "1",
+                    "2030-01-01 00:00:00+00",
+                    "t",
+                    "t"
+                ],
+                false
+            ),
+            [
+                "su",
+                "Superuser, No inheritance, Create role, Create DB, Cannot login, \
+                 Replication, Bypass RLS\n1 connection\n\
+                 Password valid until 2030-01-01 00:00:00+00"
+            ]
+        );
+        // No flag at all: the limit starts the cell; `+` adds the description
+        // and moves replication and bypassrls one column on.
+        assert_eq!(
+            cells(
+                &["u", "f", "t", "f", "f", "t", "0", "", "a user", "t", "f"],
+                true
+            ),
+            ["u", "Replication\nNo connections", "a user"]
+        );
+        assert_eq!(
+            cells(&["u", "f", "t", "f", "f", "t", "3", "", "", "f", "f"], true),
+            ["u", "3 connections", ""]
+        );
+        assert_eq!(
+            cells(&["u", "f", "t", "f", "f", "t", "-1", "", "f", "f"], false),
+            ["u", ""]
+        );
+        // Before 9.5 there is no bypassrls column to read.
+        assert_eq!(
+            describe_roles_row(
+                &role(&["u", "f", "t", "f", "f", "t", "-1", "", "t"]),
+                false,
+                90_424
+            )[1],
+            b"Replication"
+        );
+    }
+
+    #[test]
+    fn atoi_reads_a_leading_integer() {
+        assert_eq!(atoi(b"-1"), -1);
+        assert_eq!(atoi(b"  +42x"), 42);
+        assert_eq!(atoi(b""), 0);
+        assert_eq!(atoi(b"x1"), 0);
+    }
+
+    #[test]
+    fn db_role_settings_take_a_role_pattern_then_a_database_one() {
+        let q = list_db_role_settings_query(Some("r*"), Some("d*"), PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "LEFT JOIN pg_catalog.pg_roles r ON r.oid = setrole\n\
+                 WHERE r.rolname OPERATOR(pg_catalog.~) '^(r.*)$' COLLATE pg_catalog.default\n  \
+                 AND d.datname OPERATOR(pg_catalog.~) '^(d.*)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+        // A `*` role pattern adds nothing, so the database one opens the WHERE.
+        let q = list_db_role_settings_query(Some("*"), Some("d"), PG18).unwrap();
+        assert!(
+            q.contains("setrole\nWHERE d.datname OPERATOR(pg_catalog.~) '^(d)$'"),
+            "{q}"
+        );
+        // `psql.sql:1775`: either pattern takes no dot.
+        assert_eq!(
+            list_db_role_settings_query(Some("regression.lc_messages"), None, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): regression.lc_messages"
+                    .to_string()
+            ))
+        );
+        assert!(list_db_role_settings_query(Some("r"), Some("a.b"), PG18).is_err());
+        assert_eq!(
+            db_role_settings_not_found(Some("r"), Some("d")),
+            "Did not find any settings for role \"r\" and database \"d\"."
+        );
+        assert_eq!(
+            db_role_settings_not_found(Some("r"), None),
+            "Did not find any settings for role \"r\"."
+        );
+        assert_eq!(
+            db_role_settings_not_found(None, None),
+            "Did not find any settings."
+        );
+    }
+
+    #[test]
+    fn role_grants_before_16_stand_in_for_the_inherit_and_set_options() {
+        let q = describe_role_grants_query(None, false, PG18).unwrap();
+        assert!(
+            q.contains("    CASE WHEN pam.set_option THEN 'SET' END\n  ) AS \"Options\",\n"),
+            "{q}"
+        );
+        assert!(
+            q.ends_with("WHERE m.rolname !~ '^pg_'\nORDER BY 1, 2, 4;\n"),
+            "{q}"
+        );
+        let v15 = ServerContext {
+            sversion: 150_010,
+            ..PG18
+        };
+        let q = describe_role_grants_query(None, true, v15).unwrap();
+        assert!(
+            q.contains(
+                "    CASE WHEN m.rolinherit THEN 'INHERIT' END,\n    'SET'\n  ) AS \"Options\",\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with("(pam.grantor = g.oid)\nORDER BY 1, 2, 4;\n"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn domains_show_their_privileges_and_description_with_plus() {
+        let q = list_domains_query(None, false, false, PG18).unwrap();
+        assert!(!q.contains("pg_description"), "{q}");
+        assert!(
+            q.contains(
+                "r.contype = 'c' ORDER BY r.conname\n       ), ' ') as \"Check\"\n\
+                 FROM pg_catalog.pg_type t\n"
+            ),
+            "{q}"
+        );
+        let q = list_domains_query(Some("s.d"), true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "as \"Check\",\n  CASE WHEN pg_catalog.array_length(t.typacl, 1) = 0 THEN '(none)' \
+                 ELSE pg_catalog.array_to_string(t.typacl, E'\\n') END AS \"Access privileges\",\n       \
+                 d.description as \"Description\"\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "     LEFT JOIN pg_catalog.pg_description d ON d.classoid = t.tableoid \
+                 AND d.objoid = t.oid AND d.objsubid = 0\n\
+                 WHERE t.typtype = 'd'\n  \
+                 AND t.typname OPERATOR(pg_catalog.~) '^(d)$' COLLATE pg_catalog.default\n  \
+                 AND n.nspname OPERATOR(pg_catalog.~) '^(s)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2;"
             ),
             "{q}"
         );

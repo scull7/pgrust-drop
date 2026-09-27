@@ -357,6 +357,42 @@ impl Cluster {
         }
     }
 
+    /// A `psql` command aimed at this cluster through the environment, as
+    /// `PostgreSQL::Test::Cluster::_get_env` (`Cluster.pm:1715`) aims a TAP test's,
+    /// with no arguments yet.
+    pub fn command(&self, psql: &Path) -> Command {
+        let mut command = Command::new(psql);
+        command
+            .env("PGHOST", &self.dir)
+            .env("PGPORT", self.port.to_string())
+            .env("PGUSER", "regress")
+            .env("PGDATABASE", "postgres")
+            .env("LC_ALL", "C")
+            .env_remove("PGOPTIONS")
+            .env_remove("PGSERVICE")
+            .env_remove("PSQLRC");
+        command
+    }
+
+    /// A libpq connection to the cluster's `postgres` database.
+    ///
+    /// # Panics
+    /// When the connection fails.
+    pub fn connect(&self) -> rlibpq::Connection<rlibpq::Stream> {
+        let mut conninfo = rlibpq::conndefaults(&rlibpq::Env::empty());
+        for (key, value) in [
+            ("host", self.dir.display().to_string()),
+            ("port", self.port.to_string()),
+            ("user", "regress".to_string()),
+            ("dbname", "postgres".to_string()),
+        ] {
+            conninfo
+                .set(key.as_bytes(), value.as_bytes())
+                .expect("a conninfo keyword");
+        }
+        rlibpq::Connection::connect(&conninfo).expect("rlibpq connects to the cluster")
+    }
+
     /// The reference `psql` beside `initdb`, if this lane's installation has
     /// one (the Maven bundles `scripts/fetch-ref-binaries.sh` fetches do not).
     pub fn reference_psql(&self) -> Option<PathBuf> {

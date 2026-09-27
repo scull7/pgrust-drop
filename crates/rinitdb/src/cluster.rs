@@ -26,6 +26,10 @@ use crate::wal;
 /// The superuser the template was minted with (`-U postgres`).
 pub const TEMPLATE_SUPERUSER: &str = "postgres";
 
+/// The encoding the template was minted with (`--encoding=UTF8`), as
+/// `pg_encoding_to_char` spells it.
+pub const TEMPLATE_ENCODING: &str = "UTF8";
+
 /// `lc_ctype`'s text search configuration for locale C: `find_matching_ts_config`
 /// over `tsearch_config_languages` (`initdb.c:883`).
 pub const C_TEXT_SEARCH_CONFIG: &str = "english";

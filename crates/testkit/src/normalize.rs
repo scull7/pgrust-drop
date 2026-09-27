@@ -99,12 +99,34 @@ pub const EXTRA_VERSION: Normalizer = Normalizer {
     apply: extra_version,
 };
 
+/// initdb's closing instructions name the `pg_ctl` in the directory initdb
+/// itself was started from, and the reference and the candidate are two
+/// binaries in two directories.
+///
+/// Upstream: `src/bin/initdb/initdb.c:3533`-`:3539` takes `argv[0]`,
+/// canonicalizes it, drops its last component and joins `pg_ctl` on, then
+/// `:3554` prints `    <that> -D <datadir> -l logfile start`.
+///
+/// Only the directory goes: the line must be exactly that shape, the program
+/// must still be named `pg_ctl`, and the `-D` argument and everything after it
+/// are left alone, so a wrong data directory, a wrong quoting of it or a
+/// missing `-l logfile start` still fails. A bare `pg_ctl` (initdb found on
+/// `PATH`) has no directory and is not rewritten.
+pub const PG_CTL_DIRECTORY: Normalizer = Normalizer {
+    name: "pg-ctl-directory",
+    justification: "initdb names the pg_ctl beside its own argv[0] (src/bin/initdb/initdb.c:3533)",
+    apply: pg_ctl_directory,
+};
+
 /// The three nondeterminism normalizers, in the order a psql gate wants them.
 ///
 /// [`EXTRA_VERSION`] is deliberately not one of them: only a gate that runs
 /// `--version` has a line for it to rewrite, and a gate should carry no
 /// normalizer it does not need.
 pub const DEFAULT: [Normalizer; 3] = [TIMING, PID, SYSTEM_IDENTIFIER];
+
+/// Placeholder written in place of the directory of `pg_ctl`.
+pub const PG_CTL_PLACEHOLDER: &str = "<bindir>/pg_ctl";
 
 /// Placeholder written in place of an elapsed time.
 pub const ELAPSED_PLACEHOLDER: &str = "Time: <elapsed>";
@@ -164,6 +186,34 @@ fn system_identifier(text: &str) -> String {
         }
         None => line.to_owned(),
     })
+}
+
+fn pg_ctl_directory(text: &str) -> String {
+    map_lines(text, |line| {
+        strip_pg_ctl_directory(line).unwrap_or_else(|| line.to_owned())
+    })
+}
+
+/// `    <dir>/pg_ctl -D <rest> -l logfile start` with the directory replaced,
+/// and `None` for every other line. The program may be quoted as
+/// `appendShellString` quotes it (`'<dir>/pg_ctl'`).
+fn strip_pg_ctl_directory(line: &str) -> Option<String> {
+    const INDENT: &str = "    ";
+    const TAIL: &str = " -l logfile start";
+    let body = line.strip_prefix(INDENT)?;
+    if body.starts_with(' ') || !body.ends_with(TAIL) {
+        return None;
+    }
+    let (program, rest) = body.split_once(" -D ")?;
+    let unquoted = program
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+        .unwrap_or(program);
+    let directory = unquoted.strip_suffix("/pg_ctl")?;
+    if directory.is_empty() {
+        return None;
+    }
+    Some(format!("{INDENT}{PG_CTL_PLACEHOLDER} -D {rest}"))
 }
 
 fn extra_version(text: &str) -> String {
@@ -402,6 +452,44 @@ mod tests {
                 "{} must cite the upstream source",
                 normalizer.name
             );
+        }
+    }
+    #[test]
+    fn the_pg_ctl_directory_is_replaced_and_the_rest_of_the_line_kept() {
+        let c = "\nSuccess. You can now start the database server using:\n\n    \
+                 /usr/lib/postgresql/18/bin/pg_ctl -D data -l logfile start\n\n";
+        let ours = "\nSuccess. You can now start the database server using:\n\n    \
+                    /work/target/debug/pg_ctl -D data -l logfile start\n\n";
+        assert_eq!(
+            PG_CTL_DIRECTORY.normalize(c),
+            PG_CTL_DIRECTORY.normalize(ours)
+        );
+        assert_eq!(
+            PG_CTL_DIRECTORY.normalize(c),
+            "\nSuccess. You can now start the database server using:\n\n    \
+             <bindir>/pg_ctl -D data -l logfile start\n\n"
+        );
+        assert_eq!(
+            PG_CTL_DIRECTORY.normalize("    '/my bin/pg_ctl' -D 'a b' -l logfile start"),
+            "    <bindir>/pg_ctl -D 'a b' -l logfile start"
+        );
+    }
+
+    #[test]
+    fn a_different_data_directory_or_program_still_differs() {
+        let normalize = |line: &str| PG_CTL_DIRECTORY.normalize(line);
+        assert_ne!(
+            normalize("    /a/pg_ctl -D data -l logfile start"),
+            normalize("    /b/pg_ctl -D other -l logfile start")
+        );
+        for untouched in [
+            "    /a/postgres -D data -l logfile start",
+            "    pg_ctl -D data -l logfile start",
+            "    /a/pg_ctl -D data start",
+            "  /a/pg_ctl -D data -l logfile start",
+            "/a/pg_ctl -D data -l logfile start",
+        ] {
+            assert_eq!(normalize(untouched), untouched);
         }
     }
 }

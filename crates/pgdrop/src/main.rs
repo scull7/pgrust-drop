@@ -13,7 +13,10 @@ fn main() -> ExitCode {
     let mut stderr = std::io::stderr().lock();
     match dispatch::dispatch(&argv) {
         Dispatch::Applet(Applet::Initdb, applet_args) => {
-            rinitdb::run(&applet_args, &mut stdout, &mut stderr)
+            let argv0 = argv
+                .first()
+                .map_or(OsStr::new("initdb"), OsString::as_os_str);
+            rinitdb::run(argv0, &applet_args, &mut stdout, &mut stderr)
         }
         Dispatch::Applet(Applet::Psql, applet_args) => {
             rpsql::run(&applet_args, &mut stdout, &mut stderr)

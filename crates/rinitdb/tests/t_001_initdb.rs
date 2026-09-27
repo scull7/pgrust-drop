@@ -31,12 +31,17 @@ const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
 
 /// Why several gates below are judged on stderr and the exit status only.
 ///
-/// C initdb has already printed its progress ("The files belonging to this
+/// C initdb has already printed its preamble ("The files belonging to this
 /// database system will be owned by …", "creating directory … ok") by the time
-/// it reaches these errors; rinitdb prints that once cluster creation exists.
-/// The diagnostics are finished now, so they are gated now — and the stdout
-/// difference is still rendered and flagged, never dropped (`testkit::Scope`).
-const STDOUT_PENDING: &str = "cluster-creation progress output lands with Linear NAT-379 … NAT-387";
+/// it reaches these errors. rinitdb prints the same lines, and the success
+/// path's stdout is gated in full by `tests/success_output.rs` (NAT-387); but
+/// these gates run in the inherited environment, whose locale C reports and
+/// this port does not consult (`docs/divergences.md`), and a data directory
+/// that is not empty is refused here before the preamble rather than after
+/// it. The stdout difference is still rendered and flagged, never dropped
+/// (`testkit::Scope`).
+const STDOUT_PENDING: &str =
+    "the preamble names the environment's locale, and pre-flight errors precede it here (NAT-387)";
 
 /// Names an existing PostgreSQL 18 data directory, for the round-trip gate on a
 /// machine that has a cluster but not the binaries that made it.
@@ -92,6 +97,28 @@ fn fails_with(argv: &[OsString], expected_stderr: &str) {
     let outcome = testkit::run(Path::new(RINITDB), argv).expect("run rinitdb");
     assert_eq!(outcome.status, Some(1), "{argv:?}");
     assert_eq!(outcome.stdout, Vec::<u8>::new(), "{argv:?}");
+    assert_eq!(
+        outcome.stderr_text(),
+        format!("{expected_stderr}\n"),
+        "{argv:?}"
+    );
+}
+
+/// [`fails_with`] for a failure C reports once PGDATA exists: stdout then
+/// ends with the finished `creating directory` line (`initdb.c:2898`) and
+/// nothing after it.
+fn fails_after_creating(argv: &[OsString], datadir: &Path, expected_stderr: &str) {
+    testkit::command_fails(Path::new(RINITDB), argv);
+    let outcome = testkit::run(Path::new(RINITDB), argv).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(1), "{argv:?}");
+    assert!(
+        outcome.stdout_text().ends_with(&format!(
+            "\n\ncreating directory {} ... ok\n",
+            datadir.display()
+        )),
+        "{argv:?}: {}",
+        outcome.stdout_text()
+    );
     assert_eq!(
         outcome.stderr_text(),
         format!("{expected_stderr}\n"),
@@ -230,8 +257,9 @@ fn existing_nonempty_xlog_directory() {
         OsString::from(&datadir),
     ];
 
-    fails_with(
+    fails_after_creating(
         &argv,
+        &datadir,
         &format!(
             "initdb: error: directory \"{}\" exists but is not empty\n\
              initdb: detail: It contains a lost+found directory, perhaps due to it being a \
@@ -263,8 +291,9 @@ fn relative_xlog_directory_not_allowed() {
         OsString::from(&datadir),
     ];
 
-    fails_with(
+    fails_after_creating(
         &argv,
+        &datadir,
         &format!(
             "initdb: error: WAL directory location must be an absolute path\n\
              initdb: removing data directory \"{}\"",
@@ -1808,7 +1837,13 @@ fn fails_for_invalid_set_option() {
     let (datadir, conf) = (datadir.display(), conf.display());
     let line = appended_line(rinitdb::conf::POSTGRESQL_CONF_SAMPLE);
     assert_eq!(ours.status, Some(1));
-    assert_eq!(ours.stdout_text(), "");
+    // C's stdout stops where its bootstrap backend failed (initdb.c:1554).
+    assert!(
+        ours.stdout_text()
+            .ends_with("creating configuration files ... ok\nrunning bootstrap script ... "),
+        "{}",
+        ours.stdout_text()
+    );
     assert_eq!(
         ours.stderr_text(),
         format!(

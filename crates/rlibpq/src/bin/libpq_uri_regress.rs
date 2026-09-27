@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::process::ExitCode;
 
-use rlibpq::{Env, conndefaults, parse_conninfo, regress_report};
+use rlibpq::{Env, Filesystem, conndefaults, parse_conninfo, regress_report};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -32,7 +32,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let defaults = conndefaults(&Env::from_process());
+    let defaults = conndefaults(&Env::from_process(), &Filesystem);
     let _ = std::io::stdout()
         .lock()
         .write_all(&regress_report(&parsed, &defaults));

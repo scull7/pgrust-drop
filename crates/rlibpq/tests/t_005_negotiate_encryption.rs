@@ -42,7 +42,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rlibpq::conninfo::{Env, parse_conninfo};
-use rlibpq::{Build, Connection, ExecStatus};
+use rlibpq::{Build, Connection, ExecStatus, Filesystem};
 
 mod common;
 
@@ -222,7 +222,8 @@ fn exec_ok(conn: &mut Connection, sql: &str) {
 /// `PQconnectdb(conninfo)`: `Err` carries libpq's message.
 fn connect(conninfo: &str) -> Result<Connection, String> {
     let mut info = parse_conninfo(conninfo.as_bytes()).map_err(|err| err.to_string())?;
-    info.add_defaults(&Env::empty());
+    info.add_defaults(&Env::empty(), &Filesystem)
+        .expect("no service to look up");
     Connection::connect(&info).map_err(|err| err.to_string())
 }
 

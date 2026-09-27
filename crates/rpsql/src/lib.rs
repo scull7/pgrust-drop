@@ -49,7 +49,9 @@ use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
-use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
+use rlibpq::{
+    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, QueryResult, Stream,
+};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
@@ -130,12 +132,20 @@ pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
 }
 
 /// Action: open the connection this session asks for.
+///
+/// `conninfo_array_parse` (`fe-connect.c:6466`, `:6602`), which
+/// `PQconnectdbParams` runs: the keywords first, then the
+/// defaults — a service file, then the environment — for whatever they left
+/// unset, so a failed service lookup is the connection's error.
 fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
-    let mut conninfo = conndefaults(&Env::from_process());
+    let mut conninfo = ConnInfo::new();
     for (key, value) in connection_keywords(session) {
         // Every keyword here is a row of `PQconninfoOptions[]`, so an unknown
         // one is a bug in this function rather than in the command line.
         let _ = conninfo.set(key.as_bytes(), value.as_bytes());
+    }
+    if let Err(err) = conninfo.add_defaults(&Env::from_process(), &Filesystem) {
+        return Err(ConnectionError::from(err).into());
     }
     match Connection::connect(&conninfo) {
         Ok(connection) => Ok(LiveExecutor {

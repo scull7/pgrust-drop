@@ -81,6 +81,15 @@ pub const DEFAULT_PGSOCKET_DIR: &str = "/tmp";
 #[cfg(windows)]
 pub const DEFAULT_PGSOCKET_DIR: &str = "";
 
+/// `SYSCONFDIR`, which `src/port/Makefile:142` writes into `pg_config_paths.h`
+/// from the configure step's `sysconfdir`: `${prefix}/etc` under the default
+/// prefix `/usr/local/pgsql` (`configure:591`, `:966`), left without the `/postgresql`
+/// suffix `src/Makefile.global.in:121`-`:123` adds because the path already
+/// names `pgsql`. `parseServiceInfo` looks for `pg_service.conf` here when
+/// `PGSYSCONFDIR` is unset (`fe-connect.c:5977`). A stock-build constant, as
+/// `DEFAULT_PGSOCKET_DIR` is.
+pub const SYSCONFDIR: &str = "/usr/local/pgsql/etc";
+
 #[cfg(test)]
 mod tests {
     use super::*;

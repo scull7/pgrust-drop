@@ -504,8 +504,8 @@ impl Connection<Stream> {
     /// packet, authenticate, and return once ReadyForQuery arrives.
     ///
     /// The caller is expected to have run `ConnInfo::add_defaults` already —
-    /// `conndefaults(&Env::from_process())` is what `PQconnectdb` does with
-    /// the environment.
+    /// `add_defaults(&Env::from_process(), &Filesystem)` is what
+    /// `PQconnectdb` does with the environment and the service files.
     ///
     /// # Errors
     /// An encryption option this build refuses (`sslmode=require` without
@@ -1480,7 +1480,11 @@ mod tests {
 
     fn conninfo(s: &str) -> ConnInfo {
         let mut info = parse_conninfo(s.as_bytes()).unwrap();
-        info.add_defaults(&Env::empty().with("USER", "alice"));
+        info.add_defaults(
+            &Env::empty().with("USER", "alice"),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         info
     }
 

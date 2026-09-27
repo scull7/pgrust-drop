@@ -7,7 +7,8 @@
 //!
 //! What is here so far is the connection-string front end
 //! (`PQconninfoOptions[]` and the two parsers that fill a working copy of it,
-//! proved against `t/001_uri.pl`) and the protocol version 3 core: the wire
+//! proved against `t/001_uri.pl`, and the connection service files that fill
+//! in its defaults, proved against `t/006_service.pl`) and the protocol version 3 core: the wire
 //! messages, the authentication methods a build without TLS or GSSAPI can do
 //! (trust, password, md5, SCRAM-SHA-256), and a `Connection` that runs simple
 //! queries and the extended-query commands, blocking (`PQexec`,
@@ -54,6 +55,7 @@ pub mod pipeline;
 pub mod regress;
 pub mod result;
 pub mod scram;
+pub mod service;
 pub mod sha256;
 mod text;
 pub mod trace;
@@ -88,6 +90,7 @@ pub use result::{
     ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,
 };
 pub use scram::{Mechanism, ScramClient, ScramError};
+pub use service::{Files, Filesystem, parse_service_file, parse_service_info};
 pub use text::RawText;
 pub use trace::{AuthResponse, Origin, TraceFlags};
 pub use uri::{parse_uri, uri_decode};

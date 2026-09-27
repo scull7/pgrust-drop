@@ -232,12 +232,16 @@ impl<'a> CommandSource<'a> {
 /// `pset.copyStream` (`settings.h:108`): where `\copy` sends a COPY's data
 /// or takes it from, instead of the default places.
 pub enum CopyStream<'a> {
-    /// `NULL`, or a stream that *is* the default place: COPY OUT writes to
-    /// `pset.queryFout` — or to `\g`'s file — and COPY IN reads
-    /// [`CommandSource`]. `\copy … to stdout` and `\copy … from stdin` set
-    /// `copyStream` to those very streams (`copy.c:299`, `:318`), which
-    /// behaves the same in every test upstream makes of it.
+    /// `NULL`, or `\copy … from stdin`'s `pset.cur_cmd_source`
+    /// (`copy.c:299`), which COPY IN reads either way: COPY OUT writes to
+    /// `\g`'s file if there is one, else to `pset.queryFout`, and COPY IN
+    /// reads [`CommandSource`].
     Default,
+    /// `\copy … to stdout`: `pset.queryFout` (`copy.c:318`). Not
+    /// [`Self::Default`], because a `copyStream` is picked before
+    /// `pset.gfname` (`common.c:1955`-`:1966`): a `\g` file left over from
+    /// an earlier `-c` does not catch the data.
+    QueryFout,
     /// `\copy … to pstdout`: psql's own stdout (`copy.c:320`), which is
     /// `pset.queryFout` too unless `-o` or `\o` moved that.
     Stdout,
@@ -865,7 +869,7 @@ fn copy_out(
                 }
             }
         }
-        CopyStream::Default => {
+        CopyStream::Default | CopyStream::QueryFout => {
             let (ok, r) = handle_copy_out(executor, Some(out.query_fout()), pset, stderr);
             (ok, r, true)
         }
@@ -906,7 +910,7 @@ fn copy_in(
         ),
         // A `\copy … to` whose query the server ran as a COPY FROM: C reads
         // a stream opened for writing, which fails.
-        CopyStream::Write(_) => handle_copy_in(
+        CopyStream::Write(_) | CopyStream::QueryFout => handle_copy_in(
             Some(executor),
             &mut std::io::BufReader::new(ReadOnly),
             false,
@@ -2435,6 +2439,45 @@ mod tests {
             String::from_utf8(out).unwrap(),
             " ?column? \n----------\n        1\n(1 row)\n\n"
         );
+    }
+
+    #[test]
+    fn copy_to_stdout_ignores_a_leftover_g_file() {
+        // `psql -c '\g gf' -c '\copy (select 1) to stdout'`: the first
+        // `-c` sends nothing and leaves `gfname` set, but `\copy`'s
+        // `copyStream` is `pset.queryFout` (`copy.c:318`) and is picked
+        // before `gfname` (`common.c:1955`-`:1966`). The data goes to
+        // queryFout, so its status line is suppressed (`common.c:961`).
+        let path = scratch("leftover");
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyOut)],
+            vec![tag("COPY 1")],
+        );
+        server.rows = VecDeque::from([b"1\n".to_vec()]);
+        let mut pset = PsqlSettings {
+            gfname: Some(path.as_os_str().as_encoded_bytes().to_vec()),
+            ..PsqlSettings::default()
+        };
+        let mut input: &[u8] = b"";
+        let mut source = CommandSource::file(&mut input);
+        let mut io = CopyIo {
+            source: &mut source,
+            stream: CopyStream::QueryFout,
+            copy_from_stdin: Some(0),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query_with(
+            &mut server,
+            b"COPY  ( select 1 ) TO STDOUT ",
+            &mut pset,
+            &mut VariableSpace::new(),
+            &mut io,
+            &mut Output::new(&mut out),
+            &mut err,
+        ));
+        assert_eq!(out, b"1\n");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// `SendQuery` after `\g gfname`: success, stdout, stderr, and the

@@ -489,7 +489,8 @@ pub fn do_copy(
         // and stdout is `pset.queryFout`; pstdin is psql's own stdin, which
         // is the command source too when that is stdin, and pstdout is
         // psql's own stdout.
-        CopyFile::Stdio => CopyStream::Default,
+        CopyFile::Stdio if options.from => CopyStream::Default,
+        CopyFile::Stdio => CopyStream::QueryFout,
         CopyFile::PsqlStdio if !options.from => CopyStream::Stdout,
         CopyFile::PsqlStdio if source.is_stdin => CopyStream::Default,
         CopyFile::PsqlStdio => {

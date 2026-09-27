@@ -1,12 +1,17 @@
 //! Port of `src/bin/psql/t/001_basic.pl` (PostgreSQL 18.6), in upstream order.
 //!
-//! Only the server-free assertions exist so far (lines 12-14 and the
-//! `--help=foo` loop at 51-63); the `\copyright`, `\help` and
-//! `\echo :ENCODING` cases need a running cluster, which this environment has
-//! no PostgreSQL 18 to start, and the rest of the file lands with Linear
+//! The server-free assertions (lines 12-14 and the `--help=foo` loop at
+//! 51-63) run everywhere. The cluster cases start a PostgreSQL 18 cluster
+//! from the reference `initdb` and `pg_ctl` (`regress::Cluster`) and run each
+//! stolen assertion through rpsql and, when the lane has one, through C psql
+//! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
+//! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
+//! (lines 86-108) and `\errverbose with no previous error` (159-164). The
+//! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
+//! `\errverbose` cases, and the rest of the file, land with Linear
 //! NAT-400 … NAT-405.
 //!
-//! The byte-diff gate this issue's Acceptance names —
+//! The byte-diff gate NAT-398's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the
 //! reference binary and a server, so it is declared here and prints
 //! `SKIP (flagged, not silent)` when either is missing. It is never narrowed
@@ -15,12 +20,17 @@
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
 
+mod regress;
+
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use testkit::env::Environment;
 use testkit::normalize::EXTRA_VERSION;
+use testkit::pattern::Pattern;
 use testkit::{Gate, reference};
+
+use regress::{Cluster, PsqlOutcome};
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 
@@ -62,6 +72,107 @@ fn psql_help_arg() {
             "psql --help={arg} nothing to stderr"
         );
     }
+}
+
+/// Ports of the cluster cases; each starts its own cluster, so each has its own.
+const TIMING_WITH_SUCCESSFUL_QUERY_PORT: u16 = 55_401;
+const TIMING_WITH_QUERY_ERROR_PORT: u16 = 55_402;
+const ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT: u16 = 55_403;
+
+/// The psql binaries a cluster case runs against: rpsql, and C psql when the
+/// lane's reference installation has one (the skip is flagged otherwise).
+fn every_psql(cluster: &Cluster) -> Vec<PathBuf> {
+    let mut psqls = vec![PathBuf::from(RPSQL)];
+    match cluster.reference_psql() {
+        Some(psql) => psqls.push(psql),
+        None => reference::skip("psql"),
+    }
+    psqls
+}
+
+/// `like($got, qr/…/, $name)` with the pattern's flags written inline.
+fn assert_like(got: &str, pattern: &str, name: &str) {
+    let re = Pattern::new(pattern).expect("a supported pattern");
+    assert!(re.is_match(got), "{name}: {got:?} does not match {pattern}");
+}
+
+/// `unlike($got, qr/…/, $name)`.
+fn assert_unlike(got: &str, pattern: &str, name: &str) {
+    let re = Pattern::new(pattern).expect("a supported pattern");
+    assert!(!re.is_match(got), "{name}: {got:?} matches {pattern}");
+}
+
+/// `psql_like()` — 001_basic.pl:17: exit 0, nothing on stderr, stdout like
+/// the pattern, through every psql in turn.
+fn psql_like(cluster: &Cluster, sql: &str, expected_stdout: &str, test_name: &str) {
+    for psql in every_psql(cluster) {
+        let PsqlOutcome {
+            ret,
+            stdout,
+            stderr,
+        } = cluster.psql(&psql, sql, true);
+        let name = format!("{test_name} ({})", psql.display());
+        assert_eq!(ret, 0, "{name}: exit code 0; stderr {stderr:?}");
+        assert_eq!(stderr, "", "{name}: no stderr");
+        assert_like(&stdout, expected_stdout, &format!("{name}: matches"));
+    }
+}
+
+/// `# test \timing` — 001_basic.pl:86-93.
+#[test]
+fn timing_with_successful_query() {
+    let Some(cluster) = Cluster::start(TIMING_WITH_SUCCESSFUL_QUERY_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "\\timing on\nSELECT 1",
+        "(?m)^1$\n^Time: \\d+[.,]\\d\\d\\d ms",
+        "\\timing with successful query",
+    );
+}
+
+/// `# test \timing with query that fails` — 001_basic.pl:95-108.
+#[test]
+fn timing_with_query_error() {
+    let Some(cluster) = Cluster::start(TIMING_WITH_QUERY_ERROR_PORT) else {
+        return;
+    };
+    for psql in every_psql(&cluster) {
+        let PsqlOutcome { ret, stdout, .. } =
+            cluster.psql(&psql, "\\timing on\nSELECT error", true);
+        let name = |what: &str| format!("\\timing with query error: {what} ({})", psql.display());
+        assert_ne!(ret, 0, "{}", name("query failed"));
+        assert_like(
+            &stdout,
+            "(?m)^Time: \\d+[.,]\\d\\d\\d ms",
+            &name("timing output appears"),
+        );
+        assert_unlike(
+            &stdout,
+            "(?m)^Time: 0[.,]000 ms",
+            &name("timing was updated"),
+        );
+    }
+}
+
+/// `# test \errverbose`, its first case — 001_basic.pl:153-164.
+///
+/// The three cases after it (`:170`-`:210`) need `LINE 1:` and its caret,
+/// which rlibpq does not draw yet (`reportErrorPosition`; see
+/// `docs/divergences.md`), and `FETCH_COUNT` and `\gdesc`; they are NAT-403's
+/// remaining work, not narrowed here.
+#[test]
+fn errverbose_with_no_previous_error() {
+    let Some(cluster) = Cluster::start(ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "SELECT 1;\n\\errverbose",
+        "^1\nThere is no previous error\\.$",
+        "\\errverbose with no previous error",
+    );
 }
 
 /// The Acceptance gate for `--help`, `--help=commands` and `--help=variables`:

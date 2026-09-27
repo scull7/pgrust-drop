@@ -107,7 +107,7 @@ fn atoi(value: &str) -> i32 {
 
 /// `ParseVariableBool(value, name, …)` with a name, which logs its own error
 /// (`variables.c:141`).
-fn parse_bool_named(value: &str, name: &str) -> Result<bool, PsetError> {
+pub(crate) fn parse_bool_named(value: &str, name: &str) -> Result<bool, PsetError> {
     let mut result = false;
     if parse_variable_bool(Some(value), Some(name), &mut result) {
         Ok(result)

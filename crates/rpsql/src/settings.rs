@@ -8,7 +8,7 @@
 //! `\gset`, `\crosstabview` and pipeline fields belong to NAT-402/NAT-403 and
 //! are not declared as dead weight here.
 
-use rlibpq::{ContextVisibility, Verbosity};
+use rlibpq::{ContextVisibility, QueryResult, Verbosity};
 
 /// `DEFAULT_CSV_FIELD_SEP` (`settings.h:14`).
 pub const DEFAULT_CSV_FIELD_SEP: char = ',';
@@ -405,8 +405,16 @@ pub struct PsqlSettings {
     pub lineno: u64,
     /// `stmt_lineno`: line number inside the current statement.
     pub stmt_lineno: u64,
-    /// `timing`
+    /// `timing`: `\timing`'s switch.
     pub timing: bool,
+    /// `last_error_result`: the most recent failed result, for `\errverbose`
+    /// (`ClearOrSaveResult`, `common.c:560`).
+    pub last_error_result: Option<QueryResult>,
+    /// `log_flags & PG_LOG_FLAG_TERSE`. Not a `pset` member upstream but
+    /// `logging.c`'s own global, which psql sets through `pg_logging_config`
+    /// at `startup.c:384`, `:397`, `:462` and `command.c:4970`, `:4979`; it is
+    /// kept here so [`crate::logging`] reads all of its state from one place.
+    pub log_terse: bool,
 
     // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
@@ -472,6 +480,9 @@ impl Default for PsqlSettings {
             lineno: 0,
             stmt_lineno: 1,
             timing: false,
+            last_error_result: None,
+            // `log_flags` starts at 0 (`logging.c:24`).
+            log_terse: false,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,

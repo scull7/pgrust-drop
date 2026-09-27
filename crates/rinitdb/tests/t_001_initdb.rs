@@ -20,11 +20,12 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rinitdb::control::{ControlFile, DataChecksums, SystemIdentifier};
 use testkit::normalize::EXTRA_VERSION;
-use testkit::{Gate, reference};
+use testkit::{Gate, Pattern, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
 
@@ -1223,10 +1224,347 @@ fn sync_method_syncfs() {
     gate_strictly(&argv);
 }
 
+/// Which side of `if ($ENV{with_icu} eq 'yes')` (001_initdb.pl:114) a build
+/// is on. Upstream reads it from the build's configuration
+/// (`src/bin/initdb/Makefile:64`, `src/bin/initdb/meson.build:34`); a
+/// reference binary carries no configuration to read, so it is asked of the
+/// binary itself ([`icu_support`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IcuSupport {
+    /// `with_icu` is `yes`: the cases at 001_initdb.pl:116-190 apply.
+    With,
+    /// `with_icu` is `no`: the `else` case at 001_initdb.pl:194 applies.
+    Without,
+}
+
+/// `[ 'initdb', '--no-sync', '--locale-provider' => 'icu', @rest, $datadir ]`,
+/// the shape every case of the ICU block shares.
+fn icu_argv(rest: &[&str], datadir: &Path) -> Vec<OsString> {
+    let mut argv = args(&["--no-sync", "--locale-provider", "icu"]);
+    argv.extend(args(rest));
+    argv.push(OsString::from(datadir));
+    argv
+}
+
+/// The probe that tells the two builds apart: 'fails for encoding not
+/// supported by ICU' (001_initdb.pl:161). Either build stops inside
+/// `setup_locale_encoding` (`initdb.c:3490`), before
+/// `initialize_data_directory` (`:3506`) creates anything. A build with ICU
+/// stops at the encoding check (`:2786`, `check_icu_locale_encoding`'s
+/// `encoding mismatch`, `:2304`). A build without ICU never gets there:
+/// `setlocales` (`:2687`) runs first and stops in `icu_language_tag`'s `#else`
+/// (`:2362`).
+const ICU_PROBE: [&str; 4] = ["--encoding", "SQL_ASCII", "--icu-locale", "en"];
+
+/// `icu_language_tag`'s `#else` (`initdb.c:2362`): what a build without ICU
+/// writes once a command line reaches ICU.
+const ICU_NOT_SUPPORTED: &str = "initdb: error: ICU is not supported in this build";
+
+/// Pure: read [`ICU_PROBE`]'s outcome. Anything but one of the two known
+/// failures is an error, never a guess.
+fn icu_support_from_probe(outcome: &testkit::CommandOutcome) -> Result<IcuSupport, String> {
+    let stderr = outcome.stderr_text();
+    if outcome.succeeded() {
+        Err(format!("the ICU probe succeeded; stderr: {stderr:?}"))
+    } else if stderr.lines().any(|line| line == ICU_NOT_SUPPORTED) {
+        Ok(IcuSupport::Without)
+    } else if stderr
+        .lines()
+        .any(|line| line == "initdb: error: encoding mismatch")
+    {
+        Ok(IcuSupport::With)
+    } else {
+        Err(format!(
+            "the ICU probe failed with neither `encoding mismatch` nor `{ICU_NOT_SUPPORTED}`; \
+             stderr: {stderr:?}"
+        ))
+    }
+}
+
+/// Action: run [`ICU_PROBE`] through `initdb`.
+fn icu_support(initdb: &Path) -> IcuSupport {
+    let tempdir = TempDir::new("icu-probe");
+    let argv = icu_argv(&ICU_PROBE, &tempdir.join("probe"));
+    let outcome = testkit::run(initdb, &argv).expect("run the ICU probe");
+    icu_support_from_probe(&outcome).unwrap_or_else(|why| panic!("{}: {why}", initdb.display()))
+}
+
+/// Action: the reference `initdb` and its side of the branch, or `None` with
+/// the skip already applied (`reference::find_or_skip`). The probe runs once
+/// per process; every case below asks.
+fn reference_icu() -> Option<(PathBuf, IcuSupport)> {
+    static PROBED: OnceLock<IcuSupport> = OnceLock::new();
+    let initdb = reference::find_or_skip("initdb")?;
+    let support = *PROBED.get_or_init(|| icu_support(&initdb));
+    Some((initdb, support))
+}
+
+/// What rinitdb does with the command line of a case in the ICU block.
+/// rinitdb is a build without ICU (`docs/divergences.md`), so upstream would
+/// never run these cases against it. What a C build without ICU writes for
+/// the same line is pinned instead.
+#[derive(Clone, Copy, Debug)]
+enum OursWithoutIcu {
+    /// It fails with this error before ICU is reached, so a build with ICU
+    /// fails the same way.
+    FailsFirst(&'static str),
+    /// It reaches ICU and stops at [`ICU_NOT_SUPPORTED`].
+    NotSupported,
+}
+
+impl OursWithoutIcu {
+    fn stderr(self) -> &'static str {
+        match self {
+            Self::FailsFirst(error) => error,
+            Self::NotSupported => ICU_NOT_SUPPORTED,
+        }
+    }
+}
+
+/// Pure: whether ours and the reference must agree byte for byte (stderr and
+/// exit status) on an ICU case. They must when the line fails before ICU is
+/// reached, or when the reference is a build without ICU as well. With ICU
+/// on one side only, the two builds are on different sides of
+/// 001_initdb.pl:114 and nothing obliges them to agree.
+fn icu_case_is_byte_diffed(ours: OursWithoutIcu, reference: IcuSupport) -> bool {
+    matches!(ours, OursWithoutIcu::FailsFirst(_)) || reference == IcuSupport::Without
+}
+
+/// One case of the `with_icu` block (001_initdb.pl:114-191).
+///
+/// Ours: rinitdb must fail with exactly `ours.stderr()`.
+///
+/// The reference, when it is built with ICU: the upstream assertion,
+/// `stolen`, runs against it, as upstream runs it against a build with
+/// `with_icu=yes`. When the byte diff does not apply
+/// ([`icu_case_is_byte_diffed`]), that narrowing is printed
+/// `SKIP (flagged, not silent)`. When the reference is built without ICU, the
+/// case does not apply to it either (its `else` case is
+/// `locale_provider_icu_fails_since_no_icu_support`), and the two builds must
+/// then agree byte for byte.
+fn icu_case(argv: &[OsString], ours: OursWithoutIcu, stolen: impl FnOnce(&Path)) {
+    fails_with(argv, ours.stderr());
+
+    let Some((initdb, support)) = reference_icu() else {
+        return;
+    };
+    if support == IcuSupport::With {
+        stolen(&initdb);
+    }
+    if icu_case_is_byte_diffed(ours, support) {
+        gate_diagnostics(argv);
+    } else {
+        reference::announce_skip(&format!(
+            "{}: the byte diff of {argv:?}: the reference initdb at {} is built with ICU and \
+             rinitdb without, so they take different sides of `if ($ENV{{with_icu}} eq 'yes')` \
+             (001_initdb.pl:114). The upstream assertion ran against the reference, and \
+             rinitdb's stderr is pinned to `{ICU_NOT_SUPPORTED}`",
+            reference::SKIP_FLAG,
+            initdb.display()
+        ));
+    }
+}
+
+/// `testkit::command_fails_like` with a pattern that must compile.
+fn fails_like(initdb: &Path, argv: &[OsString], pattern: &str) {
+    let pattern = Pattern::new(pattern).expect("the stolen pattern compiles");
+    testkit::command_fails_like(initdb, argv, &pattern);
+}
+
+/// The two builds tell themselves apart by [`ICU_PROBE`], and rinitdb is on
+/// the side without ICU. This is the claim `docs/divergences.md` makes and
+/// the ICU cases below rely on.
+#[test]
+fn rinitdb_is_a_build_without_icu() {
+    assert_eq!(icu_support(Path::new(RINITDB)), IcuSupport::Without);
+}
+
+/// The probe reading and the byte-diff rule, on hand-made outcomes. No CI
+/// lane has a reference built without ICU, so the `Without` side of the
+/// reference is exercised here only.
+#[test]
+fn the_icu_probe_and_the_byte_diff_rule_read_both_builds() {
+    let failed = |stderr: &str| {
+        testkit::CommandOutcome::new(Some(1), b"stdout\n".to_vec(), stderr.as_bytes().to_vec())
+    };
+    let with = failed(
+        "initdb: error: encoding mismatch\n\
+         initdb: detail: The encoding you selected (SQL_ASCII) is not supported with the ICU \
+         provider.\n",
+    );
+    let without = failed("initdb: error: ICU is not supported in this build\n");
+    assert_eq!(icu_support_from_probe(&with), Ok(IcuSupport::With));
+    assert_eq!(icu_support_from_probe(&without), Ok(IcuSupport::Without));
+    assert!(icu_support_from_probe(&failed("initdb: error: something else\n")).is_err());
+    assert!(icu_support_from_probe(&testkit::CommandOutcome::silent_success()).is_err());
+    // A line that merely mentions the message is not the message.
+    assert!(
+        icu_support_from_probe(&failed(
+            "initdb: error: ICU is not supported in this build, apparently\n"
+        ))
+        .is_err()
+    );
+
+    let first = OursWithoutIcu::FailsFirst("initdb: error: locale must be specified");
+    assert!(icu_case_is_byte_diffed(first, IcuSupport::With));
+    assert!(icu_case_is_byte_diffed(first, IcuSupport::Without));
+    assert!(!icu_case_is_byte_diffed(
+        OursWithoutIcu::NotSupported,
+        IcuSupport::With
+    ));
+    assert!(icu_case_is_byte_diffed(
+        OursWithoutIcu::NotSupported,
+        IcuSupport::Without
+    ));
+}
+
+/// `command_fails_like([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// "$tempdir/data2" ], qr/initdb: error: locale must be specified if provider
+/// is icu/, 'locale provider ICU requires --icu-locale');` — 001_initdb.pl:116.
+///
+/// `setlocales` (`initdb.c:2471`) fails before ICU is reached, so both builds
+/// write the same error and the byte diff always runs.
+#[test]
+fn locale_provider_icu_requires_icu_locale() {
+    let tempdir = TempDir::new("icu-requires-locale");
+    let argv = icu_argv(&[], &tempdir.join("data2"));
+    icu_case(
+        &argv,
+        OursWithoutIcu::FailsFirst("initdb: error: locale must be specified if provider is icu"),
+        |initdb| {
+            fails_like(
+                initdb,
+                &argv,
+                "initdb: error: locale must be specified if provider is icu",
+            );
+        },
+    );
+}
+
+/// `command_ok([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// '--icu-locale' => 'en', "$tempdir/data3" ], 'option --icu-locale');`
+/// — 001_initdb.pl:125.
+#[test]
+fn option_icu_locale() {
+    let tempdir = TempDir::new("icu-locale");
+    let argv = icu_argv(&["--icu-locale", "en"], &tempdir.join("data3"));
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        testkit::command_ok(initdb, &argv);
+    });
+}
+
+/// `command_like([ 'initdb', '--no-sync', '--auth' => 'trust',
+/// '--locale-provider' => 'icu', '--locale' => 'und', '--lc-collate' => 'C',
+/// '--lc-ctype' => 'C', '--lc-messages' => 'C', '--lc-numeric' => 'C',
+/// '--lc-monetary' => 'C', '--lc-time' => 'C', "$tempdir/data4" ],
+/// qr/^\s+default collation:\s+und\n/ms, 'options --locale-provider=icu
+/// --locale=und --lc-*=C');` — 001_initdb.pl:134. Perl's trailing `/ms` is the
+/// leading `(?ms)` here (`testkit::pattern`).
+#[test]
+fn options_locale_provider_icu_locale_und_lc_c() {
+    let tempdir = TempDir::new("icu-und");
+    // Upstream's word order: `--auth` comes before `--locale-provider`.
+    let mut argv = args(&["--no-sync", "--auth", "trust", "--locale-provider", "icu"]);
+    argv.extend(args(&[
+        "--locale",
+        "und",
+        "--lc-collate",
+        "C",
+        "--lc-ctype",
+        "C",
+        "--lc-messages",
+        "C",
+        "--lc-numeric",
+        "C",
+        "--lc-monetary",
+        "C",
+        "--lc-time",
+        "C",
+    ]));
+    argv.push(OsString::from(tempdir.join("data4")));
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        let pattern = Pattern::new(r"(?ms)^\s+default collation:\s+und\n")
+            .expect("the stolen pattern compiles");
+        testkit::command_like(initdb, &argv, &pattern);
+    });
+}
+
+/// `command_fails_like([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// '--icu-locale' => '@colNumeric=lower', "$tempdir/dataX" ], qr/could not
+/// open collator for locale/, 'fails for invalid ICU locale');`
+/// — 001_initdb.pl:151.
+#[test]
+fn fails_for_invalid_icu_locale() {
+    let tempdir = TempDir::new("icu-invalid-locale");
+    let argv = icu_argv(
+        &["--icu-locale", "@colNumeric=lower"],
+        &tempdir.join("dataX"),
+    );
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        fails_like(initdb, &argv, "could not open collator for locale");
+    });
+}
+
+/// `command_fails_like([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// '--encoding' => 'SQL_ASCII', '--icu-locale' => 'en', "$tempdir/dataX" ],
+/// qr/error: encoding mismatch/, 'fails for encoding not supported by ICU');`
+/// — 001_initdb.pl:161. The same command line is [`ICU_PROBE`].
+#[test]
+fn fails_for_encoding_not_supported_by_icu() {
+    let tempdir = TempDir::new("icu-sql-ascii");
+    let argv = icu_argv(&ICU_PROBE, &tempdir.join("dataX"));
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        fails_like(initdb, &argv, "error: encoding mismatch");
+    });
+}
+
+/// `command_fails_like([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// '--icu-locale' => 'nonsense-nowhere', "$tempdir/dataX" ], qr/error: locale
+/// "nonsense-nowhere" has unknown language "nonsense"/, 'fails for nonsense
+/// language');` — 001_initdb.pl:172.
+#[test]
+fn fails_for_nonsense_language() {
+    let tempdir = TempDir::new("icu-nonsense");
+    let argv = icu_argv(
+        &["--icu-locale", "nonsense-nowhere"],
+        &tempdir.join("dataX"),
+    );
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        fails_like(
+            initdb,
+            &argv,
+            r#"error: locale "nonsense-nowhere" has unknown language "nonsense""#,
+        );
+    });
+}
+
+/// `command_fails_like([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
+/// '--icu-locale' => '@colNumeric=lower', "$tempdir/dataX" ], qr/could not
+/// open collator for locale "und-u-kn-lower": U_ILLEGAL_ARGUMENT_ERROR/,
+/// 'fails for invalid collation argument');` — 001_initdb.pl:182. The same
+/// command line as :151, held to the full message.
+#[test]
+fn fails_for_invalid_collation_argument() {
+    let tempdir = TempDir::new("icu-invalid-collation");
+    let argv = icu_argv(
+        &["--icu-locale", "@colNumeric=lower"],
+        &tempdir.join("dataX"),
+    );
+    icu_case(&argv, OursWithoutIcu::NotSupported, |initdb| {
+        fails_like(
+            initdb,
+            &argv,
+            r#"could not open collator for locale "und-u-kn-lower": U_ILLEGAL_ARGUMENT_ERROR"#,
+        );
+    });
+}
+
 /// `command_fails([ 'initdb', '--no-sync', '--locale-provider' => 'icu',
 /// "$tempdir/data2" ], 'locale provider ICU fails since no ICU support');`
 /// — 001_initdb.pl:194, the `$ENV{with_icu} ne 'yes'` branch, which is the one
-/// that applies: rinitdb has no ICU dependency.
+/// that applies: rinitdb has no ICU dependency
+/// (`rinitdb_is_a_build_without_icu`). The ICU block above it runs against a
+/// reference built with ICU.
 ///
 /// `initdb.c:2471` — with no `--locale` and no `--icu-locale`, `datlocale` is
 /// still NULL when `setlocales` checks it, so this fails for a missing locale

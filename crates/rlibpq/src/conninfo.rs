@@ -8,8 +8,9 @@
 //!   same order", `libpq_uri_regress.c:50`).
 //! - [`ConnInfo`] is one working copy of that table (`conninfo_init`,
 //!   `fe-connect.c:6197`), and every parser here is a pure function over bytes.
-//! - [`Env::from_process`] is the only action: reading this process's
-//!   environment so [`conndefaults`] can fill the fallbacks in.
+//! - [`Env::from_process`] is the only action here: reading this process's
+//!   environment so [`conndefaults`] can fill the fallbacks in. The service
+//!   files it may name are read through [`Files`](crate::service::Files).
 
 use std::collections::BTreeMap;
 
@@ -20,6 +21,7 @@ use crate::pg_config::{
     DEFAULT_OPTION, DEFAULT_SSL_MODE, DEFAULT_SSL_NEGOTIATION, DEFAULT_TARGET_SESSION_ATTRS,
     PG_KRB_SRVNAM, SCRAM_MAX_KEY_LEN,
 };
+use crate::service::{Files, parse_service_info};
 use crate::text::RawText;
 use crate::uri;
 
@@ -601,13 +603,35 @@ impl ConnInfo {
             })
     }
 
-    /// `conninfo_add_defaults` (`fe-connect.c:6624`): fill every unset option
-    /// from its environment variable, then its compiled-in default.
+    /// `parseServiceFile`'s assignment (`fe-connect.c:6126`): set row `index`
+    /// unless it already has a value.
+    pub(crate) fn set_if_unset(&mut self, index: usize, value: &[u8]) {
+        if self.values[index].is_none() {
+            self.values[index] = Some(value.into());
+        }
+    }
+
+    /// `conninfo_add_defaults` (`fe-connect.c:6624`) with an error buffer:
+    /// absorb the service file's options (`parseServiceInfo`,
+    /// `fe-connect.c:6636`), then fill every option still unset from its
+    /// environment variable, then its compiled-in default.
     ///
     /// Failure to find a default is not an error upstream either — the value
-    /// just stays NULL — so this returns nothing. The one thing it cannot do
-    /// is `parseServiceInfo`; see `docs/divergences.md` and NAT-393.
-    pub fn add_defaults(&mut self, env: &Env) {
+    /// just stays NULL.
+    ///
+    /// # Errors
+    /// The [`ConnError`] `parseServiceInfo` reported: the service has no
+    /// group in any file, or a file is missing or malformed. Nothing past the
+    /// service lookup is filled in then, as in C.
+    pub fn add_defaults(&mut self, env: &Env, files: &impl Files) -> Result<(), ConnError> {
+        parse_service_info(self, env, files)?;
+        self.add_fallbacks(env);
+        Ok(())
+    }
+
+    /// The rest of `conninfo_add_defaults`, after the service lookup
+    /// (`fe-connect.c:6639`).
+    fn add_fallbacks(&mut self, env: &Env) {
         let mut sslmode_default = None;
         for (index, def) in CONNINFO_OPTIONS.iter().enumerate() {
             if self.values[index].is_some() {
@@ -716,10 +740,15 @@ impl Env {
 
 /// `PQconndefaults` (`fe-connect.c:2193`): a working copy with nothing set,
 /// then all the defaults filled in.
+///
+/// `PQconndefaults` passes `conninfo_add_defaults` no error buffer, so a
+/// service lookup that fails is ignored (`fe-connect.c:2206`, `:6636`): what
+/// it had set stays, and the environment and compiled defaults follow.
 #[must_use]
-pub fn conndefaults(env: &Env) -> ConnInfo {
+pub fn conndefaults(env: &Env, files: &impl Files) -> ConnInfo {
     let mut options = ConnInfo::new();
-    options.add_defaults(env);
+    let _ = parse_service_info(&mut options, env, files);
+    options.add_fallbacks(env);
     options
 }
 
@@ -873,6 +902,9 @@ fn read_quoted_value(buf: &[u8], cp: &mut usize) -> Result<Vec<u8>, ConnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No files at all: every test here that names no service.
+    const NO_FILES: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     /// The keywords of `PQconninfoOptions[]` (`fe-connect.c:200`), in its
     /// order. `libpq_uri_regress` walks the parsed options and the defaults in
@@ -1102,17 +1134,17 @@ mod tests {
 
     #[test]
     fn an_environment_variable_beats_the_compiled_default() {
-        let defaults = conndefaults(&Env::empty().with("PGPORT", "6789"));
+        let defaults = conndefaults(&Env::empty().with("PGPORT", "6789"), &NO_FILES);
         assert_eq!(defaults.get("port"), Some(b"6789".as_slice()));
         assert_eq!(
-            conndefaults(&Env::empty()).get("port"),
+            conndefaults(&Env::empty(), &NO_FILES).get("port"),
             Some(DEF_PGPORT_STR.as_bytes())
         );
     }
 
     #[test]
     fn an_option_with_neither_a_variable_nor_a_default_stays_unset() {
-        let defaults = conndefaults(&Env::empty());
+        let defaults = conndefaults(&Env::empty(), &NO_FILES);
         assert_eq!(defaults.get("host"), None);
         assert_eq!(defaults.get("hostaddr"), None);
         assert_eq!(defaults.get("dbname"), None);
@@ -1122,16 +1154,17 @@ mod tests {
     /// `sslmode=require`; anything else is ignored; `PGSSLMODE` wins over both.
     #[test]
     fn the_deprecated_pgrequiressl_is_read_only_when_pgsslmode_is_absent() {
-        let required = conndefaults(&Env::empty().with("PGREQUIRESSL", "1"));
+        let required = conndefaults(&Env::empty().with("PGREQUIRESSL", "1"), &NO_FILES);
         assert_eq!(required.get("sslmode"), Some(b"require".as_slice()));
 
-        let ignored = conndefaults(&Env::empty().with("PGREQUIRESSL", "0"));
+        let ignored = conndefaults(&Env::empty().with("PGREQUIRESSL", "0"), &NO_FILES);
         assert_eq!(ignored.get("sslmode"), Some(DEFAULT_SSL_MODE.as_bytes()));
 
         let explicit = conndefaults(
             &Env::empty()
                 .with("PGREQUIRESSL", "1")
                 .with("PGSSLMODE", "allow"),
+            &NO_FILES,
         );
         assert_eq!(explicit.get("sslmode"), Some(b"allow".as_slice()));
     }
@@ -1140,10 +1173,13 @@ mod tests {
     /// there to pin.
     #[test]
     fn sslrootcert_system_strengthens_the_default_sslmode_to_verify_full() {
-        let system = conndefaults(&Env::empty().with("PGSSLROOTCERT", "system"));
+        let system = conndefaults(&Env::empty().with("PGSSLROOTCERT", "system"), &NO_FILES);
         assert_eq!(system.get("sslmode"), Some(b"verify-full".as_slice()));
 
-        let other = conndefaults(&Env::empty().with("PGSSLROOTCERT", "/etc/ca.crt"));
+        let other = conndefaults(
+            &Env::empty().with("PGSSLROOTCERT", "/etc/ca.crt"),
+            &NO_FILES,
+        );
         assert_eq!(other.get("sslmode"), Some(DEFAULT_SSL_MODE.as_bytes()));
     }
 
@@ -1155,11 +1191,14 @@ mod tests {
             &Env::empty()
                 .with("PGSSLROOTCERT", "system")
                 .with("PGSSLMODE", "disable"),
+            &NO_FILES,
         );
         assert_eq!(given.get("sslmode"), Some(b"disable".as_slice()));
 
         let mut parsed = parse_conninfo(b"postgresql://host?sslmode=prefer").expect("parses");
-        parsed.add_defaults(&Env::empty().with("PGSSLROOTCERT", "system"));
+        parsed
+            .add_defaults(&Env::empty().with("PGSSLROOTCERT", "system"), &NO_FILES)
+            .expect("no service to look up");
         assert_eq!(parsed.get("sslmode"), Some(b"prefer".as_slice()));
     }
 
@@ -1168,21 +1207,29 @@ mod tests {
     #[test]
     fn the_default_user_comes_from_user_then_logname() {
         assert_eq!(
-            conndefaults(&Env::empty().with("USER", "alice")).get("user"),
+            conndefaults(&Env::empty().with("USER", "alice"), &NO_FILES).get("user"),
             Some(b"alice".as_slice())
         );
         assert_eq!(
-            conndefaults(&Env::empty().with("LOGNAME", "bob")).get("user"),
+            conndefaults(&Env::empty().with("LOGNAME", "bob"), &NO_FILES).get("user"),
             Some(b"bob".as_slice())
         );
         assert_eq!(
-            conndefaults(&Env::empty().with("USER", "alice").with("LOGNAME", "bob")).get("user"),
+            conndefaults(
+                &Env::empty().with("USER", "alice").with("LOGNAME", "bob"),
+                &NO_FILES
+            )
+            .get("user"),
             Some(b"alice".as_slice())
         );
-        assert_eq!(conndefaults(&Env::empty()).get("user"), None);
+        assert_eq!(conndefaults(&Env::empty(), &NO_FILES).get("user"), None);
         // An exported but empty USER is not a user name.
         assert_eq!(
-            conndefaults(&Env::empty().with("USER", "").with("LOGNAME", "bob")).get("user"),
+            conndefaults(
+                &Env::empty().with("USER", "").with("LOGNAME", "bob"),
+                &NO_FILES
+            )
+            .get("user"),
             Some(b"bob".as_slice())
         );
     }
@@ -1190,17 +1237,61 @@ mod tests {
     /// `PGUSER` is `user`'s envvar, so it is consulted before the fallback.
     #[test]
     fn pguser_beats_the_effective_user() {
-        let defaults = conndefaults(&Env::empty().with("USER", "alice").with("PGUSER", "carol"));
+        let defaults = conndefaults(
+            &Env::empty().with("USER", "alice").with("PGUSER", "carol"),
+            &NO_FILES,
+        );
         assert_eq!(defaults.get("user"), Some(b"carol".as_slice()));
     }
 
-    /// See `docs/divergences.md`: `parseServiceInfo` (`fe-connect.c:5929`) is
-    /// NAT-393's, so a service name contributes no defaults here yet.
+    /// The service file fills in before the environment does
+    /// (`fe-connect.c:6636`), so its `host` beats `PGHOST` — the property
+    /// `t/006_service.pl` leans on when its dummy node's `PGHOST` and `PGPORT`
+    /// are in the environment.
     #[test]
-    fn a_service_name_contributes_no_defaults_yet() {
-        let defaults = conndefaults(&Env::empty().with("PGSERVICE", "somewhere"));
+    fn a_service_file_beats_the_environment() {
+        let env = Env::empty()
+            .with("PGSERVICE", "s")
+            .with("PGSERVICEFILE", "/s.conf")
+            .with("PGHOST", "fromenv")
+            .with("PGPORT", "1");
+        let files = BTreeMap::from([(b"/s.conf".to_vec(), b"[s]\nhost=fromfile\n".to_vec())]);
+        let mut options = ConnInfo::new();
+        options
+            .add_defaults(&env, &files)
+            .expect("the service is found");
+        assert_eq!(options.get("host"), Some(b"fromfile".as_slice()));
+        assert_eq!(options.get("port"), Some(b"1".as_slice()));
+        assert_eq!(options.get("service"), Some(b"s".as_slice()));
+    }
+
+    /// With an error buffer, a failed lookup stops `conninfo_add_defaults`
+    /// before any fallback (`fe-connect.c:6636`).
+    #[test]
+    fn a_service_that_is_not_found_is_an_error_for_add_defaults() {
+        let env = Env::empty()
+            .with("PGSERVICEFILE", "/missing.conf")
+            .with("PGPORT", "1");
+        let mut options = parse_conninfo(b"service=s").expect("parses");
+        assert_eq!(
+            options.add_defaults(&env, &NO_FILES),
+            Err(ConnError::ServiceFileNotFound("/missing.conf".into()))
+        );
+        assert_eq!(options.get("port"), None);
+    }
+
+    /// `PQconndefaults` passes no error buffer (`fe-connect.c:2206`), so the
+    /// same failure is ignored and the fallbacks are filled in anyway.
+    #[test]
+    fn conndefaults_ignores_a_service_that_is_not_found() {
+        let defaults = conndefaults(
+            &Env::empty()
+                .with("PGSERVICE", "somewhere")
+                .with("PGPORT", "1"),
+            &NO_FILES,
+        );
         assert_eq!(defaults.get("service"), Some(b"somewhere".as_slice()));
+        assert_eq!(defaults.get("port"), Some(b"1".as_slice()));
         assert_eq!(defaults.get("host"), None);
-        assert_eq!(defaults.get("dbname"), None);
     }
 }

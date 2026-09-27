@@ -81,11 +81,25 @@ pub enum ConnError {
     GssNotCompiledIn(RawText),
     /// `fe-connect.c:4709` — `gssencmode=require` over a Unix socket.
     GssapiOverLocalSocket,
+    /// `fe-connect.c:5989` — no service file read had the named group.
+    ServiceNotFound(RawText),
+    /// `fe-connect.c:6015` — `parseServiceFile` could not open the file.
+    ServiceFileNotFound(RawText),
+    /// `fe-connect.c:6027` — a line filled `fgets`'s 1024-byte buffer.
+    ServiceFileLineTooLong { file: RawText, line: usize },
+    /// `fe-connect.c:6098`, `:6141` — a line in the group with no `=`, or
+    /// whose key is not a conninfo keyword.
+    ServiceFileSyntaxError { file: RawText, line: usize },
+    /// `fe-connect.c:6109` — `service=` inside a service group.
+    NestedServiceSpecification { file: RawText, line: usize },
 }
 
 impl ConnError {
     /// The bytes libpq's error buffer would hold, without the trailing newline
     /// `libpq_append_error` adds (`fe-misc.c:1539`).
+    // One arm per call site, each its format string; splitting the match
+    // would scatter the table without removing an arm.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn message(&self) -> Vec<u8> {
         match self {
@@ -186,6 +200,25 @@ impl ConnError {
             ConnError::GssapiOverLocalSocket => {
                 b"GSSAPI encryption required but it is not supported over a local socket".to_vec()
             }
+            ConnError::ServiceNotFound(service) => {
+                wrap("definition of service \"", service, "\" not found")
+            }
+            ConnError::ServiceFileNotFound(file) => wrap("service file \"", file, "\" not found"),
+            ConnError::ServiceFileLineTooLong { file, line } => wrap(
+                &format!("line {line} too long in service file \""),
+                file,
+                "\"",
+            ),
+            ConnError::ServiceFileSyntaxError { file, line } => wrap(
+                "syntax error in service file \"",
+                file,
+                &format!("\", line {line}"),
+            ),
+            ConnError::NestedServiceSpecification { file, line } => wrap(
+                "nested service specifications not supported in service file \"",
+                file,
+                &format!("\", line {line}"),
+            ),
         }
     }
 }
@@ -300,6 +333,45 @@ mod tests {
             .to_string(),
             "invalid integer value \"abc\" for connection option \"port\""
         );
+    }
+
+    /// The five `parseServiceInfo` / `parseServiceFile` messages
+    /// (`fe-connect.c:5989`, `:6015`, `:6027`, `:6098`, `:6109`); the first
+    /// two are the ones `t/006_service.pl:76`, `:100` match.
+    #[test]
+    fn the_service_messages_are_the_ones_parse_service_file_appends() {
+        let file: RawText = "/etc/pg_service.conf".into();
+        let cases: [(ConnError, &str); 5] = [
+            (
+                ConnError::ServiceNotFound("undefined-service".into()),
+                "definition of service \"undefined-service\" not found",
+            ),
+            (
+                ConnError::ServiceFileNotFound(file.clone()),
+                "service file \"/etc/pg_service.conf\" not found",
+            ),
+            (
+                ConnError::ServiceFileLineTooLong {
+                    file: file.clone(),
+                    line: 3,
+                },
+                "line 3 too long in service file \"/etc/pg_service.conf\"",
+            ),
+            (
+                ConnError::ServiceFileSyntaxError {
+                    file: file.clone(),
+                    line: 4,
+                },
+                "syntax error in service file \"/etc/pg_service.conf\", line 4",
+            ),
+            (
+                ConnError::NestedServiceSpecification { file, line: 5 },
+                "nested service specifications not supported in service file \"/etc/pg_service.conf\", line 5",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     /// `libpq_append_error` appends the newline, not the format string

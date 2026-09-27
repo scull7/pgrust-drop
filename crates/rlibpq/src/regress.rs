@@ -49,7 +49,8 @@ mod tests {
 
     fn report(conninfo: &[u8], env: &Env) -> String {
         let parsed = parse_conninfo(conninfo).expect("parses");
-        String::from_utf8(regress_report(&parsed, &conndefaults(env))).expect("ascii")
+        let defaults = conndefaults(env, &std::collections::BTreeMap::new());
+        String::from_utf8(regress_report(&parsed, &defaults)).expect("ascii")
     }
 
     #[test]

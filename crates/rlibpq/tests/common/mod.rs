@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rlibpq::conninfo::{Env, parse_conninfo};
-use rlibpq::{Connection, ExecStatus, QueryResult, TraceFlags};
+use rlibpq::{Connection, ExecStatus, Filesystem, QueryResult, TraceFlags};
 use testkit::reference;
 
 /// The three C tools a live gate needs.
@@ -210,7 +210,8 @@ impl Cluster {
 /// `PQconnectdb(conninfo)`, with a failure a test failure.
 fn connect_to(conninfo: &str) -> Connection {
     let mut info = parse_conninfo(conninfo.as_bytes()).expect("conninfo parses");
-    info.add_defaults(&Env::empty());
+    info.add_defaults(&Env::empty(), &Filesystem)
+        .expect("no service to look up");
     Connection::connect(&info).expect("rlibpq connects")
 }
 

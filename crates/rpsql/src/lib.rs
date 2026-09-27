@@ -16,12 +16,16 @@
 //! `prompt.c`), enough of `print.c` to render the default aligned output, and
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
-//! `print.c`. `\d` is NAT-401's and interactive input is NAT-405's.
+//! `print.c`. NAT-405 adds Ctrl-C ([`cancel`], `fe_utils/cancel.c`): a
+//! SIGINT cancels the running query. `\d` is NAT-401's and interactive input
+//! is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
-//! calculation over its inputs, and the only actions are [`connect`] and the
-//! stream writing in [`run`].
+//! calculation over its inputs, and the only actions are [`connect`], the
+//! SIGINT handler in [`cancel`] and the stream writing in [`run`].
 
+// Denied everywhere but `cancel`'s declarations of `signal()`, `write()` and
+// `errno`, which a signal handler cannot do without (ADR-0009).
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
 // allowed here because crate attributes are the only level that outranks that
@@ -30,6 +34,7 @@
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
+pub mod cancel;
 pub mod command;
 pub mod common;
 pub mod help;
@@ -51,7 +56,7 @@ use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
-use crate::mainloop::{Lines, Session as LoopSession, main_loop};
+use crate::mainloop::{LineSource, Lines, ReadLines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
@@ -92,7 +97,13 @@ struct LiveExecutor {
 
 impl Executor for LiveExecutor {
     fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
-        match self.connection.exec(query) {
+        // `SetCancelConn(pset.db)` … `ResetCancelConn()` around the query, as
+        // both `SendQuery` (`common.c:1173`, `:1309`) and `PSQLexec`
+        // (`common.c:686`, `:690`) have it: a Ctrl-C meanwhile cancels it.
+        cancel::set_cancel_conn(self.connection.get_cancel());
+        let outcome = self.connection.exec(query);
+        cancel::reset_cancel_conn();
+        match outcome {
             Ok(results) => Ok(results),
             Err(err) => {
                 self.alive = false;
@@ -210,6 +221,8 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             return ExitCode::from(EXIT_BADCONN);
         }
     };
+    // `startup.c:314`, once the connection is up.
+    cancel::setup_cancel_handler();
 
     // The list is consumed here and never read again, so it moves out rather
     // than being cloned past the `&mut session` the loop needs.
@@ -338,36 +351,45 @@ fn run_action(
                 EXIT_SUCCESS
             }
         }
-        // `ACT_FILE` (`startup.c:418`): `None` is stdin.
-        Action::File(name) => {
-            let read = if let Some(name) = name {
-                std::fs::read(name).map_err(|err| format!("{name}: {err}"))
-            } else {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
-                    .map(|_| bytes)
-                    .map_err(|err| err.to_string())
-            };
-            let input = match read {
+        // `ACT_FILE` (`startup.c:418`): `None` is stdin, read a line at a
+        // time as `MainLoop` asks for it, so a statement runs as soon as it
+        // arrives on a pipe that stays open.
+        Action::File(None) => {
+            let mut source = ReadLines::new(std::io::stdin().lock());
+            let code = run_main_loop(&mut source, session, executor, stdout, stderr);
+            if let Some(err) = source.take_error() {
+                let _ = writeln!(stderr, "psql: error: could not read from input file: {err}");
+            }
+            code
+        }
+        Action::File(Some(name)) => {
+            let input = match std::fs::read(name) {
                 Ok(bytes) => bytes,
-                Err(message) => {
-                    let _ = writeln!(stderr, "psql: error: {message}");
+                Err(err) => {
+                    let _ = writeln!(stderr, "psql: error: {name}: {err}");
                     return EXIT_FAILURE;
                 }
             };
-            let mut loop_session = LoopSession {
-                pset: &mut session.pset,
-                vars: &mut session.vars,
-            };
-            main_loop(
-                &mut Lines::new(&input),
-                &mut loop_session,
-                executor,
-                stdout,
-                stderr,
-            )
+            run_main_loop(&mut Lines::new(&input), session, executor, stdout, stderr)
         }
     }
+}
+
+/// `MainLoop` over `source` in this session, with the process's
+/// `cancel_pressed`.
+fn run_main_loop(
+    source: &mut dyn LineSource,
+    session: &mut Session,
+    executor: &mut LiveExecutor,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    let mut loop_session = LoopSession {
+        pset: &mut session.pset,
+        vars: &mut session.vars,
+        cancel_pressed: &cancel::CANCEL_PRESSED,
+    };
+    main_loop(source, &mut loop_session, executor, stdout, stderr)
 }
 
 #[cfg(test)]

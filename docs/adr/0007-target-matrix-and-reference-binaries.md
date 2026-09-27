@@ -1,7 +1,7 @@
 # ADR-0007: target matrix, libc lanes and reference binaries
 
 Status: accepted (owner decision 2026-09-17); amended 2026-09-18 (CI reference
-source per lane, see below).
+source per lane) and 2026-09-26 (apple and gnu also run on main), see below.
 
 ## Context
 
@@ -132,3 +132,34 @@ back out of the `postgresql.conf` C wrote rather than assuming the stock
 value. And the musl lane's checks run as an unprivileged user (`su -c … ci`, which also gives the gates that user's `HOME`, `USER` and `LOGNAME`)
 because container steps run as root and C `initdb`/`postgres` refuse root — a
 gate that compared two refusals would be green and prove nothing.
+
+## Amendment 2026-09-26: apple and gnu also run on main, and on a schedule
+
+Made for NAT-598 (every lane under five minutes). It reverses one clause of the
+**CI** decision above: `apple` and `gnu` no longer carry
+`if: github.event_name == 'pull_request'`. They still declare `needs: musl`, so
+the lane *order* stands — musl first, the other two only once it is green —
+but all three now run on a push to `main` and on a twice-weekly schedule as
+well as on a pull request.
+
+The reason is the cache, not coverage. Since pgrust arrived (ADR-0001,
+amendment of 2026-09-23) a lane that compiles the ~870-crate tree from scratch
+spends 7–12 minutes; one that restores it from `Swatinem/rust-cache` spends 2–5.
+A pull request can restore only caches saved on its own ref or on `main`. With
+`apple` and `gnu` confined to pull requests, `main` never held a cache for
+either, so the first run of every new pull request built both lanes cold (runs
+35818631322, 35831483351: apple 10m26s–11m12s, gnu 5m10s–7m25s) and then saved
+~600 MB per lane under that pull request's ref, where no other pull request
+could reach it. Running both on `main` gives each lane one cache every pull
+request restores by exact key; a pull request that changes no manifest then
+compiles only the workspace and saves nothing.
+
+The schedule (`cron: '17 5 * * 1,4'`) exists because GitHub evicts a cache that
+nobody has restored for seven days. A scheduled run is on `main`, restores
+`main`'s three caches by exact key, saves nothing, and keeps every gap between
+restores under a week; it is also a twice-weekly canary for runner-image drift.
+
+Costs: an `apple` and a `gnu` run per merge and two per week of each lane.
+The repository is public, so standard runners — macOS included — are not
+billed; a private fork would pay for them. Required checks and their names are
+unchanged.

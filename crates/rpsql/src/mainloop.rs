@@ -3,11 +3,13 @@
 //! `MainLoop()` (`mainloop.c:33`) reads lines, feeds them to the lexer, and
 //! sends a statement whenever the lexer finds a semicolon. This port keeps the
 //! same shape with two substitutions: lines come from a [`LineSource`] rather
-//! than a `FILE *`, and queries go to a [`crate::common::Executor`]. Readline
-//! history and the SIGINT `siglongjmp` belong to NAT-405 and are absent, not
-//! stubbed.
+//! than a `FILE *`, and queries go to a [`crate::common::Executor`]. A Ctrl-C
+//! stops a script (`mainloop.c:88`, through [`Session::cancel_pressed`]);
+//! readline history and the SIGINT `siglongjmp` out of waiting for input are
+//! interactive mode's (NAT-405) and are absent, not stubbed.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{Executor, send_query};
@@ -49,12 +51,59 @@ impl LineSource for Lines {
     }
 }
 
+/// A [`LineSource`] that reads as it goes, one `gets_fromFile` (`input.c:186`)
+/// per line, so that a script on a pipe runs statement by statement while the
+/// pipe is still open — `020_cancel.pl` never closes psql's stdin.
+pub struct ReadLines<R> {
+    reader: R,
+    error: Option<std::io::Error>,
+}
+
+impl<R: BufRead> ReadLines<R> {
+    #[must_use]
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            error: None,
+        }
+    }
+
+    /// The read error that ended the input early, if one did: `gets_fromFile`
+    /// reports it (`input.c:213`-`:215`) and then answers end of file.
+    pub fn take_error(&mut self) -> Option<std::io::Error> {
+        self.error.take()
+    }
+}
+
+impl<R: BufRead> LineSource for ReadLines<R> {
+    fn next_line(&mut self) -> Option<Vec<u8>> {
+        let mut line = Vec::new();
+        match self.reader.read_until(b'\n', &mut line) {
+            Ok(0) => None,
+            Ok(_) => {
+                // Only the one `\n` goes (`input.c:230`).
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                Some(line)
+            }
+            Err(err) => {
+                self.error = Some(err);
+                None
+            }
+        }
+    }
+}
+
 /// The session state `MainLoop` mutates as it goes.
 pub struct Session<'a> {
     /// `pset`
     pub pset: &'a mut PsqlSettings,
     /// `pset.vars`
     pub vars: &'a mut VariableSpace,
+    /// `cancel_pressed` (`common.c:323`): [`crate::cancel::CANCEL_PRESSED`]
+    /// in a live session, a flag of the test's own in a unit test.
+    pub cancel_pressed: &'a AtomicBool,
 }
 
 /// `MainLoop()` (`mainloop.c:33`). Returns the process exit status.
@@ -80,6 +129,16 @@ pub fn main_loop(
     session.pset.stmt_lineno = 1;
 
     'lines: while success_result == EXIT_SUCCESS {
+        // Clean up after a previous Control-C (`mainloop.c:88`-`:100`): it
+        // stops a script, and is forgotten at an interactive prompt.
+        if session.cancel_pressed.load(Ordering::SeqCst) {
+            if !session.pset.cur_cmd_interactive {
+                success_result = EXIT_USER;
+                break;
+            }
+            session.cancel_pressed.store(false, Ordering::SeqCst);
+        }
+
         let Some(line) = source.next_line() else {
             break;
         };
@@ -282,9 +341,11 @@ mod tests {
     fn run(input: &str, pset: PsqlSettings) -> Outcome {
         let mut pset = pset;
         let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(false);
         let mut session = Session {
             pset: &mut pset,
             vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
         };
         let mut executor = Recorder::new();
         let mut stdout = Vec::new();
@@ -358,9 +419,11 @@ mod tests {
         };
         let mut vars = VariableSpace::new();
         vars.set("ON_ERROR_STOP", Some("on")).unwrap();
+        let cancel_pressed = AtomicBool::new(false);
         let mut session = Session {
             pset: &mut pset,
             vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
         };
         let mut executor = Recorder::new();
         executor.fail = vec![false, true, false];
@@ -384,9 +447,11 @@ mod tests {
             ..PsqlSettings::default()
         };
         let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(false);
         let mut session = Session {
             pset: &mut pset,
             vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
         };
         let mut executor = Recorder::new();
         executor.fail = vec![true, false];
@@ -445,6 +510,127 @@ mod tests {
         let out = run("\\set ECHO all\nselect 1;\n", PsqlSettings::default());
         assert!(out.stdout.contains("select 1;"), "{}", out.stdout);
         assert_eq!(out.stderr, "");
+    }
+
+    #[test]
+    fn a_control_c_stops_a_script_before_its_next_line() {
+        // `mainloop.c:88`-`:96`: "You get here if you stopped a script with
+        // Ctrl-C."
+        let mut pset = PsqlSettings::default();
+        let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(true);
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
+        };
+        let mut executor = Recorder::new();
+        let code = main_loop(
+            &mut Lines::new(b"select 1;\nselect 2"),
+            &mut session,
+            &mut executor,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(code, EXIT_USER);
+        assert!(
+            executor.seen.is_empty(),
+            "nothing is sent, not even the unterminated statement at the end: {:?}",
+            executor.seen
+        );
+        assert!(
+            cancel_pressed.load(Ordering::SeqCst),
+            "a script leaves the flag set"
+        );
+    }
+
+    #[test]
+    fn an_interactive_session_forgets_a_control_c_and_reads_on() {
+        // `mainloop.c:99`.
+        let mut pset = PsqlSettings {
+            cur_cmd_interactive: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(true);
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
+        };
+        let mut executor = Recorder::new();
+        let code = main_loop(
+            &mut Lines::new(b"select 1;\n"),
+            &mut session,
+            &mut executor,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        assert_eq!(executor.seen, ["select 1;"]);
+        assert!(!cancel_pressed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reading_as_it_goes_yields_the_lines_reading_it_all_first_does() {
+        for input in [
+            &b""[..],
+            b"\n",
+            b"a",
+            b"a\n",
+            b"a\n\n",
+            b"a\nb",
+            b"a\r\nb\n",
+            b"\n\nselect 1;\n\\q\n",
+        ] {
+            let mut whole = Lines::new(input);
+            let mut streamed = ReadLines::new(input);
+            loop {
+                let (w, s) = (whole.next_line(), streamed.next_line());
+                assert_eq!(w, s, "{:?}", String::from_utf8_lossy(input));
+                if w.is_none() {
+                    break;
+                }
+            }
+            assert!(streamed.take_error().is_none());
+        }
+    }
+
+    #[test]
+    fn reading_as_it_goes_does_not_wait_for_the_end_of_the_input() {
+        /// A reader that has one line and then fails the test if read again:
+        /// a pipe whose writer is still waiting for the answer.
+        struct OneLineThenBlock(Option<&'static [u8]>);
+        impl std::io::Read for OneLineThenBlock {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let line = self.0.take().expect("read past the first line");
+                buf[..line.len()].copy_from_slice(line);
+                Ok(line.len())
+            }
+        }
+        let mut source = ReadLines::new(std::io::BufReader::new(OneLineThenBlock(Some(
+            b"select pg_sleep(180);\n",
+        ))));
+        assert_eq!(
+            source.next_line().as_deref(),
+            Some(&b"select pg_sleep(180);"[..])
+        );
+    }
+
+    #[test]
+    fn a_read_error_ends_the_input_and_is_kept_for_the_report() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+        let mut source = ReadLines::new(std::io::BufReader::new(Broken));
+        assert_eq!(source.next_line(), None);
+        assert_eq!(
+            source.take_error().map(|e| e.to_string()).as_deref(),
+            Some("boom")
+        );
     }
 
     #[test]

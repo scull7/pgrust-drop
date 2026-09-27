@@ -26,7 +26,13 @@
 //! ([`list_publications_query`], `\dRp`; [`describe_publications_query`],
 //! `\dRp+`; [`describe_subscriptions_query`], `\dRs`;
 //! [`list_extensions_query`], `\dx`; [`list_extension_contents_query`],
-//! `\dx+`). Every other command the switch recognizes is refused by name
+//! `\dx+`); and slice 6's single-query listings
+//! ([`describe_tablespaces_query`], `\db`; [`list_conversions_query`], `\dc`;
+//! [`list_casts_query`], `\dC`; [`object_description_query`], `\dd`;
+//! [`list_large_objects_query`], `\dl`; [`list_languages_query`], `\dL`;
+//! [`list_schemas_query`], `\dn`; [`list_collations_query`], `\dO`;
+//! [`list_extended_stats_query`], `\dX`; [`list_event_triggers_query`],
+//! `\dy`). Every other command the switch recognizes is refused by name
 //! until its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
@@ -87,6 +93,26 @@ pub enum DescribeCommand {
     /// `listExtensions()` (`describe.c:6182`): `\dx`, and with `+`
     /// `listExtensionContents()` (`describe.c:6236`).
     Extensions,
+    /// `describeTablespaces()` (`describe.c:222`): `\db`.
+    Tablespaces,
+    /// `listConversions()` (`describe.c:4635`): `\dc`.
+    Conversions,
+    /// `listCasts()` (`describe.c:4959`): `\dC`.
+    Casts,
+    /// `objectDescription()` (`describe.c:1299`): `\dd`.
+    ObjectDescriptions,
+    /// `listLargeObjects()` (`describe.c:7284`): `\dl`.
+    LargeObjects,
+    /// `listLanguages()` (`describe.c:4476`): `\dL`.
+    Languages,
+    /// `listSchemas()` (`describe.c:5206`): `\dn`.
+    Schemas,
+    /// `listCollations()` (`describe.c:5083`): `\dO`.
+    Collations,
+    /// `listExtendedStats()` (`describe.c:4863`): `\dX`.
+    ExtendedStats,
+    /// `listEventTriggers()` (`describe.c:4783`): `\dy`.
+    EventTriggers,
     /// A command the switch recognizes whose port has not landed yet; the
     /// name is its `describe.c` function.
     NotYet(&'static str),
@@ -140,12 +166,12 @@ impl DescribeCommand {
                 _ => None,
             },
             b'a' => Some(Self::Aggregates),
-            b'b' => not_yet("describeTablespaces"),
+            b'b' => Some(Self::Tablespaces),
             b'c' if cmd.starts_with("dconfig") => Some(Self::ConfigurationParameters),
-            b'c' => not_yet("listConversions"),
-            b'C' => not_yet("listCasts"),
+            b'c' => Some(Self::Conversions),
+            b'C' => Some(Self::Casts),
             b'd' if cmd.starts_with("ddp") => Some(Self::DefaultAcls),
-            b'd' => not_yet("objectDescription"),
+            b'd' => Some(Self::ObjectDescriptions),
             b'D' => Some(Self::Domains),
             b'f' => match at(2) {
                 0 | b'+' | b'S' | b'a' | b'n' | b'p' | b't' | b'w' | b'x' => {
@@ -154,11 +180,11 @@ impl DescribeCommand {
                 _ => None,
             },
             b'g' | b'u' => Some(Self::Roles),
-            b'l' => not_yet("listLargeObjects"),
-            b'L' => not_yet("listLanguages"),
-            b'n' => not_yet("listSchemas"),
+            b'l' => Some(Self::LargeObjects),
+            b'L' => Some(Self::Languages),
+            b'n' => Some(Self::Schemas),
             b'o' => Some(Self::Operators),
-            b'O' => not_yet("listCollations"),
+            b'O' => Some(Self::Collations),
             b'p' => Some(Self::Permissions),
             b'P' => match at(2) {
                 0 | b'+' | b't' | b'i' | b'n' | b'x' => {
@@ -193,8 +219,8 @@ impl DescribeCommand {
                 _ => None,
             },
             b'x' => Some(Self::Extensions),
-            b'X' => not_yet("listExtendedStats"),
-            b'y' => not_yet("listEventTriggers"),
+            b'X' => Some(Self::ExtendedStats),
+            b'y' => Some(Self::EventTriggers),
             _ => None,
         }
     }
@@ -2876,6 +2902,711 @@ pub fn describe_subscriptions_query(
     Ok(buf)
 }
 
+/// The query half of `describeTablespaces()` (`describe.c:222`-`:263`), for
+/// `\db`, whose title is "List of tablespaces".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn describe_tablespaces_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT spcname AS \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(spcowner) AS \"Owner\",\n",
+        "  pg_catalog.pg_tablespace_location(oid) AS \"Location\"",
+    ));
+    if verbose {
+        buf.push_str(",\n  ");
+        push_acl_column(&mut buf, "spcacl");
+        buf.push_str(concat!(
+            ",\n  spcoptions AS \"Options\"",
+            ",\n  pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) AS \"Size\"",
+            ",\n  pg_catalog.shobj_description(oid, 'pg_tablespace') AS \"Description\"",
+        ));
+    }
+    buf.push_str("\nFROM pg_catalog.pg_tablespace\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("spcname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The kinds of object `objectDescription()` looks for descriptions of, in
+/// its order (`describe.c:1316`-`:1454`): the branch that selects them, the
+/// filter that hides the system schemas (a `WHERE` of its own, or an `AND`
+/// onto the branch's last clause), whether that filter is how the branch's
+/// `WHERE` begins, and the name column and visibility rule the pattern is
+/// matched against.
+struct DescribedObjects {
+    select: &'static str,
+    starts_where: bool,
+    namevar: &'static str,
+    visibilityrule: &'static str,
+}
+
+/// `objectDescription()`'s six branches (`describe.c:1316`-`:1454`).
+const DESCRIBED_OBJECTS: [DescribedObjects; 6] = [
+    // Table constraint descriptions
+    DescribedObjects {
+        select: concat!(
+            "  SELECT pgc.oid as oid, pgc.tableoid AS tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(pgc.conname AS pg_catalog.text) as name,",
+            "  CAST('table constraint' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_constraint pgc\n",
+            "    JOIN pg_catalog.pg_class c ON c.oid = pgc.conrelid\n",
+            "    LEFT JOIN pg_catalog.pg_namespace n     ON n.oid = c.relnamespace\n",
+        ),
+        starts_where: true,
+        namevar: "pgc.conname",
+        visibilityrule: "pg_catalog.pg_table_is_visible(c.oid)",
+    },
+    // Domain constraint descriptions
+    DescribedObjects {
+        select: concat!(
+            "UNION ALL\n",
+            "  SELECT pgc.oid as oid, pgc.tableoid AS tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(pgc.conname AS pg_catalog.text) as name,",
+            "  CAST('domain constraint' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_constraint pgc\n",
+            "    JOIN pg_catalog.pg_type t ON t.oid = pgc.contypid\n",
+            "    LEFT JOIN pg_catalog.pg_namespace n     ON n.oid = t.typnamespace\n",
+        ),
+        starts_where: true,
+        namevar: "pgc.conname",
+        visibilityrule: "pg_catalog.pg_type_is_visible(t.oid)",
+    },
+    // Operator class descriptions
+    DescribedObjects {
+        select: concat!(
+            "UNION ALL\n",
+            "  SELECT o.oid as oid, o.tableoid as tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(o.opcname AS pg_catalog.text) as name,\n",
+            "  CAST('operator class' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_opclass o\n",
+            "    JOIN pg_catalog.pg_am am ON o.opcmethod = am.oid\n",
+            "    JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace\n",
+        ),
+        starts_where: false,
+        namevar: "o.opcname",
+        visibilityrule: "pg_catalog.pg_opclass_is_visible(o.oid)",
+    },
+    // Operator family descriptions
+    DescribedObjects {
+        select: concat!(
+            "UNION ALL\n",
+            "  SELECT opf.oid as oid, opf.tableoid as tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(opf.opfname AS pg_catalog.text) AS name,\n",
+            "  CAST('operator family' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_opfamily opf\n",
+            "    JOIN pg_catalog.pg_am am ON opf.opfmethod = am.oid\n",
+            "    JOIN pg_catalog.pg_namespace n ON opf.opfnamespace = n.oid\n",
+        ),
+        starts_where: false,
+        namevar: "opf.opfname",
+        visibilityrule: "pg_catalog.pg_opfamily_is_visible(opf.oid)",
+    },
+    // Rule descriptions (ignore rules for views)
+    DescribedObjects {
+        select: concat!(
+            "UNION ALL\n",
+            "  SELECT r.oid as oid, r.tableoid as tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(r.rulename AS pg_catalog.text) as name,",
+            "  CAST('rule' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_rewrite r\n",
+            "       JOIN pg_catalog.pg_class c ON c.oid = r.ev_class\n",
+            "       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n",
+            "  WHERE r.rulename != '_RETURN'\n",
+        ),
+        starts_where: false,
+        namevar: "r.rulename",
+        visibilityrule: "pg_catalog.pg_table_is_visible(c.oid)",
+    },
+    // Trigger descriptions
+    DescribedObjects {
+        select: concat!(
+            "UNION ALL\n",
+            "  SELECT t.oid as oid, t.tableoid as tableoid,\n",
+            "  n.nspname as nspname,\n",
+            "  CAST(t.tgname AS pg_catalog.text) as name,",
+            "  CAST('trigger' AS pg_catalog.text) as object\n",
+            "  FROM pg_catalog.pg_trigger t\n",
+            "       JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid\n",
+            "       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n",
+        ),
+        starts_where: true,
+        namevar: "t.tgname",
+        visibilityrule: "pg_catalog.pg_table_is_visible(c.oid)",
+    },
+];
+
+/// The query half of `objectDescription()` (`describe.c:1299`-`:1460`), for
+/// `\dd`, whose title is "Object descriptions": the descriptions of the
+/// objects no other `\d` command shows them for.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn object_description_query(
+    pattern: Option<&str>,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT DISTINCT tt.nspname AS \"Schema\", tt.name AS \"Name\", ",
+        "tt.object AS \"Object\", d.description AS \"Description\"\n",
+        "FROM (\n",
+    ));
+    let hide_system = !show_system && pattern.is_none();
+    for objects in &DESCRIBED_OBJECTS {
+        buf.push_str(objects.select);
+        if hide_system {
+            buf.push_str(if objects.starts_where {
+                "WHERE n.nspname <> 'pg_catalog'\n"
+            } else {
+                "      AND n.nspname <> 'pg_catalog'\n"
+            });
+            buf.push_str("      AND n.nspname <> 'information_schema'\n");
+        }
+        validate_sql_name_pattern(
+            &mut buf,
+            pattern,
+            !objects.starts_where || hide_system,
+            false,
+            PatternVars {
+                schemavar: Some("n.nspname"),
+                namevar: Some(objects.namevar),
+                altnamevar: None,
+                visibilityrule: Some(objects.visibilityrule),
+            },
+            3,
+            server.sversion,
+            server.db,
+        )?;
+    }
+    buf.push_str(concat!(
+        ") AS tt\n",
+        "  JOIN pg_catalog.pg_description d ON (tt.oid = d.objoid ",
+        "AND tt.tableoid = d.classoid AND d.objsubid = 0)\n",
+        "ORDER BY 1, 2, 3;",
+    ));
+    Ok(buf)
+}
+
+/// The query half of `listLanguages()` (`describe.c:4476`-`:4529`), for
+/// `\dL`, whose title is "List of languages". Without `S` or a pattern, the
+/// internal languages, which have no call handler, are left out.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_languages_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT l.lanname AS \"Name\",\n",
+        "       pg_catalog.pg_get_userbyid(l.lanowner) as \"Owner\",\n",
+        "       l.lanpltrusted AS \"Trusted\"",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            ",\n       NOT l.lanispl AS \"Internal language\",\n",
+            "       l.lanplcallfoid::pg_catalog.regprocedure AS \"Call handler\",\n",
+            "       l.lanvalidator::pg_catalog.regprocedure AS \"Validator\",\n       ",
+            "l.laninline::pg_catalog.regprocedure AS \"Inline handler\",\n       ",
+        ));
+        push_acl_column(&mut buf, "l.lanacl");
+    }
+    buf.push_str(concat!(
+        ",\n       d.description AS \"Description\"",
+        "\nFROM pg_catalog.pg_language l\n",
+        "LEFT JOIN pg_catalog.pg_description d\n",
+        "  ON d.classoid = l.tableoid AND d.objoid = l.oid\n",
+        "  AND d.objsubid = 0\n",
+    ));
+    if pattern.is_some() {
+        validate_sql_name_pattern(
+            &mut buf,
+            pattern,
+            false,
+            false,
+            PatternVars {
+                namevar: Some("l.lanname"),
+                ..PatternVars::default()
+            },
+            2,
+            server.sversion,
+            server.db,
+        )?;
+    }
+    if !show_system && pattern.is_none() {
+        buf.push_str("WHERE l.lanplcallfoid != 0\n");
+    }
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The query half of `listConversions()` (`describe.c:4635`-`:4691`), for
+/// `\dc`, whose title is "List of conversions".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_conversions_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname AS \"Schema\",\n",
+        "       c.conname AS \"Name\",\n",
+        "       pg_catalog.pg_encoding_to_char(c.conforencoding) AS \"Source\",\n",
+        "       pg_catalog.pg_encoding_to_char(c.contoencoding) AS \"Destination\",\n",
+        "       CASE WHEN c.condefault THEN 'yes'\n",
+        "       ELSE 'no' END AS \"Default?\"",
+    ));
+    if verbose {
+        buf.push_str(",\n       d.description AS \"Description\"");
+    }
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_conversion c\n",
+        "     JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "LEFT JOIN pg_catalog.pg_description d ON d.classoid = c.tableoid\n",
+            "          AND d.objoid = c.oid AND d.objsubid = 0\n",
+        ));
+    }
+    buf.push_str("WHERE true\n");
+    if !show_system && pattern.is_none() {
+        buf.push_str("  AND n.nspname <> 'pg_catalog'\n  AND n.nspname <> 'information_schema'\n");
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("c.conname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_conversion_is_visible(c.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listEventTriggers()` (`describe.c:4783`-`:4839`), for
+/// `\dy`, whose title is "List of event triggers".
+///
+/// # Errors
+/// A server before 9.3, or a pattern that failed `validateSQLNamePattern`.
+pub fn list_event_triggers_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    if server.sversion < 90_300 {
+        return Err(does_not_support(server.sversion, "event triggers"));
+    }
+    let mut buf = String::from(concat!(
+        "SELECT evtname as \"Name\", ",
+        "evtevent as \"Event\", ",
+        "pg_catalog.pg_get_userbyid(e.evtowner) as \"Owner\",\n",
+        " case evtenabled when 'O' then 'enabled'",
+        "  when 'R' then 'replica'",
+        "  when 'A' then 'always'",
+        "  when 'D' then 'disabled' end as \"Enabled\",\n",
+        " e.evtfoid::pg_catalog.regproc as \"Function\", ",
+        "pg_catalog.array_to_string(array(select x",
+        " from pg_catalog.unnest(evttags) as t(x)), ', ') as \"Tags\"",
+    ));
+    if verbose {
+        buf.push_str(",\npg_catalog.obj_description(e.oid, 'pg_event_trigger') as \"Description\"");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_event_trigger e ");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("evtname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1");
+    Ok(buf)
+}
+
+/// The query half of `listExtendedStats()` (`describe.c:4863`-`:4937`), for
+/// `\dX`, whose title is "List of extended statistics". Each kind of
+/// statistics is `defined` or null: `STATS_EXT_NDISTINCT`,
+/// `STATS_EXT_DEPENDENCIES` and, from 12, `STATS_EXT_MCV`
+/// (`pg_statistic_ext.h:84`-`:86`).
+///
+/// # Errors
+/// A server before 10, or a pattern that failed `validateSQLNamePattern`.
+pub fn list_extended_stats_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    let sversion = server.sversion;
+    if sversion < 100_000 {
+        return Err(does_not_support(sversion, "extended statistics"));
+    }
+    let mut buf = String::from(concat!(
+        "SELECT \n",
+        "es.stxnamespace::pg_catalog.regnamespace::pg_catalog.text AS \"Schema\", \n",
+        "es.stxname AS \"Name\", \n",
+    ));
+    buf.push_str(if sversion >= 140_000 {
+        concat!(
+            "pg_catalog.format('%s FROM %s', \n",
+            "  pg_catalog.pg_get_statisticsobjdef_columns(es.oid), \n",
+            "  es.stxrelid::pg_catalog.regclass) AS \"Definition\"",
+        )
+    } else {
+        concat!(
+            "pg_catalog.format('%s FROM %s', \n",
+            "  (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname),', ') \n",
+            "   FROM pg_catalog.unnest(es.stxkeys) s(attnum) \n",
+            "   JOIN pg_catalog.pg_attribute a \n",
+            "   ON (es.stxrelid = a.attrelid \n",
+            "   AND a.attnum = s.attnum \n",
+            "   AND NOT a.attisdropped)), \n",
+            "es.stxrelid::pg_catalog.regclass) AS \"Definition\"",
+        )
+    });
+    buf.push_str(concat!(
+        ",\nCASE WHEN 'd' = any(es.stxkind) THEN 'defined' \n",
+        "END AS \"Ndistinct\", \n",
+        "CASE WHEN 'f' = any(es.stxkind) THEN 'defined' \n",
+        "END AS \"Dependencies\"",
+    ));
+    // Include the MCV statistics kind.
+    if sversion >= 120_000 {
+        buf.push_str(",\nCASE WHEN 'm' = any(es.stxkind) THEN 'defined' \nEND AS \"MCV\" ");
+    }
+    buf.push_str(" \nFROM pg_catalog.pg_statistic_ext es \n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            schemavar: Some("es.stxnamespace::pg_catalog.regnamespace::pg_catalog.text"),
+            namevar: Some("es.stxname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_statistics_obj_is_visible(es.oid)"),
+        },
+        3,
+        sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listCasts()` (`describe.c:4959`-`:5055`), for `\dC`,
+/// whose title is "List of casts". A pattern matches the source type or the
+/// target type, by its internal name or by `format_type`'s. The method and
+/// context letters are `COERCION_METHOD_BINARY` and `_INOUT`, and
+/// `COERCION_CODE_EXPLICIT` and `_ASSIGNMENT` (`pg_cast.h:78`-`:91`).
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_casts_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT pg_catalog.format_type(castsource, NULL) AS \"Source type\",\n",
+        "       pg_catalog.format_type(casttarget, NULL) AS \"Target type\",\n",
+        "       CASE WHEN c.castmethod = 'b' THEN '(binary coercible)'\n",
+        "            WHEN c.castmethod = 'i' THEN '(with inout)'\n",
+        "            ELSE p.proname\n",
+        "       END AS \"Function\",\n",
+        "       CASE WHEN c.castcontext = 'e' THEN 'no'\n",
+        "            WHEN c.castcontext = 'a' THEN 'in assignment'\n",
+        "            ELSE 'yes'\n",
+        "       END AS \"Implicit?\"",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            ",\n       CASE WHEN p.proleakproof THEN 'yes'\n",
+            "            ELSE 'no'\n",
+            "       END AS \"Leakproof?\",\n",
+            "       d.description AS \"Description\"",
+        ));
+    }
+    // We need a left join to pg_proc for binary casts; the others are just
+    // paranoia.
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_cast c LEFT JOIN pg_catalog.pg_proc p\n",
+        "     ON c.castfunc = p.oid\n",
+        "     LEFT JOIN pg_catalog.pg_type ts\n",
+        "     ON c.castsource = ts.oid\n",
+        "     LEFT JOIN pg_catalog.pg_namespace ns\n",
+        "     ON ns.oid = ts.typnamespace\n",
+        "     LEFT JOIN pg_catalog.pg_type tt\n",
+        "     ON c.casttarget = tt.oid\n",
+        "     LEFT JOIN pg_catalog.pg_namespace nt\n",
+        "     ON nt.oid = tt.typnamespace\n",
+    ));
+    if verbose {
+        buf.push_str(concat!(
+            "     LEFT JOIN pg_catalog.pg_description d\n",
+            "     ON d.classoid = c.tableoid AND d.objoid = c.oid AND d.objsubid = 0\n",
+        ));
+    }
+    buf.push_str("WHERE ( (true");
+    // Match name pattern against either internal or external name of either
+    // castsource or casttarget.
+    for (schemavar, namevar, altnamevar, visibilityrule) in [
+        (
+            "ns.nspname",
+            "ts.typname",
+            "pg_catalog.format_type(ts.oid, NULL)",
+            "pg_catalog.pg_type_is_visible(ts.oid)",
+        ),
+        (
+            "nt.nspname",
+            "tt.typname",
+            "pg_catalog.format_type(tt.oid, NULL)",
+            "pg_catalog.pg_type_is_visible(tt.oid)",
+        ),
+    ] {
+        validate_sql_name_pattern(
+            &mut buf,
+            pattern,
+            true,
+            false,
+            PatternVars {
+                schemavar: Some(schemavar),
+                namevar: Some(namevar),
+                altnamevar: Some(altnamevar),
+                visibilityrule: Some(visibilityrule),
+            },
+            3,
+            server.sversion,
+            server.db,
+        )?;
+        buf.push_str(if namevar == "ts.typname" {
+            ") OR (true"
+        } else {
+            ") )\nORDER BY 1, 2;"
+        });
+    }
+    Ok(buf)
+}
+
+/// The query half of `listCollations()` (`describe.c:5083`-`:5182`), for
+/// `\dO`, whose title is "List of collations". Before 10 every collation is
+/// libc's; the column positions never move, a server without a column
+/// selecting a stand-in. Only the collations usable in the database's
+/// encoding are listed. The provider letters are `pg_collation.h:70`-`:73`'s.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_collations_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let sversion = server.sversion;
+    let mut buf = String::from("SELECT\n  n.nspname AS \"Schema\",\n  c.collname AS \"Name\",\n");
+    buf.push_str(if sversion >= 100_000 {
+        concat!(
+            "  CASE c.collprovider ",
+            "WHEN 'd' THEN 'default' ",
+            "WHEN 'b' THEN 'builtin' ",
+            "WHEN 'c' THEN 'libc' ",
+            "WHEN 'i' THEN 'icu' ",
+            "END AS \"Provider\",\n",
+        )
+    } else {
+        "  'libc' AS \"Provider\",\n"
+    });
+    buf.push_str("  c.collcollate AS \"Collate\",\n  c.collctype AS \"Ctype\",\n");
+    buf.push_str(if sversion >= 170_000 {
+        "  c.colllocale AS \"Locale\",\n"
+    } else if sversion >= 150_000 {
+        "  c.colliculocale AS \"Locale\",\n"
+    } else {
+        "  c.collcollate AS \"Locale\",\n"
+    });
+    buf.push_str(if sversion >= 160_000 {
+        "  c.collicurules AS \"ICU Rules\",\n"
+    } else {
+        "  NULL AS \"ICU Rules\",\n"
+    });
+    buf.push_str(if sversion >= 120_000 {
+        "  CASE WHEN c.collisdeterministic THEN 'yes' ELSE 'no' END AS \"Deterministic?\""
+    } else {
+        "  'yes' AS \"Deterministic?\""
+    });
+    if verbose {
+        buf.push_str(",\n  pg_catalog.obj_description(c.oid, 'pg_collation') AS \"Description\"");
+    }
+    buf.push_str(concat!(
+        "\nFROM pg_catalog.pg_collation c, pg_catalog.pg_namespace n\n",
+        "WHERE n.oid = c.collnamespace\n",
+    ));
+    if !show_system && pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+    // Hide collations that aren't usable in the current database's encoding.
+    buf.push_str(concat!(
+        "      AND c.collencoding IN (-1, ",
+        "pg_catalog.pg_char_to_encoding(pg_catalog.getdatabaseencoding()))\n",
+    ));
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("c.collname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_collation_is_visible(c.oid)"),
+        },
+        3,
+        sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1, 2;");
+    Ok(buf)
+}
+
+/// The query half of `listSchemas()` (`describe.c:5206`-`:5244`), for `\dn`,
+/// whose title is "List of schemas". Without `S` or a pattern, the system
+/// schemas are left out.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_schemas_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    show_system: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT n.nspname AS \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\"",
+    ));
+    if verbose {
+        buf.push_str(",\n  ");
+        push_acl_column(&mut buf, "n.nspacl");
+        buf.push_str(",\n  pg_catalog.obj_description(n.oid, 'pg_namespace') AS \"Description\"");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_namespace n\n");
+    let hide_system = !show_system && pattern.is_none();
+    if hide_system {
+        buf.push_str("WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'\n");
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        hide_system,
+        false,
+        PatternVars {
+            namevar: Some("n.nspname"),
+            ..PatternVars::default()
+        },
+        2,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The publications `listSchemas()` adds as footers from 15, when there is a
+/// pattern (`describe.c:5253`-`:5266`): those that publish the schema whose
+/// name is the pattern, pasted in as typed, as upstream does.
+#[must_use]
+pub fn schema_publications_query(pattern: Option<&str>, sversion: i32) -> Option<String> {
+    let pattern = pattern.filter(|_| sversion >= 150_000)?;
+    Some(format!(
+        "SELECT pubname \n\
+         FROM pg_catalog.pg_publication p\n     \
+         JOIN pg_catalog.pg_publication_namespace pn ON p.oid = pn.pnpubid\n     \
+         JOIN pg_catalog.pg_namespace n ON n.oid = pn.pnnspid \n\
+         WHERE n.nspname = '{pattern}'\n\
+         ORDER BY 1"
+    ))
+}
+
+/// `listSchemas()`'s footers (`describe.c:5268`-`:5292`): none for no
+/// publication, else "Publications:" and each one's name, quoted.
+#[must_use]
+pub fn schema_publication_footers(pubnames: &[&[u8]]) -> Vec<Vec<u8>> {
+    if pubnames.is_empty() {
+        return Vec::new();
+    }
+    let mut footers = vec![b"Publications:".to_vec()];
+    for name in pubnames {
+        let mut footer = b"    \"".to_vec();
+        footer.extend_from_slice(name);
+        footer.push(b'"');
+        footers.push(footer);
+    }
+    footers
+}
+
+/// The query of `listLargeObjects()` (`describe.c:7284`-`:7308`), for `\dl`,
+/// whose title is "Large objects".
+#[must_use]
+pub fn list_large_objects_query(verbose: bool) -> String {
+    let mut buf = String::from(concat!(
+        "SELECT oid as \"ID\",\n",
+        "  pg_catalog.pg_get_userbyid(lomowner) as \"Owner\",\n  ",
+    ));
+    if verbose {
+        push_acl_column(&mut buf, "lomacl");
+        buf.push_str(",\n  ");
+    }
+    buf.push_str(concat!(
+        "pg_catalog.obj_description(oid, 'pg_largeobject') as \"Description\"\n",
+        "FROM pg_catalog.pg_largeobject_metadata\n",
+        "ORDER BY oid",
+    ));
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3105,12 +3836,12 @@ mod tests {
         assert_eq!(p("dT+", true), Some(DescribeCommand::Types));
         assert_eq!(p("doS", true), Some(DescribeCommand::Operators));
         assert_eq!(
-            p("dc", false),
-            Some(DescribeCommand::NotYet("listConversions"))
+            p("dFp", false),
+            Some(DescribeCommand::NotYet("listTSParsers"))
         );
         assert_eq!(
-            p("dy", false),
-            Some(DescribeCommand::NotYet("listEventTriggers"))
+            p("des", false),
+            Some(DescribeCommand::NotYet("listForeignServers"))
         );
         assert_eq!(p("dx+", false), Some(DescribeCommand::Extensions));
         assert_eq!(p("dRp+x", true), Some(DescribeCommand::Publications));
@@ -3897,7 +4628,7 @@ mod tests {
         // `\dd` without `p` is `objectDescription`; `\dr` needs `ds` or `g`.
         assert_eq!(
             DescribeCommand::parse("dd", false),
-            Some(DescribeCommand::NotYet("objectDescription"))
+            Some(DescribeCommand::ObjectDescriptions)
         );
         assert_eq!(DescribeCommand::parse("drd", true), None);
         assert_eq!(DescribeCommand::parse("dr", true), None);
@@ -4502,5 +5233,307 @@ mod tests {
             publications_not_found(Some("p")),
             "Did not find any publication named \"p\"."
         );
+    }
+
+    #[test]
+    fn the_single_query_listings_parse_to_their_functions() {
+        let p = DescribeCommand::parse;
+        assert_eq!(p("db+", true), Some(DescribeCommand::Tablespaces));
+        assert_eq!(p("dc", false), Some(DescribeCommand::Conversions));
+        assert_eq!(
+            p("dconfig", false),
+            Some(DescribeCommand::ConfigurationParameters)
+        );
+        assert_eq!(p("dconf", false), Some(DescribeCommand::Conversions));
+        assert_eq!(p("dCx", true), Some(DescribeCommand::Casts));
+        assert_eq!(p("ddS", false), Some(DescribeCommand::ObjectDescriptions));
+        assert_eq!(p("ddp", false), Some(DescribeCommand::DefaultAcls));
+        assert_eq!(p("dl+", false), Some(DescribeCommand::LargeObjects));
+        assert_eq!(p("dLS", true), Some(DescribeCommand::Languages));
+        assert_eq!(p("dn+", true), Some(DescribeCommand::Schemas));
+        assert_eq!(p("dO", false), Some(DescribeCommand::Collations));
+        assert_eq!(p("dXx", false), Some(DescribeCommand::ExtendedStats));
+        assert_eq!(p("dy+", false), Some(DescribeCommand::EventTriggers));
+        // `\dl` reads a pattern like every `\d` command, and ignores it.
+        assert_eq!(DescribeCommand::patterns_read("dl", true), 1);
+    }
+
+    #[test]
+    fn the_verbose_tablespace_listing_is_upstreams() {
+        assert_eq!(
+            describe_tablespaces_query(Some("ts"), true, PG18).unwrap(),
+            "SELECT spcname AS \"Name\",\n  \
+             pg_catalog.pg_get_userbyid(spcowner) AS \"Owner\",\n  \
+             pg_catalog.pg_tablespace_location(oid) AS \"Location\",\n  \
+             CASE WHEN pg_catalog.array_length(spcacl, 1) = 0 THEN '(none)' \
+             ELSE pg_catalog.array_to_string(spcacl, E'\\n') END AS \"Access privileges\",\n  \
+             spcoptions AS \"Options\",\n  \
+             pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) AS \"Size\",\n  \
+             pg_catalog.shobj_description(oid, 'pg_tablespace') AS \"Description\"\n\
+             FROM pg_catalog.pg_tablespace\n\
+             WHERE spcname OPERATOR(pg_catalog.~) '^(ts)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1;"
+        );
+        assert_eq!(
+            describe_tablespaces_query(Some("a.b"), false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): a.b".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn object_descriptions_hide_the_system_schemas_by_where_or_by_and() {
+        let q = object_description_query(None, false, PG18).unwrap();
+        // The constraint and trigger branches start their `WHERE` with the
+        // filter; the others add it to a join or a `WHERE` of their own.
+        assert!(
+            q.contains(
+                "    LEFT JOIN pg_catalog.pg_namespace n     ON n.oid = c.relnamespace\n\
+                 WHERE n.nspname <> 'pg_catalog'\n      \
+                 AND n.nspname <> 'information_schema'\n  \
+                 AND pg_catalog.pg_table_is_visible(c.oid)\nUNION ALL\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "    JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace\n      \
+                 AND n.nspname <> 'pg_catalog'\n      \
+                 AND n.nspname <> 'information_schema'\n  \
+                 AND pg_catalog.pg_opclass_is_visible(o.oid)\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                ") AS tt\n  JOIN pg_catalog.pg_description d ON (tt.oid = d.objoid \
+                 AND tt.tableoid = d.classoid AND d.objsubid = 0)\nORDER BY 1, 2, 3;"
+            ),
+            "{q}"
+        );
+        // With `S`, the constraint branch's visibility rule opens its `WHERE`.
+        let q = object_description_query(None, true, PG18).unwrap();
+        assert!(!q.contains("information_schema"), "{q}");
+        assert!(
+            q.contains("ON n.oid = c.relnamespace\nWHERE pg_catalog.pg_table_is_visible(c.oid)\n"),
+            "{q}"
+        );
+        assert_eq!(q.matches("UNION ALL\n").count(), 5);
+    }
+
+    #[test]
+    fn languages_hide_the_internal_ones_only_without_s_or_a_pattern() {
+        let q = list_languages_query(None, false, false, PG18).unwrap();
+        assert!(
+            q.ends_with("  AND d.objsubid = 0\nWHERE l.lanplcallfoid != 0\nORDER BY 1;"),
+            "{q}"
+        );
+        let q = list_languages_query(None, false, true, PG18).unwrap();
+        assert!(q.ends_with("  AND d.objsubid = 0\nORDER BY 1;"), "{q}");
+        let q = list_languages_query(Some("plpgsql"), true, false, PG18).unwrap();
+        assert!(
+            q.contains(
+                "       l.laninline::pg_catalog.regprocedure AS \"Inline handler\",\n       \
+                 CASE WHEN pg_catalog.array_length(l.lanacl, 1) = 0"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "WHERE l.lanname OPERATOR(pg_catalog.~) '^(plpgsql)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1;"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn conversions_and_collations_filter_after_a_where_of_their_own() {
+        let q = list_conversions_query(None, true, false, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "LEFT JOIN pg_catalog.pg_description d ON d.classoid = c.tableoid\n          \
+                 AND d.objoid = c.oid AND d.objsubid = 0\n\
+                 WHERE true\n  AND n.nspname <> 'pg_catalog'\n  \
+                 AND n.nspname <> 'information_schema'\n  \
+                 AND pg_catalog.pg_conversion_is_visible(c.oid)\nORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+        let q = list_collations_query(Some("s.c"), false, false, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "WHERE n.oid = c.collnamespace\n      \
+                 AND c.collencoding IN (-1, \
+                 pg_catalog.pg_char_to_encoding(pg_catalog.getdatabaseencoding()))\n  \
+                 AND c.collname OPERATOR(pg_catalog.~) '^(c)$' COLLATE pg_catalog.default\n  \
+                 AND n.nspname OPERATOR(pg_catalog.~) '^(s)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn a_collation_listing_keeps_its_columns_on_any_server() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        let q = list_collations_query(None, false, false, at(90_600)).unwrap();
+        assert!(
+            q.starts_with(
+                "SELECT\n  n.nspname AS \"Schema\",\n  c.collname AS \"Name\",\n  \
+                 'libc' AS \"Provider\",\n  c.collcollate AS \"Collate\",\n  \
+                 c.collctype AS \"Ctype\",\n  c.collcollate AS \"Locale\",\n  \
+                 NULL AS \"ICU Rules\",\n  'yes' AS \"Deterministic?\"\nFROM"
+            ),
+            "{q}"
+        );
+        // `\dO` has no version floor, so a pre-12 server has no `COLLATE`.
+        assert!(!q.contains("COLLATE pg_catalog.default"), "{q}");
+        let q = list_collations_query(None, true, false, at(150_000)).unwrap();
+        assert!(
+            q.contains(
+                "WHEN 'i' THEN 'icu' END AS \"Provider\",\n  c.collcollate AS \"Collate\",\n  \
+                 c.collctype AS \"Ctype\",\n  c.colliculocale AS \"Locale\",\n  \
+                 NULL AS \"ICU Rules\",\n  CASE WHEN c.collisdeterministic THEN 'yes' \
+                 ELSE 'no' END AS \"Deterministic?\",\n  \
+                 pg_catalog.obj_description(c.oid, 'pg_collation') AS \"Description\"\n"
+            ),
+            "{q}"
+        );
+        let q = list_collations_query(None, false, false, PG18).unwrap();
+        assert!(
+            q.contains("  c.colllocale AS \"Locale\",\n  c.collicurules AS \"ICU Rules\",\n"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn event_triggers_and_extended_statistics_need_their_server() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        assert_eq!(
+            list_event_triggers_query(None, false, at(90_200)),
+            Err(Refusal::ServerTooOld(
+                "The server (version 9.2) does not support event triggers.".to_string()
+            ))
+        );
+        assert_eq!(
+            list_extended_stats_query(None, at(90_600)),
+            Err(Refusal::ServerTooOld(
+                "The server (version 9.6) does not support extended statistics.".to_string()
+            ))
+        );
+        let q = list_event_triggers_query(Some("e"), true, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                ",\npg_catalog.obj_description(e.oid, 'pg_event_trigger') as \"Description\"\n\
+                 FROM pg_catalog.pg_event_trigger e \
+                 WHERE evtname OPERATOR(pg_catalog.~) '^(e)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1"
+            ),
+            "{q}"
+        );
+        // Before 12 there is no MCV column; before 14 the definition is
+        // built from the key columns.
+        let q = list_extended_stats_query(None, at(110_000)).unwrap();
+        assert!(!q.contains("MCV"), "{q}");
+        assert!(
+            q.contains("   AND NOT a.attisdropped)), \nes.stxrelid::pg_catalog.regclass)"),
+            "{q}"
+        );
+        let q = list_extended_stats_query(None, PG18).unwrap();
+        assert!(
+            q.contains(
+                "END AS \"Dependencies\",\nCASE WHEN 'm' = any(es.stxkind) THEN 'defined' \n\
+                 END AS \"MCV\"  \nFROM pg_catalog.pg_statistic_ext es \n\
+                 WHERE pg_catalog.pg_statistics_obj_is_visible(es.oid)\nORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn a_cast_pattern_matches_either_type_by_either_name() {
+        let q = list_casts_query(Some("int8"), false, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "WHERE ( (true  AND (ts.typname OPERATOR(pg_catalog.~) '^(int8)$' \
+                 COLLATE pg_catalog.default\n        \
+                 OR pg_catalog.format_type(ts.oid, NULL) OPERATOR(pg_catalog.~) '^(int8)$' \
+                 COLLATE pg_catalog.default)\n  \
+                 AND pg_catalog.pg_type_is_visible(ts.oid)\n\
+                 ) OR (true  AND (tt.typname OPERATOR(pg_catalog.~) '^(int8)$' \
+                 COLLATE pg_catalog.default\n        \
+                 OR pg_catalog.format_type(tt.oid, NULL) OPERATOR(pg_catalog.~) '^(int8)$' \
+                 COLLATE pg_catalog.default)\n  \
+                 AND pg_catalog.pg_type_is_visible(tt.oid)\n\
+                 ) )\nORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+        let q = list_casts_query(None, true, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "     LEFT JOIN pg_catalog.pg_description d\n     \
+                 ON d.classoid = c.tableoid AND d.objoid = c.oid AND d.objsubid = 0\n\
+                 WHERE ( (true  AND pg_catalog.pg_type_is_visible(ts.oid)\n\
+                 ) OR (true  AND pg_catalog.pg_type_is_visible(tt.oid)\n\
+                 ) )\nORDER BY 1, 2;"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn schemas_list_the_publications_of_the_one_named_from_15() {
+        let q = list_schemas_query(None, false, false, PG18).unwrap();
+        assert!(
+            q.ends_with(
+                "FROM pg_catalog.pg_namespace n\n\
+                 WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'\n\
+                 ORDER BY 1;"
+            ),
+            "{q}"
+        );
+        assert_eq!(
+            list_schemas_query(Some("a.b"), false, false, PG18),
+            Err(PatternError(
+                "cross-database references are not implemented: a.b".to_string()
+            ))
+        );
+        assert_eq!(schema_publications_query(None, 180_000), None);
+        assert_eq!(schema_publications_query(Some("s"), 140_000), None);
+        // The pattern is pasted in as typed, wildcards and all.
+        assert_eq!(
+            schema_publications_query(Some("s*"), 150_000).unwrap(),
+            "SELECT pubname \nFROM pg_catalog.pg_publication p\n     \
+             JOIN pg_catalog.pg_publication_namespace pn ON p.oid = pn.pnpubid\n     \
+             JOIN pg_catalog.pg_namespace n ON n.oid = pn.pnnspid \n\
+             WHERE n.nspname = 's*'\nORDER BY 1"
+        );
+        assert!(schema_publication_footers(&[]).is_empty());
+        assert_eq!(
+            schema_publication_footers(&[b"p1", b"p2"]),
+            vec![
+                b"Publications:".to_vec(),
+                b"    \"p1\"".to_vec(),
+                b"    \"p2\"".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn large_objects_show_their_privileges_with_plus() {
+        assert_eq!(
+            list_large_objects_query(false),
+            "SELECT oid as \"ID\",\n  pg_catalog.pg_get_userbyid(lomowner) as \"Owner\",\n  \
+             pg_catalog.obj_description(oid, 'pg_largeobject') as \"Description\"\n\
+             FROM pg_catalog.pg_largeobject_metadata\nORDER BY oid"
+        );
+        assert!(list_large_objects_query(true).contains(
+            "as \"Owner\",\n  CASE WHEN pg_catalog.array_length(lomacl, 1) = 0 \
+                 THEN '(none)' ELSE pg_catalog.array_to_string(lomacl, E'\\n') END \
+                 AS \"Access privileges\",\n  pg_catalog.obj_description"
+        ));
     }
 }

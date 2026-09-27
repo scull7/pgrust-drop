@@ -333,6 +333,7 @@ const FUNCTIONS_AND_OPERATORS_PORT: u16 = 55_501;
 const FUNCTION_TYPE_OPERATOR_LISTINGS_PORT: u16 = 55_502;
 const ROLES_AND_PRIVILEGES_PORT: u16 = 55_503;
 const PUBLICATIONS_SUBSCRIPTIONS_EXTENSIONS_PORT: u16 = 55_504;
+const SINGLE_QUERY_LISTINGS_PORT: u16 = 55_505;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -1283,6 +1284,264 @@ fn the_publication_subscription_and_extension_listings_match_c_psql() {
         "publication, subscription and extension listings",
         &script,
     );
+}
+
+/// Every line of `psql.sql`'s invalid-name sections (`:1679`-`:1919`) that
+/// names `\db`, `\dc`, `\dC`, `\dd`, `\dL`, `\dn`, `\dO`, `\dX` or `\dy`,
+/// in file order, but for [`INVALID_LISTING_NAMES_IN_REGRESSION`].
+const INVALID_LISTING_NAMES: [&str; 47] = [
+    "\\db nonesuch.pg_default",
+    "\\db regression.pg_default",
+    "\\dc host.regression.public.conversion",
+    "\\dc (.public.conversion",
+    "\\dc nonesuch.public.conversion",
+    "\\dC host.regression.pg_catalog.int8",
+    "\\dC ).pg_catalog.int8",
+    "\\dC nonesuch.pg_catalog.int8",
+    "\\dd host.regression.pg_catalog.pg_class",
+    "\\dd [.pg_catalog.pg_class",
+    "\\dd nonesuch.pg_catalog.pg_class",
+    "\\dL host.regression.plpgsql",
+    "\\dL *.plpgsql",
+    "\\dL nonesuch.plpgsql",
+    "\\dn host.regression.public",
+    "\\dn \"\"\"\".public",
+    "\\dn nonesuch.public",
+    "\\dO host.regression.pg_catalog.POSIX",
+    "\\dO .pg_catalog.POSIX",
+    "\\dO nonesuch.pg_catalog.POSIX",
+    "\\dX host.regression.public.func_deps_stat",
+    "\\dX \"^regression$\".public.func_deps_stat",
+    "\\dX nonesuch.public.func_deps_stat",
+    "\\dy regression.myevt",
+    "\\dy nonesuch.myevt",
+    "\\db \"no.such.tablespace\"",
+    "\\dc \"no.such.conversion\"",
+    "\\dC \"no.such.cast\"",
+    "\\dd \"no.such.object.description\"",
+    "\\dL \"no.such.language\"",
+    "\\dn \"no.such.schema\"",
+    "\\dO \"no.such.collation\"",
+    "\\dX \"no.such.extended.statistics\"",
+    "\\dy \"no.such.event.trigger\"",
+    "\\db \"no.such.schema\".\"no.such.tablespace\"",
+    "\\dc \"no.such.schema\".\"no.such.conversion\"",
+    "\\dC \"no.such.schema\".\"no.such.cast\"",
+    "\\dd \"no.such.schema\".\"no.such.object.description\"",
+    "\\dL \"no.such.schema\".\"no.such.language\"",
+    "\\dO \"no.such.schema\".\"no.such.collation\"",
+    "\\dX \"no.such.schema\".\"no.such.extended.statistics\"",
+    "\\dy \"no.such.schema\".\"no.such.event.trigger\"",
+    "\\dc \"no.such.database\".\"no.such.schema\".\"no.such.conversion\"",
+    "\\dC \"no.such.database\".\"no.such.schema\".\"no.such.cast\"",
+    "\\dd \"no.such.database\".\"no.such.schema\".\"no.such.object.description\"",
+    "\\dO \"no.such.database\".\"no.such.schema\".\"no.such.collation\"",
+    "\\dX \"no.such.database\".\"no.such.schema\".\"no.such.extended.statistics\"",
+];
+
+/// The lines of those sections, for the same commands, that name the
+/// database `regression` in a three-part name (`:1875`-`:1894`).
+/// `psql.out` lists nothing for them, having been connected to
+/// `regression`; a gate cluster's database is `postgres`, so they are
+/// "cross-database references" here, and are gated against C psql only.
+const INVALID_LISTING_NAMES_IN_REGRESSION: &str = "\\dc regression.\"no.such.schema\".\"no.such.conversion\"\n\\dC regression.\"no.such.schema\".\"no.such.cast\"\n\\dd regression.\"no.such.schema\".\"no.such.object.description\"\n\\dO regression.\"no.such.schema\".\"no.such.collation\"\n\\dX regression.\"no.such.schema\".\"no.such.extended.statistics\"\n";
+
+/// The objects [`the_single_query_listings_match_c_psql`] lists: one of each
+/// kind, commented, set up once by rpsql so that both sides see the same
+/// OIDs. The tablespace is in place (`allow_in_place_tablespaces`), so it
+/// needs no directory, and its location names its OID. A publication warns
+/// that `wal_level` is too low, a server notice rpsql does not print yet,
+/// so the setup keeps notices from being sent.
+const SINGLE_QUERY_LISTINGS_SETUP: &str = "set client_min_messages = error;\n\
+    set allow_in_place_tablespaces = on;\n\
+    create tablespace s6_ts location '';\n\
+    comment on tablespace s6_ts is 'in place';\n\
+    create schema s6;\n\
+    comment on schema s6 is 'slice six';\n\
+    grant usage on schema s6 to public;\n\
+    create publication s6_pub for tables in schema s6;\n\
+    create publication s6_pub2 for tables in schema s6;\n\
+    create conversion s6.myconv for 'LATIN1' to 'UTF8' from iso8859_1_to_utf8;\n\
+    comment on conversion s6.myconv is 'latin one';\n\
+    create type s6.c as (a int);\n\
+    create function s6.c_to_int(s6.c) returns int language sql immutable as 'select $1.a';\n\
+    create cast (s6.c as int) with function s6.c_to_int(s6.c) as assignment;\n\
+    create cast (s6.c as text) with inout;\n\
+    comment on cast (s6.c as int) is 'first field';\n\
+    create table s6.t (a int constraint pos check (a > 0), b int);\n\
+    create table s6.st (a int, b int);\n\
+    comment on constraint pos on s6.t is 'positive';\n\
+    create domain s6.d as int constraint dpos check (value > 0);\n\
+    comment on constraint dpos on domain s6.d is 'positive domain';\n\
+    create operator family s6.fam using hash;\n\
+    comment on operator family s6.fam using hash is 'a family';\n\
+    create operator class s6.int4_ops2 for type int4 using btree as \
+    operator 1 <, operator 2 <=, operator 3 =, operator 4 >=, operator 5 >, \
+    function 1 btint4cmp(int4, int4);\n\
+    comment on operator class s6.int4_ops2 using btree is 'a class';\n\
+    create rule r as on insert to s6.t where new.a > 100 do also \
+    insert into s6.st values (new.a, new.b);\n\
+    comment on rule r on s6.t is 'a rule';\n\
+    create function s6.trg() returns trigger language plpgsql as 'begin return new; end';\n\
+    create trigger tg before insert on s6.t for each row execute function s6.trg();\n\
+    comment on trigger tg on s6.t is 'a trigger';\n\
+    select lo_create(4242);\n\
+    select lo_create(4243);\n\
+    comment on large object 4242 is 'a blob';\n\
+    grant select on large object 4242 to public;\n\
+    create collation s6.coll (provider = libc, locale = 'C');\n\
+    create collation s6.posix (provider = libc, lc_collate = 'POSIX', lc_ctype = 'C');\n\
+    comment on collation s6.coll is 'plain C';\n\
+    create statistics s6.st1 (dependencies, ndistinct) on a, b from s6.st;\n\
+    create statistics s6.st2 (mcv) on a, (a + b) from s6.st;\n\
+    create function s6.evt() returns event_trigger language plpgsql as 'begin end';\n\
+    create event trigger s6_evt on ddl_command_start \
+    when tag in ('CREATE TABLE', 'DROP TABLE') execute function s6.evt();\n\
+    alter event trigger s6_evt disable;\n\
+    create event trigger s6_evt2 on sql_drop execute function s6.evt();\n\
+    alter event trigger s6_evt2 enable always;\n\
+    comment on event trigger s6_evt2 is 'on drop';\n";
+
+/// Each listing with and without a pattern, with `+`, `S` and `x`, and with
+/// nothing found, under `ECHO_HIDDEN` so every catalog query is compared
+/// too; then too many dots for each. `\db+` names only the new tablespace,
+/// whose size cannot change between the two runs.
+const SINGLE_QUERY_LISTING_COMMANDS: &str = "\\set QUIET off\n\
+    \\set ECHO_HIDDEN on\n\
+    \\db\n\
+    \\db s6_*\n\
+    \\db+ s6_ts\n\
+    \\dbx s6_ts\n\
+    \\db nonesuch\n\
+    \\dc\n\
+    \\dc+\n\
+    \\dc+ s6.*\n\
+    \\dcS iso_8859_1_*\n\
+    \\dcx myconv\n\
+    \\dC s6.c\n\
+    \\dC+ s6.c\n\
+    \\dC bigint\n\
+    \\dC+ int8\n\
+    \\dC\n\
+    \\dCx s6.*\n\
+    \\dd\n\
+    \\dd s6.*\n\
+    \\dd tg\n\
+    \\ddS\n\
+    \\ddx s6.pos\n\
+    \\dd nonesuch\n\
+    \\dl\n\
+    \\dl+\n\
+    \\dlx\n\
+    \\dl ignored\n\
+    \\dL\n\
+    \\dL+\n\
+    \\dLS\n\
+    \\dLS+ internal\n\
+    \\dLx plpgsql\n\
+    \\dn\n\
+    \\dn+\n\
+    \\dnS\n\
+    \\dn s6\n\
+    \\dn+ s6\n\
+    \\dnx s6\n\
+    \\dn s?\n\
+    \\dn nonesuch\n\
+    \\dO\n\
+    \\dO+ s6.*\n\
+    \\dOS pg_catalog.c*\n\
+    \\dOx s6.coll\n\
+    \\dO nonesuch\n\
+    \\dX\n\
+    \\dX s6.st1\n\
+    \\dXx st2\n\
+    \\dX nonesuch\n\
+    \\dy\n\
+    \\dy+\n\
+    \\dy s6_evt2\n\
+    \\dy+x s6_evt\n\
+    \\dy nonesuch\n\
+    \\set ECHO_HIDDEN off\n\
+    \\db a.b\n\
+    \\dc a.b.c.d\n\
+    \\dC a.b.c.d\n\
+    \\dd a.b.c.d\n\
+    \\dL a.b.c\n\
+    \\dn a.b.c\n\
+    \\dO a.b.c.d\n\
+    \\dX a.b.c.d\n\
+    \\dy a.b\n\
+    \\dn postgres.s6\n\
+    \\dL postgres.plpgsql\n";
+
+/// `\dn`'s "Publications:" footers, which `printQuery` takes from
+/// `opt->footers`, normal and expanded, in every format at borders 0 and 2
+/// and with `tuples_only`. `wrapped` needs a target width this port does not
+/// take from the terminal, hence `\pset columns`.
+fn schema_footers_in_every_format() -> String {
+    let mut script = String::from("\\pset columns 60\n");
+    for format in [
+        "aligned",
+        "wrapped",
+        "unaligned",
+        "csv",
+        "html",
+        "asciidoc",
+        "latex",
+        "latex-longtable",
+        "troff-ms",
+    ] {
+        let _ = writeln!(script, "\\pset format {format}");
+        for settings in [
+            "\\pset border 0\n",
+            "\\pset border 2\n",
+            "\\pset tuples_only on\n",
+        ] {
+            script.push_str(settings);
+            script.push_str("\\dn s6\n\\dnx s6\n\\dn nonesuch\n\\dnx nonesuch\n");
+        }
+        script.push_str("\\pset tuples_only off\n\\pset border 1\n");
+    }
+    script
+}
+
+/// The single-query listings, `NAT-401`'s fifth group: `\db`, `\dc`, `\dC`,
+/// `\dd`, `\dl`, `\dL`, `\dn`, `\dO`, `\dX` and `\dy`.
+///
+/// `psql.sql` names them only in its invalid-name sections (`:1679`-`:1919`),
+/// whose `\dF` and `\de` commands a later slice brings, so those lines are
+/// gated alone ([`only`]), verbatim, against their `psql.out` output and C
+/// psql's. The rest runs against C psql over [`SINGLE_QUERY_LISTINGS_SETUP`]:
+/// [`INVALID_LISTING_NAMES_IN_REGRESSION`],
+/// [`SINGLE_QUERY_LISTING_COMMANDS`], then [`schema_footers_in_every_format`].
+#[test]
+fn the_single_query_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(SINGLE_QUERY_LISTINGS_PORT) else {
+        return;
+    };
+    let (sql, expected) = only(
+        &sections(
+            "-- check describing invalid multipart names",
+            "-- again, but with dotted database and dotted schema qualifications.",
+        ),
+        &INVALID_LISTING_NAMES,
+    );
+    gate_text(
+        &cluster,
+        "psql.sql's invalid \\db, \\dc, \\dC, \\dd, \\dL, \\dn, \\dO, \\dX and \\dy names vs psql.out",
+        &sql,
+        &expected,
+        None,
+    );
+
+    let out = cluster.run_script(Path::new(RPSQL), SINGLE_QUERY_LISTINGS_SETUP);
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+    let script = format!(
+        "{INVALID_LISTING_NAMES_IN_REGRESSION}{SINGLE_QUERY_LISTING_COMMANDS}{}",
+        schema_footers_in_every_format()
+    );
+    diff_against_c_psql(&cluster, "single-query listings", &script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

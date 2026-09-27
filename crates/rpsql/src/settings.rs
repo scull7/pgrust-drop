@@ -379,6 +379,9 @@ pub struct PrintQueryOpt {
     pub null_print: Option<String>,
     /// `title`
     pub title: Option<String>,
+    /// `footers`: override the default `(n rows)` footer, as `listSchemas()`
+    /// does (`print.c:3601`); empty is `NULL`.
+    pub footers: Vec<Vec<u8>>,
 }
 
 /// `PsqlSettings` (`settings.h:101`), minus the fields this port has not

@@ -392,7 +392,10 @@ fn exec_command(
             CommandResult::SkipLine
         }
         // `exec_command_watch()` (`command.c:3370`): the arguments here, the
-        // runs where the query buffer is.
+        // runs where the query buffer is. Every argument has been read by
+        // now, where C reads them one at a time, stops at the first bad one
+        // (`command.c:3398`) and throws the rest away unread (`:290`). No
+        // argument has a side effect until backquotes run (NAT-405).
         "watch" => {
             if ctx.pipeline != PipelineStatus::Off {
                 // `command.c:3384`: refused before any argument is read.

@@ -33,8 +33,9 @@ name: ci
 # build are separate) on a 4-core runner, plus the clone; warm, every lane
 # restores ~/.cargo (registry + git) and target/ from Swatinem/rust-cache and
 # compiles none of it. Budget (NAT-598): every lane under 5 minutes warm. A
-# cold lane cannot meet that on a standard runner -- two build flavours of the
-# pgrust tree are 4-6 minutes of compilation alone -- so the caches are kept
+# cold lane cannot meet that on a standard runner -- clippy and test, two build
+# flavours of the pgrust tree, measured 4-11 minutes of compilation alone
+# (gnu 4m06s, apple 5m43s, musl 6m35s-11m39s) -- so the caches are kept
 # from going cold instead: main saves one per lane, a pull request that does
 # not change a manifest restores it by exact key and saves nothing, and the
 # schedule restores them often enough that GitHub's 7-day eviction never fires.

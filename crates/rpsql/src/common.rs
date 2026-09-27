@@ -6,13 +6,14 @@
 //! runs, and [`crate::print::print_query`], which renders the result.
 
 use std::io::Write;
+use std::num::NonZeroUsize;
 
 use rlibpq::result::diag;
 use rlibpq::{ConnectionError, ExecStatus, QueryResult, ResultError};
 
 use crate::logging::{Level, log};
 use crate::print::print_query;
-use crate::settings::{Echo, PsqlSettings};
+use crate::settings::{Echo, PrintQueryOpt, PsqlSettings};
 use crate::variables::VariableSpace;
 
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
@@ -83,7 +84,15 @@ pub trait Executor {
     /// the notice processor printed it while `PQgetResult` was still parsing.
     /// A *failed query* is a `PGRES_FATAL_ERROR` result, as in libpq; a
     /// broken connection is a final [`Reply::Broken`].
-    fn exec(&mut self, query: &[u8]) -> Vec<Reply>;
+    ///
+    /// With `chunk_rows`, the rows come in `PGRES_TUPLES_CHUNK` results of at
+    /// most that many, then an empty `PGRES_TUPLES_OK`
+    /// (`PQsetChunkedRowsMode`, `fe-exec.c:1982`, right after the send).
+    /// Outside a pipeline libpq cannot refuse that call there
+    /// (`canChangeResultMode`, `fe-exec.c:1942`), so upstream's
+    /// `fetching results in chunked mode failed` (`common.c:1774`) is not
+    /// reachable.
+    fn exec(&mut self, query: &[u8], chunk_rows: Option<NonZeroUsize>) -> Vec<Reply>;
 
     /// `PQprepare(pset.db, "", query, 0, NULL)` (`fe-exec.c:2323`): parse
     /// `query` as the unnamed statement, without running it, and hand back
@@ -420,12 +429,19 @@ fn error_message(
     pset: &PsqlSettings,
 ) -> Vec<u8> {
     match result {
-        Ok(Some(result)) => match result.error() {
-            Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
-            None => result.error_message(),
-        },
+        Ok(Some(result)) => result_error_message(result, pset),
         Ok(None) => Vec::new(),
         Err(err) => err.as_bytes().to_vec(),
+    }
+}
+
+/// `PQresultErrorMessage(result)`: `pqBuildErrorMessage3`'s rendering of
+/// the server's error at the configured verbosity (`fe-protocol3.c:973`), or
+/// libpq's own text for an error it made up.
+fn result_error_message(result: &QueryResult, pset: &PsqlSettings) -> Vec<u8> {
+    match result.error() {
+        Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
+        None => result.error_message(),
     }
 }
 
@@ -516,7 +532,7 @@ fn describe_query(
                     return false;
                 }
             };
-            result = last_result(executor.exec(&sql), pset, stderr);
+            result = last_result(executor.exec(&sql, None), pset, stderr);
             ok = accept_and_report(&result, pset, stderr);
             if ok && let Ok(Some(columns)) = &result {
                 ok = print_query_result(columns, true, executor, pset, vars, stdout, stderr);
@@ -528,6 +544,38 @@ fn describe_query(
 
     set_result_variables(vars, result.ok().flatten().as_ref(), ok);
     ok
+}
+
+/// Whether `ExecQueryAndProcessResults` fetches in chunks, and of how many
+/// rows (`common.c:1769`-`:1775`): under `FETCH_COUNT`, unless
+/// `SHOW_ALL_RESULTS` is off, or `\gexec` or `\gset` needs the whole result.
+/// `\crosstabview` and `\watch`, which upstream also leaves unchunked, are
+/// not ported.
+#[must_use]
+pub fn chunk_rows(pset: &PsqlSettings) -> Option<NonZeroUsize> {
+    let fetch_count = usize::try_from(pset.fetch_count).ok()?;
+    if !pset.show_all_results || pset.gexec_flag || pset.gset_prefix.is_some() {
+        return None;
+    }
+    NonZeroUsize::new(fetch_count)
+}
+
+/// A result `ExecQueryAndProcessResults` holds back until it knows whether
+/// it is the last (`common.c:2164`).
+enum Pending {
+    /// Not handled yet at all.
+    Result(QueryResult),
+    /// The failure that ended a chunked result, already reported
+    /// (`common.c:2108`-`:2116`): only its variables are still to set, and
+    /// only if it is the last.
+    FailedChunks(QueryResult),
+}
+
+/// A chunked result being printed (`common.c:2014`-`:2025`): the print
+/// options for the next chunk and the rows so far.
+struct Chunks {
+    popt: PrintQueryOpt,
+    total_tuples: u64,
 }
 
 /// `ExecQueryAndProcessResults()` (`common.c:1581`).
@@ -542,9 +590,12 @@ fn exec_query_and_process_results(
     // A result is handled only once the next one has been fetched
     // (`common.c:2164`), so every notice parsed up to then is already on
     // stderr: hold each result back until the next result, or the end, is
-    // reached.
+    // reached. A chunk is the exception: it is printed before the next one
+    // is fetched (`common.c:2039`-`:2067`).
     let mut success = true;
-    let mut pending: Option<QueryResult> = None;
+    let mut pending: Option<Pending> = None;
+    let mut chunks: Option<Chunks> = None;
+    let chunk_rows = chunk_rows(pset);
     let mut session = Handling {
         executor,
         pset,
@@ -552,18 +603,32 @@ fn exec_query_and_process_results(
         stdout,
         stderr,
     };
-    for reply in session.executor.exec(query) {
+    for reply in session.executor.exec(query, chunk_rows) {
         match reply {
             Reply::Notice(notice) => notice_processor(&notice, session.pset, session.stderr),
+            Reply::Result(result) if result.status() == ExecStatus::TuplesChunk => {
+                if let Some(previous) = pending.take() {
+                    success = session.handle(previous, false, success);
+                }
+                let chunks = chunks.get_or_insert_with(|| Chunks::new(&session.pset.popt));
+                success = session.print_chunk(chunks, &result, success);
+            }
             Reply::Result(result) => {
                 if let Some(previous) = pending.take() {
-                    success = session.handle_result(&previous, false, success);
+                    success = session.handle(previous, false, success);
                 }
-                pending = Some(result);
+                pending = match chunks.take() {
+                    Some(chunks) => {
+                        let ended;
+                        (ended, success) = session.end_chunks(chunks, result, success);
+                        ended
+                    }
+                    None => Some(Pending::Result(result)),
+                };
             }
             Reply::Broken(err) => {
                 if let Some(previous) = pending.take() {
-                    let _ = session.handle_result(&previous, false, success);
+                    let _ = session.handle(previous, false, success);
                 }
                 let _ = session.stderr.write_all(&err.rendered());
                 set_result_variables(session.vars, None, false);
@@ -572,9 +637,23 @@ fn exec_query_and_process_results(
         }
     }
     if let Some(last) = pending {
-        success = session.handle_result(&last, true, success);
+        success = session.handle(last, true, success);
     }
     success
+}
+
+impl Chunks {
+    /// `my_popt` for the first chunk (`common.c:2022`-`:2025`).
+    fn new(popt: &PrintQueryOpt) -> Self {
+        let mut popt = popt.clone();
+        popt.topt.start_table = true;
+        popt.topt.stop_table = false;
+        popt.topt.prior_records = 0;
+        Self {
+            popt,
+            total_tuples: 0,
+        }
+    }
 }
 
 /// What one query's results are handled with: `\gexec` may send more
@@ -588,25 +667,37 @@ struct Handling<'a> {
 }
 
 impl Handling<'_> {
+    /// `pg_log_info("%s", error)` of a failed result's
+    /// `PQresultErrorMessage`, when there is one (`common.c:1831`-`:1834`).
+    fn report(&mut self, result: &QueryResult) {
+        let message = result_error_message(result, self.pset);
+        if !message.is_empty() {
+            log(self.stderr, self.pset, Level::Info, &message);
+        }
+    }
+
+    /// What becomes of a held-back result once it is known whether it is
+    /// the last.
+    fn handle(&mut self, pending: Pending, last: bool, success: bool) -> bool {
+        match pending {
+            Pending::Result(result) => self.handle_result(&result, last, success),
+            Pending::FailedChunks(result) => {
+                // `common.c:2230`
+                if last {
+                    set_result_variables(self.vars, Some(&result), success);
+                }
+                success
+            }
+        }
+    }
+
     /// One pass of `ExecQueryAndProcessResults`'s result loop
     /// (`common.c:1818`-`:2231`): report a failed result, or print a good
     /// one while nothing has failed yet, and set the result variables from
     /// the last. Returns the loop's `success` after this result.
     fn handle_result(&mut self, result: &QueryResult, last: bool, success: bool) -> bool {
         if !accept_result(result) {
-            // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at
-            // the configured verbosity (`common.c:1831`).
-            let message = match result.error() {
-                Some(error) => {
-                    error.message(result.status(), self.pset.verbosity, self.pset.show_context)
-                }
-                None => result.error_message(),
-            };
-            // `pg_log_info("%s", error)`, when there is one
-            // (`common.c:1833`-`:1834`).
-            if !message.is_empty() {
-                log(self.stderr, self.pset, Level::Info, &message);
-            }
+            self.report(result);
             set_result_variables(self.vars, Some(result), false);
             return false;
         }
@@ -624,6 +715,79 @@ impl Handling<'_> {
             set_result_variables(self.vars, Some(result), success);
         }
         success
+    }
+
+    /// One chunk of a chunked result, printed straight away unless
+    /// something has failed (`common.c:2039`-`:2067`): the header with the
+    /// first chunk only, and no footer. Returns the loop's `success`.
+    fn print_chunk(&mut self, chunks: &mut Chunks, chunk: &QueryResult, success: bool) -> bool {
+        let mut success = success;
+        if success {
+            match print_query(chunk, &chunks.popt) {
+                Ok(text) => {
+                    let _ = self.stdout.write_all(&text);
+                }
+                Err(err) => {
+                    log(self.stderr, self.pset, Level::Error, err.to_string());
+                    success = false;
+                }
+            }
+        }
+        chunks.popt.topt.start_table = false;
+        let ntuples = chunk.ntuples() as u64;
+        chunks.popt.topt.prior_records += ntuples;
+        chunks.total_tuples += ntuples;
+        success
+    }
+
+    /// The result after the last chunk (`common.c:2069`-`:2116`). The
+    /// empty `TUPLES_OK` that ends a chunked result prints the footer,
+    /// counting every row, and the status line, and sets `ERROR`,
+    /// `SQLSTATE` and `ROW_COUNT` itself, there being no one result for the
+    /// whole query; nothing of it is left to handle. Anything else is
+    /// probably an error, reported now, whose variables are set only if it
+    /// turns out to be the last.
+    fn end_chunks(
+        &mut self,
+        mut chunks: Chunks,
+        result: QueryResult,
+        success: bool,
+    ) -> (Option<Pending>, bool) {
+        if result.status() != ExecStatus::TuplesOk {
+            // `success &= AcceptResult(result, true)`: an error is logged
+            // now, and what was accepted is handled as any other result.
+            if accept_result(&result) {
+                return (Some(Pending::Result(result)), success);
+            }
+            self.report(&result);
+            return (Some(Pending::FailedChunks(result)), false);
+        }
+        let mut success = success;
+        if success {
+            chunks.popt.topt.stop_table = true;
+            match print_query(&result, &chunks.popt) {
+                Ok(text) => {
+                    let _ = self.stdout.write_all(&text);
+                }
+                Err(err) => {
+                    log(self.stderr, self.pset, Level::Error, err.to_string());
+                    success = false;
+                }
+            }
+        }
+        if let Some(status) = query_status_line(&result, self.pset) {
+            let _ = self.stdout.write_all(&status);
+        }
+        for (name, value) in [
+            ("ERROR", "false".to_string()),
+            ("SQLSTATE", "00000".to_string()),
+            ("ROW_COUNT", chunks.total_tuples.to_string()),
+        ] {
+            // None of these names has a hook, so the assignment cannot be
+            // refused.
+            let _ = self.vars.set(name, Some(&value));
+        }
+        (None, success)
     }
 }
 
@@ -651,7 +815,7 @@ pub(crate) mod tests {
     struct Replay(Vec<Vec<Reply>>);
 
     impl Executor for Replay {
-        fn exec(&mut self, _query: &[u8]) -> Vec<Reply> {
+        fn exec(&mut self, _query: &[u8], _chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
             self.0.remove(0)
         }
         no_gdesc!();
@@ -966,6 +1130,163 @@ pub(crate) mod tests {
         assert_eq!(both, "NOTICE:  between\nCREATE TABLE\nDROP TABLE\n");
     }
 
+    #[test]
+    fn chunk_rows_is_fetch_count_unless_the_whole_result_is_needed() {
+        let base = PsqlSettings {
+            fetch_count: 10,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(chunk_rows(&base), NonZeroUsize::new(10));
+        for (why, pset) in [
+            ("FETCH_COUNT unset", PsqlSettings::default()),
+            (
+                "FETCH_COUNT -1",
+                PsqlSettings {
+                    fetch_count: -1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "SHOW_ALL_RESULTS off",
+                PsqlSettings {
+                    show_all_results: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "\\gexec",
+                PsqlSettings {
+                    gexec_flag: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "\\gset",
+                PsqlSettings {
+                    gset_prefix: Some(String::new()),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert_eq!(chunk_rows(&pset), None, "{why}");
+        }
+    }
+
+    /// `INSERT … RETURNING` of `rows` rows, collected in chunks of
+    /// `chunk_rows`.
+    fn returning_in_chunks(rows: usize, chunk_rows: usize) -> Vec<Reply> {
+        let mut runner = QueryRunner::new();
+        assert!(runner.set_chunked_rows_mode(chunk_rows));
+        runner
+            .push(Backend::RowDescription(vec![column(b"n", 23, -1)]))
+            .unwrap();
+        for n in 1..=rows {
+            runner
+                .push(Backend::DataRow(vec![Some(n.to_string().into_bytes())]))
+                .unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(
+                format!("INSERT 0 {rows}").into_bytes(),
+            ))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner
+            .into_results()
+            .into_iter()
+            .map(Reply::Result)
+            .collect()
+    }
+
+    /// The footer counts every chunk's rows and `ROW_COUNT` is their total
+    /// (`common.c:2080`-`:2100`). The tag is printed from the empty result
+    /// after the chunks (`common.c:2091`), which carries it only when the
+    /// last chunk was full: libpq writes a CommandComplete's tag onto the
+    /// current result (`fe-protocol3.c:218`), a partial chunk if there is
+    /// one.
+    #[test]
+    fn a_chunked_result_counts_every_row_and_prints_a_tag_the_empty_result_carries() {
+        for (rows, tag) in [(4, "INSERT 0 4\n"), (3, "")] {
+            let mut vars = VariableSpace::new();
+            let (ok, out, err, _) = run_replies(
+                returning_in_chunks(rows, 2),
+                &PsqlSettings::default(),
+                &mut vars,
+            );
+            assert!(ok, "{rows}: {err}");
+            let values = (1..=rows)
+                .map(|n| format!(" {n}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(out, format!(" n \n---\n{values}({rows} rows)\n\n{tag}"));
+            assert_eq!(
+                variables(&vars)[..3],
+                [
+                    ("ERROR", Some("false".to_string())),
+                    ("SQLSTATE", Some("00000".to_string())),
+                    ("ROW_COUNT", Some(rows.to_string())),
+                ]
+            );
+        }
+    }
+
+    /// A chunk is printed as soon as it arrives, before the notices parsed
+    /// while the next one is fetched (`common.c:2039`-`:2067`), unlike a
+    /// whole result, which waits for the next (`common.c:2164`).
+    #[test]
+    fn a_chunk_is_printed_before_the_notices_after_it() {
+        let pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut replies = returning_in_chunks(2, 1);
+        replies.insert(
+            1,
+            Reply::Notice(server_error(&[(b'S', b"NOTICE"), (b'M', b"between")])),
+        );
+        let (ok, _, _, both) = run_replies(replies, &pset, &mut VariableSpace::new());
+        assert!(ok);
+        assert_eq!(
+            both,
+            " n \n---\n 1\nNOTICE:  between\n 2\n(2 rows)\n\nINSERT 0 2\n"
+        );
+    }
+
+    /// An error after the first chunk leaves that chunk printed, then
+    /// reports the error and sets the variables from it
+    /// (`common.c:2108`-`:2116`, `:2230`).
+    #[test]
+    fn an_error_after_a_chunk_is_reported_after_it() {
+        let pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut replies = returning_in_chunks(1, 1);
+        replies.truncate(1);
+        replies.push(Reply::Result(error_result(&[
+            (b'S', b"ERROR"),
+            (b'V', b"ERROR"),
+            (b'C', b"22012"),
+            (b'M', b"division by zero"),
+        ])));
+        let mut vars = VariableSpace::new();
+        let (ok, _, _, both) = run_replies(replies, &pset, &mut vars);
+        assert!(!ok);
+        assert_eq!(both, " n \n---\n 1\nERROR:  division by zero\n");
+        assert_eq!(
+            variables(&vars),
+            [
+                ("ERROR", Some("true".to_string())),
+                ("SQLSTATE", Some("22012".to_string())),
+                ("ROW_COUNT", Some("0".to_string())),
+                ("LAST_ERROR_MESSAGE", Some("division by zero".to_string())),
+                ("LAST_ERROR_SQLSTATE", Some("22012".to_string())),
+            ]
+        );
+    }
+
     /// A `text`-only result with `rows`, a `None` cell being NULL.
     pub(crate) fn rows(names: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
         let mut runner = QueryRunner::new();
@@ -1013,7 +1334,7 @@ pub(crate) mod tests {
     }
 
     impl Executor for Script {
-        fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
+        fn exec(&mut self, query: &[u8], _chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
             vec![Reply::Result(self.answers.remove(0))]
         }
@@ -1602,7 +1923,7 @@ pub(crate) mod tests {
         // anywhere between the socket and stderr turns them into U+FFFD.
         struct Broken;
         impl Executor for Broken {
-            fn exec(&mut self, _query: &[u8]) -> Vec<Reply> {
+            fn exec(&mut self, _query: &[u8], _chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
                 vec![Reply::Broken(ErrorMessage::new(
                     b"no such database \"\xc3\x28\"".to_vec(),
                 ))]
@@ -1658,7 +1979,7 @@ pub(crate) mod tests {
     fn an_all_whitespace_query_is_not_sent() {
         struct Never;
         impl Executor for Never {
-            fn exec(&mut self, _query: &[u8]) -> Vec<Reply> {
+            fn exec(&mut self, _query: &[u8], _chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
                 panic!("an empty query must not reach the server");
             }
             no_gdesc!();

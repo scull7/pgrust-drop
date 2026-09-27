@@ -283,8 +283,8 @@ impl Separator {
     }
 }
 
-/// `printTableOpt` (`fe_utils/print.h:111`), minus `prior_records` and
-/// `encoding`, which nothing here reads yet.
+/// `printTableOpt` (`fe_utils/print.h:111`), minus `encoding`, which
+/// nothing here reads yet.
 // One field per C struct member, and upstream's are `bool`; grouping them into
 // an enum here would put this struct out of step with the header it tracks.
 #[allow(clippy::struct_excessive_bools)]
@@ -308,6 +308,9 @@ pub struct TableOpt {
     pub start_table: bool,
     /// `stop_table`
     pub stop_table: bool,
+    /// `prior_records`: rows printed before this chunk of a chunked result,
+    /// which the default footer counts in.
+    pub prior_records: u64,
     /// `default_footer`
     pub default_footer: bool,
     /// `line_style`
@@ -348,6 +351,7 @@ impl Default for TableOpt {
             tuples_only: false,
             start_table: true,
             stop_table: true,
+            prior_records: 0,
             default_footer: true,
             line_style: LineStyle::Ascii,
             field_sep: Separator {

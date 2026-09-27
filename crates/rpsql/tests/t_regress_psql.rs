@@ -328,10 +328,8 @@ fn gdesc_section_matches_psql_out_but_for_the_cursors() {
 /// echoed, NULLs skipped, a failing one not stopping the rest — against
 /// `psql.out` and C psql.
 ///
-/// The second section's queries run under `FETCH_COUNT 1`, which upstream
-/// fetches in chunks and this port does not yet (NAT-402's next slice). Each
-/// chunk's column widths come out as the whole result's here, so the gate
-/// holds; it does not claim chunking is ported.
+/// The second section's generating query runs whole, as `\gexec` needs
+/// (`common.c:1770`), and the queries it generates in chunks of one row.
 #[test]
 fn gexec_sections_match_psql_out() {
     let (sql, expected, first) = joined_sections("-- \\gexec", "-- \\setenv, \\getenv", &[]);
@@ -577,7 +575,8 @@ fn gate_but_for_cursors(
 /// that block is rewritten in the expected output, and in C psql's, and must
 /// occur exactly once in each, so the gate cannot quietly widen. The rest of
 /// the section is [`gdesc_result_variables_match_psql_out_but_for_the_cursor`]
-/// and, for the chunked `FETCH_COUNT` blocks, NAT-402's next slice.
+/// and, for the chunked `FETCH_COUNT` blocks,
+/// [`chunked_result_variables_match_psql_out`].
 #[test]
 fn show_context_query_buffer_and_result_variables_match_psql_out_but_for_the_cursor() {
     let (sql, expected, first) = joined_sections("-- SHOW_CONTEXT", "-- working \\gdesc", &[]);
@@ -606,7 +605,7 @@ const GDESC_WITH_AN_ERROR_CURSOR: (&str, &str) = (
 /// against `psql.out` and C psql, but for the one drawn cursor.
 ///
 /// The rest of `-- tests for special result variables`, the chunked
-/// `FETCH_COUNT` blocks, is NAT-402's next slice.
+/// `FETCH_COUNT` blocks, is [`chunked_result_variables_match_psql_out`].
 #[test]
 fn gdesc_result_variables_match_psql_out_but_for_the_cursor() {
     let (sql, expected, first) = joined_sections(
@@ -623,5 +622,63 @@ fn gdesc_result_variables_match_psql_out_but_for_the_cursor() {
         &expected,
         &first,
         &[GDESC_WITH_AN_ERROR_CURSOR],
+    );
+}
+
+/// Port of the gate below.
+const CHUNKED_RESULTS_PORT: u16 = 55_513;
+
+/// The part of `tenk1` the chunked sections read, as `pg_regress`'s earlier
+/// tests leave it: `unique2` running 0 to 9999 (`test_setup.sql:144`-`:165`,
+/// `data/tenk.data`) with its btree index (`create_index.sql:26`), so that
+/// `order by unique2 limit 19` walks the index and computes each row as it
+/// goes. Without the index the whole table is sorted first, and
+/// `1/(15-unique2)` fails before any chunk is sent. The other fifteen
+/// columns are not read, so they are left out rather than made up.
+const TENK1_UNIQUE2: &str = "\
+CREATE TABLE tenk1 (unique2 int4);
+INSERT INTO tenk1 SELECT g FROM generate_series(0, 9999) g;
+CREATE INDEX tenk1_unique2 ON tenk1 USING btree(unique2 int4_ops);
+VACUUM ANALYZE tenk1;
+";
+
+/// `-- check row count for a query with chunked results` and `-- chunked
+/// results with an error after the first chunk` (`psql.sql:1239`-`:1258`),
+/// the rest of `-- tests for special result variables`: under
+/// `FETCH_COUNT 10` one table printed across two chunks, its footer and
+/// `ROW_COUNT` counting both, and an error after the first chunk leaving
+/// that chunk printed, then the error and the error's variables — against
+/// `psql.out` and C psql.
+///
+/// The second section runs on into the setup of the next topic, the
+/// partitioned-relation listings (`create schema testpart` … `set role`,
+/// `psql.sql:1259`-`:1264`). That is cut off at its first line, in the
+/// script and in `psql.out`: it belongs with the `\dP` gate, and it cannot
+/// run twice on one cluster, as C psql's run after rpsql's would.
+#[test]
+fn chunked_result_variables_match_psql_out() {
+    let (sql, expected, first) = joined_sections(
+        "-- check row count for a query with chunked results",
+        "-- run test inside own schema and hide other partitions",
+        &[],
+    );
+    let next_topic = "create schema testpart;\n";
+    let before_next_topic = |text: &str, whose: &str| -> String {
+        assert_eq!(text.matches(next_topic).count(), 1, "the cut in {whose}");
+        text[..text.find(next_topic).unwrap()].to_string()
+    };
+    let sql = before_next_topic(&sql, "psql.sql");
+    let expected = before_next_topic(&expected, "psql.out");
+    let Some(cluster) = Cluster::start(CHUNKED_RESULTS_PORT) else {
+        return;
+    };
+    cluster.load_fixture(Path::new(RPSQL), TENK1_UNIQUE2);
+    gate_section(
+        &cluster,
+        &Section {
+            sql: &sql,
+            expected: &expected,
+            ..first
+        },
     );
 }

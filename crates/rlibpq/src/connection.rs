@@ -280,9 +280,10 @@ pub fn unix_socket_path(sockdir: &str, port: u16) -> PathBuf {
 /// order, each only when it is set and non-empty.
 ///
 /// The `PQEnvironmentOption` loop at `:2494` (`PGDATESTYLE`, `PGTZ`,
-/// `PGGEQO`) is not here: those come from the environment, and this is a
-/// function of the `ConnInfo` alone. `conndefaults` has already applied every
-/// `PG*` variable that names a conninfo keyword.
+/// `PGGEQO`) is [`environment_parameters`], which the packet carries after
+/// these: those name GUCs, not conninfo keywords, and this is a function of
+/// the `ConnInfo` alone. `conndefaults` has already applied every `PG*`
+/// variable that names a conninfo keyword.
 #[must_use]
 pub fn startup_parameters(conninfo: &ConnInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut parameters = Vec::new();
@@ -316,6 +317,31 @@ pub fn startup_parameters(conninfo: &ConnInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         conninfo.get("client_encoding").unwrap_or_default(),
     );
     parameters
+}
+
+/// `EnvironmentOptions`, `fe-connect.c:420`: the environment variables
+/// `build_startup_packet` turns into GUCs, and the GUC each sets.
+pub const ENVIRONMENT_OPTIONS: [(&str, &str); 3] = [
+    ("PGDATESTYLE", "datestyle"),
+    ("PGTZ", "timezone"),
+    ("PGGEQO", "geqo"),
+];
+
+/// The `PQEnvironmentOption` loop of `build_startup_packet`
+/// (`fe-protocol3.c:2494`): each of [`ENVIRONMENT_OPTIONS`] that `getenv`
+/// finds set, unless its value is `default` in any case, in table order.
+///
+/// Unlike the conninfo options, an empty value is sent: upstream tests only
+/// for `NULL`. `getenv` is passed in so the decision stays pure; the one
+/// caller that reads the process environment is [`Connection::connect`].
+pub fn environment_parameters(getenv: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ENVIRONMENT_OPTIONS
+        .iter()
+        .filter_map(|&(env_name, pg_name)| {
+            let value = getenv(env_name)?;
+            (!value.eq_ignore_ascii_case(b"default")).then(|| (pg_name.as_bytes().to_vec(), value))
+        })
+        .collect()
 }
 
 /// `pg_strong_random`, `src/port/pg_strong_random.c:140` — the arm that reads
@@ -518,7 +544,10 @@ impl Connection<Stream> {
         let stream = Stream::connect(&address)?;
         let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
-        let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
+        let environment = environment_parameters(|name| {
+            std::env::var_os(name).map(std::os::unix::ffi::OsStringExt::into_vec)
+        });
+        let mut conn = Connection::start_up_with(stream, conninfo, &environment, &nonce)?;
         conn.raddr = raddr;
         Ok(conn)
     }
@@ -548,13 +577,29 @@ impl<S: Read + Write> Connection<S> {
     /// The server sent an ErrorResponse, a message that cannot appear during
     /// startup, or an authentication request this build cannot answer.
     pub fn start_up(
-        mut stream: S,
+        stream: S,
         conninfo: &ConnInfo,
         raw_nonce: &[u8],
     ) -> Result<Self, ConnectionError> {
+        Self::start_up_with(stream, conninfo, &[], raw_nonce)
+    }
+
+    /// [`Connection::start_up`], with the startup packet also carrying
+    /// `environment`: what [`environment_parameters`] read.
+    ///
+    /// # Errors
+    /// As [`Connection::start_up`].
+    pub fn start_up_with(
+        mut stream: S,
+        conninfo: &ConnInfo,
+        environment: &[(Vec<u8>, Vec<u8>)],
+        raw_nonce: &[u8],
+    ) -> Result<Self, ConnectionError> {
+        let mut parameters = startup_parameters(conninfo);
+        parameters.extend_from_slice(environment);
         let startup = Frontend::Startup {
             version: PROTOCOL_VERSION_3_0,
-            parameters: startup_parameters(conninfo),
+            parameters,
         };
         stream.write_all(&startup.encode())?;
         stream.flush()?;
@@ -1529,22 +1574,43 @@ mod tests {
     }
 
     /// The three GUCs `build_startup_packet` takes from the environment
-    /// (`fe-protocol3.c:2494`: `PGDATESTYLE`, `PGTZ`, `PGGEQO`) are not sent.
-    /// `startup_parameters` is a function of the `ConnInfo` alone and cannot
-    /// read them — which is the point, and the divergence
-    /// `docs/divergences.md` records.
+    /// (`fe-protocol3.c:2494`, table at `fe-connect.c:420`): each one set is
+    /// sent, in table order, unless it says `default` in any case; an empty
+    /// value is still sent. `startup_parameters` never reads them.
     #[test]
-    fn the_environment_driven_gucs_are_not_sent_yet() {
-        let info = conninfo("user=alice options=-c%20datestyle%3DISO");
+    fn the_environment_driven_gucs_are_sent_unless_default() {
+        let env = |pairs: &'static [(&str, &str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.as_bytes().to_vec())
+            }
+        };
+        let pair = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+        // pg_regress's own two (`pg_regress.c:785`-`:786`).
+        assert_eq!(
+            environment_parameters(env(&[
+                ("PGTZ", "America/Los_Angeles"),
+                ("PGDATESTYLE", "Postgres, MDY"),
+            ])),
+            [
+                pair("datestyle", "Postgres, MDY"),
+                pair("timezone", "America/Los_Angeles")
+            ]
+        );
+        assert_eq!(
+            environment_parameters(env(&[("PGGEQO", "DeFault"), ("PGTZ", "")])),
+            [pair("timezone", "")]
+        );
+        assert!(environment_parameters(env(&[])).is_empty());
+
+        let info = conninfo("user=alice");
         let keys: Vec<Vec<u8>> = startup_parameters(&info)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        for guc in [&b"DateStyle"[..], b"TimeZone", b"geqo"] {
-            assert!(!keys.contains(&guc.to_vec()), "{guc:?} must not be sent");
-        }
-        // `options` is sent, which is how a session asks for them instead.
-        assert!(keys.contains(&b"options".to_vec()));
+        assert_eq!(keys, [b"user".to_vec()]);
     }
 
     /// Host classification: `fe-connect.c:1327` and `:1339`.

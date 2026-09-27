@@ -98,8 +98,10 @@ drive `psql`, `pg_controldata` and `pg_checksums`, and a cluster gate needs all
 of its tools from one tree (ADR-0007, amendment). `PGDROP_REQUIRE_REF=1` in CI
 turns a missing reference into a failure. `scripts/setup-branch-ruleset.sh`
 applies the matching `main` ruleset (owner-run, needs `gh` as a repository
-admin). CI runs musl on every push (`container: alpine`), then gnu and apple on
-pull requests via `needs: musl`; all three are required checks. Docker is not a
+admin). CI runs musl first (`container: alpine`), then gnu and apple via
+`needs: musl`, on pull requests, pushes to `main` and a twice-weekly schedule
+(so `main` holds a warm cache for every lane, NAT-598); all three are required
+checks, each budgeted under 5 minutes warm. Docker is not a
 dependency of the product, the harness or the developer workflow — CI's
 container does not change that.
 

@@ -20,7 +20,14 @@ fn main() -> ExitCode {
             let argv0 = argv
                 .first()
                 .map_or(OsStr::new("initdb"), OsString::as_os_str);
-            rinitdb::run(argv0, &applet_args, &mut stdout, &mut stderr)
+            let server = postgres::embedded_server();
+            rinitdb::run_with(
+                argv0,
+                &applet_args,
+                server.as_ref(),
+                &mut stdout,
+                &mut stderr,
+            )
         }
         Dispatch::Applet(Applet::Psql, applet_args) => {
             rpsql::run(&applet_args, &mut stdout, &mut stderr)

@@ -130,55 +130,26 @@ fn allowed_in_tls13(scheme: SignatureScheme) -> bool {
     )
 }
 
-/// Calculation: one DER element — its tag, its contents, and what follows.
-fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let (&tag, rest) = input.split_first()?;
-    let (&first, rest) = rest.split_first()?;
-    let (len, rest) = if first < 0x80 {
-        (usize::from(first), rest)
-    } else {
-        let width = usize::from(first & 0x7f);
-        if width == 0 || width > 4 || rest.len() < width {
-            return None;
-        }
-        let len = rest[..width]
-            .iter()
-            .fold(0usize, |len, byte| (len << 8) | usize::from(*byte));
-        (len, &rest[width..])
-    };
-    (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
-}
-
 /// Calculation: a certificate's SubjectPublicKeyInfo (RFC 5280 §4.1), as
 /// the contents of its AlgorithmIdentifier and the subjectPublicKey bits —
 /// the two halves a `SignatureVerificationAlgorithm` takes. Works for every
 /// X.509 version: the `[0]` version field is optional and skipped.
 fn subject_public_key_info(cert: &[u8]) -> Option<(&[u8], &[u8])> {
-    const SEQUENCE: u8 = 0x30;
-    const BIT_STRING: u8 = 0x03;
-    const VERSION: u8 = 0xa0; // [0] EXPLICIT
+    use crate::der::{BIT_STRING, SEQUENCE, element};
 
-    let (SEQUENCE, certificate, _) = der_element(cert)? else {
-        return None;
-    };
-    let (SEQUENCE, mut tbs, _) = der_element(certificate)? else {
-        return None;
-    };
-    if tbs.first() == Some(&VERSION) {
-        tbs = der_element(tbs)?.2;
-    }
+    let mut tbs = crate::der::tbs_fields(cert)?;
     // serialNumber, signature, issuer, validity, subject.
     for _ in 0..5 {
-        tbs = der_element(tbs)?.2;
+        tbs = element(tbs)?.2;
     }
-    let (SEQUENCE, spki, _) = der_element(tbs)? else {
+    let (SEQUENCE, spki, _) = element(tbs)? else {
         return None;
     };
-    let (SEQUENCE, algorithm, rest) = der_element(spki)? else {
+    let (SEQUENCE, algorithm, rest) = element(spki)? else {
         return None;
     };
     // A key's bit string has no unused bits.
-    let (BIT_STRING, [0, key @ ..], _) = der_element(rest)? else {
+    let (BIT_STRING, [0, key @ ..], _) = element(rest)? else {
         return None;
     };
     Some((algorithm, key))
@@ -338,10 +309,5 @@ mod tests {
     fn a_truncated_certificate_has_no_key() {
         assert_eq!(subject_public_key_info(&[]), None);
         assert_eq!(subject_public_key_info(&[0x30, 0x05, 0x30]), None);
-        assert_eq!(der_element(&[0x30, 0x81]), None);
-        assert_eq!(
-            der_element(&[0x02, 0x81, 0x01, 0x07, 0xff]),
-            Some((0x02, &[0x07][..], &[0xff][..]))
-        );
     }
 }

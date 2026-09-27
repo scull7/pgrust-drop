@@ -24,7 +24,8 @@
 //! a pure state machine, with SSL over rustls behind the default-on `tls`
 //! feature (ADR-0006). Without that feature every connection is plaintext
 //! and a mode that needs TLS is refused, as a C libpq built without SSL
-//! refuses it. The
+//! refuses it. `fe-secure-common.c`'s host-name check for `verify-full` is
+//! `peer_name`, pure and not yet wired to a handshake. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
@@ -44,12 +45,14 @@ pub mod cancel;
 pub mod connection;
 pub mod conninfo;
 mod cstr;
+mod der;
 pub mod error;
 pub mod extended;
 pub mod hmac;
 pub mod md5;
 pub mod message;
 pub mod negotiate;
+pub mod peer_name;
 pub mod pg_config;
 pub mod pipeline;
 pub mod regress;
@@ -82,6 +85,9 @@ pub use message::{
 pub use negotiate::{
     AfterRefusal, Build, EncMethod, EncryptionOptions, GssEncMode, Negotiation, SslMode,
     SslNegotiation,
+};
+pub use peer_name::{
+    CertificateNames, GeneralName, PeerNameError, verify_peer_name_matches_certificate,
 };
 pub use pipeline::{
     AsyncStatus, CopyStep, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass,

@@ -368,7 +368,10 @@ pub fn send_query(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
-    let success = if query.iter().all(u8::is_ascii_whitespace) {
+    // Upstream sends even an empty buffer; skipping one is ours, and only
+    // for the simple-query path, because `\gdesc` on an empty buffer
+    // prepares "" and reports that it has no columns (`common.c:1212`).
+    let success = if !pset.gdesc_flag && query.iter().all(u8::is_ascii_whitespace) {
         true
     } else {
         if let Some(line) = echo_line(query, pset) {
@@ -1043,6 +1046,15 @@ pub(crate) mod tests {
         pset: &mut PsqlSettings,
         vars: &mut VariableSpace,
     ) -> (bool, String, Vec<String>) {
+        session_of(b"select", answers, pset, vars)
+    }
+
+    fn session_of(
+        query: &[u8],
+        answers: Vec<QueryResult>,
+        pset: &mut PsqlSettings,
+        vars: &mut VariableSpace,
+    ) -> (bool, String, Vec<String>) {
         let mut executor = Script {
             answers,
             seen: Vec::new(),
@@ -1051,7 +1063,7 @@ pub(crate) mod tests {
         let mut out = Tee(Vec::new(), both.clone());
         let mut err = Tee(Vec::new(), both.clone());
         pset.log_terse = true;
-        let ok = send_query(&mut executor, b"select", pset, vars, &mut out, &mut err);
+        let ok = send_query(&mut executor, query, pset, vars, &mut out, &mut err);
         assert!(executor.answers.is_empty(), "every answer is asked for");
         let both = String::from_utf8(both.0.borrow().clone()).unwrap();
         (ok, both, executor.seen)
@@ -1372,6 +1384,36 @@ pub(crate) mod tests {
             ["ERROR", "SQLSTATE", "ROW_COUNT"].map(|name| vars.get(name)),
             [Some("false"), Some("00000"), Some("0")]
         );
+    }
+
+    /// `\gdesc` on an empty buffer, e.g. a session's first command, when
+    /// there is no previous query to copy: `SendQuery` has no emptiness
+    /// check (`common.c:1126`-`:1224`), so `DescribeQuery` prepares "",
+    /// which has no columns (`common.c:1458`-`:1460`).
+    #[test]
+    fn gdesc_of_an_empty_buffer_prepares_it_and_says_it_has_no_columns() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (ok, both, seen) = session_of(
+            b"",
+            vec![parsed(), described(Vec::new())],
+            &mut pset,
+            &mut vars,
+        );
+        assert!(ok);
+        assert_eq!(seen, ["Parse: ", "Describe"]);
+        assert_eq!(
+            both,
+            "The command has no result, or the result has no columns.\n"
+        );
+        assert_eq!(
+            ["ERROR", "ROW_COUNT"].map(|name| vars.get(name)),
+            [Some("false"), Some("0")]
+        );
+        assert!(!pset.gdesc_flag);
     }
 
     /// psql.sql:159-160 and :1231-1237, `-- should fail cleanly - syntax

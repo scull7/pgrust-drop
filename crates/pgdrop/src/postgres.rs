@@ -51,8 +51,8 @@ pub fn transport(args: &[OsString]) -> seams_init::Transport {
 }
 
 /// Run the applet. `argv0` is the name the process was started as: pgrust
-/// finds the share files pgdrop does not embed from it (`find_my_exec`), as
-/// C does.
+/// finds its own executable, and `share_path` beside it, from it
+/// (`find_my_exec`), as C does.
 ///
 /// Write failures on the version line are ignored and the exit status is
 /// still 0, as `main.c:170`'s unchecked `fputs` is.

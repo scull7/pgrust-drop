@@ -27,11 +27,16 @@
 //! without SSL refuses it; and the encoding-aware escaping of `fe-exec.c`
 //! (`PQescapeLiteral`, `PQescapeIdentifier`, `PQescapeStringConn`,
 //! `PQescapeByteaConn`, `PQunescapeBytea`) over the client encoding the
-//! server reports, proved against `test_escape.c`. The
+//! server reports, proved against `test_escape.c`; and the socket I/O of
+//! `fe-misc.c` — a flush that reads while it waits to write, non-blocking
+//! mode (`PQsetnonblocking`) and `PQsocketPoll` — proved against
+//! `test_pipelined_insert` and `test_uniqviol`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
-//! crate denies it until that layer exists as its own module.
+//! crate denies it until that layer exists as its own module. The one
+//! exception is `poll::sys`, the `poll(2)` declaration a readiness wait needs
+//! and the standard library does not offer (ADR-0010).
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -57,6 +62,7 @@ pub mod message;
 pub mod negotiate;
 pub mod pg_config;
 pub mod pipeline;
+pub mod poll;
 pub mod regress;
 pub mod result;
 pub mod scram;
@@ -69,7 +75,7 @@ pub mod uri;
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
 pub use cancel::{Cancel, CancelConn, CancelError, CancelStatus, CancelStep, Peer};
 pub use connection::{
-    Address, Connection, ConnectionError, CopyRead, Stream, Tracer, socket_address,
+    Address, Connection, ConnectionError, CopyRead, Flush, Socket, Stream, Tracer, socket_address,
 };
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,

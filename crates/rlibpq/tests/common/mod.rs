@@ -378,9 +378,9 @@ pub fn finish_and_compare_trace(mut conn: Connection, sink: &SharedSink, name: &
     assert_eq!(ours, expected);
 }
 
-/// A connection set up the way `libpq_pipeline.c`'s `main` sets one up
-/// before it turns tracing on (`:2332`-`:2337`, `:2352`-`:2354`).
-pub fn traced_like_libpq_pipeline(cluster: &Cluster) -> (Connection, SharedSink) {
+/// A connection set up the way `libpq_pipeline.c`'s `main` sets one up for
+/// a test run without `-t` (`:2332`-`:2337`).
+pub fn like_libpq_pipeline(cluster: &Cluster) -> Connection {
     let mut conn = cluster.connect();
     for setup in [
         &b"SET lc_messages TO \"C\""[..],
@@ -389,6 +389,13 @@ pub fn traced_like_libpq_pipeline(cluster: &Cluster) -> (Connection, SharedSink)
         let result = only(conn.exec(setup).expect("runs"));
         assert_eq!(result.status(), ExecStatus::CommandOk);
     }
+    conn
+}
+
+/// A connection set up the way `libpq_pipeline.c`'s `main` sets one up
+/// before it turns tracing on (`:2332`-`:2337`, `:2352`-`:2354`).
+pub fn traced_like_libpq_pipeline(cluster: &Cluster) -> (Connection, SharedSink) {
+    let mut conn = like_libpq_pipeline(cluster);
     let sink = SharedSink::default();
     conn.trace(Box::new(sink.clone()));
     conn.set_trace_flags(TraceFlags::SUPPRESS_TIMESTAMPS | TraceFlags::REGRESS_MODE);

@@ -10,7 +10,9 @@
 //! (`:2556`), which are `PQexecStart`, one send, and `PQexecFinish` — and
 //! the COPY data transfer, `PQputCopyData` (`:2712`), `PQputCopyEnd`
 //! (`:2766`) and `PQgetCopyData` (`:2833`, with `fe-protocol3.c`'s
-//! `pqGetCopyData3`, `:1907`).
+//! `pqGetCopyData3`, `:1907`) — and `fe-misc.c`'s socket I/O: `pqSendSome`
+//! (`:971`), which reads while it waits to write, and `pqReadData` (`:615`),
+//! over the readiness wait in [`crate::poll`].
 //!
 //! The decisions are pure and live above the socket: [`startup_parameters`]
 //! and [`socket_address`] are functions of the `ConnInfo` alone, and
@@ -20,6 +22,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -40,6 +43,7 @@ use crate::pipeline::{
     Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
     message_id,
 };
+use crate::poll;
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
 use crate::trace::{self, AuthResponse, Origin, TraceFlags};
@@ -72,6 +76,9 @@ pub enum ConnectionError {
     /// blocking call in pipeline mode, a second command outside it, leaving
     /// pipeline mode with results outstanding.
     Pipeline(PipelineError),
+    /// `PQsetnonblocking` could not leave non-blocking mode: its flush left
+    /// output unsent (`fe-exec.c:4001`).
+    FlushPending,
 }
 
 impl ConnectionError {
@@ -97,6 +104,8 @@ impl ConnectionError {
             ConnectionError::Conninfo(err) => err.message(),
             ConnectionError::Argument(err) => err.message(),
             ConnectionError::Pipeline(err) => err.message(),
+            // C sets no message for it; `PQerrorMessage` keeps what it had.
+            ConnectionError::FlushPending => Vec::new(),
         }
     }
 }
@@ -393,6 +402,40 @@ impl Stream {
     }
 }
 
+impl AsFd for Stream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Stream::Tcp(s) => s.as_fd(),
+            Stream::Unix(s) => s.as_fd(),
+        }
+    }
+}
+
+/// What a [`Connection`] needs of its socket beyond reading and writing
+/// bytes: a way to wait until it can do either.
+///
+/// A [`Stream`] that [`Connection::connect`] opened is non-blocking, as C's
+/// socket is (`pg_set_noblock`, `fe-connect.c:3368`): a read or write that
+/// cannot proceed returns `WouldBlock`, and the connection then waits here
+/// for the direction it needs, so a blocking call never blocks inside a
+/// `read` or `write` — which is what lets [`Connection::flush`] read while
+/// it waits to write.
+pub trait Socket: Read + Write {
+    /// `pqWait(forRead, forWrite)`, `fe-misc.c:1165`: block until the socket
+    /// can be read (`for_read`) or written (`for_write`), or has an error or
+    /// hang-up for the next read or write to find.
+    ///
+    /// # Errors
+    /// The wait itself failed.
+    fn wait(&self, for_read: bool, for_write: bool) -> io::Result<()>;
+}
+
+impl Socket for Stream {
+    fn wait(&self, for_read: bool, for_write: bool) -> io::Result<()> {
+        poll::socket_check(self.as_fd(), for_read, for_write, None).map(|_| ())
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -468,6 +511,16 @@ pub enum CopyRead {
     End,
 }
 
+/// What [`Connection::flush`] left behind: `pqFlush`'s `0` and `1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flush {
+    /// Everything buffered was sent (`0`).
+    Done,
+    /// A non-blocking connection could not send it all without waiting; the
+    /// rest stays buffered for the next flush (`1`, `fe-misc.c:1109`).
+    Pending,
+}
+
 /// `pqPutMsgEnd`, `fe-misc.c:559`: output is pushed once this much is
 /// buffered, "the typical size of a pipe buffer on Unix systems".
 const PUT_MSG_PUSH_THRESHOLD: usize = 8192;
@@ -499,6 +552,9 @@ pub struct Connection<S = Stream> {
     /// was opened (`fe-connect.c:3249`), so nothing the peer does later
     /// changes it. `None` for a stream [`Connection::start_up`] was handed.
     raddr: Option<Peer>,
+    /// `conn->nonblocking` (`libpq-int.h:465`): whether a flush may leave
+    /// output unsent rather than wait ([`Connection::set_nonblocking`]).
+    nonblocking: bool,
 }
 
 impl Connection<Stream> {
@@ -533,6 +589,9 @@ impl Connection<Stream> {
         // there is no SSLRequest to send and no method to fall back to.
         debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
         let stream = Stream::connect(&address)?;
+        // fe-connect.c:3368 — the socket itself is always non-blocking;
+        // `conn->nonblocking` only decides whether libpq waits on it.
+        stream.set_nonblocking(true)?;
         let raddr = stream.raddr(&address);
         let nonce = strong_random(RAW_NONCE_LEN)?;
         let mut conn = Connection::start_up(stream, conninfo, &nonce)?;
@@ -540,23 +599,15 @@ impl Connection<Stream> {
         Ok(conn)
     }
 
-    /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
-    /// already sent, without waiting for more and without parsing it.
-    ///
-    /// # Errors
-    /// The socket failed, or the server closed the connection.
-    pub fn consume_input(&mut self) -> Result<(), ConnectionError> {
-        self.stream.set_nonblocking(true)?;
-        let read = self.read_more();
-        self.stream.set_nonblocking(false)?;
-        match read {
-            Err(ConnectionError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            other => other,
-        }
+    /// `PQsocket`, `fe-connect.c:7664`: the connection's socket, for a
+    /// caller that waits on it itself (with [`poll::socket_poll`], say).
+    #[must_use]
+    pub fn socket(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 }
 
-impl<S: Read + Write> Connection<S> {
+impl<S: Socket> Connection<S> {
     /// The startup exchange over an already-open stream. `raw_nonce` is what
     /// `pg_strong_random` drew for SCRAM (`fe-auth-scram.c:363`); passing it in
     /// keeps the exchange reproducible for a replayed trace.
@@ -565,7 +616,7 @@ impl<S: Read + Write> Connection<S> {
     /// The server sent an ErrorResponse, a message that cannot appear during
     /// startup, or an authentication request this build cannot answer.
     pub fn start_up(
-        mut stream: S,
+        stream: S,
         conninfo: &ConnInfo,
         raw_nonce: &[u8],
     ) -> Result<Self, ConnectionError> {
@@ -573,8 +624,6 @@ impl<S: Read + Write> Connection<S> {
             version: PROTOCOL_VERSION_3_0,
             parameters: startup_parameters(conninfo),
         };
-        stream.write_all(&startup.encode())?;
-        stream.flush()?;
 
         let channel_binding = match conninfo.get("channel_binding") {
             Some(b"disable") => ChannelBinding::Disable,
@@ -602,7 +651,13 @@ impl<S: Read + Write> Connection<S> {
             notifications: Vec::new(),
             trace: None,
             raddr: None,
+            nonblocking: false,
         };
+        // fe-connect.c:3737 — `pqPacketSend` (`:5409`) puts the startup
+        // packet in the output buffer and `pqFlush`es it (`:5425`), as every
+        // later message is sent.
+        conn.outbuf = startup.encode();
+        conn.flush()?;
 
         loop {
             match conn.read_message()? {
@@ -841,7 +896,8 @@ impl<S: Read + Write> Connection<S> {
         if self.state.put_copy_end()? {
             self.put_message(&Frontend::Sync);
         }
-        self.flush()
+        self.flush()?;
+        Ok(())
     }
 
     /// `PQgetCopyData`, `fe-exec.c:2833`, and `pqGetCopyData3`,
@@ -1115,7 +1171,9 @@ impl<S: Read + Write> Connection<S> {
                 // waiting for a reply to a command the server never got;
                 // then wait for more and parse it.
                 Next::Block => {
-                    self.flush()?;
+                    while self.flush()? == Flush::Pending {
+                        self.stream.wait(false, true)?;
+                    }
                     self.read_more()?;
                     self.parse_input()?;
                 }
@@ -1133,16 +1191,100 @@ impl<S: Read + Write> Connection<S> {
         Ok(self.state.is_busy())
     }
 
-    /// `PQflush`, `fe-exec.c:4031`: write everything buffered.
+    /// `PQflush`, `fe-exec.c:4031`, which is `pqSendSome`
+    /// (`fe-misc.c:971`) over the whole buffer: write what is buffered, and
+    /// while the socket will not take more, read what the server has sent
+    /// (`:1103`) — so a pipeline whose requests and replies both overflow
+    /// the socket buffers cannot deadlock, the server blocked writing
+    /// replies nobody reads and the client blocked writing requests it does
+    /// not read. A blocking connection then waits until the socket can be
+    /// read *or* written (`pqWait(true, true)`, `:1115`) and goes on until
+    /// all is sent; a non-blocking one returns [`Flush::Pending`] (`:1109`).
+    /// What is read is buffered, not parsed.
     ///
     /// # Errors
-    /// The socket write failed.
-    pub fn flush(&mut self) -> Result<(), ConnectionError> {
-        if !self.outbuf.is_empty() {
-            self.stream.write_all(&self.outbuf)?;
-            self.outbuf.clear();
+    /// The socket write failed — the output is then dropped, "no chance
+    /// it'll ever be sent" (`:1044`), and input already sent is read first
+    /// (`:1047`), a read failure being the error reported — or a read or wait
+    /// made while the write was blocked failed.
+    pub fn flush(&mut self) -> Result<Flush, ConnectionError> {
+        let mut sent = 0;
+        let result = loop {
+            if sent == self.outbuf.len() {
+                break Ok(Flush::Done);
+            }
+            match self.stream.write(&self.outbuf[sent..]) {
+                Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(n) => sent += n,
+                // :1029 — EAGAIN is "wait and try again", EINTR "try again".
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    // :1043-:1066
+                    self.outbuf.clear();
+                    sent = 0;
+                    break match self.read_data() {
+                        Err(read) => Err(read),
+                        Ok(_) => Err(err.into()),
+                    };
+                }
+            }
+            if sent == self.outbuf.len() {
+                continue;
+            }
+            // :1103 — not all sent: take in what the server has sent.
+            if let Err(err) = self.read_data() {
+                break Err(err);
+            }
+            if self.nonblocking {
+                break Ok(Flush::Pending);
+            }
+            if let Err(err) = self.stream.wait(true, true) {
+                break Err(err.into());
+            }
+        };
+        // :1123 — keep what is still unsent.
+        self.outbuf.drain(..sent);
+        result
+    }
+
+    /// `PQsetnonblocking`, `fe-exec.c:3975`: from now on, may a flush leave
+    /// output buffered instead of waiting to send it? What is buffered is
+    /// flushed first, in the mode being left (`:4000`).
+    ///
+    /// # Errors
+    /// That flush failed, or — leaving non-blocking mode — could not send
+    /// everything without waiting ([`ConnectionError::FlushPending`]; C
+    /// returns `-1` for either, `:4001`). The mode is then unchanged.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), ConnectionError> {
+        if nonblocking == self.nonblocking {
+            return Ok(());
         }
-        self.stream.flush()?;
+        if self.flush()? == Flush::Pending {
+            return Err(ConnectionError::FlushPending);
+        }
+        self.nonblocking = nonblocking;
+        Ok(())
+    }
+
+    /// `PQisnonblocking`, `fe-exec.c:4014`.
+    #[must_use]
+    pub fn is_nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+
+    /// `PQconsumeInput`, `fe-exec.c:2001`: read whatever the server has
+    /// already sent, without waiting for more and without parsing it. A
+    /// non-blocking connection first flushes what it has buffered (`:2011`),
+    /// or it might wait for replies to requests the server never got.
+    ///
+    /// # Errors
+    /// The socket failed, or the server closed the connection.
+    pub fn consume_input(&mut self) -> Result<(), ConnectionError> {
+        if self.nonblocking {
+            self.flush()?;
+        }
+        self.read_data()?;
         Ok(())
     }
 
@@ -1199,12 +1341,14 @@ impl<S: Read + Write> Connection<S> {
     /// The message could not be written to the socket.
     pub fn terminate(&mut self) -> Result<(), ConnectionError> {
         self.put_message(&Frontend::Terminate);
-        self.flush()
+        self.flush()?;
+        Ok(())
     }
 
     fn send(&mut self, message: &Frontend) -> Result<(), ConnectionError> {
         self.put_message(message);
-        self.flush()
+        self.flush()?;
+        Ok(())
     }
 
     /// Decode the whole message at the head of the buffer, trace it, and
@@ -1234,20 +1378,38 @@ impl<S: Read + Write> Connection<S> {
         Ok(message)
     }
 
-    /// `pqReadData`, blocking: append what one read returns, after moving
-    /// what is left unparsed to the front of the buffer (`fe-misc.c:659`) —
+    /// `pqReadData`, `fe-misc.c:615`: append what one read returns, after
+    /// moving what is left unparsed to the front of the buffer (`:659`) —
     /// without that, a long COPY OUT would keep every byte it ever read.
-    fn read_more(&mut self) -> Result<(), ConnectionError> {
+    /// `false` when the socket has nothing yet (`EAGAIN`, `:710`); a read a
+    /// signal interrupted is retried (`:705`).
+    fn read_data(&mut self) -> Result<bool, ConnectionError> {
         if self.start > 0 {
             self.inbuf.drain(..self.start);
             self.start = 0;
         }
         let mut chunk = [0u8; 8192];
-        let n = self.stream.read(&mut chunk)?;
+        let n = loop {
+            match self.stream.read(&mut chunk) {
+                Ok(n) => break n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(err) => return Err(err.into()),
+            }
+        };
         if n == 0 {
             return Err(ConnectionError::ServerClosedConnection);
         }
         self.inbuf.extend_from_slice(&chunk[..n]);
+        Ok(true)
+    }
+
+    /// `pqWait(true, false)` then `pqReadData`, until a read brings
+    /// something: the blocking read `PQgetResult` makes (`fe-exec.c:2114`).
+    fn read_more(&mut self) -> Result<(), ConnectionError> {
+        while !self.read_data()? {
+            self.stream.wait(true, false)?;
+        }
         Ok(())
     }
 
@@ -1479,7 +1641,7 @@ fn server_version_number(value: &[u8]) -> i32 {
     }
 }
 
-impl<S: Read + Write> Connection<S> {
+impl<S: Socket> Connection<S> {
     /// `PQsetClientEncoding`, `fe-connect.c:7736`: send
     /// `set client_encoding to '<encoding>'` and return its result. The new
     /// encoding takes effect when the server reports it, which it does
@@ -1600,6 +1762,13 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// A script never refuses a read or a write, so nothing waits on it.
+    impl Socket for Scripted {
+        fn wait(&self, _: bool, _: bool) -> io::Result<()> {
+            unreachable!("a scripted stream never returns WouldBlock")
         }
     }
 
@@ -2201,6 +2370,11 @@ mod tests {
                 Ok(())
             }
         }
+        impl Socket for Dribble {
+            fn wait(&self, _: bool, _: bool) -> io::Result<()> {
+                unreachable!("a dribble never returns WouldBlock")
+            }
+        }
 
         let mut script = auth_ok();
         script.extend(message(b'S', b"server_version\x0018.6\x00"));
@@ -2767,5 +2941,119 @@ mod tests {
         // 128 < 28 + 101: one byte too many for qbuf.
         assert!(conn.set_client_encoding(&[b'x'; 101]).unwrap().is_none());
         assert_eq!(conn.stream.to_server.len(), sent);
+    }
+
+    /// More than any socket buffer holds, both ways.
+    const OVERFLOW: usize = 4 << 20;
+
+    /// A connection over one end of a socket pair whose other end is a
+    /// "server" that has sent AuthenticationOk and ReadyForQuery, and that
+    /// reads the startup packet and then runs `serve`; the socket is
+    /// non-blocking, as `connect` leaves it.
+    fn over_a_socket_pair(
+        serve: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<()>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(&auth_ok()).unwrap();
+        server.write_all(&ready(b'I')).unwrap();
+        let stream = Stream::Unix(client);
+        stream.set_nonblocking(true).unwrap();
+        let conn = Connection::start_up(stream, &conninfo("user=alice"), &[0; 18]).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut length = [0u8; 4];
+            server.read_exact(&mut length).unwrap();
+            let mut rest = vec![0u8; u32::from_be_bytes(length) as usize - 4];
+            server.read_exact(&mut rest).unwrap();
+            serve(server);
+        });
+        (conn, server)
+    }
+
+    /// `pqSendSome`'s reason for being (`fe-misc.c:1076`-`:1102`): a server
+    /// that writes everything it has before it reads anything, and a client
+    /// with more to send than the socket holds. Were the flush a plain
+    /// blocking write, each side would wait on the other for ever; reading
+    /// while the write is blocked lets both finish.
+    #[test]
+    fn a_blocking_flush_reads_while_the_socket_will_not_take_more() {
+        let (mut conn, server) = over_a_socket_pair(|mut server| {
+            server.write_all(&vec![b'r'; OVERFLOW]).unwrap();
+            let mut got = vec![0u8; OVERFLOW];
+            server.read_exact(&mut got).unwrap();
+            assert!(got.iter().all(|&b| b == b's'));
+        });
+        conn.outbuf = vec![b's'; OVERFLOW];
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let flushed = conn.flush().unwrap();
+            done.send(()).unwrap();
+            (conn, flushed)
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_mins(1))
+            .expect("the flush deadlocked");
+        let (conn, flushed) = client.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(flushed, Flush::Done);
+        assert!(conn.outbuf.is_empty());
+        // What arrived while writing was kept, not parsed and not lost.
+        assert!(conn.inbuf[conn.start..].iter().all(|&b| b == b'r'));
+        assert!(!conn.inbuf.is_empty());
+    }
+
+    /// In non-blocking mode the flush returns `1` instead of waiting
+    /// (`fe-misc.c:1109`), keeping the unsent tail; `PQsetnonblocking` will
+    /// not leave the mode until that tail is gone (`fe-exec.c:4001`).
+    #[test]
+    fn a_non_blocking_flush_returns_pending_and_keeps_the_rest() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (mut conn, server) = over_a_socket_pair(move |mut server| {
+            released.recv().unwrap();
+            // Everything the client sends, then the end of the stream once
+            // the client is dropped.
+            let mut got = Vec::new();
+            server.read_to_end(&mut got).unwrap();
+            assert_eq!(got.len(), OVERFLOW);
+        });
+        assert!(!conn.is_nonblocking());
+        conn.set_nonblocking(true).unwrap();
+        assert!(conn.is_nonblocking());
+        conn.outbuf = vec![b's'; OVERFLOW];
+
+        assert_eq!(conn.flush().unwrap(), Flush::Pending);
+        let left = conn.outbuf.len();
+        assert!(left > 0 && left < OVERFLOW, "some sent, the rest kept");
+        assert!(matches!(
+            conn.set_nonblocking(false),
+            Err(ConnectionError::FlushPending)
+        ));
+        assert!(conn.is_nonblocking(), "the mode is unchanged");
+
+        release.send(()).unwrap();
+        while conn.flush().unwrap() == Flush::Pending {
+            conn.stream.wait(false, true).unwrap();
+        }
+        conn.set_nonblocking(false).unwrap();
+        assert!(!conn.is_nonblocking());
+        drop(conn);
+        server.join().unwrap();
+    }
+
+    /// A write the socket refuses outright drops what is unsent — "no chance
+    /// it'll ever be sent" (`fe-misc.c:1044`) — after reading what the
+    /// server sent (`:1047`), whose end of stream is then the error. C would
+    /// set `write_failed` and report later (`fe-exec.c:2131`); see
+    /// `docs/divergences.md`.
+    #[test]
+    fn a_failed_write_drops_the_output_and_reports_the_closed_connection() {
+        let (mut conn, server) = over_a_socket_pair(drop);
+        server.join().unwrap();
+        conn.outbuf = vec![b's'; OVERFLOW];
+        assert!(matches!(
+            conn.flush(),
+            Err(ConnectionError::ServerClosedConnection)
+        ));
+        assert!(conn.outbuf.is_empty());
     }
 }

@@ -1,9 +1,10 @@
 //! Port of `src/bin/psql/t/001_basic.pl` (PostgreSQL 18.6), in upstream order.
 //!
-//! Only the server-free assertions of the first block exist so far; the
-//! `\copyright`, `\help` and `\echo :ENCODING` cases need a running cluster,
-//! which this environment has no PostgreSQL 18 to start, and the rest of the
-//! file lands with Linear NAT-399 … NAT-405.
+//! Only the server-free assertions exist so far (lines 12-14 and the
+//! `--help=foo` loop at 51-63); the `\copyright`, `\help` and
+//! `\echo :ENCODING` cases need a running cluster, which this environment has
+//! no PostgreSQL 18 to start, and the rest of the file lands with Linear
+//! NAT-400 … NAT-405.
 //!
 //! The byte-diff gate this issue's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the
@@ -17,35 +18,74 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+use testkit::env::Environment;
 use testkit::normalize::EXTRA_VERSION;
 use testkit::{Gate, reference};
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 
-/// `program_help_ok('psql');`
-///
-/// `usage()` must be byte-identical to upstream, which is NAT-399's issue; the
-/// stolen assertion is declared here, ignored with its reason, so the file
-/// keeps upstream's order and the gap is visible rather than absent.
+/// `program_help_ok('psql');` — 001_basic.pl:12.
 #[test]
-#[ignore = "psql --help is byte-identical work tracked in Linear NAT-399"]
 fn program_help_ok() {
     testkit::program_help_ok(Path::new(RPSQL));
 }
 
-/// `program_version_ok('psql');`
+/// `program_version_ok('psql');` — 001_basic.pl:13.
 #[test]
 fn program_version_ok() {
     testkit::program_version_ok(Path::new(RPSQL));
 }
 
-/// `program_options_handling_ok('psql');`
+/// `program_options_handling_ok('psql');` — 001_basic.pl:14.
 ///
 /// Only a nonzero exit and a non-empty stderr are required, which is what lets
 /// usage-rs's clap-shaped parse errors stand in for glibc getopt's (ADR-0004).
 #[test]
 fn program_options_handling_ok() {
     testkit::program_options_handling_ok(Path::new(RPSQL));
+}
+
+/// `# test --help=foo, analogous to program_help_ok()` — 001_basic.pl:51-:63:
+/// for `commands` and `variables`, exit 0, stdout non-empty, stderr empty.
+#[test]
+fn psql_help_arg() {
+    for arg in ["commands", "variables"] {
+        let outcome =
+            testkit::run(Path::new(RPSQL), [format!("--help={arg}")]).expect("spawn rpsql");
+        assert_eq!(outcome.status, Some(0), "psql --help={arg} exit code 0");
+        assert!(
+            !outcome.stdout.is_empty(),
+            "psql --help={arg} goes to stdout"
+        );
+        assert!(
+            outcome.stderr.is_empty(),
+            "psql --help={arg} nothing to stderr"
+        );
+    }
+}
+
+/// The Acceptance gate for `--help`, `--help=commands` and `--help=variables`:
+/// each through C psql and through rpsql, stdout, stderr and exit status
+/// diffed as raw bytes with no normalizer. `--version`, the fourth invocation,
+/// is [`version_matches_c_psql`].
+///
+/// The environment is `Utils.pm`'s scrub, which pins `LC_MESSAGES=C` so a
+/// PGDG psql built with NLS prints the untranslated text, with `TERM` and
+/// `COLUMNS` removed as well. The command-line paths pass `NOPAGER`
+/// (`startup.c:89`, `:704`-`:715`), so neither a pager nor the window width
+/// should reach the text; removing them makes that a property of the gate
+/// rather than of the machine it runs on.
+#[test]
+fn help_matches_c_psql() {
+    let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
+        return;
+    };
+    let env = Environment::postgres_test("001_basic.pl")
+        .without("TERM")
+        .without("COLUMNS");
+    for arg in ["--help", "--help=commands", "--help=variables"] {
+        gate.clone().with_env(env.clone()).arg(arg).assert_clean();
+    }
 }
 
 /// The Acceptance gate: `psql -X -c 'select 1'` byte for byte against C psql,

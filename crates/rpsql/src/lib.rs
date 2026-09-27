@@ -13,9 +13,9 @@
 //! ([`startup`], `startup.c`), the input loop ([`mainloop`], `mainloop.c`),
 //! `SendQuery` ([`common`], `common.c`), the four backslash commands this
 //! issue names ([`command`], `command.c`), the prompt renderer ([`prompt`],
-//! `prompt.c`) and enough of `print.c` to render the default aligned output.
-//! `--help` is NAT-399's, the rest of `print.c` is NAT-400's, `\d` is
-//! NAT-401's and interactive input is NAT-405's.
+//! `prompt.c`), enough of `print.c` to render the default aligned output, and
+//! `help.c`'s three help texts ([`help`], NAT-399). The rest of `print.c` is
+//! NAT-400's, `\d` is NAT-401's and interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -31,6 +31,7 @@
 
 pub mod command;
 pub mod common;
+pub mod help;
 pub mod mainloop;
 pub mod print;
 pub mod prompt;
@@ -51,7 +52,7 @@ use crate::common::{ErrorMessage, Executor, send_query};
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
-use crate::startup::{Action, Invocation, Session};
+use crate::startup::{Action, HelpTopic, Invocation, Session};
 use crate::variables::VarView;
 
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
@@ -61,6 +62,24 @@ pub const PG_VERSION: &str = "18.6";
 #[must_use]
 pub fn version_line() -> String {
     format!("psql (PostgreSQL) {PG_VERSION}")
+}
+
+/// The text `--help[=topic]` prints.
+///
+/// Upstream calls `slashUsage()` while the options are still being parsed, so
+/// there is no connection yet (`currently no connection`) and `\timing` is
+/// off; the other `(currently …)` notes are the switches seen so far.
+#[must_use]
+pub fn help_text(topic: HelpTopic) -> String {
+    match topic {
+        HelpTopic::Options => help::usage(),
+        HelpTopic::Commands(switches) => help::slash_usage(&help::SlashUsageState {
+            switches,
+            timing: false,
+            currdb: None,
+        }),
+        HelpTopic::Variables => help::help_variables(),
+    }
 }
 
 /// A live connection as an [`Executor`].
@@ -130,14 +149,10 @@ pub fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write) 
             let _ = writeln!(stdout, "{}", version_line());
             ExitCode::SUCCESS
         }
-        Invocation::PrintHelp(_) => {
-            // `usage()`, `slashUsage()` and `helpVariables()` must be
-            // byte-identical to upstream, which is NAT-399's whole issue.
-            let _ = writeln!(
-                stderr,
-                "psql: error: --help is not implemented yet (Linear NAT-399)"
-            );
-            ExitCode::from(EXIT_FAILURE)
+        // `startup.c:704`-`:715`: the text on stdout, then `exit(EXIT_SUCCESS)`.
+        Invocation::PrintHelp(topic) => {
+            let _ = stdout.write_all(help_text(topic).as_bytes());
+            ExitCode::SUCCESS
         }
         Invocation::Unparsable(rendered) => {
             let _ = stderr.write_all(rendered.as_bytes());
@@ -366,6 +381,31 @@ mod tests {
         assert_eq!(run(&args, &mut out, &mut err), ExitCode::SUCCESS);
         assert_eq!(String::from_utf8(out).unwrap(), "psql (PostgreSQL) 18.6\n");
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn every_help_topic_goes_to_stdout_and_exits_zero() {
+        // `001_basic.pl`'s `--help=foo` loop, and `program_help_ok`: exit 0,
+        // stdout non-empty, stderr empty.
+        for (arg, starts) in [
+            ("--help", "psql is the PostgreSQL interactive terminal.\n"),
+            (
+                "--help=options",
+                "psql is the PostgreSQL interactive terminal.\n",
+            ),
+            ("--help=commands", "General\n"),
+            ("--help=variables", "List of specially treated variables\n"),
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                run(&[OsString::from(arg)], &mut out, &mut err),
+                ExitCode::SUCCESS,
+                "{arg}"
+            );
+            assert!(String::from_utf8(out).unwrap().starts_with(starts), "{arg}");
+            assert!(err.is_empty(), "{arg}");
+        }
     }
 
     #[test]

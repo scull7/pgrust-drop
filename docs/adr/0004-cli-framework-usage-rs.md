@@ -2,7 +2,8 @@
 
 Status: accepted (owner decision, 2026-09-16); amended 2026-09-16 — the
 `psql` half of the first consequence is not true yet and lands with NAT-399
-(see Amendment below).
+(see Amendment below); amended 2026-09-26 — NAT-399 landed it (see the second
+amendment).
 
 ## Context
 
@@ -67,3 +68,31 @@ parser, printing checked-in upstream text, is how `rpsql` will do it too. Only
 psql's text (`usage()`, `slashUsage()`, `helpVariables()` in `help.c`) is not
 written yet. The first consequence holds for `initdb` today and for `psql` when
 NAT-399 lands.
+
+## Amendment 2026-09-26: the psql half is true
+
+NAT-399 ports `usage()`, `slashUsage()` and `helpVariables()` from `help.c`
+into `crates/rpsql/src/help.rs` as checked-in upstream text, which is what the
+Decision asked for. `run` now answers `Invocation::PrintHelp` with that text on
+stdout and exit 0. The first amendment's `#[ignore]` on
+`program_help_ok('psql')` is gone, and so is the last `#[ignore]` in the
+repository.
+
+The byte-diff gate the first amendment said was missing exists:
+`help_matches_c_psql` in `crates/rpsql/tests/t_001_basic.rs` diffs `--help`,
+`--help=commands` and `--help=variables` against C `psql` as raw bytes, and
+`version_matches_c_psql` diffs `--version` under `normalize::EXTRA_VERSION`,
+the same way `rinitdb`'s gate does. Both print `SKIP (flagged, not silent)`
+where PostgreSQL 18 is not installed. Every CI lane installs it and sets
+`PGDROP_REQUIRE_REF=1`, so the gates run there for real.
+
+psql's option loop can also exit early, which `initdb`'s cannot: `-V`,
+`--version`, a standalone `-?` and `--help[=topic]` stop it wherever they
+appear (`startup.c:666`, `:690`, `:704`), not only as `argv[1]`. The fast path
+still runs first. After it, `startup::help_or_version` walks argv in getopt
+order over `long_options[]` and returns the first early exit that comes before
+any option getopt would refuse. usage-rs never sees those flags, so it keeps
+its built-in help and version flags disabled. That walk is the one that already
+kept `-c`/`-f` in argv order (`startup::actions`); both now read it.
+
+The first consequence now holds for `psql` as it does for `initdb`.

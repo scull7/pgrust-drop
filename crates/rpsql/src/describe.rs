@@ -6,12 +6,15 @@
 //! upstream's, byte for byte, because `ECHO_HIDDEN` shows it and because the
 //! server's answer is only the same if the question is.
 //!
-//! Scope (NAT-401, slice 1): the dispatcher's whole `\d` switch
-//! ([`DescribeCommand::parse`]), name patterns ([`pattern_to_sql_regex`],
-//! [`process_sql_name_pattern`], [`validate_sql_name_pattern`]) and
+//! Scope (NAT-401): the dispatcher's whole `\d` switch
+//! ([`DescribeCommand::parse`]) and name patterns ([`pattern_to_sql_regex`],
+//! [`process_sql_name_pattern`], [`validate_sql_name_pattern`]); slice 1's
 //! `listTables` ([`list_tables_query`]), which answers `\d` with no pattern
-//! and `\dt`, `\di`, `\dv`, `\dm`, `\ds` and `\dE`. Every other command the
-//! switch recognizes is refused by name until its slice lands.
+//! and `\dt`, `\di`, `\dv`, `\dm`, `\ds` and `\dE`; and slice 2's
+//! `listPartitionedTables` ([`list_partitioned_tables_query`], `\dP`) and the
+//! access-method listings ([`describe_access_methods_query`], `\dA`, and
+//! [`OperatorListing`], `\dAc`, `\dAf`, `\dAo`, `\dAp`). Every other command
+//! the switch recognizes is refused by name until its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -29,6 +32,14 @@ pub enum DescribeCommand {
     ListTables(String),
     /// `describeTableDetails()` (`describe.c:1492`): `\d` with a pattern.
     TableDetails,
+    /// `listPartitionedTables()` (`describe.c:4266`), with the letters after
+    /// `\dP` (`&cmd[2]`).
+    ListPartitionedTables(String),
+    /// `describeAccessMethods()` (`describe.c:148`): `\dA`.
+    AccessMethods,
+    /// One of the `\dA` listings that take an access-method pattern and a
+    /// second one (`command.c:1061`-`:1092`).
+    OperatorListing(OperatorListing),
     /// A command the switch recognizes whose port has not landed yet; the
     /// name is its `describe.c` function.
     NotYet(&'static str),
@@ -74,11 +85,11 @@ impl DescribeCommand {
                 Self::ListTables("tvmsE".to_string())
             }),
             b'A' => match at(2) {
-                0 | b'+' | b'x' => not_yet("describeAccessMethods"),
-                b'c' => not_yet("listOperatorClasses"),
-                b'f' => not_yet("listOperatorFamilies"),
-                b'o' => not_yet("listOpFamilyOperators"),
-                b'p' => not_yet("listOpFamilyFunctions"),
+                0 | b'+' | b'x' => Some(Self::AccessMethods),
+                b'c' => Some(Self::OperatorListing(OperatorListing::Classes)),
+                b'f' => Some(Self::OperatorListing(OperatorListing::Families)),
+                b'o' => Some(Self::OperatorListing(OperatorListing::Operators)),
+                b'p' => Some(Self::OperatorListing(OperatorListing::Functions)),
                 _ => None,
             },
             b'a' => not_yet("describeAggregates"),
@@ -103,7 +114,9 @@ impl DescribeCommand {
             b'O' => not_yet("listCollations"),
             b'p' => not_yet("permissionsList"),
             b'P' => match at(2) {
-                0 | b'+' | b't' | b'i' | b'n' | b'x' => not_yet("listPartitionedTables"),
+                0 | b'+' | b't' | b'i' | b'n' | b'x' => {
+                    Some(Self::ListPartitionedTables(cmd[2..].to_string()))
+                }
                 _ => None,
             },
             b'T' => not_yet("describeTypes"),
@@ -138,6 +151,32 @@ impl DescribeCommand {
             _ => None,
         }
     }
+
+    /// How many patterns `exec_command_d()` reads for `cmd`: a second one only
+    /// for `\dAc`, `\dAf`, `\dAo` and `\dAp`, and only after a first
+    /// (`command.c:1065`). Any argument past them draws the "extra argument"
+    /// warning.
+    #[must_use]
+    pub fn patterns_read(cmd: &str, has_pattern: bool) -> usize {
+        match Self::parse(cmd, has_pattern) {
+            Some(Self::OperatorListing(_)) if has_pattern => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// The `\dA` listings with two patterns: an access method's, then a type's
+/// (`\dAc`, `\dAf`) or an operator family's (`\dAo`, `\dAp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorListing {
+    /// `listOperatorClasses()` (`describe.c:6898`): `\dAc`.
+    Classes,
+    /// `listOperatorFamilies()` (`describe.c:6999`): `\dAf`.
+    Families,
+    /// `listOpFamilyOperators()` (`describe.c:7088`): `\dAo`.
+    Operators,
+    /// `listOpFamilyFunctions()` (`describe.c:7195`): `\dAp`.
+    Functions,
 }
 
 /// `patternToSQLRegex()`'s output (`string_utils.c:1335`): up to three
@@ -692,6 +731,524 @@ pub fn list_tables_query(
     Ok(buf)
 }
 
+/// `formatPGVersionNumber()` (`string_utils.c:313`): a `server_version_num`
+/// as the release it names, `18` or `18.6` from 10 on, `9.6` or `9.6.24`
+/// before.
+#[must_use]
+pub fn format_pg_version_number(version: i32, include_minor: bool) -> String {
+    match (version >= 100_000, include_minor) {
+        (true, true) => format!("{}.{}", version / 10000, version % 10000),
+        (true, false) => format!("{}", version / 10000),
+        (false, true) => format!(
+            "{}.{}.{}",
+            version / 10000,
+            (version / 100) % 100,
+            version % 100
+        ),
+        (false, false) => format!("{}.{}", version / 10000, (version / 100) % 100),
+    }
+}
+
+/// What a `\d` command's query builder refuses with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// `validateSQLNamePattern` failed: the command fails.
+    Pattern(PatternError),
+    /// The server predates the feature. Upstream logs the message and still
+    /// reports success (`describe.c:155`-`:163`, `:4282`-`:4290`).
+    ServerTooOld(String),
+}
+
+impl From<PatternError> for Refusal {
+    fn from(err: PatternError) -> Self {
+        Self::Pattern(err)
+    }
+}
+
+/// The query half of `describeAccessMethods()` (`describe.c:148`-`:199`),
+/// whose title is "List of access methods".
+///
+/// # Errors
+/// A server before 9.6, or a pattern with a dot.
+pub fn describe_access_methods_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    if server.sversion < 90_600 {
+        return Err(Refusal::ServerTooOld(format!(
+            "The server (version {}) does not support access methods.",
+            format_pg_version_number(server.sversion, false)
+        )));
+    }
+    let mut buf = String::from(
+        "SELECT amname AS \"Name\",\n  \
+         CASE amtype WHEN 'i' THEN 'Index' WHEN 't' THEN 'Table' END AS \"Type\"",
+    );
+    if verbose {
+        buf.push_str(concat!(
+            ",\n  amhandler AS \"Handler\",\n",
+            "  pg_catalog.obj_description(oid, 'pg_am') AS \"Description\"",
+        ));
+    }
+    buf.push_str("\nFROM pg_catalog.pg_am\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("amname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+impl OperatorListing {
+    /// The printed title.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Classes => "List of operator classes",
+            Self::Families => "List of operator families",
+            Self::Operators => "List of operators of operator families",
+            Self::Functions => "List of support functions of operator families",
+        }
+    }
+
+    /// The listing's target list and joins, which only `+` changes.
+    // Four upstream query texts, one per arm, kept whole so each reads
+    // against its C.
+    #[allow(clippy::too_many_lines)]
+    fn select_from(self, verbose: bool) -> String {
+        let mut buf = String::from("SELECT\n  am.amname AS \"AM\",\n");
+        match self {
+            Self::Classes => {
+                buf.push_str(concat!(
+                    "  pg_catalog.format_type(c.opcintype, NULL) AS \"Input type\",\n",
+                    "  CASE\n",
+                    "    WHEN c.opckeytype <> 0 AND c.opckeytype <> c.opcintype\n",
+                    "    THEN pg_catalog.format_type(c.opckeytype, NULL)\n",
+                    "    ELSE NULL\n",
+                    "  END AS \"Storage type\",\n",
+                    "  CASE\n",
+                    "    WHEN pg_catalog.pg_opclass_is_visible(c.oid)\n",
+                    "    THEN pg_catalog.format('%I', c.opcname)\n",
+                    "    ELSE pg_catalog.format('%I.%I', n.nspname, c.opcname)\n",
+                    "  END AS \"Operator class\",\n",
+                    "  (CASE WHEN c.opcdefault\n",
+                    "    THEN 'yes'\n",
+                    "    ELSE 'no'\n",
+                    "  END) AS \"Default?\"",
+                ));
+                if verbose {
+                    buf.push_str(concat!(
+                        ",\n  CASE\n",
+                        "    WHEN pg_catalog.pg_opfamily_is_visible(of.oid)\n",
+                        "    THEN pg_catalog.format('%I', of.opfname)\n",
+                        "    ELSE pg_catalog.format('%I.%I', ofn.nspname, of.opfname)\n",
+                        "  END AS \"Operator family\",\n",
+                        " pg_catalog.pg_get_userbyid(c.opcowner) AS \"Owner\"\n",
+                    ));
+                }
+                buf.push_str(concat!(
+                    "\nFROM pg_catalog.pg_opclass c\n",
+                    "  LEFT JOIN pg_catalog.pg_am am on am.oid = c.opcmethod\n",
+                    "  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.opcnamespace\n",
+                    "  LEFT JOIN pg_catalog.pg_type t ON t.oid = c.opcintype\n",
+                    "  LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace\n",
+                ));
+                if verbose {
+                    buf.push_str(concat!(
+                        "  LEFT JOIN pg_catalog.pg_opfamily of ON of.oid = c.opcfamily\n",
+                        "  LEFT JOIN pg_catalog.pg_namespace ofn ON ofn.oid = of.opfnamespace\n",
+                    ));
+                }
+            }
+            Self::Families => {
+                buf.push_str(concat!(
+                    "  CASE\n",
+                    "    WHEN pg_catalog.pg_opfamily_is_visible(f.oid)\n",
+                    "    THEN pg_catalog.format('%I', f.opfname)\n",
+                    "    ELSE pg_catalog.format('%I.%I', n.nspname, f.opfname)\n",
+                    "  END AS \"Operator family\",\n",
+                    "  (SELECT\n",
+                    "     pg_catalog.string_agg(pg_catalog.format_type(oc.opcintype, NULL), ', ')\n",
+                    "   FROM pg_catalog.pg_opclass oc\n",
+                    "   WHERE oc.opcfamily = f.oid) \"Applicable types\"",
+                ));
+                if verbose {
+                    buf.push_str(",\n  pg_catalog.pg_get_userbyid(f.opfowner) AS \"Owner\"\n");
+                }
+                buf.push_str(concat!(
+                    "\nFROM pg_catalog.pg_opfamily f\n",
+                    "  LEFT JOIN pg_catalog.pg_am am on am.oid = f.opfmethod\n",
+                    "  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = f.opfnamespace\n",
+                ));
+            }
+            Self::Operators => {
+                buf.push_str(concat!(
+                    "  CASE\n",
+                    "    WHEN pg_catalog.pg_opfamily_is_visible(of.oid)\n",
+                    "    THEN pg_catalog.format('%I', of.opfname)\n",
+                    "    ELSE pg_catalog.format('%I.%I', nsf.nspname, of.opfname)\n",
+                    "  END AS \"Operator family\",\n",
+                    // Upstream's comma leads the next line here.
+                    "  o.amopopr::pg_catalog.regoperator AS \"Operator\"\n,",
+                    "  o.amopstrategy AS \"Strategy\",\n",
+                    "  CASE o.amoppurpose\n",
+                    "    WHEN 'o' THEN 'ordering'\n",
+                    "    WHEN 's' THEN 'search'\n",
+                    "  END AS \"Purpose\"\n",
+                ));
+                if verbose {
+                    buf.push_str(concat!(
+                        ", ofs.opfname AS \"Sort opfamily\",\n",
+                        "  CASE\n",
+                        "    WHEN p.proleakproof THEN 'yes'\n",
+                        "    ELSE 'no'\n",
+                        "  END AS \"Leakproof?\"\n",
+                    ));
+                }
+                buf.push_str(concat!(
+                    "FROM pg_catalog.pg_amop o\n",
+                    "  LEFT JOIN pg_catalog.pg_opfamily of ON of.oid = o.amopfamily\n",
+                    "  LEFT JOIN pg_catalog.pg_am am ON am.oid = of.opfmethod AND am.oid = o.amopmethod\n",
+                    "  LEFT JOIN pg_catalog.pg_namespace nsf ON of.opfnamespace = nsf.oid\n",
+                ));
+                if verbose {
+                    buf.push_str(concat!(
+                        "  LEFT JOIN pg_catalog.pg_opfamily ofs ON ofs.oid = o.amopsortfamily\n",
+                        "  LEFT JOIN pg_catalog.pg_operator op ON op.oid = o.amopopr\n",
+                        "  LEFT JOIN pg_catalog.pg_proc p ON p.oid = op.oprcode\n",
+                    ));
+                }
+            }
+            Self::Functions => {
+                buf.push_str(concat!(
+                    "  CASE\n",
+                    "    WHEN pg_catalog.pg_opfamily_is_visible(of.oid)\n",
+                    "    THEN pg_catalog.format('%I', of.opfname)\n",
+                    "    ELSE pg_catalog.format('%I.%I', ns.nspname, of.opfname)\n",
+                    "  END AS \"Operator family\",\n",
+                    "  pg_catalog.format_type(ap.amproclefttype, NULL) AS \"Registered left type\",\n",
+                    "  pg_catalog.format_type(ap.amprocrighttype, NULL) AS \"Registered right type\",\n",
+                    "  ap.amprocnum AS \"Number\"\n",
+                ));
+                buf.push_str(if verbose {
+                    ", ap.amproc::pg_catalog.regprocedure AS \"Function\"\n"
+                } else {
+                    ", p.proname AS \"Function\"\n"
+                });
+                buf.push_str(concat!(
+                    "FROM pg_catalog.pg_amproc ap\n",
+                    "  LEFT JOIN pg_catalog.pg_opfamily of ON of.oid = ap.amprocfamily\n",
+                    "  LEFT JOIN pg_catalog.pg_am am ON am.oid = of.opfmethod\n",
+                    "  LEFT JOIN pg_catalog.pg_namespace ns ON of.opfnamespace = ns.oid\n",
+                    "  LEFT JOIN pg_catalog.pg_proc p ON ap.amproc = p.oid\n",
+                ));
+            }
+        }
+        buf
+    }
+
+    /// The listing's query: `describe.c:6909`-`:6971` for `\dAc`,
+    /// `:7010`-`:7059` for `\dAf`, `:7100`-`:7165` for `\dAo` and
+    /// `:7206`-`:7257` for `\dAp`.
+    ///
+    /// # Errors
+    /// The access-method pattern has a dot, or the second pattern failed
+    /// `validateSQLNamePattern`.
+    pub fn query(
+        self,
+        access_method_pattern: Option<&str>,
+        second_pattern: Option<&str>,
+        verbose: bool,
+        server: ServerContext<'_>,
+    ) -> Result<String, PatternError> {
+        let mut buf = self.select_from(verbose);
+
+        let mut have_where = false;
+        if access_method_pattern.is_some() {
+            have_where = validate_sql_name_pattern(
+                &mut buf,
+                access_method_pattern,
+                false,
+                false,
+                PatternVars {
+                    namevar: Some("am.amname"),
+                    ..PatternVars::default()
+                },
+                1,
+                server.sversion,
+                server.db,
+            )?;
+        }
+        if second_pattern.is_some() {
+            // A type is matched by its internal or its external name; an
+            // operator family by its name.
+            let (schemavar, namevar, altnamevar, visibilityrule) = match self {
+                Self::Classes | Self::Families => (
+                    "tn.nspname",
+                    "t.typname",
+                    Some("pg_catalog.format_type(t.oid, NULL)"),
+                    Some("pg_catalog.pg_type_is_visible(t.oid)"),
+                ),
+                Self::Operators => ("nsf.nspname", "of.opfname", None, None),
+                Self::Functions => ("ns.nspname", "of.opfname", None, None),
+            };
+            if self == Self::Families {
+                let _ = write!(
+                    buf,
+                    concat!(
+                        "  {} EXISTS (\n",
+                        "    SELECT 1\n",
+                        "    FROM pg_catalog.pg_type t\n",
+                        "    JOIN pg_catalog.pg_opclass oc ON oc.opcintype = t.oid\n",
+                        "    LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace\n",
+                        "    WHERE oc.opcfamily = f.oid\n",
+                    ),
+                    if have_where { "AND" } else { "WHERE" }
+                );
+                have_where = true;
+            }
+            validate_sql_name_pattern(
+                &mut buf,
+                second_pattern,
+                have_where,
+                false,
+                PatternVars {
+                    schemavar: Some(schemavar),
+                    namevar: Some(namevar),
+                    altnamevar,
+                    visibilityrule,
+                },
+                3,
+                server.sversion,
+                server.db,
+            )?;
+            if self == Self::Families {
+                buf.push_str("  )\n");
+            }
+        }
+
+        buf.push_str(match self {
+            Self::Classes => "ORDER BY 1, 2, 4;",
+            Self::Families => "ORDER BY 1, 2;",
+            Self::Operators => concat!(
+                "ORDER BY 1, 2,\n",
+                "  o.amoplefttype = o.amoprighttype DESC,\n",
+                "  pg_catalog.format_type(o.amoplefttype, NULL),\n",
+                "  pg_catalog.format_type(o.amoprighttype, NULL),\n",
+                "  o.amopstrategy;",
+            ),
+            Self::Functions => concat!(
+                "ORDER BY 1, 2,\n",
+                "  ap.amproclefttype = ap.amprocrighttype DESC,\n",
+                "  3, 4, 5;",
+            ),
+        });
+        Ok(buf)
+    }
+}
+
+/// The relation kinds `listPartitionedTables()` was asked for
+/// (`describe.c:4268`-`:4270`, `:4293`-`:4294`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionTypes {
+    /// `t`: partitioned tables.
+    pub tables: bool,
+    /// `i`: partitioned indexes.
+    pub indexes: bool,
+    /// `n`: non-root partitioned relations too, with their parents.
+    pub nested: bool,
+}
+
+impl PartitionTypes {
+    /// Each letter anywhere in `reltypes`, and neither `t` nor `i` meaning
+    /// both.
+    #[must_use]
+    pub fn parse(reltypes: &str) -> Self {
+        let (tables, indexes) = (reltypes.contains('t'), reltypes.contains('i'));
+        Self {
+            tables: tables || !indexes,
+            indexes: indexes || !tables,
+            nested: reltypes.contains('n'),
+        }
+    }
+
+    /// Both kinds, which adds a "Type" column (`mixed_output`).
+    #[must_use]
+    pub fn mixed(self) -> bool {
+        self.tables && self.indexes
+    }
+
+    /// The printed title (`describe.c:4296`-`:4305`).
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        if self.mixed() {
+            "List of partitioned relations"
+        } else if self.indexes {
+            "List of partitioned indexes"
+        } else {
+            "List of partitioned tables"
+        }
+    }
+}
+
+/// The `LATERAL` subquery `listPartitionedTables()` sums partition sizes
+/// with under `+` (`describe.c:4388`-`:4417`).
+fn partition_sizes(sversion: i32) -> &'static str {
+    if sversion < 120_000 {
+        concat!(
+            ",\n     LATERAL (WITH RECURSIVE d\n",
+            "                AS (SELECT inhrelid AS oid, 1 AS level\n",
+            "                      FROM pg_catalog.pg_inherits\n",
+            "                     WHERE inhparent = c.oid\n",
+            "                    UNION ALL\n",
+            "                    SELECT inhrelid, level + 1\n",
+            "                      FROM pg_catalog.pg_inherits i\n",
+            "                           JOIN d ON i.inhparent = d.oid)\n",
+            "                SELECT pg_catalog.pg_size_pretty(sum(pg_catalog.pg_table_size(",
+            "d.oid))) AS tps,\n",
+            "                       pg_catalog.pg_size_pretty(sum(",
+            "\n             CASE WHEN d.level = 1",
+            " THEN pg_catalog.pg_table_size(d.oid) ELSE 0 END)) AS dps\n",
+            "               FROM d) s",
+        )
+    } else {
+        // PostgreSQL 12 has pg_partition_tree.
+        concat!(
+            ",\n     LATERAL (SELECT pg_catalog.pg_size_pretty(sum(",
+            "\n                 CASE WHEN ppt.isleaf AND ppt.level = 1",
+            "\n                      THEN pg_catalog.pg_table_size(ppt.relid)",
+            " ELSE 0 END)) AS dps",
+            ",\n                     pg_catalog.pg_size_pretty(sum(",
+            "pg_catalog.pg_table_size(ppt.relid))) AS tps",
+            "\n              FROM pg_catalog.pg_partition_tree(c.oid) ppt) s",
+        )
+    }
+}
+
+/// The query half of `listPartitionedTables()` (`describe.c:4266`-`:4447`).
+///
+/// # Errors
+/// A server before 10, or a pattern that failed `validateSQLNamePattern`.
+pub fn list_partitioned_tables_query(
+    types: PartitionTypes,
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    if server.sversion < 100_000 {
+        return Err(Refusal::ServerTooOld(format!(
+            "The server (version {}) does not support declarative table partitioning.",
+            format_pg_version_number(server.sversion, false)
+        )));
+    }
+    // With a pattern a partition can match, so its parent is shown too.
+    let with_parent = types.nested || pattern.is_some();
+
+    let mut buf = String::from(
+        "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  \
+         pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"",
+    );
+    if types.mixed() {
+        buf.push_str(
+            ",\n  CASE c.relkind WHEN 'p' THEN 'partitioned table' \
+             WHEN 'I' THEN 'partitioned index' END as \"Type\"",
+        );
+    }
+    if with_parent {
+        buf.push_str(",\n  inh.inhparent::pg_catalog.regclass as \"Parent name\"");
+    }
+    if types.indexes {
+        // One space of indent, as upstream has it.
+        buf.push_str(",\n c2.oid::pg_catalog.regclass as \"Table\"");
+    }
+    if verbose {
+        buf.push_str(",\n  am.amname as \"Access method\"");
+        if types.nested {
+            buf.push_str(",\n  s.dps as \"Leaf partition size\"");
+        }
+        // Without `n`, the sizes of all partitions are summed.
+        buf.push_str(
+            ",\n  s.tps as \"Total size\"\
+             ,\n  pg_catalog.obj_description(c.oid, 'pg_class') as \"Description\"",
+        );
+    }
+
+    buf.push_str(
+        "\nFROM pg_catalog.pg_class c\
+         \n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+    );
+    if types.indexes {
+        buf.push_str(
+            "\n     LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\
+             \n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid",
+        );
+    }
+    if with_parent {
+        buf.push_str("\n     LEFT JOIN pg_catalog.pg_inherits inh ON c.oid = inh.inhrelid");
+    }
+    if verbose {
+        buf.push_str("\n     LEFT JOIN pg_catalog.pg_am am ON c.relam = am.oid");
+        buf.push_str(partition_sizes(server.sversion));
+    }
+
+    buf.push_str("\nWHERE c.relkind IN (");
+    if types.tables {
+        buf.push_str("'p',");
+    }
+    if types.indexes {
+        buf.push_str("'I',");
+    }
+    buf.push_str("'')\n");
+    if !with_parent {
+        buf.push_str(" AND NOT c.relispartition\n");
+    }
+    if pattern.is_none() {
+        buf.push_str(
+            "      AND n.nspname <> 'pg_catalog'\n      \
+             AND n.nspname !~ '^pg_toast'\n      \
+             AND n.nspname <> 'information_schema'\n",
+        );
+    }
+
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            schemavar: Some("n.nspname"),
+            namevar: Some("c.relname"),
+            altnamevar: None,
+            visibilityrule: Some("pg_catalog.pg_table_is_visible(c.oid)"),
+        },
+        3,
+        server.sversion,
+        server.db,
+    )?;
+
+    let _ = write!(
+        buf,
+        "ORDER BY \"Schema\", {}{}\"Name\";",
+        if types.mixed() { "\"Type\" DESC, " } else { "" },
+        if with_parent {
+            "\"Parent name\" NULLS FIRST, "
+        } else {
+            ""
+        }
+    );
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,10 +1469,52 @@ mod tests {
             p("dx", false),
             Some(DescribeCommand::NotYet("listExtensions"))
         );
+        assert_eq!(p("dA+", true), Some(DescribeCommand::AccessMethods));
+        assert_eq!(p("dAx", false), Some(DescribeCommand::AccessMethods));
+        assert_eq!(
+            p("dApx+", true),
+            Some(DescribeCommand::OperatorListing(OperatorListing::Functions))
+        );
+        assert_eq!(
+            p("dAc", false),
+            Some(DescribeCommand::OperatorListing(OperatorListing::Classes))
+        );
+        assert_eq!(
+            p("dPtn+", false),
+            Some(DescribeCommand::ListPartitionedTables("tn+".into()))
+        );
+        assert_eq!(
+            p("dP", true),
+            Some(DescribeCommand::ListPartitionedTables(String::new()))
+        );
+        assert_eq!(p("dPS", false), None);
         assert_eq!(p("dAz", false), None);
         assert_eq!(p("dfz", false), None);
         assert_eq!(p("drx", false), None);
         assert_eq!(p("dz", false), None);
+    }
+
+    #[test]
+    fn only_a_da_listing_after_a_first_pattern_reads_a_second() {
+        // `command.c:1065`: `cmd[2]` is not '\0', '+' or 'x', and there was a
+        // first pattern.
+        let n = DescribeCommand::patterns_read;
+        assert_eq!(n("dAc", true), 2);
+        assert_eq!(n("dAo+", true), 2);
+        assert_eq!(n("dAc", false), 1);
+        assert_eq!(n("dA", true), 1);
+        assert_eq!(n("dA+", true), 1);
+        assert_eq!(n("dAx", true), 1);
+        assert_eq!(n("dt", true), 1);
+        assert_eq!(n("dAz", true), 1);
+    }
+
+    #[test]
+    fn a_version_number_reads_as_its_release() {
+        assert_eq!(format_pg_version_number(180_006, false), "18");
+        assert_eq!(format_pg_version_number(180_006, true), "18.6");
+        assert_eq!(format_pg_version_number(90_524, false), "9.5");
+        assert_eq!(format_pg_version_number(90_524, true), "9.5.24");
     }
 
     #[test]
@@ -1007,6 +1606,318 @@ mod tests {
             Err(PatternError(
                 "improper qualified name (too many dotted names): a.b.c.d".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn the_da_query_is_upstreams() {
+        assert_eq!(
+            describe_access_methods_query(None, false, PG18).unwrap(),
+            "SELECT amname AS \"Name\",\n\
+             \x20 CASE amtype WHEN 'i' THEN 'Index' WHEN 't' THEN 'Table' END AS \"Type\"\n\
+             FROM pg_catalog.pg_am\n\
+             ORDER BY 1;"
+        );
+        assert_eq!(
+            describe_access_methods_query(Some("h*"), true, PG18).unwrap(),
+            "SELECT amname AS \"Name\",\n\
+             \x20 CASE amtype WHEN 'i' THEN 'Index' WHEN 't' THEN 'Table' END AS \"Type\",\n\
+             \x20 amhandler AS \"Handler\",\n\
+             \x20 pg_catalog.obj_description(oid, 'pg_am') AS \"Description\"\n\
+             FROM pg_catalog.pg_am\n\
+             WHERE amname OPERATOR(pg_catalog.~) '^(h.*)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1;"
+        );
+    }
+
+    #[test]
+    fn an_access_method_has_no_schema_so_a_dot_is_refused() {
+        assert_eq!(
+            describe_access_methods_query(Some("regression.heap"), false, PG18),
+            Err(Refusal::Pattern(PatternError(
+                "improper qualified name (too many dotted names): regression.heap".to_string()
+            )))
+        );
+        assert_eq!(
+            OperatorListing::Classes.query(Some("regression.brin"), None, false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): regression.brin".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_server_too_old_is_told_so() {
+        let old = ServerContext {
+            sversion: 90_524,
+            ..PG18
+        };
+        assert_eq!(
+            describe_access_methods_query(None, false, old),
+            Err(Refusal::ServerTooOld(
+                "The server (version 9.5) does not support access methods.".to_string()
+            ))
+        );
+        assert_eq!(
+            list_partitioned_tables_query(PartitionTypes::parse(""), None, false, old),
+            Err(Refusal::ServerTooOld(
+                "The server (version 9.5) does not support declarative table partitioning."
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_dac_query_matches_the_type_by_either_name() {
+        // `\dAc brin pg*.oid*` (`psql.sql:1341`).
+        let q = OperatorListing::Classes
+            .query(Some("brin"), Some("pg*.oid*"), false, PG18)
+            .unwrap();
+        assert!(
+            q.ends_with(
+                "  LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace\n\
+                 WHERE am.amname OPERATOR(pg_catalog.~) '^(brin)$' COLLATE pg_catalog.default\n\
+                 \x20 AND (t.typname OPERATOR(pg_catalog.~) '^(oid.*)$' COLLATE pg_catalog.default\n\
+                 \x20       OR pg_catalog.format_type(t.oid, NULL) OPERATOR(pg_catalog.~) '^(oid.*)$' COLLATE pg_catalog.default)\n\
+                 \x20 AND tn.nspname OPERATOR(pg_catalog.~) '^(pg.*)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2, 4;"
+            ),
+            "{q}"
+        );
+        // Verbose adds the family and owner, and their joins.
+        let q = OperatorListing::Classes
+            .query(None, None, true, PG18)
+            .unwrap();
+        assert!(
+            q.contains(
+                " pg_catalog.pg_get_userbyid(c.opcowner) AS \"Owner\"\n\n\
+                 FROM pg_catalog.pg_opclass c\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "  LEFT JOIN pg_catalog.pg_namespace ofn ON ofn.oid = of.opfnamespace\n\
+                 ORDER BY 1, 2, 4;"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn the_daf_type_pattern_is_an_exists_subquery() {
+        // `*` as the access method adds no clause, so the subquery opens the
+        // WHERE.
+        let q = OperatorListing::Families
+            .query(Some("*"), Some("int4"), false, PG18)
+            .unwrap();
+        assert_eq!(
+            q,
+            "SELECT\n\
+             \x20 am.amname AS \"AM\",\n\
+             \x20 CASE\n\
+             \x20   WHEN pg_catalog.pg_opfamily_is_visible(f.oid)\n\
+             \x20   THEN pg_catalog.format('%I', f.opfname)\n\
+             \x20   ELSE pg_catalog.format('%I.%I', n.nspname, f.opfname)\n\
+             \x20 END AS \"Operator family\",\n\
+             \x20 (SELECT\n\
+             \x20    pg_catalog.string_agg(pg_catalog.format_type(oc.opcintype, NULL), ', ')\n\
+             \x20  FROM pg_catalog.pg_opclass oc\n\
+             \x20  WHERE oc.opcfamily = f.oid) \"Applicable types\"\n\
+             FROM pg_catalog.pg_opfamily f\n\
+             \x20 LEFT JOIN pg_catalog.pg_am am on am.oid = f.opfmethod\n\
+             \x20 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = f.opfnamespace\n\
+             \x20 WHERE EXISTS (\n\
+             \x20   SELECT 1\n\
+             \x20   FROM pg_catalog.pg_type t\n\
+             \x20   JOIN pg_catalog.pg_opclass oc ON oc.opcintype = t.oid\n\
+             \x20   LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace\n\
+             \x20   WHERE oc.opcfamily = f.oid\n\
+             \x20 AND (t.typname OPERATOR(pg_catalog.~) '^(int4)$' COLLATE pg_catalog.default\n\
+             \x20       OR pg_catalog.format_type(t.oid, NULL) OPERATOR(pg_catalog.~) '^(int4)$' COLLATE pg_catalog.default)\n\
+             \x20 AND pg_catalog.pg_type_is_visible(t.oid)\n\
+             \x20 )\n\
+             ORDER BY 1, 2;"
+        );
+        let q = OperatorListing::Families
+            .query(Some("btree"), Some("int4"), false, PG18)
+            .unwrap();
+        assert!(
+            q.contains("'^(btree)$' COLLATE pg_catalog.default\n  AND EXISTS (\n"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn the_dao_and_dap_queries_order_same_type_entries_first() {
+        let q = OperatorListing::Operators
+            .query(Some("btree"), Some("array_ops|float_ops"), true, PG18)
+            .unwrap();
+        // Upstream's comma leads the line after "Operator".
+        assert!(
+            q.contains("AS \"Operator\"\n,  o.amopstrategy AS \"Strategy\",\n"),
+            "{q}"
+        );
+        assert!(
+            q.contains("  END AS \"Purpose\"\n, ofs.opfname AS \"Sort opfamily\",\n"),
+            "{q}"
+        );
+        assert!(
+            q.ends_with(
+                "  LEFT JOIN pg_catalog.pg_proc p ON p.oid = op.oprcode\n\
+                 WHERE am.amname OPERATOR(pg_catalog.~) '^(btree)$' COLLATE pg_catalog.default\n\
+                 \x20 AND of.opfname OPERATOR(pg_catalog.~) '^(array_ops|float_ops)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1, 2,\n\
+                 \x20 o.amoplefttype = o.amoprighttype DESC,\n\
+                 \x20 pg_catalog.format_type(o.amoplefttype, NULL),\n\
+                 \x20 pg_catalog.format_type(o.amoprighttype, NULL),\n\
+                 \x20 o.amopstrategy;"
+            ),
+            "{q}"
+        );
+        let q = OperatorListing::Functions
+            .query(None, None, false, PG18)
+            .unwrap();
+        assert!(q.contains(", p.proname AS \"Function\"\nFROM"), "{q}");
+        assert!(
+            q.ends_with(
+                "  LEFT JOIN pg_catalog.pg_proc p ON ap.amproc = p.oid\n\
+                 ORDER BY 1, 2,\n\
+                 \x20 ap.amproclefttype = ap.amprocrighttype DESC,\n\
+                 \x20 3, 4, 5;"
+            ),
+            "{q}"
+        );
+        let q = OperatorListing::Functions
+            .query(Some("*"), Some("pg_catalog.uuid_ops"), true, PG18)
+            .unwrap();
+        assert!(
+            q.contains(", ap.amproc::pg_catalog.regprocedure AS \"Function\"\nFROM"),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "WHERE of.opfname OPERATOR(pg_catalog.~) '^(uuid_ops)$' COLLATE pg_catalog.default\n  \
+                 AND ns.nspname OPERATOR(pg_catalog.~) '^(pg_catalog)$' COLLATE pg_catalog.default\n"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn partition_types_default_to_both_kinds() {
+        let t = PartitionTypes::parse("");
+        assert!(t.tables && t.indexes && !t.nested && t.mixed());
+        assert_eq!(t.title(), "List of partitioned relations");
+        assert_eq!(
+            PartitionTypes::parse("t+").title(),
+            "List of partitioned tables"
+        );
+        assert_eq!(
+            PartitionTypes::parse("in").title(),
+            "List of partitioned indexes"
+        );
+        assert_eq!(
+            PartitionTypes::parse("tix").title(),
+            "List of partitioned relations"
+        );
+        assert!(PartitionTypes::parse("n").nested);
+    }
+
+    #[test]
+    fn the_bare_dp_query_is_upstreams() {
+        let q =
+            list_partitioned_tables_query(PartitionTypes::parse(""), None, false, PG18).unwrap();
+        assert_eq!(
+            q,
+            "SELECT n.nspname as \"Schema\",\n\
+             \x20 c.relname as \"Name\",\n\
+             \x20 pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\",\n\
+             \x20 CASE c.relkind WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",\n\
+             \x20c2.oid::pg_catalog.regclass as \"Table\"\n\
+             FROM pg_catalog.pg_class c\n\
+             \x20    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n\
+             \x20    LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n\
+             \x20    LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid\n\
+             WHERE c.relkind IN ('p','I','')\n\
+             \x20AND NOT c.relispartition\n\
+             \x20     AND n.nspname <> 'pg_catalog'\n\
+             \x20     AND n.nspname !~ '^pg_toast'\n\
+             \x20     AND n.nspname <> 'information_schema'\n\
+             \x20 AND pg_catalog.pg_table_is_visible(c.oid)\n\
+             ORDER BY \"Schema\", \"Type\" DESC, \"Name\";"
+        );
+    }
+
+    #[test]
+    fn a_dp_pattern_or_n_shows_parents_and_partitions() {
+        let q = list_partitioned_tables_query(
+            PartitionTypes::parse("t+"),
+            Some("testpart.*"),
+            true,
+            PG18,
+        )
+        .unwrap();
+        assert!(
+            q.starts_with(
+                "SELECT n.nspname as \"Schema\",\n  c.relname as \"Name\",\n  \
+                 pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\",\n  \
+                 inh.inhparent::pg_catalog.regclass as \"Parent name\",\n  \
+                 am.amname as \"Access method\",\n  s.tps as \"Total size\",\n  \
+                 pg_catalog.obj_description(c.oid, 'pg_class') as \"Description\"\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "\n     LEFT JOIN pg_catalog.pg_inherits inh ON c.oid = inh.inhrelid\
+                 \n     LEFT JOIN pg_catalog.pg_am am ON c.relam = am.oid,\n     \
+                 LATERAL (SELECT pg_catalog.pg_size_pretty(sum(\n                 \
+                 CASE WHEN ppt.isleaf AND ppt.level = 1\n                      \
+                 THEN pg_catalog.pg_table_size(ppt.relid) ELSE 0 END)) AS dps,\n                     \
+                 pg_catalog.pg_size_pretty(sum(pg_catalog.pg_table_size(ppt.relid))) AS tps\n              \
+                 FROM pg_catalog.pg_partition_tree(c.oid) ppt) s\n\
+                 WHERE c.relkind IN ('p','')\n  \
+                 AND n.nspname OPERATOR(pg_catalog.~) '^(testpart)$' COLLATE pg_catalog.default\n\
+                 ORDER BY \"Schema\", \"Parent name\" NULLS FIRST, \"Name\";"
+            ),
+            "{q}"
+        );
+        // `n` alone keeps the schema filter, and verbose adds the leaf size.
+        let q =
+            list_partitioned_tables_query(PartitionTypes::parse("in+"), None, true, PG18).unwrap();
+        assert!(
+            q.contains("  s.dps as \"Leaf partition size\",\n  s.tps as \"Total size\""),
+            "{q}"
+        );
+        assert!(
+            q.contains("WHERE c.relkind IN ('I','')\n      AND n.nspname <> 'pg_catalog'\n"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn before_12_partition_sizes_come_from_a_recursive_query() {
+        let v11 = ServerContext {
+            sversion: 110_022,
+            ..PG18
+        };
+        let q = list_partitioned_tables_query(PartitionTypes::parse("n"), None, true, v11).unwrap();
+        assert!(
+            q.contains(
+                ",\n     LATERAL (WITH RECURSIVE d\n\
+                 \x20               AS (SELECT inhrelid AS oid, 1 AS level\n"
+            ),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "SELECT pg_catalog.pg_size_pretty(sum(pg_catalog.pg_table_size(d.oid))) AS tps,\n\
+                 \x20                      pg_catalog.pg_size_pretty(sum(\n\
+                 \x20            CASE WHEN d.level = 1 THEN pg_catalog.pg_table_size(d.oid) ELSE 0 END)) AS dps\n\
+                 \x20              FROM d) s\n"
+            ),
+            "{q}"
         );
     }
 }

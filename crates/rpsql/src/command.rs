@@ -10,9 +10,12 @@
 
 use std::io::Write;
 
+use rlibpq::QueryResult;
+
 use crate::common::{Executor, LogLevel, log_prefix, psql_exec};
 use crate::describe::{
-    DescribeCommand, DescribeFlags, ServerContext, TableTypes, list_tables_query,
+    DescribeCommand, DescribeFlags, PartitionTypes, Refusal, ServerContext, TableTypes,
+    describe_access_methods_query, list_partitioned_tables_query, list_tables_query,
 };
 use crate::print::print_query;
 use crate::scan::{Scanner, VariableSource};
@@ -177,9 +180,8 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "c" | "connect" => 4,
         "pset" => 2,
         "unset" => 1,
-        // `exec_command_d` reads one pattern; the commands that read a
-        // second are not ported yet.
-        d if d.starts_with('d') => 1,
+        // `exec_command_d` reads one pattern, or two for some `\dA`s.
+        d if d.starts_with('d') => DescribeCommand::patterns_read(d, !options.is_empty()),
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -267,16 +269,51 @@ fn exec_command_d(
         pset.popt.topt.expanded = Expanded::On;
     }
 
+    let pattern = pattern.as_deref();
+    let db = ctx.executor.db().map(str::to_owned);
+    let server = ServerContext {
+        sversion: pset.sversion,
+        hide_tableam: pset.hide_tableam,
+        db: db.as_deref(),
+    };
+    let mut listing = |query: Result<String, Refusal>, title: &str| {
+        run_listing(query, title, &pset, ctx.executor, stdout, stderr)
+    };
     let success = match command {
         DescribeCommand::ListTables(tabtypes) => list_tables(
             &tabtypes,
-            pattern.as_deref(),
+            pattern,
             flags,
+            server,
             &pset,
             ctx.executor,
             stdout,
             stderr,
         ),
+        DescribeCommand::ListPartitionedTables(reltypes) => {
+            let types = PartitionTypes::parse(&reltypes);
+            listing(
+                list_partitioned_tables_query(types, pattern, flags.verbose, server),
+                types.title(),
+            )
+        }
+        DescribeCommand::AccessMethods => listing(
+            describe_access_methods_query(pattern, flags.verbose, server),
+            "List of access methods",
+        ),
+        DescribeCommand::OperatorListing(which) => {
+            // The second pattern is only read after a first (`command.c:1065`).
+            let second = options
+                .get(1)
+                .filter(|_| pattern.is_some())
+                .map(SlashOption::without_trailing_semicolons);
+            listing(
+                which
+                    .query(pattern, second.as_deref(), flags.verbose, server)
+                    .map_err(Refusal::from),
+                which.title(),
+            )
+        }
         DescribeCommand::TableDetails => {
             not_yet(&pset, cmd, "describeTableDetails", stderr);
             false
@@ -303,24 +340,74 @@ fn not_yet(pset: &PsqlSettings, cmd: &str, function: &str, stderr: &mut dyn Writ
     );
 }
 
+/// The shape most `describe.c` listings share: build the query, run it
+/// through `PSQLexec`, and print the result under `title`.
+///
+/// A refused pattern fails the command. A server too old for the feature is
+/// logged as an error, yet the command succeeds, as upstream returns `true`
+/// there (`describe.c:155`-`:163`).
+fn run_listing(
+    query: Result<String, Refusal>,
+    title: &str,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match query {
+        Ok(query) => query,
+        Err(refusal) => {
+            let (message, success) = match refusal {
+                Refusal::Pattern(err) => (err.0, false),
+                Refusal::ServerTooOld(message) => (message, true),
+            };
+            let _ = writeln!(stderr, "{}{message}", log_prefix(pset, LogLevel::Error));
+            return success;
+        }
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    print_titled(&result, title, pset, stdout, stderr)
+}
+
+/// `printQuery()` of a listing under its title.
+fn print_titled(
+    result: &QueryResult,
+    title: &str,
+    pset: &PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let mut opt = pset.popt.clone();
+    opt.title = Some(title.to_string());
+    match print_query(result, &opt) {
+        Ok(text) => {
+            let _ = stdout.write_all(&text);
+            true
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
+            false
+        }
+    }
+}
+
 /// `listTables()` (`describe.c:4011`): build the query, run it through
 /// `PSQLexec`, and print the result under its title — or, when nothing
 /// matched and psql is not quiet, say so instead (`describe.c:4179`).
+#[allow(clippy::too_many_arguments)]
 fn list_tables(
     tabtypes: &str,
     pattern: Option<&str>,
     flags: DescribeFlags,
+    server: ServerContext<'_>,
     pset: &PsqlSettings,
     executor: &mut dyn Executor,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
     let types = TableTypes::parse(tabtypes);
-    let server = ServerContext {
-        sversion: pset.sversion,
-        hide_tableam: pset.hide_tableam,
-        db: executor.db(),
-    };
     let query = match list_tables_query(types, pattern, flags.verbose, flags.system, server) {
         Ok(query) => query,
         Err(err) => {
@@ -341,18 +428,7 @@ fn list_tables(
         );
         return true;
     }
-    let mut opt = pset.popt.clone();
-    opt.title = Some(types.title().to_string());
-    match print_query(&result, &opt) {
-        Ok(text) => {
-            let _ = stdout.write_all(&text);
-            true
-        }
-        Err(err) => {
-            let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
-            false
-        }
-    }
+    print_titled(&result, types.title(), pset, stdout, stderr)
 }
 
 /// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
@@ -886,6 +962,101 @@ mod tests {
         assert_eq!(
             run.stderr,
             "psql: error: You are currently not connected to a database.\n"
+        );
+    }
+
+    #[test]
+    fn da_reads_one_pattern_and_warns_about_a_second() {
+        // `\dA foo bar` (`psql.sql:1336`): `\dA` itself never reads `bar`.
+        let answer = relations(&["Name", "Type"], &[]);
+        let (run, seen) = run_with("\\dA foo bar", pg18(), Some(vec![answer]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert!(
+            seen[0].contains("amname OPERATOR(pg_catalog.~) '^(foo)$'"),
+            "{}",
+            seen[0]
+        );
+        assert!(!seen[0].contains("bar"), "{}", seen[0]);
+        assert!(
+            run.stdout.starts_with("List of access methods\n"),
+            "{}",
+            run.stdout
+        );
+        assert_eq!(
+            run.stderr,
+            "psql: warning: \\dA: extra argument \"bar\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn dac_reads_a_second_pattern_and_warns_about_a_third() {
+        let answer = relations(&["AM", "Input type"], &[]);
+        let (run, seen) = run_with("\\dAc brin int4; x", pg18(), Some(vec![answer]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert!(seen[0].contains("'^(brin)$'"), "{}", seen[0]);
+        // The second pattern loses its trailing semicolon too.
+        assert!(
+            seen[0].contains("t.typname OPERATOR(pg_catalog.~) '^(int4)$'"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            run.stdout.starts_with("List of operator classes\n"),
+            "{}",
+            run.stdout
+        );
+        assert_eq!(
+            run.stderr,
+            "psql: warning: \\dAc: extra argument \"x\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn dp_prints_its_listing_under_its_title() {
+        let answer = relations(&["Schema", "Name", "Owner"], &[&["s", "p", "me"]]);
+        let (run, seen) = run_with("\\dPt", pg18(), Some(vec![answer]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert!(
+            seen[0].contains("WHERE c.relkind IN ('p','')\n"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            run.stdout.starts_with("List of partitioned tables\n"),
+            "{}",
+            run.stdout
+        );
+        // An empty listing is printed, not reported: `listPartitionedTables`
+        // has no not-found message.
+        let (run, _) = run_with("\\dP", pg18(), Some(vec![relations(&["Schema"], &[])]));
+        assert!(run.stdout.ends_with("(0 rows)\n\n"), "{}", run.stdout);
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn a_server_too_old_is_an_error_message_yet_the_command_succeeds() {
+        // `describe.c:155`-`:163`: `pg_log_error`, then `return true`.
+        let old = PsqlSettings {
+            sversion: 90_524,
+            ..PsqlSettings::default()
+        };
+        let (run, seen) = run_with("\\dA", old, Some(vec![]));
+        assert!(seen.is_empty());
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(
+            run.stderr,
+            "psql: error: The server (version 9.5) does not support access methods.\n"
+        );
+    }
+
+    #[test]
+    fn a_bad_access_method_pattern_fails_the_command() {
+        let (run, seen) = run_with("\\dAo regression.brin", pg18(), Some(vec![]));
+        assert!(seen.is_empty());
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: improper qualified name (too many dotted names): regression.brin\n"
         );
     }
 

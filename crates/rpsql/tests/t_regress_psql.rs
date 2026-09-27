@@ -310,6 +310,9 @@ const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
 const DISPLAY_WIDTH_PORT: u16 = 55_495;
 const CONDITIONAL_AM_DISPLAY_PORT: u16 = 55_496;
 const RELATION_LISTINGS_PORT: u16 = 55_497;
+const PARTITIONED_RELATIONS_PORT: u16 = 55_498;
+const ACCESS_METHODS_PORT: u16 = 55_499;
+const PARTITION_AND_AM_LISTINGS_PORT: u16 = 55_500;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -715,13 +718,123 @@ fn the_relation_listings_match_c_psql() {
     diff_against_c_psql(&cluster, "relation listings", script);
 }
 
+/// `-- run test inside own schema and hide other partitions` and `-- only
+/// partition related object should be displayed` (`psql.sql:1266`, `:1280`),
+/// live: `\dP`, `\dPt`, `\dPi` and `\dPn` alone and combined, with and
+/// without a pattern, over partitioned tables and indexes nested two deep.
+///
+/// The two sections start from what the end of the section before sets up
+/// (`psql.sql:1259`-`:1264`: the `testpart` schema, and a role that owns it
+/// and is the session's), so the gate starts at `create schema testpart;`,
+/// which sits at the end of the section before. The second section drops
+/// all of it again, role included, so C psql starts where rpsql did.
+#[test]
+fn the_partitioned_relations_sections_run_live() {
+    let Some(cluster) = Cluster::start(PARTITIONED_RELATIONS_PORT) else {
+        return;
+    };
+    let run = sections(
+        "-- chunked results with an error after the first chunk",
+        "-- only partition related object should be displayed",
+    );
+    gate_section(&cluster, &tail(&run, "create schema testpart;"));
+}
+
+/// `-- check printing info about access methods` (`psql.sql:1331`), live:
+/// `\dA` with and without `+`, a pattern and an extra argument, and one each
+/// of `\dAc`, `\dAf`, `\dAo`, `\dAp` with one or two patterns, `+` and `x`.
+///
+/// `pg_regress` runs `psql.sql` in a database where `create_am.sql:94` has
+/// already made the table access method `heap2`, which `\dA` lists; the
+/// preamble makes the same one, and the reset drops it between rpsql and
+/// C psql.
+#[test]
+fn the_access_methods_section_runs_live() {
+    let Some(cluster) = Cluster::start(ACCESS_METHODS_PORT) else {
+        return;
+    };
+    let section = section("-- check printing info about access methods");
+    let preamble = "CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;\n";
+    gate_text(
+        &cluster,
+        &format!(
+            "psql.sql:{} vs psql.out:{} ({}, after {preamble:?})",
+            section.sql_line, section.out_line, section.header
+        ),
+        &format!("{preamble}{}", section.sql),
+        &format!("{preamble}{}", section.expected),
+        Some("DROP ACCESS METHOD heap2;\n"),
+    );
+}
+
+/// `listPartitionedTables` and the access-method listings beyond what
+/// `psql.sql` exercises, against C psql, with `ECHO_HIDDEN` on so each
+/// catalog query is compared byte for byte: `\dP` with every letter and `+`
+/// (both size queries), `x`, schema- and database-qualified patterns; `\dA`
+/// with every listing's `+`, no pattern, one, two, `*` for the access method
+/// (which adds no clause, so `\dAf`'s type subquery opens the `WHERE`), a
+/// schema-qualified second pattern, a trailing semicolon on each, a third
+/// argument, and the patterns `validateSQLNamePattern` refuses.
+#[test]
+fn the_partition_and_access_method_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(PARTITION_AND_AM_LISTINGS_PORT) else {
+        return;
+    };
+    let script = "\\set QUIET off\n\
+        create schema s2;\n\
+        create table s2.parent (id int) partition by range (id);\n\
+        create index parent_id on s2.parent (id);\n\
+        create table s2.leaf partition of s2.parent for values from (0) to (10);\n\
+        create table s2.mid partition of s2.parent for values from (10) to (20) partition by range (id);\n\
+        create table s2.low partition of s2.mid for values from (10) to (15);\n\
+        comment on table s2.parent is 'the root';\n\
+        \\set ECHO_HIDDEN on\n\
+        \\dP\n\
+        \\dP+\n\
+        \\dPn+\n\
+        \\dPt+ s2.*\n\
+        \\dPi+\n\
+        \\dPin s2.*\n\
+        \\dPtix\n\
+        \\dP postgres.s2.m*;\n\
+        \\dA\n\
+        \\dA+ b*;\n\
+        \\dAc\n\
+        \\dAc+ btree\n\
+        \\dAc gist pg_catalog.point\n\
+        \\dAf+ hash\n\
+        \\dAf * int4;\n\
+        \\dAf btree int4 extra\n\
+        \\dAo gist\n\
+        \\dAo+ * pg_catalog.box_ops\n\
+        \\dAp+ spgist\n\
+        \\dApx hash integer_ops\n\
+        \\set ECHO_HIDDEN off\n\
+        \\dA regression.heap\n\
+        \\dAc nonesuch.brin\n\
+        \\dAf btree postgres.pg_catalog.int4\n\
+        \\dAp btree nonesuch.pg_catalog.uuid_ops\n\
+        \\dAo btree a.b.c.d\n\
+        \\dP a.b.c.d\n\
+        \\dPS\n\
+        set client_min_messages = warning;\n\
+        drop schema s2 cascade;\n\
+        \\dP\n";
+    diff_against_c_psql(&cluster, "partition and access method listings", script);
+}
+
 /// A script `psql.out` has no expected output for: rpsql must render all of
 /// it, and print what C psql prints when this lane has C psql.
+///
+/// "Rendered all of it" means no refusal of this port's, each of which says
+/// `is not implemented yet`, and no server `ERROR`. Upstream's own "…are not
+/// implemented: <pattern>" (`describe.c:6380`) is output to diff, not a
+/// refusal.
 fn diff_against_c_psql(cluster: &Cluster, what: &str, script: &str) {
     let ours = cluster.run_script(Path::new(RPSQL), script);
     let text = String::from_utf8_lossy(&ours);
     assert!(
-        !text.contains("not implemented") && !text.contains("ERROR"),
+        !text.contains("not implemented yet") && !text.contains("ERROR"),
         "rpsql ({what}):\n{text}"
     );
     match cluster.reference_psql() {

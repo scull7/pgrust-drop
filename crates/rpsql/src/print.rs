@@ -405,7 +405,8 @@ enum LineWrap {
 /// The pager is not ported, so neither is the pager arithmetic; the target
 /// width `output_columns` matters only to `expanded auto`, which escapes to
 /// the vertical format (a later slice) when the table is wider. That width is
-/// `\pset columns`; the terminal's (`$COLUMNS`, `TIOCGWINSZ`) is not read yet.
+/// `\pset columns`; the terminal's (`$COLUMNS`, `TIOCGWINSZ`) is not read yet,
+/// so `expanded auto` under `\pset columns 0` is refused.
 // One function, as upstream's is, so a reader can follow the two side by side.
 #[allow(clippy::too_many_lines)]
 fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
@@ -442,12 +443,15 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
     width_total += max_width.iter().sum::<usize>();
 
     // Expanded auto escapes to vertical when the table is wider than the
-    // target and has more than one column (`print.c:877`).
+    // target and has more than one column (`print.c:877`). Under `\pset
+    // columns 0` the target is the terminal's (`print.c:804`-`:816`), which is
+    // not read here, so whether C goes vertical cannot be decided: refuse.
     let output_columns = usize::try_from(opt.columns).unwrap_or(0);
     if opt.expanded == Expanded::Auto
-        && output_columns > 0
         && col_count > 1
-        && (output_columns < total_header_width || output_columns < width_total)
+        && (output_columns == 0
+            || output_columns < total_header_width
+            || output_columns < width_total)
     {
         return Err(PrintError::Unsupported(Unsupported::Expanded));
     }
@@ -959,11 +963,23 @@ mod tests {
             PrintError::Unsupported(Unsupported::NumericLocale)
         );
 
+        // Under `\pset columns 0` C measures the terminal, when stdout is
+        // one (`print.c:804`), and this port does not: refused, not guessed.
+        assert_eq!(
+            refused(&|o| o.topt.expanded = Expanded::Auto),
+            PrintError::Unsupported(Unsupported::Expanded)
+        );
+
         // And each is a no-op where upstream's is.
         let mut opt = PrintQueryOpt::default();
         opt.topt.expanded = Expanded::Auto;
         opt.topt.columns = 80;
         assert!(print_query(&res, &opt).is_ok());
+        // One column never goes vertical (`print.c:877`), whatever the width.
+        let one_column = result(vec![int4_field("n")], vec![vec![Some("1")]]);
+        let mut opt = PrintQueryOpt::default();
+        opt.topt.expanded = Expanded::Auto;
+        assert!(print_query(&one_column, &opt).is_ok());
         let text_only = result(vec![text_field("s")], vec![vec![Some("a")]]);
         let mut opt = PrintQueryOpt::default();
         opt.topt.numeric_locale = true;

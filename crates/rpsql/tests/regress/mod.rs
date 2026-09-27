@@ -214,6 +214,75 @@ pub fn tail(section: &Section<'static>, line: &str) -> Section<'static> {
     }
 }
 
+/// The part of `section` before its first line that reads `line`: the same
+/// cut in both files, as [`tail`] makes. It is for a section whose last part
+/// needs what this port does not have yet.
+///
+/// # Panics
+/// When either file has no such line in `section`.
+pub fn head(section: &Section<'static>, line: &str) -> Section<'static> {
+    let cut = |text: &'static str, what: &str| -> &'static str {
+        let mut at = 0;
+        for l in text.split_inclusive('\n') {
+            if l.trim_end_matches('\n') == line {
+                return &text[..at];
+            }
+            at += l.len();
+        }
+        panic!("{what} of {:?} has no line {line:?}", section.header);
+    };
+    Section {
+        sql: cut(section.sql, "psql.sql"),
+        expected: cut(section.expected, "psql.out"),
+        ..section.clone()
+    }
+}
+
+/// `section` with some of its input lines taken out, as owned text: each
+/// line equal to one of `commands` leaves the script, and leaves the
+/// expected output together with what it printed, through the empty line
+/// that ends a printed table. It is for a section that mixes commands this
+/// port has with ones a later slice brings, when the ones it has do not
+/// depend on the others: the rest of the section is still gated whole.
+///
+/// # Panics
+/// When a command is not in the section, or its output has no end.
+pub fn without(section: &Section<'_>, commands: &[&str]) -> (String, String) {
+    let is_cut = |line: &str| commands.contains(&line.trim_end_matches('\n'));
+    let sql: String = section
+        .sql
+        .split_inclusive('\n')
+        .filter(|l| !is_cut(l))
+        .collect();
+
+    let mut expected = String::new();
+    let mut cut = 0;
+    let mut lines = section.expected.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        if is_cut(line) {
+            cut += 1;
+            assert!(
+                lines.any(|l| l == "\n"),
+                "{:?}: the output of {line:?} has no end",
+                section.header
+            );
+        } else {
+            expected.push_str(line);
+        }
+    }
+    let wanted = section
+        .sql
+        .split_inclusive('\n')
+        .filter(|l| is_cut(l))
+        .count();
+    assert!(
+        wanted > 0 && cut == wanted,
+        "{:?}: cut {cut} of {wanted} lines naming {commands:?}",
+        section.header
+    );
+    (sql, expected)
+}
+
 /// The C tools a cluster is started with. `psql` is not among them: the
 /// section gate compares rpsql against `psql.out` with only a server, and
 /// against C psql when that is present too.

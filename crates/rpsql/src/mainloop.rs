@@ -150,8 +150,14 @@ pub fn main_loop(
                 }
                 added_nl_pos = None;
 
-                slash_status =
-                    dispatch_slash(&mut scanner, session.pset, session.vars, stdout, stderr);
+                slash_status = dispatch_slash(
+                    &mut scanner,
+                    session.pset,
+                    session.vars,
+                    executor,
+                    stdout,
+                    stderr,
+                );
                 success = slash_status != CommandResult::Error;
                 session.pset.stmt_lineno = 1;
 

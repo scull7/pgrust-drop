@@ -270,6 +270,48 @@ pub fn socket_address(conninfo: &ConnInfo) -> Result<Address, ConnError> {
     })
 }
 
+/// `pqSaveParameterStatus`'s reading of `server_version`
+/// (`fe-exec.c:1158`): `sscanf("%d.%d.%d")`, then the old three-part style
+/// (`9.6.1`), the new two-part style (`10.1`), the old style without a minor
+/// version (`9.6devel`) or the new one without (`10devel`); anything else is
+/// 0, unknown.
+#[must_use]
+pub fn server_version_num(value: &[u8]) -> i32 {
+    // One `%d`: optional white space, an optional sign, at least one digit.
+    fn int(s: &[u8]) -> Option<(i32, &[u8])> {
+        let s = &s[s.iter().take_while(|b| b.is_ascii_whitespace()).count()..];
+        let (negative, s) = match s.first() {
+            Some(b'-') => (true, &s[1..]),
+            Some(b'+') => (false, &s[1..]),
+            _ => (false, s),
+        };
+        let digits = s.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        let n = s[..digits].iter().fold(0i32, |n, d| {
+            n.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
+        });
+        Some((if negative { n.wrapping_neg() } else { n }, &s[digits..]))
+    }
+    // A literal `.` in the format, then the next `%d`.
+    fn next(s: &[u8]) -> Option<(i32, &[u8])> {
+        s.strip_prefix(b".").and_then(int)
+    }
+
+    let Some((vmaj, rest)) = int(value) else {
+        return 0;
+    };
+    match next(rest) {
+        Some((vmin, rest)) => match next(rest) {
+            Some((vrev, _)) => (100 * vmaj + vmin) * 100 + vrev,
+            None if vmaj >= 10 => 100 * 100 * vmaj + vmin,
+            None => (100 * vmaj + vmin) * 100,
+        },
+        None => 100 * 100 * vmaj,
+    }
+}
+
 /// `UNIXSOCK_PATH`, `pqcomm.h:44`.
 #[must_use]
 pub fn unix_socket_path(sockdir: &str, port: u16) -> PathBuf {
@@ -1311,6 +1353,15 @@ impl<S: Read + Write> Connection<S> {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// `PQserverVersion`, `fe-connect.c:7628`: the `server_version` the
+    /// server reported, as [`server_version_num`] reads it, or 0 when it sent
+    /// none.
+    #[must_use]
+    pub fn server_version(&self) -> i32 {
+        self.parameter_status(b"server_version")
+            .map_or(0, server_version_num)
+    }
+
     /// `PQbackendPID`, `fe-connect.c:7674`.
     #[must_use]
     pub fn backend_pid(&self) -> i32 {
@@ -1376,6 +1427,23 @@ mod tests {
     use crate::conninfo::{Env, parse_conninfo};
     use crate::pg_config::DEF_PGPORT_STR;
     use crate::result::diag;
+
+    #[test]
+    fn server_version_is_read_the_way_pq_save_parameter_status_reads_it() {
+        // `fe-exec.c:1166`-`:1192`.
+        assert_eq!(server_version_num(b"18.6"), 180_006);
+        assert_eq!(
+            server_version_num(b"18.6 (Debian 18.6-1.pgdg13+2)"),
+            180_006
+        );
+        assert_eq!(server_version_num(b"10.1"), 100_001);
+        assert_eq!(server_version_num(b"9.6.1"), 90_601);
+        assert_eq!(server_version_num(b"9.6devel"), 90_600);
+        assert_eq!(server_version_num(b"10devel"), 100_000);
+        assert_eq!(server_version_num(b"19beta1"), 190_000);
+        assert_eq!(server_version_num(b"devel"), 0);
+        assert_eq!(server_version_num(b""), 0);
+    }
 
     /// A stream that plays back recorded server bytes and records what the
     /// client wrote — the replay harness for a captured trace.

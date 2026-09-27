@@ -216,8 +216,9 @@ pub fn do_pset(
                     "unicode_column_linestyle" => (&mut topt.unicode_column_linestyle, "column"),
                     _ => (&mut topt.unicode_header_linestyle, "header"),
                 };
-                // `refresh_utf8format` is the unicode renderer's to call when
-                // it draws; the setting is all there is to store.
+                // C refreshes `pg_utf8format` here (`command.c:5167`); the
+                // printer derives it from these settings when it draws
+                // (`print::refresh_utf8format`).
                 *slot = unicode_line_style(value).ok_or_else(|| {
                     PsetError::new(format!(
                         "\\pset: allowed Unicode {which} line styles are single, double"

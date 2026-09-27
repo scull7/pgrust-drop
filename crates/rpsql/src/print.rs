@@ -4,11 +4,11 @@
 //! `PRINT_WRAPPED` and `PRINT_UNALIGNED` here, at every border (0, 1, 2) in
 //! the ascii and old-ascii line styles (`expanded auto` under a `\pset
 //! columns` target), and the document formats (csv, html, asciidoc, latex,
-//! latex-longtable, troff-ms) in [`markup`]. NAT-400 still owns the unicode
-//! line style and `numericlocale`; until they land each is
-//! [`PrintError::Unsupported`], which the caller reports rather than printing
-//! something that only looks right. So is a table whose layout depends on the
-//! terminal's width, which is never read (see [`Unsupported::TerminalWidth`]).
+//! latex-longtable, troff-ms) in [`markup`], in the ascii, old-ascii and
+//! unicode line styles, with `numericlocale`. A table whose layout depends
+//! on the terminal's width, which is never read, is
+//! [`PrintError::Unsupported`] (see [`Unsupported::TerminalWidth`]), which
+//! the caller reports rather than printing something that only looks right.
 //!
 //! The whole module is a pure function from a result to bytes; nothing here
 //! opens a file or a pager.
@@ -28,30 +28,21 @@ pub enum Unsupported {
     /// That is `wrapped`, `expanded auto` over more than one column, and
     /// `xheader_width page`.
     TerminalWidth,
-    /// `\pset linestyle unicode`.
-    Unicode,
-    /// `\pset numericlocale on` over a right-aligned column.
-    NumericLocale,
 }
 
 /// A table this port does not render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrintError {
-    /// The feature belongs to a later slice of NAT-400.
+    /// A layout this port declines to guess.
     Unsupported(Unsupported),
 }
 
 impl std::fmt::Display for PrintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self::Unsupported(what) = self;
-        match what {
-            Unsupported::TerminalWidth => {
-                f.write_str("a target width taken from the terminal (\\pset columns 0)")?;
-            }
-            Unsupported::Unicode => f.write_str("the unicode line style")?,
-            Unsupported::NumericLocale => f.write_str("locale-adjusted numeric output")?,
-        }
-        f.write_str(" is not implemented yet (Linear NAT-400)")
+        let Self::Unsupported(Unsupported::TerminalWidth) = self;
+        f.write_str(
+            "a target width taken from the terminal (\\pset columns 0) is not implemented yet (Linear NAT-400)",
+        )
     }
 }
 
@@ -79,6 +70,110 @@ pub enum Align {
     Left,
     /// `'r'`
     Right,
+}
+
+/// What `setDecimalLocale()` (`print.c:3642`) keeps of `localeconv()` for
+/// `\pset numericlocale`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecimalLocale<'a> {
+    /// `decimal_point`
+    pub decimal_point: &'a str,
+    /// `thousands_sep`
+    pub thousands_sep: &'a str,
+    /// `groupdigits`: digits per thousands group.
+    pub groupdigits: usize,
+}
+
+impl<'a> DecimalLocale<'a> {
+    /// The C (POSIX) locale's: `decimal_point` `"."`, and `thousands_sep`
+    /// and `grouping` empty, which `setDecimalLocale` replaces with `","`
+    /// and 3.
+    ///
+    /// It is the only one this port uses, because it cannot call
+    /// `localeconv()` (the crate is `deny(unsafe_code)`); see
+    /// `docs/divergences.md`. It is what C psql uses too under `LC_ALL=C`,
+    /// and under musl whatever the locale, since musl's `localeconv()` is
+    /// the C locale's in every locale.
+    pub const POSIX: DecimalLocale<'static> = DecimalLocale {
+        decimal_point: ".",
+        thousands_sep: ",",
+        groupdigits: 3,
+    };
+
+    /// `setDecimalLocale()`'s calculation over one `struct lconv`'s
+    /// `decimal_point`, `thousands_sep` and `grouping`.
+    #[must_use]
+    pub fn from_lconv(decimal_point: &'a str, thousands_sep: &'a str, grouping: &[u8]) -> Self {
+        // "Don't accept an empty decimal_point string".
+        let decimal_point = if decimal_point.is_empty() {
+            "."
+        } else {
+            decimal_point
+        };
+        // Only the first group width counts, and one outside 1..=6
+        // (`CHAR_MAX`, however `char` is signed) means 3.
+        let groupdigits = match grouping.first() {
+            Some(&g @ 1..=6) => usize::from(g),
+            _ => 3,
+        };
+        // An empty `thousands_sep` is replaced by one that cannot be taken
+        // for the decimal point.
+        let thousands_sep = if !thousands_sep.is_empty() {
+            thousands_sep
+        } else if decimal_point != "," {
+            ","
+        } else {
+            "."
+        };
+        Self {
+            decimal_point,
+            thousands_sep,
+            groupdigits,
+        }
+    }
+}
+
+/// `format_numeric_locale()` (`print.c:314`): group the integral digits of
+/// a number and localize its decimal point. Anything that does not look
+/// like a number — a `money` value already localized, `NaN` — is returned
+/// unchanged.
+#[must_use]
+pub fn format_numeric_locale(cell: &[u8], locale: &DecimalLocale<'_>) -> Vec<u8> {
+    if !cell.iter().all(|b| b"0123456789+-.eE".contains(b)) {
+        return cell.to_vec();
+    }
+    let (sign, digits) = match cell.first() {
+        Some(b'-' | b'+') => cell.split_at(1),
+        _ => cell.split_at(0),
+    };
+    let int_len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+    let group = locale.groupdigits;
+
+    let mut out = Vec::with_capacity(cell.len() + int_len / group * locale.thousands_sep.len());
+    out.extend_from_slice(sign);
+    // Digits in the first group.
+    let mut leading = match int_len % group {
+        0 => group,
+        n => n,
+    };
+    for (i, &digit) in digits[..int_len].iter().enumerate() {
+        if i > 0 {
+            leading -= 1;
+            if leading == 0 {
+                out.extend_from_slice(locale.thousands_sep.as_bytes());
+                leading = group;
+            }
+        }
+        out.push(digit);
+    }
+    let mut rest = &digits[int_len..];
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        out.extend_from_slice(locale.decimal_point.as_bytes());
+        rest = fraction;
+    }
+    // The fraction and the exponent, as they are.
+    out.extend_from_slice(rest);
+    out
 }
 
 /// `printTextLineFormat` (`print.h:43`): the characters of one kind of rule.
@@ -183,12 +278,149 @@ pub const ASCII_FORMAT_OLD: TextFormat = TextFormat {
     wrap_right_border: false,
 };
 
-/// `get_line_style()` (`print.c:3678`), for the styles this port draws.
-fn line_style(opt: &TableOpt) -> Result<&'static TextFormat, PrintError> {
+/// `unicodeStyleRowFormat` (`print.c:101`): the header rule of one weight.
+/// The pairs are indexed by the border's weight.
+struct UnicodeRowStyle {
+    horizontal: &'static str,
+    vertical_and_right: [&'static str; 2],
+    vertical_and_left: [&'static str; 2],
+}
+
+/// `unicodeStyleColumnFormat` (`print.c:108`): the column rule of one
+/// weight. The pairs are indexed by the weight of the rule it crosses.
+struct UnicodeColumnStyle {
+    vertical: &'static str,
+    vertical_and_horizontal: [&'static str; 2],
+    up_and_horizontal: [&'static str; 2],
+    down_and_horizontal: [&'static str; 2],
+}
+
+/// `unicodeStyleBorderFormat` (`print.c:116`): the frame of one weight.
+struct UnicodeBorderStyle {
+    up_and_right: &'static str,
+    vertical: &'static str,
+    down_and_right: &'static str,
+    horizontal: &'static str,
+    down_and_left: &'static str,
+    /// Upstream's name for the bottom-right corner, U+2518 / U+255D (up and
+    /// left).
+    left_and_right: &'static str,
+}
+
+/// `unicode_style` (`print.c:140`), indexed by [`UnicodeLinestyle`]: single,
+/// then double.
+const UNICODE_ROW_STYLE: [UnicodeRowStyle; 2] = [
+    UnicodeRowStyle {
+        horizontal: "\u{2500}",
+        vertical_and_right: ["\u{251C}", "\u{255F}"],
+        vertical_and_left: ["\u{2524}", "\u{2562}"],
+    },
+    UnicodeRowStyle {
+        horizontal: "\u{2550}",
+        vertical_and_right: ["\u{255E}", "\u{2560}"],
+        vertical_and_left: ["\u{2561}", "\u{2563}"],
+    },
+];
+
+/// See [`UNICODE_ROW_STYLE`].
+const UNICODE_COLUMN_STYLE: [UnicodeColumnStyle; 2] = [
+    UnicodeColumnStyle {
+        vertical: "\u{2502}",
+        vertical_and_horizontal: ["\u{253C}", "\u{256A}"],
+        up_and_horizontal: ["\u{2534}", "\u{2567}"],
+        down_and_horizontal: ["\u{252C}", "\u{2564}"],
+    },
+    UnicodeColumnStyle {
+        vertical: "\u{2551}",
+        vertical_and_horizontal: ["\u{256B}", "\u{256C}"],
+        up_and_horizontal: ["\u{2568}", "\u{2569}"],
+        down_and_horizontal: ["\u{2565}", "\u{2566}"],
+    },
+];
+
+/// See [`UNICODE_ROW_STYLE`].
+const UNICODE_BORDER_STYLE: [UnicodeBorderStyle; 2] = [
+    UnicodeBorderStyle {
+        up_and_right: "\u{2514}",
+        vertical: "\u{2502}",
+        down_and_right: "\u{250C}",
+        horizontal: "\u{2500}",
+        down_and_left: "\u{2510}",
+        left_and_right: "\u{2518}",
+    },
+    UnicodeBorderStyle {
+        up_and_right: "\u{255A}",
+        vertical: "\u{2551}",
+        down_and_right: "\u{2554}",
+        horizontal: "\u{2550}",
+        down_and_left: "\u{2557}",
+        left_and_right: "\u{255D}",
+    },
+];
+
+/// `refresh_utf8format()` (`print.c:3692`): the unicode line style for the
+/// three `unicode_*_linestyle` settings.
+///
+/// psql keeps one `pg_utf8format` and refreshes it at startup and on every
+/// `\pset unicode_*_linestyle` (`startup.c:181`, `command.c:5167`), so it
+/// always equals this function of the current settings; computing it when a
+/// table is drawn is the same thing without the global.
+#[must_use]
+pub fn refresh_utf8format(opt: &TableOpt) -> TextFormat {
+    let b = opt.unicode_border_linestyle as usize;
+    let h = opt.unicode_header_linestyle as usize;
+    let border = &UNICODE_BORDER_STYLE[b];
+    let header = &UNICODE_ROW_STYLE[h];
+    let column = &UNICODE_COLUMN_STYLE[opt.unicode_column_linestyle as usize];
+    TextFormat {
+        name: "unicode",
+        lrule: [
+            TextLineFormat {
+                hrule: border.horizontal,
+                leftvrule: border.down_and_right,
+                midvrule: column.down_and_horizontal[b],
+                rightvrule: border.down_and_left,
+            },
+            TextLineFormat {
+                hrule: header.horizontal,
+                leftvrule: header.vertical_and_right[b],
+                midvrule: column.vertical_and_horizontal[h],
+                rightvrule: header.vertical_and_left[b],
+            },
+            TextLineFormat {
+                hrule: border.horizontal,
+                leftvrule: border.up_and_right,
+                midvrule: column.up_and_horizontal[b],
+                rightvrule: border.left_and_right,
+            },
+            TextLineFormat {
+                hrule: "",
+                leftvrule: border.vertical,
+                midvrule: column.vertical,
+                rightvrule: border.vertical,
+            },
+        ],
+        midvrule_nl: column.vertical,
+        midvrule_wrap: column.vertical,
+        midvrule_blank: column.vertical,
+        // "Same for all unicode today" (`print.c:3731`): U+21B5 marks a
+        // newline and U+2026 a wrap.
+        header_nl_left: " ",
+        header_nl_right: "\u{21B5}",
+        nl_left: " ",
+        nl_right: "\u{21B5}",
+        wrap_left: "\u{2026}",
+        wrap_right: "\u{2026}",
+        wrap_right_border: true,
+    }
+}
+
+/// `get_line_style()` (`print.c:3678`).
+fn line_style(opt: &TableOpt) -> TextFormat {
     match opt.line_style {
-        LineStyle::Ascii => Ok(&ASCII_FORMAT),
-        LineStyle::OldAscii => Ok(&ASCII_FORMAT_OLD),
-        LineStyle::Unicode => Err(PrintError::Unsupported(Unsupported::Unicode)),
+        LineStyle::Ascii => ASCII_FORMAT,
+        LineStyle::OldAscii => ASCII_FORMAT_OLD,
+        LineStyle::Unicode => refresh_utf8format(opt),
     }
 }
 
@@ -244,11 +476,6 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         .iter()
         .map(|f| column_type_alignment(f.typid))
         .collect();
-    // `format_numeric_locale` rewrites right-aligned cells; it is a later
-    // slice's, and a no-op without a right-aligned column.
-    if opt.topt.numeric_locale && aligns.contains(&Align::Right) {
-        return Err(PrintError::Unsupported(Unsupported::NumericLocale));
-    }
     let null_print = opt.null_print.as_deref().unwrap_or("");
     let cells: Vec<Vec<Vec<u8>>> = (0..result.ntuples())
         .map(|r| {
@@ -257,7 +484,14 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
                     if result.is_null(r, c) {
                         null_print.as_bytes().to_vec()
                     } else {
-                        result.value(r, c).unwrap_or(b"").to_vec()
+                        let cell = result.value(r, c).unwrap_or(b"");
+                        // `print.c:3589`: only a value, and only one that
+                        // right-aligns.
+                        if opt.topt.numeric_locale && aligns[c] == Align::Right {
+                            format_numeric_locale(cell, &DecimalLocale::POSIX)
+                        } else {
+                            cell.to_vec()
+                        }
                     }
                 })
                 .collect()
@@ -491,7 +725,7 @@ enum LineWrap {
 fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
     let opt = cont.opt;
     let opt_tuples_only = opt.tuples_only;
-    let format = line_style(opt)?;
+    let format = &line_style(opt);
     let dformat = &format.lrule[Rule::Data as usize];
     let opt_border = opt.border.min(2);
     let col_count = cont.headers.len();
@@ -899,7 +1133,7 @@ fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError
     let opt = cont.opt;
     let opt_tuples_only = opt.tuples_only;
     let opt_border = opt.border.min(2);
-    let format = line_style(opt)?;
+    let format = &line_style(opt);
     let dformat = &format.lrule[Rule::Data as usize];
     let old_ascii = opt.line_style == LineStyle::OldAscii;
     let col_count = cont.headers.len();
@@ -1308,7 +1542,7 @@ fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Separator, TableOpt};
+    use crate::settings::{Separator, TableOpt, UnicodeLinestyle};
     use rlibpq::{Backend, FieldDescription, QueryRunner, TransactionStatus};
 
     fn int4_field(name: &str) -> FieldDescription {
@@ -1496,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_numericlocale_and_the_terminal_width_are_refused_not_faked() {
+    fn the_terminal_width_is_refused_not_faked() {
         let res = result(
             vec![int4_field("n"), text_field("s")],
             vec![vec![Some("1"), Some("a")]],
@@ -1506,19 +1740,6 @@ mod tests {
             edit(&mut opt);
             print_query(&res, &opt).expect_err("must be refused")
         };
-        let unicode = refused(&|o| o.topt.line_style = LineStyle::Unicode);
-        assert_eq!(unicode, PrintError::Unsupported(Unsupported::Unicode));
-        // The message names the issue that implements it, so the refusal is
-        // actionable rather than a bare failure.
-        assert!(
-            unicode.to_string().contains("NAT-400"),
-            "the refusal must name the issue: {unicode}"
-        );
-        assert_eq!(
-            refused(&|o| o.topt.numeric_locale = true),
-            PrintError::Unsupported(Unsupported::NumericLocale)
-        );
-
         // Under `\pset columns 0` C measures the terminal, when stdout is
         // one (`print.c:803`), and this port does not: whatever would change
         // with that width is refused, not guessed.
@@ -1565,10 +1786,154 @@ mod tests {
         let mut opt = PrintQueryOpt::default();
         opt.topt.expanded = Expanded::Auto;
         assert!(print_query(&one_column, &opt).is_ok());
-        let text_only = result(vec![text_field("s")], vec![vec![Some("a")]]);
-        let mut opt = PrintQueryOpt::default();
-        opt.topt.numeric_locale = true;
-        assert!(print_query(&text_only, &opt).is_ok());
+        // The message names the issue that owns it, so the refusal is
+        // actionable rather than a bare failure.
+        let message = refused(&|o| o.topt.format = PrintFormat::Wrapped).to_string();
+        assert!(message.contains("NAT-400"), "{message}");
+    }
+
+    #[test]
+    fn unicode_draws_the_frame_in_box_drawing_characters() {
+        let res = result(
+            vec![int4_field("n"), text_field("s")],
+            vec![vec![Some("1"), Some("a\nb")]],
+        );
+        let unicode = |edit: &dyn Fn(&mut PrintQueryOpt)| {
+            render(
+                &res,
+                &with(|o| {
+                    o.topt.line_style = LineStyle::Unicode;
+                    edit(o);
+                }),
+            )
+        };
+        // Border 1: a header rule and a column rule, and U+21B5 where ascii
+        // has its `+` newline mark.
+        assert_eq!(
+            unicode(&|_| {}),
+            " n \u{2502} s \n\
+             \u{2500}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2500}\n \
+             1 \u{2502} a\u{21B5}\n   \u{2502} b\n(1 row)\n\n"
+        );
+        // Border 2, all single: ┌─┬─┐ ├─┼─┤ └─┴─┘.
+        assert_eq!(
+            unicode(&|o| o.topt.border = 2),
+            "\u{250C}\u{2500}\u{2500}\u{2500}\u{252C}\u{2500}\u{2500}\u{2500}\u{2510}\n\
+             \u{2502} n \u{2502} s \u{2502}\n\
+             \u{251C}\u{2500}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2500}\u{2524}\n\
+             \u{2502} 1 \u{2502} a\u{21B5}\u{2502}\n\
+             \u{2502}   \u{2502} b \u{2502}\n\
+             \u{2514}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2518}\n\
+             (1 row)\n\n"
+        );
+        // A double border with single columns and header: each junction is
+        // the one where those two weights meet, ╤ ╟ ┼ ╢ ╧.
+        assert_eq!(
+            unicode(&|o| {
+                o.topt.border = 2;
+                o.topt.unicode_border_linestyle = UnicodeLinestyle::Double;
+            }),
+            "\u{2554}\u{2550}\u{2550}\u{2550}\u{2564}\u{2550}\u{2550}\u{2550}\u{2557}\n\
+             \u{2551} n \u{2502} s \u{2551}\n\
+             \u{255F}\u{2500}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2500}\u{2562}\n\
+             \u{2551} 1 \u{2502} a\u{21B5}\u{2551}\n\
+             \u{2551}   \u{2502} b \u{2551}\n\
+             \u{255A}\u{2550}\u{2550}\u{2550}\u{2567}\u{2550}\u{2550}\u{2550}\u{255D}\n\
+             (1 row)\n\n"
+        );
+    }
+
+    #[test]
+    fn refresh_utf8format_picks_each_junction_by_the_weights_that_meet_there() {
+        let mut opt = TableOpt::default();
+        let single = refresh_utf8format(&opt);
+        assert_eq!(single.name, "unicode");
+        assert_eq!(single.lrule[Rule::Middle as usize].midvrule, "\u{253C}");
+        // Double columns under a single header: ╫, crossing a double
+        // header: ╬; the top and bottom junctions follow the border.
+        opt.unicode_column_linestyle = UnicodeLinestyle::Double;
+        let f = refresh_utf8format(&opt);
+        assert_eq!(f.lrule[Rule::Middle as usize].midvrule, "\u{256B}");
+        assert_eq!(f.lrule[Rule::Top as usize].midvrule, "\u{2565}");
+        assert_eq!(f.lrule[Rule::Data as usize].midvrule, "\u{2551}");
+        assert_eq!(f.midvrule_wrap, "\u{2551}");
+        opt.unicode_header_linestyle = UnicodeLinestyle::Double;
+        let f = refresh_utf8format(&opt);
+        assert_eq!(f.lrule[Rule::Middle as usize].hrule, "\u{2550}");
+        assert_eq!(f.lrule[Rule::Middle as usize].midvrule, "\u{256C}");
+        assert_eq!(f.lrule[Rule::Middle as usize].leftvrule, "\u{255E}");
+        opt.unicode_border_linestyle = UnicodeLinestyle::Double;
+        let f = refresh_utf8format(&opt);
+        assert_eq!(f.lrule[Rule::Top as usize].midvrule, "\u{2566}");
+        assert_eq!(f.lrule[Rule::Bottom as usize].midvrule, "\u{2569}");
+        assert_eq!(f.lrule[Rule::Middle as usize].leftvrule, "\u{2560}");
+    }
+
+    #[test]
+    fn format_numeric_locale_groups_the_integral_digits() {
+        let posix = |s: &str| {
+            String::from_utf8(format_numeric_locale(s.as_bytes(), &DecimalLocale::POSIX)).unwrap()
+        };
+        assert_eq!(posix("0"), "0");
+        assert_eq!(posix("999"), "999");
+        assert_eq!(posix("1000"), "1,000");
+        assert_eq!(posix("-1234567"), "-1,234,567");
+        assert_eq!(posix("+123456.789"), "+123,456.789");
+        assert_eq!(posix("1234e+90"), "1,234e+90");
+        assert_eq!(posix(".5"), ".5");
+        assert_eq!(posix(""), "");
+        // Not a number: left alone, which is what keeps a localized `money`
+        // value intact (`print.c:325`).
+        assert_eq!(posix("$1,234.00"), "$1,234.00");
+        assert_eq!(posix("NaN"), "NaN");
+        assert_eq!(posix("-Infinity"), "-Infinity");
+
+        let de = DecimalLocale::from_lconv(",", ".", &[3, 3]);
+        assert_eq!(
+            format_numeric_locale(b"-1234567.25", &de),
+            b"-1.234.567,25".to_vec()
+        );
+        let indian = DecimalLocale::from_lconv(".", ",", &[2]);
+        assert_eq!(
+            format_numeric_locale(b"12345", &indian),
+            b"1,23,45".to_vec()
+        );
+    }
+
+    #[test]
+    fn set_decimal_locale_fills_in_what_the_locale_leaves_empty() {
+        assert_eq!(
+            DecimalLocale::from_lconv(".", "", b""),
+            DecimalLocale::POSIX
+        );
+        assert_eq!(DecimalLocale::from_lconv("", "", b""), DecimalLocale::POSIX);
+        // An empty separator never matches a comma decimal point.
+        assert_eq!(DecimalLocale::from_lconv(",", "", b"").thousands_sep, ".");
+        // `CHAR_MAX`, signed or not, and 0 mean 3.
+        for grouping in [[0x7f_u8], [0xff], [0], [7]] {
+            assert_eq!(
+                DecimalLocale::from_lconv(".", ",", &grouping).groupdigits,
+                3
+            );
+        }
+        assert_eq!(DecimalLocale::from_lconv(".", ",", &[4]).groupdigits, 4);
+    }
+
+    #[test]
+    fn numericlocale_rewrites_only_right_aligned_values() {
+        let res = result(
+            vec![int4_field("n"), text_field("s"), int4_field("z")],
+            vec![vec![Some("1234"), Some("5678"), None]],
+        );
+        let opt = with(|o| {
+            o.topt.numeric_locale = true;
+            o.null_print = Some("9999".to_string());
+            o.topt.format = PrintFormat::Unaligned;
+            o.topt.field_sep.separator = Some("|".to_string());
+            o.topt.record_sep.separator = Some("\n".to_string());
+        });
+        // The text column and the null string are printed as they are.
+        assert_eq!(render(&res, &opt), "n|s|z\n1,234|5678|9999\n(1 row)\n");
     }
 
     #[test]

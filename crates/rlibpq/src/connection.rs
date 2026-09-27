@@ -43,6 +43,7 @@ use crate::pipeline::{
 };
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
 use crate::scram::RAW_NONCE_LEN;
+use crate::target::{ServerState, TargetCheck, TargetRejection, check_target};
 use crate::trace::{self, AuthResponse, Origin, TraceFlags};
 
 /// Anything that can stop a connection or a query.
@@ -73,6 +74,9 @@ pub enum ConnectionError {
     /// blocking call in pipeline mode, a second command outside it, leaving
     /// pipeline mode with results outstanding.
     Pipeline(PipelineError),
+    /// A server that accepted the connection but is not what
+    /// `target_session_attrs` asked for (`fe-connect.c:4380`-`:4659`).
+    Target(TargetRejection),
 }
 
 impl ConnectionError {
@@ -98,6 +102,7 @@ impl ConnectionError {
             ConnectionError::Conninfo(err) => err.message(),
             ConnectionError::Argument(err) => err.message(),
             ConnectionError::Pipeline(err) => err.message(),
+            ConnectionError::Target(rejection) => rejection.message(),
         }
     }
 }
@@ -549,9 +554,11 @@ impl Connection<Stream> {
     /// `random` (`fe-connect.c:2085`); each host's addresses are shuffled
     /// the same way (`:3116`). A host is left for the next one when its port
     /// is out of range (`:3044`), its name does not resolve (`:3060`), no
-    /// address accepts the socket, or the server answers "cannot connect
-    /// now" (`:4136`); anything else ends the attempt, as `error_return`
-    /// does.
+    /// address accepts the socket, the server answers "cannot connect
+    /// now" (`:4136`), or it is not what `target_session_attrs` asks for
+    /// (`CONNECTION_CHECK_TARGET`, `:4380`); anything else ends the attempt,
+    /// as `error_return` does. `prefer-standby` walks the list a second
+    /// time, settling for any server, when no standby was found (`:3010`).
     ///
     /// The caller is expected to have run `ConnInfo::add_defaults` already —
     /// `add_defaults(&Env::from_process(), &Filesystem)` is what
@@ -561,8 +568,9 @@ impl Connection<Stream> {
     /// A `host`, `hostaddr` or `port` list that does not match, an option
     /// this build refuses (`sslmode=require` without TLS, say) or does not
     /// know, a `port` that is not an integer, the nonce could not be drawn,
-    /// a server refused the connection or authentication failed — or every
-    /// host was left, and then the reason the last one was.
+    /// a server refused the connection or authentication failed, the
+    /// connection broke while `target_session_attrs` was being checked — or
+    /// every host was left, and then the reason the last one was.
     ///
     /// # Panics
     /// Never: [`conn_hosts`] always names at least one host, and every host
@@ -574,7 +582,7 @@ impl Connection<Stream> {
         // before `PQconnectPoll` reads a port or opens a socket.
         let mut hosts = conn_hosts(conninfo)?;
         let options = EncryptionOptions::from_conninfo(conninfo, Build::THIS)?;
-        TargetServerType::from_conninfo(conninfo)?;
+        let target = TargetServerType::from_conninfo(conninfo)?;
         let mut prng = match LoadBalance::from_conninfo(conninfo)? {
             LoadBalance::Disable => None,
             LoadBalance::Random => Some(libpq_prng_init()),
@@ -584,62 +592,79 @@ impl Connection<Stream> {
         }
 
         let mut last_error = None;
-        for host in &hosts {
-            // fe-connect.c:3036 — a port that is not an integer is
-            // `error_return`; one out of range moves on (`goto keep_going`).
-            let port = match parse_port(host.port.as_deref()) {
-                Ok(port) => port,
-                Err(err @ ConnError::InvalidPortNumber(_)) => {
-                    last_error = Some(err.into());
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            };
-            let mut peers = match resolve(&host_address(host, port)) {
-                Ok(peers) => peers,
-                Err(err) => {
-                    last_error = Some(err.into());
-                    continue;
-                }
-            };
-            if let Some(prng) = prng.as_mut() {
-                prng.shuffle(&mut peers);
-            }
-            for peer in peers {
-                // fe-connect.c:3285 — the first method is chosen before the
-                // socket is opened, so a combination with none fails without
-                // connecting.
-                let negotiation =
-                    Negotiation::start(&options, Build::THIS, matches!(peer, Peer::Unix(_)))?;
-                // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is
-                // ever allowed (`fe-connect.c:4721`-`:4741`; pinned by
-                // `negotiate::tests::this_build_only_ever_negotiates_plaintext`),
-                // so there is no SSLRequest to send and no method to fall
-                // back to.
-                debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
-                let stream = match peer.connect() {
-                    Ok(stream) => stream,
+        // fe-connect.c:2999-:3015 — out of hosts, `prefer-standby` drops the
+        // standby requirement and starts over at the first host
+        // (`SERVER_TYPE_PREFER_STANDBY_PASS2`), in the same order.
+        let passes: &[bool] = if target == TargetServerType::PreferStandby {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &second_pass in passes {
+            for host in &hosts {
+                // fe-connect.c:3036 — a port that is not an integer is
+                // `error_return`; one out of range moves on (`goto keep_going`).
+                let port = match parse_port(host.port.as_deref()) {
+                    Ok(port) => port,
+                    Err(err @ ConnError::InvalidPortNumber(_)) => {
+                        last_error = Some(err.into());
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let mut peers = match resolve(&host_address(host, port)) {
+                    Ok(peers) => peers,
                     Err(err) => {
-                        // fe-connect.c:3516 — try the next address.
                         last_error = Some(err.into());
                         continue;
                     }
                 };
-                let nonce = strong_random(RAW_NONCE_LEN)?;
-                match Connection::start_up(stream, conninfo, &nonce) {
-                    Ok(mut conn) => {
-                        // fe-connect.c:3249 — the address it was dialled at.
-                        conn.raddr = Some(peer);
-                        return Ok(conn);
+                if let Some(prng) = prng.as_mut() {
+                    prng.shuffle(&mut peers);
+                }
+                for peer in peers {
+                    // fe-connect.c:3285 — the first method is chosen before the
+                    // socket is opened, so a combination with none fails without
+                    // connecting.
+                    let negotiation =
+                        Negotiation::start(&options, Build::THIS, matches!(peer, Peer::Unix(_)))?;
+                    // Without `USE_SSL` or `ENABLE_GSS` nothing but plaintext is
+                    // ever allowed (`fe-connect.c:4721`-`:4741`; pinned by
+                    // `negotiate::tests::this_build_only_ever_negotiates_plaintext`),
+                    // so there is no SSLRequest to send and no method to fall
+                    // back to.
+                    debug_assert_eq!(negotiation.current(), Some(EncMethod::Plaintext));
+                    let stream = match peer.connect() {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            // fe-connect.c:3516 — try the next address.
+                            last_error = Some(err.into());
+                            continue;
+                        }
+                    };
+                    let nonce = strong_random(RAW_NONCE_LEN)?;
+                    match Connection::start_up(stream, conninfo, &nonce) {
+                        Ok(mut conn) => {
+                            // fe-connect.c:3249 — the address it was dialled at.
+                            conn.raddr = Some(peer);
+                            match conn.check_target(target, second_pass)? {
+                                None => return Ok(conn),
+                                // :4436 — the next host, not the next address.
+                                Some(rejection) => {
+                                    last_error = Some(ConnectionError::Target(rejection));
+                                    break;
+                                }
+                            }
+                        }
+                        // fe-connect.c:4136 — the next host, not the next address.
+                        Err(ConnectionError::Server(err))
+                            if err.sqlstate() == Some(ERRCODE_CANNOT_CONNECT_NOW) =>
+                        {
+                            last_error = Some(ConnectionError::Server(err));
+                            break;
+                        }
+                        Err(err) => return Err(err),
                     }
-                    // fe-connect.c:4136 — the next host, not the next address.
-                    Err(ConnectionError::Server(err))
-                        if err.sqlstate() == Some(ERRCODE_CANNOT_CONNECT_NOW) =>
-                    {
-                        last_error = Some(ConnectionError::Server(err));
-                        break;
-                    }
-                    Err(err) => return Err(err),
                 }
             }
         }
@@ -738,6 +763,39 @@ impl<S: Read + Write> Connection<S> {
                 Backend::NegotiateProtocolVersion { .. } => {}
                 other => return Err(ConnectionError::UnexpectedMessage(message_id(&other))),
             }
+        }
+    }
+
+    /// `CONNECTION_CHECK_TARGET`, `fe-connect.c:4380`: hold the server that
+    /// just accepted the connection to `target`, asking it
+    /// `SHOW transaction_read_only` or `SELECT pg_catalog.pg_is_in_recovery()`
+    /// when its startup ParameterStatus did not say. `Some` is why it was
+    /// refused; the connection has then been closed politely, a Terminate
+    /// whose failure is ignored (`sendTerminateConn`, `:5220`).
+    ///
+    /// # Errors
+    /// The connection broke while the query ran (`error_return`, `:4410`,
+    /// `:4564`).
+    pub fn check_target(
+        &mut self,
+        target: TargetServerType,
+        second_pass: bool,
+    ) -> Result<Option<TargetRejection>, ConnectionError> {
+        let mut state = ServerState::from_parameters(|name| self.parameter_status(name));
+        loop {
+            let rejection = match check_target(target, second_pass, &state) {
+                TargetCheck::Accept => return Ok(None),
+                TargetCheck::Ask(query) => {
+                    let results = self.exec(query.sql())?;
+                    match query.answer(results.first(), &mut state) {
+                        Ok(()) => continue,
+                        Err(rejection) => rejection,
+                    }
+                }
+                TargetCheck::Reject(rejection) => rejection,
+            };
+            let _ = self.terminate();
+            return Ok(Some(rejection));
         }
     }
 
@@ -2152,6 +2210,101 @@ mod tests {
         assert_eq!(
             &written[startup.len()..],
             &Frontend::Query(b"select version()".to_vec()).encode()[..]
+        );
+    }
+
+    /// A startup that reports `parameters`, then one single-column answer
+    /// `value` to whatever query comes next.
+    fn target_script(parameters: &[&[u8]], value: &[u8]) -> Vec<u8> {
+        let mut script = auth_ok();
+        for parameter in parameters {
+            script.extend(message(b'S', parameter));
+        }
+        script.extend(ready(b'I'));
+        let mut row_description = 1u16.to_be_bytes().to_vec();
+        row_description.extend_from_slice(b"answer\0");
+        row_description.extend_from_slice(&[0; 6]);
+        row_description.extend_from_slice(&25u32.to_be_bytes());
+        row_description.extend_from_slice(&(-1i16).to_be_bytes());
+        row_description.extend_from_slice(&(-1i32).to_be_bytes());
+        row_description.extend_from_slice(&0i16.to_be_bytes());
+        script.extend(message(b'T', &row_description));
+        let mut data_row = 1u16.to_be_bytes().to_vec();
+        data_row.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
+        data_row.extend_from_slice(value);
+        script.extend(message(b'D', &data_row));
+        script.extend(message(b'C', b"SHOW\0"));
+        script.extend(ready(b'I'));
+        script
+    }
+
+    /// What the client wrote after its startup packet.
+    fn after_startup(conn: &Connection<Scripted>, info: &ConnInfo) -> Vec<u8> {
+        let startup = Frontend::Startup {
+            version: PROTOCOL_VERSION_3_0,
+            parameters: startup_parameters(info),
+        }
+        .encode();
+        conn.stream.to_server[startup.len()..].to_vec()
+    }
+
+    /// fe-connect.c:4380 — a server that reported `in_hot_standby` and
+    /// `default_transaction_read_only` at startup is judged on them, with
+    /// nothing sent; a refused one is sent a Terminate (`:4432`).
+    #[test]
+    fn a_reported_server_state_is_checked_without_a_query() {
+        let info = conninfo("user=alice");
+        let reported: [&[u8]; 3] = [
+            b"server_version\x0018.6\x00",
+            b"default_transaction_read_only\0off\0",
+            b"in_hot_standby\0on\0",
+        ];
+        let script = target_script(&reported, b"unused");
+
+        let mut conn =
+            Connection::start_up(Scripted::new(script.clone()), &info, &[0; 18]).unwrap();
+        assert_eq!(
+            conn.check_target(TargetServerType::Standby, false).unwrap(),
+            None
+        );
+        assert!(after_startup(&conn, &info).is_empty());
+
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        assert_eq!(
+            conn.check_target(TargetServerType::ReadWrite, false)
+                .unwrap(),
+            Some(TargetRejection::SessionIsReadOnly)
+        );
+        assert_eq!(after_startup(&conn, &info), Frontend::Terminate.encode());
+    }
+
+    /// fe-connect.c:4398, :4457 — a server that did not report its state is
+    /// asked, and judged on the answer.
+    #[test]
+    fn an_unreported_server_state_is_asked_for() {
+        let info = conninfo("user=alice");
+        let version: [&[u8]; 1] = [b"server_version\x0018.6\x00"];
+
+        let script = target_script(&version, b"on");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        assert_eq!(
+            conn.check_target(TargetServerType::ReadWrite, false)
+                .unwrap(),
+            Some(TargetRejection::SessionIsReadOnly)
+        );
+        let mut expected = Frontend::Query(b"SHOW transaction_read_only".to_vec()).encode();
+        expected.extend(Frontend::Terminate.encode());
+        assert_eq!(after_startup(&conn, &info), expected);
+
+        let script = target_script(&version, b"t");
+        let mut conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        assert_eq!(
+            conn.check_target(TargetServerType::Standby, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            after_startup(&conn, &info),
+            Frontend::Query(b"SELECT pg_catalog.pg_is_in_recovery()".to_vec()).encode()
         );
     }
 

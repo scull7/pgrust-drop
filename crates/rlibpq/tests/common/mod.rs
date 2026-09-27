@@ -132,31 +132,55 @@ impl Cluster {
             .ok()?;
         assert!(status.status.success(), "reference initdb failed");
         if !conf.is_empty() {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(data.join("postgresql.conf"))
-                .and_then(|mut file| file.write_all(conf.as_bytes()))
-                .expect("postgresql.conf is appended to");
+            append(&data.join("postgresql.conf"), conf);
         }
 
-        let socket_dir = dir.clone();
-        let start = Command::new(bin.join("pg_ctl"))
-            .args(["-D".as_ref(), data.as_os_str()])
-            .arg("-w")
-            .arg("-o")
-            .arg(format!(
-                "-p {port} -k {} -c listen_addresses={listen_addresses}",
-                socket_dir.display()
-            ))
-            .args(["-l".as_ref(), dir.join("log").as_os_str()])
-            .arg("start")
-            .env("LC_ALL", "C")
-            .output()
-            .ok()?;
-        assert!(start.status.success(), "reference pg_ctl start failed");
-
+        pg_ctl_start(&bin, &dir, port, listen_addresses);
         Some(Cluster { bin, dir, port })
+    }
+
+    /// `$node->start` for a node [`Cluster::stop`] stopped, listening on
+    /// its Unix socket only.
+    pub fn start_again(&self) {
+        pg_ctl_start(&self.bin, &self.dir, self.port, "");
+    }
+
+    /// `$node->backup_fs_cold($backup_name)`, `Cluster.pm:864`: a copy of
+    /// the stopped node's data directory, "including WAL", less
+    /// `postmaster.pid`. It lands in `<dir>/backup/<backup_name>`.
+    pub fn backup_fs_cold(&self, backup_name: &str) -> PathBuf {
+        let backup = self.dir.join("backup").join(backup_name);
+        copy_dir(&self.dir.join("data"), &backup).expect("the data directory is copied");
+        backup
+    }
+
+    /// `init_from_backup($root_node, $backup_name, has_streaming => 1)`
+    /// (`Cluster.pm:918`) and `$node->start`: a hot standby whose data
+    /// directory is a copy of `backup`, streaming from `root`
+    /// (`enable_streaming`, `:1370`: `primary_conninfo` is the root's
+    /// `connstr`, here with the gate's user, and `standby.signal`).
+    pub fn start_standby(name: &str, port: u16, backup: &Path, root: &Cluster) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("rlibpq-gate-{name}{port}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        copy_dir(backup, &data).expect("the backup is copied");
+        append(
+            &data.join("postgresql.conf"),
+            &format!(
+                "\nprimary_conninfo='port={} host={} user=gateuser application_name={name}'\n",
+                root.port,
+                root.dir.display(),
+                name = name.trim_end_matches('-'),
+            ),
+        );
+        std::fs::write(data.join("standby.signal"), "").expect("standby.signal is written");
+        pg_ctl_start(&root.bin, &dir, port, "");
+        Cluster {
+            bin: root.bin.clone(),
+            dir,
+            port,
+        }
     }
 
     /// The server log, whole — `$node->log_content`.
@@ -242,6 +266,57 @@ impl Cluster {
         let out = child.wait_with_output().expect("reference psql exits");
         (out.stdout, out.stderr, out.status.code().unwrap_or(-1))
     }
+}
+
+/// `pg_ctl start -w` for the data directory in `dir`, its socket in `dir`
+/// and its log at `<dir>/log`.
+fn pg_ctl_start(bin: &Path, dir: &Path, port: u16, listen_addresses: &str) {
+    let start = Command::new(bin.join("pg_ctl"))
+        .args(["-D".as_ref(), dir.join("data").as_os_str()])
+        .arg("-w")
+        .arg("-o")
+        .arg(format!(
+            "-p {port} -k {} -c listen_addresses={listen_addresses}",
+            dir.display()
+        ))
+        .args(["-l".as_ref(), dir.join("log").as_os_str()])
+        .arg("start")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("reference pg_ctl runs");
+    assert!(start.status.success(), "reference pg_ctl start failed");
+}
+
+/// `$node->append_conf`.
+fn append(file: &Path, text: &str) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(file)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .expect("the file is appended to");
+}
+
+/// `PostgreSQL::Test::RecursiveCopy::copypath` with `backup_fs_cold`'s
+/// filter: every file and directory under `from`, `postmaster.pid` aside.
+/// The top directory is made `0700`, which the server insists on.
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700))?;
+    }
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if entry.file_name() != "postmaster.pid" {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// `PQconnectdb(conninfo)`, with a failure a test failure.

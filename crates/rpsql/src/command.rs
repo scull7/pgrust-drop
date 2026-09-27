@@ -5,14 +5,16 @@
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
 //! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, and NAT-404
-//! `\crosstabview`, `\g`, `\gx` and the extended-query commands `\parse`,
-//! `\bind`, `\bind_named` and `\close_prepared`. Everything else is
+//! `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
+//! `\bind`, `\bind_named` and `\close_prepared`, and the pipeline commands
+//! `\startpipeline`, `\sendpipeline`, `\syncpipeline`, `\flush`,
+//! `\flushrequest`, `\getresults` and `\endpipeline`. Everything else is
 //! [`CommandResult::Unknown`], which renders upstream's `invalid command \%s`;
 //! NAT-401 … NAT-403 fill the table in.
 
 use std::io::Write;
 
-use rlibpq::{ContextVisibility, Verbosity};
+use rlibpq::{ContextVisibility, PipelineStatus, Verbosity};
 
 use crate::crosstab::CtvArgs;
 use crate::logging;
@@ -74,6 +76,9 @@ pub struct CommandContext<'a> {
     pub pset: &'a mut PsqlSettings,
     /// `pset.vars`.
     pub vars: &'a mut VariableSpace,
+    /// `PQpipelineStatus(pset.db)`, which `\g`, `\gx` and `\sendpipeline`
+    /// read. It only changes while a query is sent, never during a command.
+    pub pipeline: PipelineStatus,
 }
 
 /// One whole backslash command, from the variable snapshot the lexer reads to
@@ -92,6 +97,7 @@ pub fn dispatch_slash(
     scanner: &mut Scanner,
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
+    pipeline: PipelineStatus,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> CommandResult {
@@ -104,6 +110,7 @@ pub fn dispatch_slash(
         let mut ctx = CommandContext {
             pset: &mut working,
             vars,
+            pipeline,
         };
         handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
     };
@@ -170,7 +177,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" => return Vec::new(),
         "c" | "connect" | "crosstabview" => 4,
         "pset" => 2,
-        "unset" | "timing" | "parse" | "close_prepared" => 1,
+        "unset" | "timing" | "parse" | "close_prepared" | "getresults" => 1,
         "g" | "gx" => GArgs::split(options).consumed,
         _ => 0,
     };
@@ -233,6 +240,25 @@ fn exec_command(
         }
         // `exec_command_g()` (`command.c:1739`).
         "g" | "gx" => exec_command_g(cmd, options, ctx, stderr),
+        // `exec_command_startpipeline()` (`command.c:3065`),
+        // `exec_command_syncpipeline()` (`:3084`),
+        // `exec_command_endpipeline()` (`:3103`), `exec_command_flush()`
+        // (`:1695`) and `exec_command_flushrequest()` (`:1714`): each is a
+        // send mode, and sends.
+        "startpipeline" | "syncpipeline" | "endpipeline" | "flush" | "flushrequest" => {
+            ctx.pset.send_mode = match cmd {
+                "startpipeline" => SendMode::StartPipelineMode,
+                "syncpipeline" => SendMode::PipelineSync,
+                "endpipeline" => SendMode::EndPipelineMode,
+                "flush" => SendMode::Flush,
+                _ => SendMode::FlushRequest,
+            };
+            CommandResult::Send
+        }
+        // `exec_command_getresults()` (`command.c:1929`).
+        "getresults" => exec_command_getresults(options, ctx, stderr),
+        // `exec_command_sendpipeline()` (`command.c:2844`).
+        "sendpipeline" => exec_command_sendpipeline(ctx, stderr),
         // `exec_command_connect()` (`command.c:638`).
         "c" | "connect" => CommandResult::Connect(Box::new(ConnectRequest::from_options(options))),
         // `exec_command_crosstabview()` (`command.c:997`): keep up to four
@@ -278,6 +304,72 @@ fn exec_command(
         }
         _ => CommandResult::Unknown,
     }
+}
+
+/// `exec_command_getresults()` (`command.c:1929`): read the requested
+/// number of pipeline results, or all of them. The send mode is set before
+/// the count is read, and stays set if it is refused.
+fn exec_command_getresults(
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    ctx.pset.send_mode = SendMode::GetResults;
+    ctx.pset.pipeline.requested_results = 0;
+    if let Some(option) = options.first() {
+        let Ok(requested) = usize::try_from(atoi(&option.value)) else {
+            logging::error(
+                ctx.pset,
+                "\\getresults: invalid number of requested results",
+                stderr,
+            );
+            return CommandResult::Error;
+        };
+        ctx.pset.pipeline.requested_results = requested;
+    }
+    CommandResult::Send
+}
+
+/// `exec_command_sendpipeline()` (`command.c:2844`): send what `\bind` or
+/// `\bind_named` prepared, into the pipeline.
+fn exec_command_sendpipeline(
+    ctx: &mut CommandContext<'_>,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let refusal: &[u8] = if ctx.pipeline == PipelineStatus::Off {
+        b"\\sendpipeline not allowed outside of pipeline mode"
+    } else if matches!(
+        ctx.pset.send_mode,
+        SendMode::ExtendedQueryParams { .. } | SendMode::ExtendedQueryPrepared { .. }
+    ) {
+        return CommandResult::Send;
+    } else {
+        b"\\sendpipeline must be used after \\bind or \\bind_named"
+    };
+    logging::error(ctx.pset, refusal, stderr);
+    // `clean_extended_state()`.
+    ctx.pset.send_mode = SendMode::Query;
+    CommandResult::Error
+}
+
+/// C's `atoi`, which `\getresults` reads its count with: leading
+/// whitespace, an optional sign and the digits after it; anything else ends
+/// the number, and no digits at all is 0.
+#[must_use]
+pub fn atoi(text: &str) -> i64 {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let magnitude = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0_i64, |n, d| {
+            n.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+        });
+    if negative { -magnitude } else { magnitude }
 }
 
 /// `pg_log_error("\\%s: missing required argument", cmd)`, the refusal every
@@ -389,6 +481,15 @@ fn exec_command_g(
         let message = format!("\\{cmd}: missing right parenthesis");
         logging::error(ctx.pset, message, stderr);
         success = false;
+    }
+    if success && ctx.pipeline != PipelineStatus::Off {
+        // `command.c:1764`: refused once the options are in force, which
+        // they stay until the next query puts them back; the send mode
+        // `\bind` left is cleaned up.
+        let message = format!("\\{cmd} not allowed in pipeline mode");
+        logging::error(ctx.pset, message, stderr);
+        ctx.pset.send_mode = SendMode::Query;
+        return CommandResult::Error;
     }
     if args.fname.is_some() && success {
         let message = format!("\\{cmd} to a file or pipe is not implemented yet (Linear NAT-403)");
@@ -572,6 +673,7 @@ mod tests {
             let mut ctx = CommandContext {
                 pset: &mut pset,
                 vars: &mut vars,
+                pipeline: PipelineStatus::Off,
             };
             handle_slash_cmds(
                 &mut scanner,
@@ -729,7 +831,14 @@ mod tests {
         );
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        let status = dispatch_slash(
+            &mut scanner,
+            &mut pset,
+            &mut vars,
+            PipelineStatus::Off,
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(status, CommandResult::Error);
         assert_eq!(String::from_utf8(stderr).unwrap(), "invalid command \\lo\n");
     }
@@ -749,7 +858,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        let status = dispatch_slash(
+            &mut scanner,
+            &mut pset,
+            &mut vars,
+            PipelineStatus::Off,
+            &mut stdout,
+            &mut stderr,
+        );
 
         (status, pset, String::from_utf8(stderr).unwrap())
     }
@@ -821,6 +937,15 @@ mod tests {
     /// [`dispatch`] on settings a test sets up, and keeps: the extended-query
     /// commands leave their state for the next query to take.
     fn dispatch_on(pset: &mut PsqlSettings, line: &str) -> (CommandResult, String) {
+        dispatch_in(pset, line, PipelineStatus::Off)
+    }
+
+    /// [`dispatch_on`] with a pipeline in the state `pipeline`.
+    fn dispatch_in(
+        pset: &mut PsqlSettings,
+        line: &str,
+        pipeline: PipelineStatus,
+    ) -> (CommandResult, String) {
         let mut vars = VariableSpace::new();
         let mut scanner = Scanner::new();
         scanner.setup(line.as_bytes(), true);
@@ -831,7 +956,14 @@ mod tests {
         );
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = dispatch_slash(&mut scanner, pset, &mut vars, &mut stdout, &mut stderr);
+        let status = dispatch_slash(
+            &mut scanner,
+            pset,
+            &mut vars,
+            pipeline,
+            &mut stdout,
+            &mut stderr,
+        );
         (status, String::from_utf8(stderr).unwrap())
     }
 
@@ -1023,6 +1155,127 @@ mod tests {
     }
 
     #[test]
+    fn each_pipeline_command_is_a_send_mode_and_sends() {
+        // `command.c:3065`, `:3084`, `:3103`, `:1695`, `:1714`.
+        for (line, mode) in [
+            ("\\startpipeline", SendMode::StartPipelineMode),
+            ("\\syncpipeline", SendMode::PipelineSync),
+            ("\\endpipeline", SendMode::EndPipelineMode),
+            ("\\flush", SendMode::Flush),
+            ("\\flushrequest", SendMode::FlushRequest),
+        ] {
+            let mut pset = terse();
+            let (status, stderr) = dispatch_on(&mut pset, line);
+            assert_eq!(status, CommandResult::Send, "{line}");
+            assert_eq!(stderr, "", "{line}");
+            assert_eq!(pset.send_mode, mode, "{line}");
+        }
+        // They read no argument, so one draws the usual warning.
+        let mut pset = terse();
+        let (status, stderr) = dispatch_on(&mut pset, "\\startpipeline now");
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(stderr, "\\startpipeline: extra argument \"now\" ignored\n");
+    }
+
+    #[test]
+    fn getresults_reads_its_count_as_atoi_does() {
+        // `command.c:1929`.
+        for (line, requested) in [
+            ("\\getresults", 0),
+            ("\\getresults 3", 3),
+            ("\\getresults 0", 0),
+            ("\\getresults 2abc", 2),
+            ("\\getresults abc", 0),
+        ] {
+            let mut pset = terse();
+            pset.pipeline.requested_results = 9;
+            let (status, stderr) = dispatch_on(&mut pset, line);
+            assert_eq!(status, CommandResult::Send, "{line}");
+            assert_eq!(stderr, "", "{line}");
+            assert_eq!(pset.send_mode, SendMode::GetResults, "{line}");
+            assert_eq!(pset.pipeline.requested_results, requested, "{line}");
+        }
+        assert_eq!(atoi("  -12x"), -12);
+        assert_eq!(atoi("+7"), 7);
+        assert_eq!(atoi(""), 0);
+    }
+
+    #[test]
+    fn a_negative_count_is_refused_but_the_send_mode_stays_set() {
+        // `psql_pipeline.sql:354`; upstream sets the mode before it reads
+        // the count, and returns without cleaning it up.
+        let mut pset = terse();
+        let (status, stderr) = dispatch_on(&mut pset, "\\getresults -1");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            stderr,
+            "\\getresults: invalid number of requested results\n"
+        );
+        assert_eq!(pset.send_mode, SendMode::GetResults);
+        assert_eq!(pset.pipeline.requested_results, 0);
+    }
+
+    #[test]
+    fn sendpipeline_needs_a_pipeline_and_a_bind() {
+        // `command.c:2844`, `psql_pipeline.sql:283`-`:292`.
+        let mut pset = terse();
+        pset.send_mode = SendMode::ExtendedQueryParams {
+            params: vec!["1".into()],
+        };
+        let (status, stderr) = dispatch_on(&mut pset, "\\sendpipeline");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            stderr,
+            "\\sendpipeline not allowed outside of pipeline mode\n"
+        );
+        assert_eq!(pset.send_mode, SendMode::Query);
+
+        let mut pset = terse();
+        let (status, stderr) = dispatch_in(&mut pset, "\\sendpipeline", PipelineStatus::On);
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            stderr,
+            "\\sendpipeline must be used after \\bind or \\bind_named\n"
+        );
+
+        for mode in [
+            SendMode::ExtendedQueryParams { params: vec![] },
+            SendMode::ExtendedQueryPrepared {
+                statement: "s".into(),
+                params: vec![],
+            },
+        ] {
+            let mut pset = terse();
+            pset.send_mode = mode.clone();
+            let (status, stderr) =
+                dispatch_in(&mut pset, "\\sendpipeline", PipelineStatus::Aborted);
+            assert_eq!(status, CommandResult::Send);
+            assert_eq!(stderr, "");
+            assert_eq!(pset.send_mode, mode);
+        }
+    }
+
+    #[test]
+    fn g_and_gx_are_refused_in_a_pipeline_after_their_options_apply() {
+        // `command.c:1764`: the options are already in force, and stay so
+        // until the next query restores them; the bind is forgotten.
+        for cmd in ["g", "gx"] {
+            let mut pset = terse();
+            pset.send_mode = SendMode::ExtendedQueryParams {
+                params: vec!["1".into()],
+            };
+            let before = pset.popt.clone();
+            let line = format!("\\{cmd} (format=unaligned tuples_only=on)");
+            let (status, stderr) = dispatch_in(&mut pset, &line, PipelineStatus::On);
+            assert_eq!(status, CommandResult::Error);
+            assert_eq!(stderr, format!("\\{cmd} not allowed in pipeline mode\n"));
+            assert_eq!(pset.send_mode, SendMode::Query);
+            assert_eq!(pset.gsavepopt, Some(before));
+            assert!(pset.popt.topt.tuples_only);
+        }
+    }
+
+    #[test]
     fn echo_text_is_pure() {
         let opt = |value: &str, quote| SlashOption {
             value: value.to_string(),
@@ -1046,7 +1299,14 @@ mod tests {
             ScanResult::Backslash
         );
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
+        let status = dispatch_slash(
+            &mut scanner,
+            &mut pset,
+            &mut vars,
+            PipelineStatus::Off,
+            &mut stdout,
+            &mut stderr,
+        );
         (
             status,
             pset,

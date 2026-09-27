@@ -497,12 +497,16 @@ pub fn apply(options: &Options, args: &[OsString]) -> Result<Session, AssignErro
     let mut pset = PsqlSettings::default();
     let mut warnings = Vec::new();
 
-    // `main()` seeds these before the option loop (`startup.c:202`-`:206`).
+    // `main()` seeds these before the option loop (`startup.c:202`-`:211`).
     for (name, value) in crate::variables::default_prompts() {
         vars.set(name, Some(value))?;
     }
     vars.set_bool("AUTOCOMMIT")?;
     vars.set_bool("SHOW_ALL_RESULTS")?;
+    // `startup.c:208`-`:211`.
+    for (name, value) in crate::common::pipeline_variables(&pset.pipeline) {
+        vars.set(name, Some(&value))?;
+    }
 
     // The getopt switch, in `long_options[]` order.
     if options.echo_all {

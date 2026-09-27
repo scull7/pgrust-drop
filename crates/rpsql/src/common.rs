@@ -4,15 +4,24 @@
 //! two streams — so it is a thin shell here over two pure calculations:
 //! [`echo_line`], which decides what `ECHO` puts on stdout before the query
 //! runs, and [`crate::print::print_query`], which renders the result.
+//!
+//! `ExecQueryAndProcessResults` (`common.c:1581`) has two halves here. Outside
+//! a pipeline a query is one blocking [`Executor::exec`] and its results are
+//! printed afterwards. In a pipeline, and for the commands that drive one,
+//! [`exec_pipelined`] ports the `PQsend…` / `PQgetResult` loop itself,
+//! because there the counters psql keeps (`settings.h:126`) decide how many
+//! results to read, and reading one too many would block.
 
 use std::io::Write;
 use std::time::Instant;
 
-use rlibpq::{ConnectionError, ExecStatus, QueryResult};
+use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultError};
 
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
+use crate::logging;
 use crate::print::print_query;
-use crate::settings::{Echo, PsqlSettings, SendMode};
+use crate::settings::{Echo, PipelineCounters, PsqlSettings, SendMode};
+use crate::variables::VariableSpace;
 
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
 ///
@@ -62,6 +71,10 @@ impl From<ConnectionError> for ErrorMessage {
 /// What psql can do with a query. An [`Executor`] is the only thing in the
 /// crate that holds a connection, which keeps every other module testable
 /// without a server.
+///
+/// [`Executor::exec`] is the whole of a query outside a pipeline. The rest
+/// are the libpq calls a pipeline is driven with, one for one; their default
+/// bodies are an executor that never enters pipeline mode.
 pub trait Executor {
     /// `ExecQueryAndProcessResults` (`common.c:1581`), minus the printing: send
     /// `query` the way `mode` says (`common.c:1602`) and hand back every
@@ -76,6 +89,57 @@ pub trait Executor {
 
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
+
+    /// Give the connection up: [`Executor::connected`] is false from then
+    /// on, which is how a non-interactive `MainLoop` comes to exit with
+    /// `EXIT_BADCONN`, as psql's own `exit(EXIT_BADCONN)` does.
+    fn abandon(&mut self);
+
+    /// `PQpipelineStatus`.
+    fn pipeline_status(&self) -> PipelineStatus {
+        PipelineStatus::Off
+    }
+
+    /// The libpq call each `mode` makes in `ExecQueryAndProcessResults`'
+    /// `switch` (`common.c:1602`-`:1724`), without waiting for a result:
+    /// a `PQsend…` for a statement (`PQsendQueryParams` with no parameters
+    /// for a plain query in a pipeline, `:1716`), `PQenterPipelineMode`,
+    /// `PQpipelineSync`, `PQsendPipelineSync`, `PQflush` or
+    /// `PQsendFlushRequest`. `GetResults` sends nothing and is not passed.
+    ///
+    /// # Errors
+    /// libpq refused the call, and [`ErrorMessage`] is its error buffer —
+    /// `cannot send pipeline when not in pipeline mode`, say — or the
+    /// connection broke.
+    fn send(&mut self, query: &[u8], mode: &SendMode) -> Result<(), ErrorMessage> {
+        let _ = (query, mode);
+        Err(ErrorMessage::new(
+            b"this connection has no pipeline mode".to_vec(),
+        ))
+    }
+
+    /// `PQgetResult`: the next result, or `None` for the NULL that ends a
+    /// command.
+    ///
+    /// # Errors
+    /// The connection broke.
+    fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+        Ok(None)
+    }
+
+    /// `PQexitPipelineMode`.
+    ///
+    /// # Errors
+    /// libpq refused: results are still to be read, or a command is busy.
+    fn exit_pipeline_mode(&mut self) -> Result<(), ErrorMessage> {
+        Ok(())
+    }
+
+    /// The notices received since the last call, oldest first: what libpq
+    /// hands to psql's `NoticeProcessor` (`common.c:281`) as it parses them.
+    fn take_notices(&mut self) -> Vec<ResultError> {
+        Vec::new()
+    }
 }
 
 /// What `ECHO` prints before a query runs, or `None`.
@@ -161,7 +225,67 @@ pub fn clear_or_save_result(result: &QueryResult, pset: &mut PsqlSettings) {
     }
 }
 
-/// `SendQuery()` (`common.c:1126`), for the simple-query path.
+/// `SetPipelineVariables()` (`common.c:536`): the three variables that
+/// publish the counters, as `%d` writes them.
+#[must_use]
+pub fn pipeline_variables(counters: &PipelineCounters) -> [(&'static str, String); 3] {
+    [
+        ("PIPELINE_SYNC_COUNT", counters.piped_syncs.to_string()),
+        (
+            "PIPELINE_COMMAND_COUNT",
+            counters.piped_commands.to_string(),
+        ),
+        (
+            "PIPELINE_RESULT_COUNT",
+            counters.available_results.to_string(),
+        ),
+    ]
+}
+
+/// Action: [`pipeline_variables`] into `vars`. None of the three has a hook,
+/// so setting one cannot fail.
+fn set_pipeline_variables(counters: &PipelineCounters, vars: &mut VariableSpace) {
+    for (name, value) in pipeline_variables(counters) {
+        let _ = vars.set(name, Some(&value));
+    }
+}
+
+/// `AcceptResult()`'s verdict (`common.c:418`), without its logging: the
+/// statuses that are not a failure.
+#[must_use]
+pub fn accept_result(status: ExecStatus) -> bool {
+    matches!(
+        status,
+        ExecStatus::CommandOk
+            | ExecStatus::TuplesOk
+            | ExecStatus::TuplesChunk
+            | ExecStatus::EmptyQuery
+            | ExecStatus::CopyIn
+            | ExecStatus::CopyOut
+            | ExecStatus::PipelineSync
+    )
+}
+
+/// `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering of a failed
+/// result at the configured verbosity (`common.c:1831`). Empty for a
+/// `PGRES_PIPELINE_ABORTED` result, which carries no error.
+fn result_error_message(result: &QueryResult, pset: &PsqlSettings) -> Vec<u8> {
+    match result.error() {
+        Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
+        None => result.error_message(),
+    }
+}
+
+/// Action: psql's `NoticeProcessor` (`common.c:281`), `pg_log_info` of what
+/// libpq built for each notice, at the connection's verbosity.
+fn print_notices(executor: &mut dyn Executor, pset: &PsqlSettings, stderr: &mut dyn Write) {
+    for notice in executor.take_notices() {
+        let message = notice.message(ExecStatus::NonfatalError, pset.verbosity, pset.show_context);
+        logging::info(pset, &message, stderr);
+    }
+}
+
+/// `SendQuery()` (`common.c:1126`).
 ///
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
@@ -177,20 +301,38 @@ pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
     pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
     let crosstab = pset.crosstab.take();
     let mode = std::mem::take(&mut pset.send_mode);
-    let ok = send_query_with(
-        executor,
-        query,
-        &mode,
-        crosstab.as_ref(),
-        pset,
-        stdout,
-        stderr,
-    );
+    let ok = if mode.is_pipeline_control() || executor.pipeline_status() != PipelineStatus::Off {
+        if let Some(line) = echo_line(query, pset) {
+            let _ = stdout.write_all(&line);
+            let _ = stdout.write_all(b"\n");
+        }
+        exec_pipelined(
+            executor,
+            query,
+            &mode,
+            crosstab.as_ref(),
+            pset,
+            vars,
+            stdout,
+            stderr,
+        )
+    } else {
+        send_query_with(
+            executor,
+            query,
+            &mode,
+            crosstab.as_ref(),
+            pset,
+            stdout,
+            stderr,
+        )
+    };
     // `restorePsetInfo` (`common.c:1319`).
     if let Some(saved) = pset.gsavepopt.take() {
         pset.popt = saved;
@@ -198,7 +340,7 @@ pub fn send_query(
     ok
 }
 
-/// [`send_query`] once its one-shot requests are taken.
+/// [`send_query`] once its one-shot requests are taken, outside a pipeline.
 fn send_query_with(
     executor: &mut dyn Executor,
     query: &[u8],
@@ -227,6 +369,8 @@ fn send_query_with(
     let before = Instant::now();
     let results = executor.exec(query, mode);
     let elapsed_msec = before.elapsed().as_secs_f64() * 1000.0;
+    // The whole query has been read, so every notice it drew comes first.
+    print_notices(executor, pset, stderr);
 
     let ok = match results {
         Ok(results) => process_results(&results, crosstab, pset, stdout, stderr),
@@ -234,7 +378,7 @@ fn send_query_with(
         // (`common.c:1834`): `001_basic.pl:147` expects
         // `psql:<stdin>:2: server closed the connection unexpectedly`.
         Err(err) => {
-            crate::logging::info(pset, err.as_bytes(), stderr);
+            logging::info(pset, err.as_bytes(), stderr);
             false
         }
     };
@@ -258,53 +402,358 @@ fn process_results(
     let mut ok = true;
     let last = results.len().saturating_sub(1);
     for (i, result) in results.iter().enumerate() {
-        let accepted = matches!(
-            result.status(),
-            ExecStatus::TuplesOk | ExecStatus::CommandOk | ExecStatus::EmptyQuery
-        );
-        if !accepted {
+        let is_last = i == last;
+        if accept_result(result.status()) {
+            ok &= print_query_result(result, is_last, crosstab, pset, stdout, stderr);
+        } else {
             // `common.c:1825`-`:1843`: an error is reported whether or not it
             // is the last result, as `PQresultErrorMessage` renders it at the
             // configured verbosity, and kept for `\errverbose`.
-            let message = match result.error() {
-                Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
-                None => result.error_message(),
-            };
+            let message = result_error_message(result, pset);
             if !message.is_empty() {
-                crate::logging::info(pset, &message, stderr);
+                logging::info(pset, &message, stderr);
             }
             clear_or_save_result(result, pset);
             ok = false;
-            continue;
         }
-        if !(i == last || pset.show_all_results) {
-            continue;
-        }
-        if result.status() == ExecStatus::TuplesOk {
-            // `PrintQueryResult()` (`common.c:1043`).
+    }
+    ok
+}
+
+/// `PrintQueryResult()` (`common.c:1043`), for a result `AcceptResult`
+/// passed: print the rows and the status line, or pivot the last result for
+/// `\crosstabview`.
+fn print_query_result(
+    result: &QueryResult,
+    last: bool,
+    crosstab: Option<&CtvArgs>,
+    pset: &PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    if !(last || pset.show_all_results) {
+        return true;
+    }
+    match result.status() {
+        ExecStatus::TuplesOk => {
             let printed = match crosstab {
-                Some(args) if i == last => {
+                Some(args) if last => {
                     print_result_in_crosstab(result, args, &pset.popt).map_err(|err| err.message())
                 }
                 _ => print_query(result, &pset.popt).map_err(|err| err.to_string().into_bytes()),
             };
-            match printed {
+            let ok = match printed {
                 Ok(text) => {
                     let _ = stdout.write_all(&text);
+                    true
                 }
                 Err(message) => {
-                    crate::logging::error(pset, message, stderr);
-                    ok = false;
+                    logging::error(pset, &message, stderr);
+                    false
+                }
+            };
+            if let Some(status) = query_status_line(result, pset) {
+                let _ = stdout.write_all(&status);
+            }
+            ok
+        }
+        ExecStatus::CommandOk => {
+            if let Some(status) = query_status_line(result, pset) {
+                let _ = stdout.write_all(&status);
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Where the pipeline loop stands after a libpq call: the connection broke,
+/// which ends the loop with libpq's message.
+struct ConnectionLost(ErrorMessage);
+
+/// Action: `PQgetResult`, then the notices parsing it drew, which psql's
+/// notice processor prints as libpq meets them — before the result.
+fn fetch(
+    executor: &mut dyn Executor,
+    pset: &PsqlSettings,
+    stderr: &mut dyn Write,
+) -> Result<Option<QueryResult>, ConnectionLost> {
+    let result = executor.get_result();
+    print_notices(executor, pset, stderr);
+    result.map_err(ConnectionLost)
+}
+
+/// `discardAbortedPipelineResults()` (`common.c:1478`): read and drop the
+/// results of an aborted pipeline, up to its next sync, a fatal error, or
+/// the last result there is to read without blocking.
+fn discard_aborted_pipeline_results(
+    executor: &mut dyn Executor,
+    pset: &mut PsqlSettings,
+    stderr: &mut dyn Write,
+) -> Result<Option<QueryResult>, ConnectionLost> {
+    loop {
+        let res = fetch(executor, pset, stderr)?;
+        match res.as_ref().map(QueryResult::status) {
+            // A synchronisation point; the caller decrements the sync counter.
+            Some(ExecStatus::PipelineSync) => return Ok(res),
+            // A FATAL error from the backend: consume the end of the current
+            // query, and let the outer loop report it.
+            Some(ExecStatus::FatalError) => {
+                let _ = fetch(executor, pset, stderr)?;
+                return Ok(res);
+            }
+            Some(_) => {}
+            // A query was processed. An error from the Sync itself is not
+            // counted in available_results, hence the guards.
+            None => {
+                if !executor.connected() {
+                    return Ok(None);
+                }
+                let c = &mut pset.pipeline;
+                c.available_results = c.available_results.saturating_sub(1);
+                c.requested_results = c.requested_results.saturating_sub(1);
+            }
+        }
+        let c = &pset.pipeline;
+        if c.requested_results == 0 {
+            // Every requested result is read.
+            return Ok(res);
+        }
+        if c.available_results == 0 && c.piped_syncs == 0 {
+            // Nothing more to read and no sync to stop at: the pipeline stays
+            // aborted.
+            return Ok(res);
+        }
+    }
+}
+
+/// The pipeline half of `ExecQueryAndProcessResults()` (`common.c:1581`):
+/// everything `SendQuery` does once a pipeline is on, or a pipeline command
+/// asks for one.
+///
+/// The counters decide what is read. A command sent in a pipeline is only
+/// counted (`piped_commands`); a sync or a flush request makes the ones
+/// before it available; `\getresults` and `\endpipeline` then read up to
+/// `requested_results` of them, syncs included, and print each as it comes.
+// One function, as upstream's is: the `switch` and the result loop share
+// `success`, `end_pipeline` and the counters, statement for statement.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn exec_pipelined(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    mode: &SendMode,
+    crosstab: Option<&CtvArgs>,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let in_pipeline = |executor: &dyn Executor| executor.pipeline_status() != PipelineStatus::Off;
+    let mut end_pipeline = false;
+
+    // `common.c:1602`-`:1724`.
+    let sent = match mode {
+        SendMode::GetResults => {
+            let c = &mut pset.pipeline;
+            if c.available_results == 0 && c.piped_syncs == 0 {
+                // PQgetResult() would block: nothing was synced or flushed.
+                c.requested_results = 0;
+                logging::info(pset, b"No pending results to get", stderr);
+                Ok(false)
+            } else {
+                // Cap the request to the results known to be there.
+                let known = c.available_results + c.piped_syncs;
+                if c.requested_results == 0 || c.requested_results > known {
+                    c.requested_results = known;
+                }
+                Ok(true)
+            }
+        }
+        // `success = PQflush(pset.db)` (`common.c:1672`): PQflush returns 0
+        // on success, so `\flush` reports failure, silently, unless the
+        // flush failed (-1). Ported as upstream has it.
+        SendMode::Flush => Ok(executor.send(query, mode).is_err()),
+        _ => executor.send(query, mode).map(|()| true),
+    };
+    print_notices(executor, pset, stderr);
+    let success = match sent {
+        Ok(success) => success,
+        Err(err) => {
+            // `pg_log_info("%s", PQerrorMessage(pset.db))` (`common.c:1731`).
+            if !err.as_bytes().is_empty() {
+                logging::info(pset, err.as_bytes(), stderr);
+            }
+            false
+        }
+    };
+    if success && in_pipeline(executor) {
+        let c = &mut pset.pipeline;
+        match mode {
+            SendMode::Query
+            | SendMode::ExtendedClose { .. }
+            | SendMode::ExtendedParse { .. }
+            | SendMode::ExtendedQueryParams { .. }
+            | SendMode::ExtendedQueryPrepared { .. } => c.piped_commands += 1,
+            SendMode::EndPipelineMode => {
+                // All queued commands are to be processed: the Sync makes
+                // them available, and every result is wanted.
+                end_pipeline = true;
+                c.piped_syncs += 1;
+                c.available_results += c.piped_commands;
+                c.piped_commands = 0;
+                c.requested_results = c.available_results + c.piped_syncs;
+            }
+            SendMode::PipelineSync => {
+                c.piped_syncs += 1;
+                c.available_results += c.piped_commands;
+                c.piped_commands = 0;
+            }
+            SendMode::FlushRequest => {
+                c.available_results += c.piped_commands;
+                c.piped_commands = 0;
+            }
+            SendMode::StartPipelineMode | SendMode::Flush | SendMode::GetResults => {}
+        }
+    }
+    if !success {
+        set_pipeline_variables(&pset.pipeline, vars);
+        return false;
+    }
+
+    if pset.pipeline.requested_results == 0 && !end_pipeline && in_pipeline(executor) {
+        // In a pipeline, and nothing to read yet (`common.c:1740`).
+        set_pipeline_variables(&pset.pipeline, vars);
+        return true;
+    }
+
+    let mut success = true;
+    let mut broken = None;
+    let mut result = match fetch(executor, pset, stderr) {
+        Ok(result) => result,
+        Err(err) => {
+            broken = Some(err);
+            None
+        }
+    };
+    // `common.c:1818`-`:2249`.
+    while let Some(current) = result.take() {
+        let status = current.status();
+        if !accept_result(status) {
+            let error = result_error_message(&current, pset);
+            if !error.is_empty() {
+                logging::info(pset, &error, stderr);
+            }
+            clear_or_save_result(&current, pset);
+            success = false;
+            if status == ExecStatus::PipelineAborted {
+                logging::info(pset, b"Pipeline aborted, command did not run", stderr);
+            }
+            // Within a pipeline, everything up to the next sync is aborted:
+            // read past it, or stop where there is nothing more.
+            let next =
+                if (end_pipeline || pset.pipeline.requested_results > 0) && in_pipeline(executor) {
+                    discard_aborted_pipeline_results(executor, pset, stderr)
+                } else {
+                    fetch(executor, pset, stderr)
+                };
+            match next {
+                Ok(next) => result = next,
+                Err(err) => broken = Some(err),
+            }
+            continue;
+        }
+
+        if matches!(status, ExecStatus::CopyIn | ExecStatus::CopyOut) && in_pipeline(executor) {
+            // `common.c:1919`: COPY breaks a pipeline's synchronisation in
+            // ways psql cannot track, so upstream gives the connection up.
+            logging::info(
+                pset,
+                b"COPY in a pipeline is not supported, aborting connection",
+                stderr,
+            );
+            executor.abandon();
+            return false;
+        }
+
+        if status == ExecStatus::PipelineSync {
+            let c = &mut pset.pipeline;
+            c.piped_syncs = c.piped_syncs.saturating_sub(1);
+            c.requested_results = c.requested_results.saturating_sub(1);
+            // Past a synchronisation point, what follows prints again.
+            success = true;
+            if end_pipeline && c.piped_syncs == 0 {
+                success &= executor.exit_pipeline_mode().is_ok();
+            }
+        } else if in_pipeline(executor) {
+            let c = &mut pset.pipeline;
+            c.available_results = c.available_results.saturating_sub(1);
+            c.requested_results = c.requested_results.saturating_sub(1);
+        }
+
+        // Is this the last result? Outside a pipeline the next PQgetResult
+        // says; in one, the NULL that ends this command is consumed first,
+        // and the next result is only asked for if it was requested.
+        let next = if in_pipeline(executor) {
+            let mut next = Ok(None);
+            if status != ExecStatus::PipelineSync {
+                next = fetch(executor, pset, stderr);
+            }
+            if pset.pipeline.requested_results > 0 && matches!(next, Ok(None)) {
+                next = fetch(executor, pset, stderr);
+            }
+            next
+        } else {
+            fetch(executor, pset, stderr)
+        };
+        let next = match next {
+            Ok(next) => next,
+            Err(err) => {
+                broken = Some(err);
+                None
+            }
+        };
+        let last = next.is_none();
+
+        // A sync has nothing to print.
+        if status != ExecStatus::PipelineSync && success {
+            success &= print_query_result(&current, last, crosstab, pset, stdout, stderr);
+        }
+        result = next;
+    }
+
+    if end_pipeline && broken.is_none() {
+        // An error in a Sync's own processing can leave syncs unread; read
+        // them before leaving pipeline mode (`common.c:2254`).
+        while pset.pipeline.piped_syncs > 0 {
+            match fetch(executor, pset, stderr) {
+                Ok(Some(remaining)) => {
+                    if remaining.status() == ExecStatus::PipelineSync {
+                        pset.pipeline.piped_syncs -= 1;
+                    }
+                }
+                Ok(None) if executor.connected() => {}
+                Ok(None) => break,
+                Err(err) => {
+                    broken = Some(err);
+                    break;
                 }
             }
         }
-        if result.status() != ExecStatus::EmptyQuery
-            && let Some(status) = query_status_line(result, pset)
-        {
-            let _ = stdout.write_all(&status);
+    }
+    if end_pipeline {
+        pset.pipeline = PipelineCounters::default();
+        if in_pipeline(executor) {
+            let _ = executor.exit_pipeline_mode();
         }
     }
-    ok
+    set_pipeline_variables(&pset.pipeline, vars);
+
+    if let Some(ConnectionLost(err)) = broken {
+        // At info level, as the non-pipeline path reports it (`common.c:1834`).
+        logging::info(pset, err.as_bytes(), stderr);
+        return false;
+    }
+    success
 }
 
 #[cfg(test)]
@@ -325,6 +774,7 @@ mod tests {
         fn connected(&self) -> bool {
             true
         }
+        fn abandon(&mut self) {}
     }
 
     fn one_row() -> Vec<QueryResult> {
@@ -367,8 +817,14 @@ mod tests {
         let mut executor = Replay(vec![results]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let mut pset = pset.clone();
-        let ok = send_query(&mut executor, b"select 1", &mut pset, &mut out, &mut err);
+        let ok = send_query(
+            &mut executor,
+            b"select 1",
+            &mut pset.clone(),
+            &mut VariableSpace::new(),
+            &mut out,
+            &mut err,
+        );
         (
             ok,
             String::from_utf8(out).unwrap(),
@@ -499,6 +955,7 @@ mod tests {
             fn connected(&self) -> bool {
                 false
             }
+            fn abandon(&mut self) {}
         }
 
         let mut out = Vec::new();
@@ -507,6 +964,7 @@ mod tests {
             &mut Broken,
             b"select 1",
             &mut PsqlSettings::default(),
+            &mut VariableSpace::new(),
             &mut out,
             &mut err,
         );
@@ -555,6 +1013,7 @@ mod tests {
             fn connected(&self) -> bool {
                 true
             }
+            fn abandon(&mut self) {}
         }
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -562,6 +1021,7 @@ mod tests {
             &mut Never,
             b"  \n ",
             &mut PsqlSettings::default(),
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -634,11 +1094,13 @@ mod tests {
         // with another error.
         let mut executor = Replay(vec![select_error(), one_row()]);
         let mut pset = PsqlSettings::default();
+        let mut vars = VariableSpace::new();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert!(!send_query(
             &mut executor,
             b"select error",
             &mut pset,
+            &mut vars,
             &mut out,
             &mut err
         ));
@@ -648,6 +1110,7 @@ mod tests {
             &mut executor,
             b"select 1",
             &mut pset,
+            &mut vars,
             &mut out,
             &mut err
         ));
@@ -719,6 +1182,7 @@ mod tests {
         fn connected(&self) -> bool {
             true
         }
+        fn abandon(&mut self) {}
     }
 
     #[test]
@@ -738,6 +1202,7 @@ mod tests {
             &mut executor,
             b"SELECT $1 ",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -745,6 +1210,7 @@ mod tests {
             &mut executor,
             b"SELECT 1",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -776,6 +1242,7 @@ mod tests {
             &mut executor,
             b"",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -783,6 +1250,7 @@ mod tests {
             &mut executor,
             b"",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -803,6 +1271,7 @@ mod tests {
             &mut executor,
             b"select 1",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -831,6 +1300,7 @@ mod tests {
             &mut executor,
             b"q",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -845,6 +1315,7 @@ mod tests {
             &mut executor,
             b"q",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -869,6 +1340,7 @@ mod tests {
             &mut executor,
             b"q",
             &mut pset,
+            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -878,5 +1350,352 @@ mod tests {
             "\\crosstabview: query result contains multiple data values for row \"1\", column \"a\"\n"
         );
         assert_eq!(pset.crosstab, None);
+    }
+
+    /// libpq's pipeline, scripted: the sends are recorded, and each
+    /// `PQgetResult` answers the next scripted result or NULL.
+    struct Pipe {
+        status: PipelineStatus,
+        sent: Vec<SendMode>,
+        results: std::collections::VecDeque<Option<QueryResult>>,
+        abandoned: bool,
+    }
+
+    impl Pipe {
+        fn new(results: Vec<Option<QueryResult>>) -> Self {
+            Self {
+                status: PipelineStatus::Off,
+                sent: Vec::new(),
+                results: results.into(),
+                abandoned: false,
+            }
+        }
+    }
+
+    impl Executor for Pipe {
+        fn exec(
+            &mut self,
+            _query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            panic!("a pipeline is never sent through PQexec");
+        }
+        fn connected(&self) -> bool {
+            !self.abandoned
+        }
+        fn abandon(&mut self) {
+            self.abandoned = true;
+        }
+        fn pipeline_status(&self) -> PipelineStatus {
+            self.status
+        }
+        fn send(&mut self, _query: &[u8], mode: &SendMode) -> Result<(), ErrorMessage> {
+            match mode {
+                SendMode::StartPipelineMode => self.status = PipelineStatus::On,
+                SendMode::EndPipelineMode | SendMode::PipelineSync
+                    if self.status == PipelineStatus::Off =>
+                {
+                    return Err(ErrorMessage::new(
+                        b"cannot send pipeline when not in pipeline mode".to_vec(),
+                    ));
+                }
+                _ => {}
+            }
+            self.sent.push(mode.clone());
+            Ok(())
+        }
+        fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+            Ok(self.results.pop_front().flatten())
+        }
+        fn exit_pipeline_mode(&mut self) -> Result<(), ErrorMessage> {
+            self.status = PipelineStatus::Off;
+            Ok(())
+        }
+    }
+
+    /// One `SendQuery` of `mode`, as `pg_regress` would log it.
+    fn pipe(
+        executor: &mut Pipe,
+        mode: SendMode,
+        pset: &mut PsqlSettings,
+        vars: &mut VariableSpace,
+    ) -> (bool, String, String) {
+        pset.send_mode = mode;
+        pset.log_terse = true;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ok = send_query(executor, b"SELECT $1 ", pset, vars, &mut out, &mut err);
+        (
+            ok,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn bind() -> SendMode {
+        SendMode::ExtendedQueryParams {
+            params: vec!["1".into()],
+        }
+    }
+
+    fn counts(vars: &VariableSpace) -> [&str; 3] {
+        [
+            "PIPELINE_COMMAND_COUNT",
+            "PIPELINE_SYNC_COUNT",
+            "PIPELINE_RESULT_COUNT",
+        ]
+        .map(|name| vars.get(name).unwrap_or("<unset>"))
+    }
+
+    #[test]
+    fn the_pipeline_variables_count_commands_syncs_and_results() {
+        // `psql_pipeline.sql:43`-`:58`, "Send multiple syncs", up to its
+        // second set of `\echo`s: nothing is read yet.
+        let mut executor = Pipe::new(vec![]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        for mode in [
+            SendMode::StartPipelineMode,
+            bind(),
+            SendMode::PipelineSync,
+            SendMode::PipelineSync,
+            bind(),
+            SendMode::PipelineSync,
+            bind(),
+        ] {
+            let (ok, out, err) = pipe(&mut executor, mode, &mut pset, &mut vars);
+            assert!(ok);
+            assert_eq!((out.as_str(), err.as_str()), ("", ""));
+        }
+        assert_eq!(counts(&vars), ["1", "3", "2"]);
+        assert_eq!(executor.status, PipelineStatus::On);
+    }
+
+    #[test]
+    fn endpipeline_reads_every_result_then_leaves_pipeline_mode() {
+        let mut executor = Pipe::new(vec![
+            Some(one_row().remove(0)),
+            None,
+            Some(one_row().remove(0)),
+            None,
+            Some(QueryResult::new(ExecStatus::PipelineSync)),
+        ]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        for mode in [SendMode::StartPipelineMode, bind(), bind()] {
+            assert!(pipe(&mut executor, mode, &mut pset, &mut vars).0);
+        }
+        let (ok, out, err) = pipe(
+            &mut executor,
+            SendMode::EndPipelineMode,
+            &mut pset,
+            &mut vars,
+        );
+        assert!(ok);
+        let table = " ?column? \n----------\n        1\n(1 row)\n\n";
+        assert_eq!(out, format!("{table}{table}"));
+        assert_eq!(err, "");
+        assert_eq!(executor.status, PipelineStatus::Off);
+        assert!(executor.results.is_empty(), "every result is read");
+        assert_eq!(pset.pipeline, PipelineCounters::default());
+        assert_eq!(counts(&vars), ["0", "0", "0"]);
+    }
+
+    #[test]
+    fn an_error_aborts_the_rest_of_the_pipeline_silently_up_to_the_sync() {
+        // `psql_pipeline.sql:218`-`:222`: the error is printed once; the aborted
+        // command after it is discarded, not reported
+        // (`discardAbortedPipelineResults`, `common.c:1478`).
+        let error = QueryResult::with_error(
+            ExecStatus::FatalError,
+            ResultError::new(vec![(b'S', b"ERROR".to_vec()), (b'M', b"boom".to_vec())]),
+        );
+        let mut executor = Pipe::new(vec![
+            Some(error),
+            None,
+            Some(QueryResult::new(ExecStatus::PipelineAborted)),
+            None,
+            Some(QueryResult::new(ExecStatus::PipelineSync)),
+        ]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        for mode in [SendMode::StartPipelineMode, bind(), bind()] {
+            assert!(pipe(&mut executor, mode, &mut pset, &mut vars).0);
+        }
+        let (ok, out, err) = pipe(
+            &mut executor,
+            SendMode::EndPipelineMode,
+            &mut pset,
+            &mut vars,
+        );
+        // Past the sync, success is reset (`common.c:2136`).
+        assert!(ok);
+        assert_eq!(out, "");
+        assert_eq!(err, "ERROR:  boom\n");
+        assert!(executor.results.is_empty());
+        assert_eq!(executor.status, PipelineStatus::Off);
+    }
+
+    #[test]
+    fn getresults_reads_only_what_was_asked_and_reports_an_aborted_command() {
+        // `psql_pipeline.sql:328`-`:340`: `\getresults 1` past an aborted
+        // command prints "Pipeline aborted, command did not run".
+        let mut executor = Pipe::new(vec![
+            Some(QueryResult::new(ExecStatus::PipelineAborted)),
+            None,
+        ]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        executor.status = PipelineStatus::Aborted;
+        pset.pipeline = PipelineCounters {
+            piped_commands: 0,
+            piped_syncs: 1,
+            available_results: 2,
+            requested_results: 1,
+        };
+        let (ok, out, err) = pipe(&mut executor, SendMode::GetResults, &mut pset, &mut vars);
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, "Pipeline aborted, command did not run\n");
+        assert_eq!(counts(&vars), ["0", "1", "1"]);
+        assert!(executor.results.is_empty());
+    }
+
+    #[test]
+    fn getresults_with_nothing_synced_or_flushed_would_block_and_is_refused() {
+        // `common.c:1688`, `psql_pipeline.sql:135`.
+        let mut executor = Pipe::new(vec![]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        pset.pipeline.requested_results = 4;
+        let (ok, out, err) = pipe(&mut executor, SendMode::GetResults, &mut pset, &mut vars);
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, "No pending results to get\n");
+        assert_eq!(pset.pipeline.requested_results, 0);
+        assert!(executor.sent.is_empty(), "\\getresults sends nothing");
+    }
+
+    #[test]
+    fn endpipeline_outside_a_pipeline_reports_libpq_s_refusal() {
+        // `psql_pipeline.sql:207`-`:208`.
+        let mut executor = Pipe::new(vec![]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        let (ok, out, err) = pipe(
+            &mut executor,
+            SendMode::EndPipelineMode,
+            &mut pset,
+            &mut vars,
+        );
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, "cannot send pipeline when not in pipeline mode\n");
+        assert_eq!(counts(&vars), ["0", "0", "0"]);
+    }
+
+    #[test]
+    fn flush_reports_failure_silently_as_upstream_does() {
+        // `common.c:1672`: `success = PQflush(pset.db)`, and PQflush returns
+        // 0 when it succeeds.
+        let mut executor = Pipe::new(vec![]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        assert!(
+            pipe(
+                &mut executor,
+                SendMode::StartPipelineMode,
+                &mut pset,
+                &mut vars
+            )
+            .0
+        );
+        let (ok, out, err) = pipe(&mut executor, SendMode::Flush, &mut pset, &mut vars);
+        assert!(!ok);
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+        assert_eq!(executor.sent.last(), Some(&SendMode::Flush));
+    }
+
+    #[test]
+    fn the_pipeline_variables_start_at_zero() {
+        // `startup.c:208`-`:211` seeds them from zeroed counters.
+        assert_eq!(
+            pipeline_variables(&PipelineCounters::default()),
+            [
+                ("PIPELINE_SYNC_COUNT", "0".to_string()),
+                ("PIPELINE_COMMAND_COUNT", "0".to_string()),
+                ("PIPELINE_RESULT_COUNT", "0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_in_a_pipeline_gives_the_connection_up() {
+        // `common.c:1919`-`:1943`: upstream logs and exits with
+        // EXIT_BADCONN rather than drive a COPY inside a pipeline.
+        let mut executor = Pipe::new(vec![Some(QueryResult::new(ExecStatus::CopyIn))]);
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        for mode in [SendMode::StartPipelineMode, bind()] {
+            assert!(pipe(&mut executor, mode, &mut pset, &mut vars).0);
+        }
+        let (ok, out, err) = pipe(
+            &mut executor,
+            SendMode::EndPipelineMode,
+            &mut pset,
+            &mut vars,
+        );
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "COPY in a pipeline is not supported, aborting connection\n"
+        );
+        assert!(!executor.connected());
+    }
+
+    #[test]
+    fn notices_are_printed_before_the_results_of_the_query_that_drew_them() {
+        // psql's `NoticeProcessor` (`common.c:281`) is `pg_log_info`. Outside
+        // a pipeline the whole query is read before anything is printed, so
+        // its notices all come first (`docs/divergences.md`).
+        struct Noisy(Vec<ResultError>);
+        impl Executor for Noisy {
+            fn exec(
+                &mut self,
+                _query: &[u8],
+                _mode: &SendMode,
+            ) -> Result<Vec<QueryResult>, ErrorMessage> {
+                Ok(one_row())
+            }
+            fn connected(&self) -> bool {
+                true
+            }
+            fn abandon(&mut self) {}
+            fn take_notices(&mut self) -> Vec<ResultError> {
+                std::mem::take(&mut self.0)
+            }
+        }
+        let mut executor = Noisy(vec![ResultError::new(vec![
+            (b'S', b"WARNING".to_vec()),
+            (
+                b'M',
+                b"SET LOCAL can only be used in transaction blocks".to_vec(),
+            ),
+        ])]);
+        let mut pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query(
+            &mut executor,
+            b"select 1",
+            &mut pset,
+            &mut VariableSpace::new(),
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "WARNING:  SET LOCAL can only be used in transaction blocks\n"
+        );
+        assert!(executor.0.is_empty(), "each notice is printed once");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            " ?column? \n----------\n        1\n(1 row)\n\n"
+        );
     }
 }

@@ -245,7 +245,8 @@ pub fn head(section: &Section<'static>, line: &str) -> Section<'static> {
 /// with ones a later slice brings, when the ones it has do not depend on the
 /// others: the rest of the section is still gated whole.
 ///
-/// `-a` echoes every input line but an empty one (`mainloop.c:222`), so the
+/// `-a` echoes every input line (`mainloop.c:360`) but an empty one, which
+/// is skipped before it is echoed (`mainloop.c:222`), so the
 /// echoes split `psql.out` into each line's output, whatever the format —
 /// unaligned output has no empty line to end a table.
 ///

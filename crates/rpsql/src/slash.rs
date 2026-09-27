@@ -140,6 +140,11 @@ impl Scanner {
             }
         }
 
+        // The option comes back as a `char *` (`psqlscanslash.l:671`), which
+        // every command reads as a C string: an escaped zero byte ends it.
+        if let Some(nul) = out.iter().position(|&b| b == 0) {
+            out.truncate(nul);
+        }
         Some(SlashOption {
             value: String::from_utf8_lossy(&out).into_owned(),
             quote,
@@ -172,6 +177,8 @@ impl Scanner {
 
     /// `<xslashquote>` (`psqlscanslash.l:321`): `''` is a quote, and the
     /// backslash escapes `\n`, `\t`, `\b`, `\r`, `\f`, `\digits`, `\xhex`.
+    /// Any other escaped byte stands for itself, except a newline, before
+    /// which the backslash is kept (`"\\".` does not match a newline).
     fn read_single_quoted(&mut self, out: &mut Vec<u8>) {
         loop {
             let rest = self.rest().to_vec();
@@ -190,15 +197,48 @@ impl Scanner {
                         self.skip(1);
                         return;
                     };
-                    self.skip(2);
+                    // `{xeoctesc}  [\\][0-7]{1,3}` and `{xehexesc}
+                    // [\\]x[0-9A-Fa-f]{1,2}`, each `(char) strtol(…)`: the
+                    // value's low byte.
+                    let digits = |from: usize, max: usize, radix: u32| {
+                        rest[from..]
+                            .iter()
+                            .take(max)
+                            .take_while(|&&d| char::from(d).is_digit(radix))
+                            .count()
+                    };
+                    let numeric = |from: usize, len: usize, radix: u32| {
+                        let text = std::str::from_utf8(&rest[from..from + len]).unwrap_or("0");
+                        u32::from_str_radix(text, radix).map_or(0, |v| v.to_le_bytes()[0])
+                    };
                     match escape {
                         b'n' => out.push(b'\n'),
                         b't' => out.push(b'\t'),
                         b'b' => out.push(0x08),
                         b'r' => out.push(b'\r'),
                         b'f' => out.push(0x0c),
+                        b'0'..=b'7' => {
+                            let len = digits(1, 3, 8);
+                            out.push(numeric(1, len, 8));
+                            self.skip(1 + len);
+                            continue;
+                        }
+                        b'x' if digits(2, 2, 16) > 0 => {
+                            let len = digits(2, 2, 16);
+                            out.push(numeric(2, len, 16));
+                            self.skip(2 + len);
+                            continue;
+                        }
+                        b'\n' => {
+                            // `{other}` takes the backslash alone; the
+                            // newline follows as itself.
+                            out.push(b'\\');
+                            self.skip(1);
+                            continue;
+                        }
                         other => out.push(other),
                     }
+                    self.skip(2);
                 }
                 _ => {
                     self.skip(1);
@@ -349,6 +389,28 @@ mod tests {
         // `psqlscanslash.l:331`-`:347`.
         let (_, options) = slash("\\echo 'a\\tb'", &NoVariables);
         assert_eq!(values(&options), ["a\tb"]);
+    }
+
+    #[test]
+    fn octal_and_hex_escapes_inside_single_quotes_are_bytes() {
+        // `psqlscanslash.l:337`-`:347`: `{xeoctesc}` takes up to three octal
+        // digits and `{xehexesc}` up to two hex digits; `\x` without one is
+        // just `x`, and a backslash before a newline stays.
+        let (_, options) = slash(
+            "\\echo '\\101\\1012' '\\x41\\x414' '\\xg' '\\777'",
+            &NoVariables,
+        );
+        assert_eq!(values(&options), ["AA2", "AA4", "xg", "\u{fffd}"]);
+        let (_, options) = slash("\\echo 'a\\\nb'", &NoVariables);
+        assert_eq!(values(&options), ["a\\\nb"]);
+    }
+
+    #[test]
+    fn an_escaped_zero_byte_ends_the_argument_as_it_ends_a_c_string() {
+        // `\pset csv_fieldsep '\0'` is an empty separator to C, which is
+        // why `expected/psql.out:3385` refuses it as not one byte.
+        let (_, options) = slash("\\pset csv_fieldsep '\\0' 'a\\0b'", &NoVariables);
+        assert_eq!(values(&options), ["csv_fieldsep", "", "a"]);
     }
 
     #[test]

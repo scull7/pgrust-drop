@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn a_bad_argument_draws_upstreams_message() {
-        // `001_basic.pl:387`-`:423`, then the ones it does not reach.
+        // `001_basic.pl:387`-`:435`, then the ones it does not reach.
         for (args, message) in [
             (&["m=x"][..], "\\watch: incorrect minimum row count \"x\""),
             (

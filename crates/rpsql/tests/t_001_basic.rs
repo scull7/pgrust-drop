@@ -9,7 +9,7 @@
 //! (lines 86-108), `\errverbose with no previous error` (159-164),
 //! `\errverbose after normal query with error` (170-181), the multiple
 //! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367),
-//! `\watch` and `WATCH_INTERVAL` (369-443) and `\g` output piped into a
+//! `\watch` and `WATCH_INTERVAL` (369-455) and `\g` output piped into a
 //! program (457-486). The `\copyright`, `\help`, `ENCODING`, notification,
 //! crash and remaining `\errverbose` cases, and the rest of the file, land
 //! with Linear NAT-400 … NAT-405.
@@ -501,7 +501,7 @@ fn psql_fails_like(cluster: &Cluster, sql: &str, expected_stderr: &str, test_nam
 }
 
 /// `# Check \watch`, `# Check \watch minimum row count` and `# Check \watch
-/// errors` — 001_basic.pl:369-423. Upstream's `sprintf('%g', …)` is
+/// errors` — 001_basic.pl:369-435. Upstream's `sprintf('%g', …)` is
 /// written out: `0.01`, `0.0001` and `0.5`.
 #[test]
 fn check_watch() {
@@ -591,7 +591,7 @@ fn check_watch() {
     );
 }
 
-/// `# Check WATCH_INTERVAL` — 001_basic.pl:425-443.
+/// `# Check WATCH_INTERVAL` — 001_basic.pl:437-455.
 #[test]
 fn check_watch_interval() {
     let Some(cluster) = Cluster::start(CHECK_WATCH_INTERVAL_PORT) else {
@@ -994,7 +994,7 @@ fn normalize_watch_time(text: &str) -> String {
 /// both, in UTC and the C locale, and stdout, stderr and the exit status
 /// must be the same bytes once each title's time is [`normalize_watch_time`]d.
 /// Not an upstream test — upstream has no psql to compare against — but it
-/// covers `001_basic.pl:369`-`:443` and the output those cases do not look
+/// covers `001_basic.pl:369`-`:455` and the output those cases do not look
 /// at: titles, status lines and COPY data under `\\watch`.
 #[test]
 fn watch_matches_c_psql() {

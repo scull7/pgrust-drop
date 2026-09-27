@@ -227,6 +227,40 @@ fn startup_popt() -> PrintQueryOpt {
     pset.popt
 }
 
+/// Ports used by the live gates here; each gate starts its own cluster.
+const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
+
+/// Run `section` through rpsql against `cluster`, and through C psql when this
+/// lane has one, and require both to print exactly `psql.out`'s slice.
+fn gate_section(cluster: &Cluster, section: &Section<'_>) {
+    let ours = cluster.run_script(Path::new(RPSQL), section.sql);
+    if let Some(diff) = first_difference(section.expected.as_bytes(), &ours) {
+        panic!(
+            "rpsql, psql.sql:{} vs psql.out:{} ({}): {diff}",
+            section.sql_line, section.out_line, section.header
+        );
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script(&psql, section.sql);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql ({}): {diff}", section.header);
+            }
+        }
+        None => reference::skip("psql"),
+    }
+}
+
+/// `-- show all pset options` (`psql.sql:219`): a bare `\pset` lists every
+/// print option with its startup value.
+#[test]
+fn show_all_pset_options() {
+    let Some(cluster) = Cluster::start(SHOW_ALL_PSET_OPTIONS_PORT) else {
+        return;
+    };
+    gate_section(&cluster, &section("-- show all pset options"));
+}
+
 /// `-- test multi-line headers, wrapping, and newline indicators` and
 /// `-- test single-line header and data` (`psql.sql:222`, `:343`), replayed
 /// in file order so each starts from the state the one before left.
@@ -264,38 +298,4 @@ fn the_aligned_and_unaligned_blocks_match_psql_out() {
             r.deferred
         );
     }
-}
-
-/// Ports used by the live gates here; each gate starts its own cluster.
-const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
-
-/// Run `section` through rpsql against `cluster`, and through C psql when this
-/// lane has one, and require both to print exactly `psql.out`'s slice.
-fn gate_section(cluster: &Cluster, section: &Section<'_>) {
-    let ours = cluster.run_script(Path::new(RPSQL), section.sql);
-    if let Some(diff) = first_difference(section.expected.as_bytes(), &ours) {
-        panic!(
-            "rpsql, psql.sql:{} vs psql.out:{} ({}): {diff}",
-            section.sql_line, section.out_line, section.header
-        );
-    }
-    match cluster.reference_psql() {
-        Some(psql) => {
-            let theirs = cluster.run_script(&psql, section.sql);
-            if let Some(diff) = first_difference(&theirs, &ours) {
-                panic!("rpsql vs C psql ({}): {diff}", section.header);
-            }
-        }
-        None => reference::skip("psql"),
-    }
-}
-
-/// `-- show all pset options` (`psql.sql:219`): a bare `\pset` lists every
-/// print option with its startup value.
-#[test]
-fn show_all_pset_options() {
-    let Some(cluster) = Cluster::start(SHOW_ALL_PSET_OPTIONS_PORT) else {
-        return;
-    };
-    gate_section(&cluster, &section("-- show all pset options"));
 }

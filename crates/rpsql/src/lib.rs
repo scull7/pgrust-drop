@@ -17,7 +17,8 @@
 //! NAT-400 adds `\pset` ([`pset`], `command.c`'s `do_pset`) and grows
 //! [`print`] toward the whole of `print.c`. `--help` is NAT-399's.
 //! NAT-401 ports the `\d` family ([`describe`], `describe.c`) a command group
-//! at a time, starting with `listTables`. Interactive input is NAT-405's.
+//! at a time, starting with `listTables`, and `\l` / `-l` (`listAllDbs`).
+//! Interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -100,11 +101,16 @@ impl Executor for LiveExecutor {
 #[must_use]
 pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
     let mut keywords = Vec::new();
+    // `startup.c:267`: `-l` with no database named connects to `postgres`.
+    let dbname = match &session.dbname {
+        None if session.list_dbs => Some("postgres".to_string()),
+        dbname => dbname.clone(),
+    };
     for (key, value) in [
         ("host", &session.host),
         ("port", &session.port),
         ("user", &session.username),
-        ("dbname", &session.dbname),
+        ("dbname", &dbname),
     ] {
         if let Some(value) = value {
             keywords.push((key.to_string(), value.clone()));
@@ -188,17 +194,19 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         );
         return ExitCode::from(EXIT_FAILURE);
     }
-    if session.actions.is_empty() {
+    // `-l` lists and exits before any action runs (`startup.c:332`), so on a
+    // tty it needs no interactive mode.
+    if session.actions.is_empty() && !session.list_dbs {
         let _ = writeln!(
             stderr,
             "psql: error: interactive mode is not implemented yet (Linear NAT-405)"
         );
         return ExitCode::from(EXIT_FAILURE);
     }
-    if session.list_dbs || session.output.is_some() || session.logfilename.is_some() {
+    if session.output.is_some() || session.logfilename.is_some() {
         let _ = writeln!(
             stderr,
-            "psql: error: -l, -o and -L are not implemented yet (Linear NAT-401, NAT-403)"
+            "psql: error: -o and -L are not implemented yet (Linear NAT-403)"
         );
         return ExitCode::from(EXIT_FAILURE);
     }
@@ -212,6 +220,15 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     };
     // `SyncVariables()` (`command.c:4582`).
     session.pset.sversion = executor.connection.server_version();
+
+    // `startup.c:332`-`:342`. `process_psqlrc` is not ported
+    // (`docs/divergences.md`), so there is no startup file to read first.
+    if session.list_dbs {
+        let success =
+            command::list_all_dbs(None, false, &session.pset, &mut executor, stdout, stderr);
+        let _ = executor.connection.terminate();
+        return ExitCode::from(if success { EXIT_SUCCESS } else { EXIT_FAILURE });
+    }
 
     // The list is consumed here and never read again, so it moves out rather
     // than being cloned past the `&mut session` the loop needs.
@@ -430,6 +447,25 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "fallback_application_name" && v == "psql")
         );
+    }
+
+    #[test]
+    fn list_dbs_connects_to_postgres_unless_a_database_is_named() {
+        // `startup.c:267`.
+        let dbname = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let Invocation::Run(session) = startup::plan(&args) else {
+                panic!("expected a session");
+            };
+            connection_keywords(&session)
+                .into_iter()
+                .find(|(k, _)| k == "dbname")
+                .map(|(_, v)| v)
+        };
+        assert_eq!(dbname(&["-l"]).as_deref(), Some("postgres"));
+        assert_eq!(dbname(&["-l", "-d", "mydb"]).as_deref(), Some("mydb"));
+        assert_eq!(dbname(&["-l", "mydb"]).as_deref(), Some("mydb"));
+        assert_eq!(dbname(&["-c", "select 1"]), None);
     }
 
     #[test]

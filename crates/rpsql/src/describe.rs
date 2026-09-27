@@ -41,7 +41,8 @@
 //! `\deu`; [`list_foreign_data_wrappers_query`], `\dew`;
 //! [`list_foreign_tables_query`], `\det`); and slice 8's `\d` with a
 //! pattern, `describeTableDetails` and `describeOneTableDetails`, in
-//! [`table`].
+//! [`table`]; and slice 9's [`list_all_dbs_query`], `listAllDbs`, which is
+//! not a `\d` command but `describe.c`'s last function: `\l` and `-l`.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -1934,6 +1935,91 @@ pub fn describe_operators_query(
     }
     push_arg_type_patterns(&mut buf, arg_patterns, server)?;
     buf.push_str("ORDER BY 1, 2, 3, 4;");
+    Ok(buf)
+}
+
+/// The query half of `listAllDbs()` (`describe.c:946`-`:1034`), for `\l`,
+/// `\list` and `-l`, whose title is "List of databases". The locale provider
+/// is `COLLPROVIDER_BUILTIN`, `_LIBC` or `_ICU` (`pg_collation.h:71`-`:73`)
+/// from 15, and `'libc'` before; the locale column is `datlocale` from 17,
+/// `daticulocale` from 15, and null before; the ICU rules are null before 16.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_all_dbs_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let sversion = server.sversion;
+    let mut buf = String::from(concat!(
+        "SELECT\n",
+        "  d.datname as \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n",
+        "  pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n",
+    ));
+    buf.push_str(if sversion >= 150_000 {
+        concat!(
+            "  CASE d.datlocprovider ",
+            "WHEN 'b' THEN 'builtin' ",
+            "WHEN 'c' THEN 'libc' ",
+            "WHEN 'i' THEN 'icu' ",
+            "END AS \"Locale Provider\",\n",
+        )
+    } else {
+        "  'libc' AS \"Locale Provider\",\n"
+    });
+    buf.push_str(concat!(
+        "  d.datcollate as \"Collate\",\n",
+        "  d.datctype as \"Ctype\",\n",
+    ));
+    buf.push_str(if sversion >= 170_000 {
+        "  d.datlocale as \"Locale\",\n"
+    } else if sversion >= 150_000 {
+        "  d.daticulocale as \"Locale\",\n"
+    } else {
+        "  NULL as \"Locale\",\n"
+    });
+    buf.push_str(if sversion >= 160_000 {
+        "  d.daticurules as \"ICU Rules\",\n"
+    } else {
+        "  NULL as \"ICU Rules\",\n"
+    });
+    buf.push_str("  ");
+    push_acl_column(&mut buf, "d.datacl");
+    if verbose {
+        buf.push_str(
+            ",\n  CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')\n       ",
+        );
+        if sversion >= 100_000 {
+            buf.push_str("OR pg_catalog.pg_has_role('pg_read_all_stats', 'USAGE')\n");
+        }
+        buf.push_str(concat!(
+            "       THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))\n",
+            "       ELSE 'No Access'\n",
+            "  END as \"Size\"",
+            ",\n  t.spcname as \"Tablespace\"",
+            ",\n  pg_catalog.shobj_description(d.oid, 'pg_database') as \"Description\"",
+        ));
+    }
+    buf.push_str("\nFROM pg_catalog.pg_database d\n");
+    if verbose {
+        buf.push_str("  JOIN pg_catalog.pg_tablespace t on d.dattablespace = t.oid\n");
+    }
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("d.datname"),
+            ..PatternVars::default()
+        },
+        1,
+        sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
     Ok(buf)
 }
 
@@ -5856,6 +5942,69 @@ mod tests {
             Err(PatternError(
                 "improper qualified name (too many dotted names): a.b".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn the_database_listing_is_upstreams() {
+        assert_eq!(
+            list_all_dbs_query(None, false, PG18).unwrap(),
+            "SELECT\n  \
+             d.datname as \"Name\",\n  \
+             pg_catalog.pg_get_userbyid(d.datdba) as \"Owner\",\n  \
+             pg_catalog.pg_encoding_to_char(d.encoding) as \"Encoding\",\n  \
+             CASE d.datlocprovider WHEN 'b' THEN 'builtin' WHEN 'c' THEN 'libc' \
+             WHEN 'i' THEN 'icu' END AS \"Locale Provider\",\n  \
+             d.datcollate as \"Collate\",\n  \
+             d.datctype as \"Ctype\",\n  \
+             d.datlocale as \"Locale\",\n  \
+             d.daticurules as \"ICU Rules\",\n  \
+             CASE WHEN pg_catalog.array_length(d.datacl, 1) = 0 THEN '(none)' \
+             ELSE pg_catalog.array_to_string(d.datacl, E'\\n') END AS \"Access privileges\"\n\
+             FROM pg_catalog.pg_database d\n\
+             ORDER BY 1;"
+        );
+        let verbose = list_all_dbs_query(Some("reg*"), true, PG18).unwrap();
+        assert!(
+            verbose.ends_with(
+                " END AS \"Access privileges\",\n  \
+                 CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')\n       \
+                 OR pg_catalog.pg_has_role('pg_read_all_stats', 'USAGE')\n       \
+                 THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))\n       \
+                 ELSE 'No Access'\n  \
+                 END as \"Size\",\n  \
+                 t.spcname as \"Tablespace\",\n  \
+                 pg_catalog.shobj_description(d.oid, 'pg_database') as \"Description\"\n\
+                 FROM pg_catalog.pg_database d\n  \
+                 JOIN pg_catalog.pg_tablespace t on d.dattablespace = t.oid\n\
+                 WHERE d.datname OPERATOR(pg_catalog.~) '^(reg.*)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1;"
+            ),
+            "{verbose}"
+        );
+        assert_eq!(
+            list_all_dbs_query(Some("a.b"), false, PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): a.b".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_database_listing_branches_on_the_server_version() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        let q = |sversion, verbose| list_all_dbs_query(None, verbose, at(sversion)).unwrap();
+        assert!(q(160_000, false).contains("  d.daticulocale as \"Locale\",\n"));
+        assert!(q(160_000, false).contains("  d.daticurules as \"ICU Rules\",\n"));
+        assert!(q(150_000, false).contains("WHEN 'i' THEN 'icu' END AS \"Locale Provider\""));
+        assert!(q(150_000, false).contains("  NULL as \"ICU Rules\",\n"));
+        let old = q(140_000, false);
+        assert!(old.contains("  'libc' AS \"Locale Provider\",\n"));
+        assert!(old.contains("  NULL as \"Locale\",\n  NULL as \"ICU Rules\",\n"));
+        // Before 10, `pg_read_all_stats` does not exist and its line is empty.
+        assert!(q(100_000, true).contains("pg_read_all_stats"));
+        assert!(
+            q(90_600, true).contains("'CONNECT')\n              THEN pg_catalog.pg_size_pretty(")
         );
     }
 

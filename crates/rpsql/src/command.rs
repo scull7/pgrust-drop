@@ -4,7 +4,7 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code, NAT-400
-//! adds `\pset`, and NAT-401 the `\d` family ([`crate::describe`]).
+//! adds `\pset`, and NAT-401 the `\d` family and `\l` ([`crate::describe`]).
 //! Everything else is [`CommandResult::Unknown`], which renders upstream's
 //! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
 
@@ -21,19 +21,19 @@ use crate::describe::{
     describe_publication_table, describe_publications_query, describe_role_grants_query,
     describe_roles_headers, describe_roles_query, describe_roles_row, describe_subscriptions_query,
     describe_tablespaces_query, describe_types_query, extension_contents_title,
-    extensions_not_found, list_casts_query, list_collations_query, list_conversions_query,
-    list_db_role_settings_query, list_default_acls_query, list_domains_query,
-    list_event_triggers_query, list_extended_stats_query, list_extension_contents_query,
-    list_extensions_query, list_foreign_data_wrappers_query, list_foreign_servers_query,
-    list_foreign_tables_query, list_languages_query, list_large_objects_query,
-    list_one_extension_contents_query, list_partitioned_tables_query, list_publications_query,
-    list_schemas_query, list_tables_query, list_ts_configs_query, list_ts_configs_verbose_query,
-    list_ts_dictionaries_query, list_ts_parsers_query, list_ts_parsers_verbose_query,
-    list_ts_templates_query, list_user_mappings_query, object_description_query,
-    permissions_list_query, publication_footers, publication_schemas_query,
-    publication_tables_query, publications_not_found, schema_publication_footers,
-    schema_publications_query, text_search_not_found, ts_config_title, ts_parser_titles,
-    ts_parser_token_types_query,
+    extensions_not_found, list_all_dbs_query, list_casts_query, list_collations_query,
+    list_conversions_query, list_db_role_settings_query, list_default_acls_query,
+    list_domains_query, list_event_triggers_query, list_extended_stats_query,
+    list_extension_contents_query, list_extensions_query, list_foreign_data_wrappers_query,
+    list_foreign_servers_query, list_foreign_tables_query, list_languages_query,
+    list_large_objects_query, list_one_extension_contents_query, list_partitioned_tables_query,
+    list_publications_query, list_schemas_query, list_tables_query, list_ts_configs_query,
+    list_ts_configs_verbose_query, list_ts_dictionaries_query, list_ts_parsers_query,
+    list_ts_parsers_verbose_query, list_ts_templates_query, list_user_mappings_query,
+    object_description_query, permissions_list_query, publication_footers,
+    publication_schemas_query, publication_tables_query, publications_not_found,
+    schema_publication_footers, schema_publications_query, text_search_not_found, ts_config_title,
+    ts_parser_titles, ts_parser_token_types_query,
 };
 use crate::print::{Align, print_query, print_table};
 use crate::scan::{Scanner, VariableSource};
@@ -200,6 +200,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "c" | "connect" => 4,
         "pset" => 2,
         "unset" | "z" | "zS" | "zx" | "zSx" | "zxS" => 1,
+        l if LIST_COMMANDS.contains(&l) => 1,
         // `exec_command_d` reads one pattern, or two for some `\dA`s.
         d if d.starts_with('d') => DescribeCommand::patterns_read(d, !options.is_empty()),
         _ => 0,
@@ -238,6 +239,8 @@ fn exec_command(
         // `exec_command_z()` (`command.c:3548`), for exactly these spellings
         // (`command.c:472`).
         "z" | "zS" | "zx" | "zSx" | "zxS" => exec_command_z(cmd, options, ctx, stdout, stderr),
+        // `exec_command_list()` (`command.c:2331`).
+        l if LIST_COMMANDS.contains(&l) => exec_command_list(cmd, options, ctx, stdout, stderr),
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
@@ -1117,6 +1120,70 @@ fn exec_command_z(
     } else {
         CommandResult::Error
     }
+}
+
+/// The spellings `exec_command()` sends to `exec_command_list()`
+/// (`command.c:411`-`:416`), and no others: `\lx+` and `\l+x` both, but not
+/// `\lxx` or `\l++`.
+const LIST_COMMANDS: [&str; 10] = [
+    "l", "list", "lx", "listx", "l+", "list+", "lx+", "listx+", "l+x", "list+x",
+];
+
+/// `exec_command_list()` (`command.c:2331`): `\l`, one pattern without its
+/// unquoted trailing semicolons, `+` for the verbose listing and `x` for
+/// expanded mode this once.
+fn exec_command_list(
+    cmd: &str,
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let pattern = options
+        .first()
+        .map(SlashOption::without_trailing_semicolons);
+    let mut pset = ctx.pset.clone();
+    if cmd.contains('x') {
+        pset.popt.topt.expanded = Expanded::On;
+    }
+    if list_all_dbs(
+        pattern.as_deref(),
+        cmd.contains('+'),
+        &pset,
+        ctx.executor,
+        stdout,
+        stderr,
+    ) {
+        CommandResult::SkipLine
+    } else {
+        CommandResult::Error
+    }
+}
+
+/// `listAllDbs()` (`describe.c:946`), for `\l` and for `-l`, which
+/// `main()` runs with no pattern and without `+` (`startup.c:332`-`:342`).
+pub fn list_all_dbs(
+    pattern: Option<&str>,
+    verbose: bool,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let db = executor.db().map(str::to_owned);
+    let server = ServerContext {
+        sversion: pset.sversion,
+        hide_tableam: pset.hide_tableam,
+        db: db.as_deref(),
+    };
+    run_listing(
+        list_all_dbs_query(pattern, verbose, server).map_err(Refusal::from),
+        "List of databases",
+        pset,
+        executor,
+        stdout,
+        stderr,
+    )
 }
 
 /// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
@@ -2085,6 +2152,61 @@ mod tests {
                 "{cmd}"
             );
         }
+    }
+
+    #[test]
+    fn l_lists_the_databases_in_exactly_ten_spellings() {
+        let answer = || {
+            Some(vec![relations(
+                &["Name", "Owner"],
+                &[&["regression", "me"]],
+            )])
+        };
+        for cmd in LIST_COMMANDS {
+            let (run, seen) = run_with(&format!("\\{cmd} reg*; more"), pg18(), answer());
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert!(seen[0].contains("'^(reg.*)$'"), "{cmd}: {}", seen[0]);
+            assert_eq!(
+                seen[0].contains("pg_database_size"),
+                cmd.contains('+'),
+                "{cmd}"
+            );
+            let expanded = run.stdout.contains("-[ RECORD 1 ]");
+            assert_eq!(expanded, cmd.contains('x'), "{cmd}: {}", run.stdout);
+            assert!(
+                run.stdout.trim_start().starts_with("List of databases\n"),
+                "{cmd}: {}",
+                run.stdout
+            );
+            assert_eq!(
+                run.stderr,
+                format!("psql: warning: \\{cmd}: extra argument \"more\" ignored\n"),
+            );
+        }
+        // Without a pattern there is no WHERE at all.
+        let (_, seen) = run_with("\\l", pg18(), answer());
+        assert!(
+            seen[0].ends_with("FROM pg_catalog.pg_database d\nORDER BY 1;"),
+            "{}",
+            seen[0]
+        );
+        for cmd in ["\\l++", "\\lxx", "\\listxx", "\\lS"] {
+            let run = run(cmd);
+            assert_eq!(run.result, CommandResult::Error, "{cmd}");
+            assert_eq!(
+                run.stderr,
+                format!("psql: error: invalid command {cmd}\n"),
+                "{cmd}"
+            );
+        }
+        // A dotted name fails the command before any query.
+        let (run, seen) = run_with("\\l a.b", pg18(), answer());
+        assert_eq!(run.result, CommandResult::Error);
+        assert!(seen.is_empty());
+        assert_eq!(
+            run.stderr,
+            "psql: error: improper qualified name (too many dotted names): a.b\n"
+        );
     }
 
     #[test]

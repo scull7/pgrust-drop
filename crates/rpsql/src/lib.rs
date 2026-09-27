@@ -14,8 +14,9 @@
 //! `SendQuery` ([`common`], `common.c`), the four backslash commands this
 //! issue names ([`command`], `command.c`), the prompt renderer ([`prompt`],
 //! `prompt.c`), enough of `print.c` to render the default aligned output, and
-//! `help.c`'s three help texts ([`help`], NAT-399). The rest of `print.c` is
-//! NAT-400's, `\d` is NAT-401's and interactive input is NAT-405's.
+//! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
+//! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
+//! `print.c`. `\d` is NAT-401's and interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`] and the
@@ -35,6 +36,7 @@ pub mod help;
 pub mod mainloop;
 pub mod print;
 pub mod prompt;
+pub mod pset;
 pub mod scan;
 pub mod settings;
 pub mod slash;
@@ -42,7 +44,7 @@ pub mod startup;
 pub mod variables;
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
@@ -169,6 +171,10 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             let _ = writeln!(stderr, "psql: warning: {warning}");
         }
     }
+
+    // `startup.c:186`: judged on the process's own descriptors, not on the
+    // streams this function writes to, which a test may have swapped.
+    session.pset.notty = !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal();
 
     // `startup.c:216`: with no action and no tty, behave as if `-f -`.
     if session.actions.is_empty() && session.pset.notty {

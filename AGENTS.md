@@ -15,6 +15,7 @@ Crates (`crates/`):
 | `testkit` | `src/test/perl/PostgreSQL/Test/Utils.pm` helpers + byte-diff gates     |
 | `rinitdb` | `src/bin/initdb/` (PostgreSQL 18.6)                                    |
 | `rlibpq`  | `src/interfaces/libpq/` (pure Rust, native crate + C ABI; pgrust #40)  |
+| `rlibpq/ffi` | crate `rlibpq-ffi`: libpq's C ABI (`exports.txt`, `libpq-fe.h`) as `libpq.a`; coverage in `docs/libpq-abi.md` (NAT-395) |
 | `rpsql`   | `src/bin/psql/` ported fresh from C (ADR-0003)                         |
 | `pgdrop`  | the multicall binary: `pgdrop initdb | psql | postgres | start`        |
 
@@ -133,7 +134,7 @@ container does not change that.
   cannot express. Do not "unify" these on `thiserror`; it would break byte
   fidelity against C libpq. (`rpsql`'s one error type, `print::PrintError`, is
   hand-written for consistency with `rlibpq`, not for byte fidelity.)
-- Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rpsql` are MIT and are
+- Licensing (ADR-0003): `testkit`, `rinitdb`, `rlibpq`, `rlibpq-ffi`, `rpsql` are MIT and are
   ported from PostgreSQL's C sources only. **Never copy code, comments or test
   corpora from pgrust into them.** `pgdrop` is AGPL-3.0 because it links pgrust.
   No MIT crate may depend on a pgrust crate through any edge, direct or

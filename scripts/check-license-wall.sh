@@ -2,7 +2,7 @@
 # The MIT/AGPL wall (ADR-0003), checked mechanically.
 #
 # pgrust is AGPL-3.0. Only the AGPL crate `pgdrop` may depend on it, directly or
-# transitively; the MIT crates (testkit, rinitdb, rlibpq, rpsql) must not
+# transitively; the MIT crates (testkit, rinitdb, rlibpq, rlibpq-ffi, rpsql) must not
 # reach a single pgrust crate through any normal, build or dev edge, on any
 # target, under any feature. The owner's approval of pgrust's dependency tree
 # (2026-09-23) is for pgdrop only.
@@ -15,7 +15,7 @@
 # Usage: scripts/check-license-wall.sh   (exit 0: wall holds; 1: breached)
 set -euo pipefail
 
-readonly MIT_CRATES=(testkit rinitdb rlibpq rpsql)
+readonly MIT_CRATES=(testkit rinitdb rlibpq rlibpq-ffi rpsql)
 readonly PGRUST_SOURCE='github\.com/[^/]*/pgrust[?#]'
 
 # Capture first, so a failing `cargo tree` fails the script instead of feeding

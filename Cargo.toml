@@ -4,6 +4,7 @@ members = [
     "crates/testkit",
     "crates/rinitdb",
     "crates/rlibpq",
+    "crates/rlibpq/ffi",
     "crates/rpsql",
     "crates/pgdrop",
 ]

@@ -39,8 +39,8 @@
 //! `test_pipelined_insert` and `test_uniqviol`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
-//! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
-//! crate denies it until that layer exists as its own module, with no
+//! The C ABI is its own crate, `rlibpq-ffi` (`crates/rlibpq/ffi`, NAT-395),
+//! which is where the `unsafe` it needs lives; this crate denies it, with no
 //! exception: the readiness wait the standard library does not offer is
 //! `rustix::event::poll`, a safe API (ADR-0010).
 

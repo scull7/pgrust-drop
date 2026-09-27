@@ -291,6 +291,58 @@ pub fn without(section: &Section<'_>, commands: &[&str]) -> (String, String) {
     (sql, expected)
 }
 
+/// `section` cut down to some of its input lines, as owned text: each line
+/// equal to one of `commands` stays in the script, and stays in the expected
+/// output with what it printed, up to the echo of the next input line;
+/// everything else leaves both. It is [`without`]'s mirror, for a section
+/// most of whose commands a later slice brings, when the ones this port has
+/// do not depend on the others.
+///
+/// # Panics
+/// When a command is not in the section, or an input line has no echo.
+pub fn only(section: &Section<'_>, commands: &[&str]) -> (String, String) {
+    let is_kept = |line: &str| commands.contains(&line.trim_end_matches('\n'));
+    let sql: String = section
+        .sql
+        .split_inclusive('\n')
+        .filter(|l| is_kept(l))
+        .collect();
+
+    let mut expected = String::new();
+    let mut out = section.expected.split_inclusive('\n');
+    // Whether the output being read belongs to a kept line.
+    let mut keeping = false;
+    let mut kept = 0;
+    for input in section.sql.split_inclusive('\n').filter(|l| *l != "\n") {
+        loop {
+            let line = out
+                .next()
+                .unwrap_or_else(|| panic!("{:?}: no echo of {input:?}", section.header));
+            if line == input {
+                break;
+            }
+            if keeping {
+                expected.push_str(line);
+            }
+        }
+        keeping = is_kept(input);
+        if keeping {
+            kept += 1;
+            expected.push_str(input);
+        }
+    }
+    if keeping {
+        expected.extend(out);
+    }
+    assert_eq!(
+        kept,
+        commands.len(),
+        "{:?}: not every one of {commands:?} is a line of it",
+        section.header
+    );
+    (sql, expected)
+}
+
 /// The C tools a cluster is started with. `psql` is not among them: the
 /// section gate compares rpsql against `psql.out` with only a server, and
 /// against C psql when that is present too.

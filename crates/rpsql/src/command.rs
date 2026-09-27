@@ -17,10 +17,14 @@ use crate::describe::{
     DescribeCommand, DescribeFlags, FUNC_MAX_ARGS, PartitionTypes, Refusal, ServerContext,
     TableTypes, db_role_settings_not_found, describe_access_methods_query,
     describe_aggregates_query, describe_configuration_parameters_query, describe_functions_query,
-    describe_operators_query, describe_role_grants_query, describe_roles_headers,
-    describe_roles_query, describe_roles_row, describe_types_query, list_db_role_settings_query,
-    list_default_acls_query, list_domains_query, list_partitioned_tables_query, list_tables_query,
-    permissions_list_query,
+    describe_operators_query, describe_publication_table, describe_publications_query,
+    describe_role_grants_query, describe_roles_headers, describe_roles_query, describe_roles_row,
+    describe_subscriptions_query, describe_types_query, extension_contents_title,
+    extensions_not_found, list_db_role_settings_query, list_default_acls_query, list_domains_query,
+    list_extension_contents_query, list_extensions_query, list_one_extension_contents_query,
+    list_partitioned_tables_query, list_publications_query, list_tables_query,
+    permissions_list_query, publication_footers, publication_schemas_query,
+    publication_tables_query, publications_not_found,
 };
 use crate::print::{Align, print_query, print_table};
 use crate::scan::{Scanner, VariableSource};
@@ -322,6 +326,14 @@ fn exec_command_d(
                 stderr,
             )
         }
+        // `command.c:1216`: `+` describes each publication instead.
+        DescribeCommand::Publications if flags.verbose => {
+            describe_publications(pattern, server, &pset, ctx.executor, stdout, stderr)
+        }
+        // `command.c:1274`: `+` lists each extension's contents instead.
+        DescribeCommand::Extensions if flags.verbose => {
+            list_extension_contents(pattern, server, &pset, ctx.executor, stdout, stderr)
+        }
         listing => {
             let (query, title) = listing_query(&listing, pattern, options, flags, server);
             run_listing(query, title, &pset, ctx.executor, stdout, stderr)
@@ -422,6 +434,19 @@ fn listing_query(
             list_domains_query(pattern, flags.verbose, flags.system, server).map_err(Refusal::from),
             "List of domains",
         ),
+        // Without `+`: [`exec_command_d`] takes the `+` forms itself.
+        DescribeCommand::Publications => (
+            list_publications_query(pattern, server),
+            "List of publications",
+        ),
+        DescribeCommand::Subscriptions => (
+            describe_subscriptions_query(pattern, flags.verbose, server),
+            "List of subscriptions",
+        ),
+        DescribeCommand::Extensions => (
+            list_extensions_query(pattern, server).map_err(Refusal::from),
+            "List of installed extensions",
+        ),
         DescribeCommand::ListTables(_)
         | DescribeCommand::TableDetails
         | DescribeCommand::Roles
@@ -474,21 +499,170 @@ fn run_listing(
 ) -> bool {
     let query = match query {
         Ok(query) => query,
-        Err(refusal) => {
-            let (message, success) = match refusal {
-                Refusal::Pattern(err) => (err.0, false),
-                Refusal::ServerTooOld(message) | Refusal::InvalidOptions(message) => {
-                    (message, true)
-                }
-            };
-            let _ = writeln!(stderr, "{}{message}", log_prefix(pset, LogLevel::Error));
-            return success;
-        }
+        Err(refusal) => return refuse(refusal, pset, stderr),
     };
     let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
         return false;
     };
     print_titled(&result, title, pset, stdout, stderr)
+}
+
+/// Log why a query builder refused, and return what the command then
+/// returns: failure for a pattern, success for the rest ([`run_listing`]).
+fn refuse(refusal: Refusal, pset: &PsqlSettings, stderr: &mut dyn Write) -> bool {
+    let (message, success) = match refusal {
+        Refusal::Pattern(err) => (err.0, false),
+        Refusal::ServerTooOld(message) | Refusal::InvalidOptions(message) => (message, true),
+    };
+    let _ = writeln!(stderr, "{}{message}", log_prefix(pset, LogLevel::Error));
+    success
+}
+
+/// Every row of `result`, a `None` for each null cell.
+fn rows_with_nulls(result: &QueryResult) -> Vec<Vec<Option<&[u8]>>> {
+    (0..result.ntuples())
+        .map(|r| {
+            (0..result.nfields())
+                .map(|c| {
+                    if result.is_null(r, c) {
+                        None
+                    } else {
+                        Some(result.value(r, c).unwrap_or_default())
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `describePublications()` (`describe.c:6531`): one table per matching
+/// publication, headed "Publication <name>", with its tables and, from 15,
+/// its schemas as footers (`addFooterToPublicationDesc`, `:6485`). No
+/// publication at all, when not quiet, is an error, and the command fails
+/// either way (`:6610`-`:6624`).
+fn describe_publications(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match describe_publications_query(pattern, server) {
+        Ok(query) => query,
+        Err(refusal) => return refuse(refusal, pset, stderr),
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    if result.ntuples() == 0 {
+        if !pset.quiet {
+            let _ = writeln!(
+                stderr,
+                "{}{}",
+                log_prefix(pset, LogLevel::Error),
+                publications_not_found(pattern)
+            );
+        }
+        return false;
+    }
+
+    for row in rows_with_nulls(&result) {
+        let row: Vec<&[u8]> = row.into_iter().map(Option::unwrap_or_default).collect();
+        let table = describe_publication_table(&row, server.sversion);
+        let mut footers = Vec::new();
+        if !table.all_tables {
+            let mut footer_queries = vec![(
+                publication_tables_query(&table.oid, server.sversion),
+                "Tables:",
+                false,
+            )];
+            if server.sversion >= 150_000 {
+                footer_queries.push((
+                    publication_schemas_query(&table.oid),
+                    "Tables from schemas:",
+                    true,
+                ));
+            }
+            for (query, footermsg, as_schema) in footer_queries {
+                let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+                    return false;
+                };
+                footers.extend(publication_footers(
+                    footermsg,
+                    as_schema,
+                    &rows_with_nulls(&result),
+                ));
+            }
+        }
+        let headers: Vec<(&str, Align)> = table.headers.iter().map(|&h| (h, Align::Left)).collect();
+        match print_table(
+            &pset.popt.topt,
+            Some(&table.title),
+            &headers,
+            vec![table.cells],
+            footers,
+        ) {
+            Ok(text) => {
+                let _ = stdout.write_all(&text);
+            }
+            Err(err) => {
+                let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `listExtensionContents()` (`describe.c:6236`): each matching extension's
+/// member objects, one listing per extension (`listOneExtensionContents()`,
+/// `:6303`). No extension at all, when not quiet, is an error, and the
+/// command fails either way (`:6264`-`:6276`).
+fn list_extension_contents(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match list_extension_contents_query(pattern, server) {
+        Ok(query) => query,
+        Err(err) => return refuse(Refusal::Pattern(err), pset, stderr),
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    if result.ntuples() == 0 {
+        if !pset.quiet {
+            let _ = writeln!(
+                stderr,
+                "{}{}",
+                log_prefix(pset, LogLevel::Error),
+                extensions_not_found(pattern)
+            );
+        }
+        return false;
+    }
+    for r in 0..result.ntuples() {
+        let extname = String::from_utf8_lossy(result.value(r, 0).unwrap_or_default());
+        let oid = String::from_utf8_lossy(result.value(r, 1).unwrap_or_default());
+        let query = list_one_extension_contents_query(&oid);
+        let Some(contents) = psql_exec(executor, &query, pset, stdout, stderr) else {
+            return false;
+        };
+        if !print_titled(
+            &contents,
+            &extension_contents_title(&extname),
+            pset,
+            stdout,
+            stderr,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `printQuery()` of a listing under its title.
@@ -587,7 +761,7 @@ fn describe_roles(
         .collect();
     let mut opt = pset.popt.topt.clone();
     opt.default_footer = false;
-    match print_table(&opt, Some("List of roles"), &headers, cells) {
+    match print_table(&opt, Some("List of roles"), &headers, cells, Vec::new()) {
         Ok(text) => {
             let _ = stdout.write_all(&text);
             true

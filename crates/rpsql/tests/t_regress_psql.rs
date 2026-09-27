@@ -34,8 +34,8 @@ use rpsql::settings::{PrintQueryOpt, PsqlSettings};
 use testkit::reference;
 
 use regress::{
-    Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, head, section, sections, split, tail,
-    without,
+    Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, head, only, section, sections, split,
+    tail, without,
 };
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
@@ -96,6 +96,22 @@ fn a_header_psql_out_never_echoes_is_an_error_not_a_silent_merge() {
     // A comment right after a statement is a note, not a new section.
     let sections = split("-- a\nselect 1;\n-- note\n", "-- a\nselect 1;\n-- note\n").unwrap();
     assert_eq!(sections.len(), 1);
+}
+
+#[test]
+fn only_keeps_the_named_lines_with_what_each_printed() {
+    let sql = "-- a\n\\x one\nselect 1;\n\n\\x two\n";
+    let out = "-- a\n\\x one\nfirst\nselect 1;\n 1\n\\x two\nsecond\nlast\n";
+    let section = Section {
+        header: "-- a",
+        sql,
+        expected: out,
+        sql_line: 1,
+        out_line: 1,
+    };
+    let (kept_sql, kept_out) = only(&section, &["\\x one", "\\x two"]);
+    assert_eq!(kept_sql, "\\x one\n\\x two\n");
+    assert_eq!(kept_out, "\\x one\nfirst\n\\x two\nsecond\nlast\n");
 }
 
 /// `text`'s OID, and `int4`'s, which right-aligns (`print.c:3615`).
@@ -316,6 +332,7 @@ const PARTITION_AND_AM_LISTINGS_PORT: u16 = 55_500;
 const FUNCTIONS_AND_OPERATORS_PORT: u16 = 55_501;
 const FUNCTION_TYPE_OPERATOR_LISTINGS_PORT: u16 = 55_502;
 const ROLES_AND_PRIVILEGES_PORT: u16 = 55_503;
+const PUBLICATIONS_SUBSCRIPTIONS_EXTENSIONS_PORT: u16 = 55_504;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -1088,6 +1105,184 @@ fn the_roles_and_privileges_sections_run_live() {
         drop role s4_all, s4_a, s4_b;\n"
     );
     diff_against_c_psql(&cluster, "roles and privileges listings", &script);
+}
+
+/// Every line of `psql.sql`'s invalid-name sections (`:1679`-`:1919`) that
+/// names `\dRp`, `\dRs` or `\dx`, in file order.
+const INVALID_PUBLICATION_SUBSCRIPTION_EXTENSION_NAMES: [&str; 12] = [
+    "\\dRp public.mypub",
+    "\\dRp regression.mypub",
+    "\\dRs public.mysub",
+    "\\dRs regression.mysub",
+    "\\dx regression.plpgsql",
+    "\\dx nonesuch.plpgsql",
+    "\\dRp \"no.such.publication\"",
+    "\\dRs \"no.such.subscription\"",
+    "\\dx \"no.such.installed.extension\"",
+    "\\dRp \"no.such.schema\".\"no.such.publication\"",
+    "\\dRs \"no.such.schema\".\"no.such.subscription\"",
+    "\\dx \"no.such.schema\".\"no.such.installed.extension\"",
+];
+
+/// What [`the_publication_subscription_and_extension_listings_match_c_psql`]
+/// lists, set up once by rpsql so that both sides see the same OIDs, which
+/// `\dRp+`'s footer queries and `\dx+`'s contents query paste in.
+///
+/// Taken from `publication.sql` (`:11`, `:14`, `:18`, `:45`, `:655`-`:660`)
+/// and `subscription.sql` (`:64`, `:73`), plus publications over a column
+/// list, a row filter, schemas, generated columns and
+/// `publish_via_partition_root`, and a subscription with every option `+`
+/// shows set away from its default.
+///
+/// A publication warns that `wal_level` is too low, and a subscription that
+/// it is not connected: server notices, which rpsql does not print yet, so
+/// the setup keeps them from being sent.
+const PUBLICATIONS_SUBSCRIPTIONS_SETUP: &str = "set client_min_messages = error;\n\
+    create schema s5;\n\
+    create schema s5b;\n\
+    create table s5.t (a int primary key, b int, c text);\n\
+    create table s5.u (a int, g int generated always as (a * 2) stored);\n\
+    create table s5b.w (y int);\n\
+    CREATE PUBLICATION testpub_default;\n\
+    COMMENT ON PUBLICATION testpub_default IS 'test publication';\n\
+    CREATE PUBLICATION testpub_ins_trunct WITH (publish = insert);\n\
+    CREATE PUBLICATION testpub_foralltables FOR ALL TABLES WITH (publish = 'insert');\n\
+    CREATE PUBLICATION testpub_both_filters;\n\
+    CREATE TABLE testpub_tbl_both_filters (a int, b int, c int, PRIMARY KEY (a,c));\n\
+    ALTER TABLE testpub_tbl_both_filters REPLICA IDENTITY USING INDEX testpub_tbl_both_filters_pkey;\n\
+    ALTER PUBLICATION testpub_both_filters ADD TABLE testpub_tbl_both_filters (a,c) WHERE (c != 1);\n\
+    create publication s5_cols for table s5.t (a, c) where (b > 0 and c <> 'x'), s5.u;\n\
+    create publication s5_schemas for tables in schema s5b, s5, table public.testpub_tbl_both_filters;\n\
+    create publication s5_gen for table s5.u \
+    with (publish_generated_columns = stored, publish_via_partition_root = true);\n\
+    CREATE SUBSCRIPTION regress_testsub3 CONNECTION 'dbname=regress_doesnotexist' \
+    PUBLICATION testpub WITH (slot_name = NONE, connect = false);\n\
+    CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' \
+    PUBLICATION testpub WITH (slot_name = NONE, connect = false, origin = none);\n\
+    create subscription regress_s5_all connection 'dbname=regress_doesnotexist port=1' \
+    publication testpub_default, s5_cols with (slot_name = none, connect = false, \
+    binary = true, streaming = parallel, two_phase = true, disable_on_error = true, \
+    password_required = false, run_as_owner = true, synchronous_commit = local);\n";
+
+/// `\dRp`, `\dRp+`, `\dRs`, `\dRs+`, `\dx` and `\dx+`, with and without a
+/// pattern, with `x`, with nothing found (loud and quiet), and with too many
+/// dots, under `ECHO_HIDDEN` so every catalog query is compared too.
+const PUBLICATION_SUBSCRIPTION_EXTENSION_COMMANDS: &str = "\\set QUIET off\n\
+    \\set ECHO_HIDDEN on\n\
+    \\dRp\n\
+    \\dRp testpub_*\n\
+    \\dRpx s5_gen\n\
+    \\dRp+\n\
+    \\dRp+ s5_*\n\
+    \\dRp+ testpub_both_filters\n\
+    \\dRp+x s5_cols\n\
+    \\dRp+ nonesuch\n\
+    \\dRp nonesuch\n\
+    \\dRs\n\
+    \\dRs regress_testsub?\n\
+    \\dRs+\n\
+    \\dRs+x regress_s5_all\n\
+    \\dRs nonesuch\n\
+    \\dx\n\
+    \\dx plpgsql\n\
+    \\dx+\n\
+    \\dx+ plpgsql\n\
+    \\dx+x plpgsql\n\
+    \\dx+ nonesuch\n\
+    \\dx nonesuch\n\
+    \\set ECHO_HIDDEN off\n\
+    \\dRp+ a.b\n\
+    \\dRs+ a.b\n\
+    \\dx+ a.b\n\
+    \\set QUIET on\n\
+    \\dRp+ nonesuch\n\
+    \\dx+ nonesuch\n\
+    \\pset title 'ignored'\n\
+    \\dRp+ s5_schemas\n\
+    \\pset title\n";
+
+/// A publication with footers and one without, normal and expanded, in every
+/// format at borders 0 and 2, with `tuples_only`, and with `\pset footer
+/// off`; then unaligned with a zero-byte record separator. `wrapped` needs a
+/// target width this port does not take from the terminal, hence
+/// `\pset columns`.
+fn publication_in_every_format() -> String {
+    let mut script = String::from("\\pset columns 60\n");
+    for format in [
+        "aligned",
+        "wrapped",
+        "unaligned",
+        "csv",
+        "html",
+        "asciidoc",
+        "latex",
+        "latex-longtable",
+        "troff-ms",
+    ] {
+        let _ = writeln!(script, "\\pset format {format}");
+        for settings in [
+            "\\pset border 0\n",
+            "\\pset border 2\n",
+            "\\pset tuples_only on\n",
+            "\\pset tuples_only off\n\\pset footer off\n",
+        ] {
+            script.push_str(settings);
+            script.push_str(
+                "\\dRp+ s5_schemas\n\\dRp+x s5_schemas\n\
+                 \\dRp+ testpub_foralltables\n\\dRp+x testpub_foralltables\n",
+            );
+        }
+        script.push_str("\\pset footer on\n\\pset border 1\n");
+    }
+    script.push_str(
+        "\\pset format unaligned\n\\pset recordsep_zero\n\\dRp+ s5_schemas\n\\dRp+x s5_schemas\n",
+    );
+    script
+}
+
+/// Publications, subscriptions and extensions, `NAT-401`'s fourth group.
+///
+/// `psql.sql` names `\dRp`, `\dRs` and `\dx` only in its invalid-name
+/// sections (`:1679`-`:1919`), whose other commands later slices bring, so
+/// those twelve lines are gated alone ([`only`]), verbatim, against their
+/// `psql.out` output and C psql's.
+///
+/// The rest runs against C psql over [`PUBLICATIONS_SUBSCRIPTIONS_SETUP`]:
+/// [`PUBLICATION_SUBSCRIPTION_EXTENSION_COMMANDS`], then
+/// [`publication_in_every_format`], which is what reaches the footers
+/// `printTableAddFooter` adds in every printer.
+#[test]
+fn the_publication_subscription_and_extension_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(PUBLICATIONS_SUBSCRIPTIONS_EXTENSIONS_PORT) else {
+        return;
+    };
+    let (sql, expected) = only(
+        &sections(
+            "-- check describing invalid multipart names",
+            "-- again, but with dotted database and dotted schema qualifications.",
+        ),
+        &INVALID_PUBLICATION_SUBSCRIPTION_EXTENSION_NAMES,
+    );
+    gate_text(
+        &cluster,
+        "psql.sql's invalid \\dRp, \\dRs and \\dx names vs psql.out",
+        &sql,
+        &expected,
+        None,
+    );
+
+    let out = cluster.run_script(Path::new(RPSQL), PUBLICATIONS_SUBSCRIPTIONS_SETUP);
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("ERROR"), "setup:\n{text}");
+    let script = format!(
+        "{PUBLICATION_SUBSCRIPTION_EXTENSION_COMMANDS}{}",
+        publication_in_every_format()
+    );
+    diff_against_c_psql(
+        &cluster,
+        "publication, subscription and extension listings",
+        &script,
+    );
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

@@ -183,7 +183,7 @@ pub(super) fn print_html_text(cont: &TableContent<'_>) -> Vec<u8> {
             out.extend_from_slice(b"  </tr>\n");
         }
     }
-    for row in &cont.cells {
+    for row in cont.rows() {
         out.extend_from_slice(b"  <tr valign=\"top\">\n");
         for (cell, &align) in row.iter().zip(&cont.aligns) {
             html_cell(&mut out, align, cell);
@@ -202,7 +202,7 @@ pub(super) fn print_html_vertical(cont: &TableContent<'_>) -> Vec<u8> {
     if cont.opt.start_table {
         html_table_start(&mut out, cont);
     }
-    for (record, row) in (1_u64..).zip(&cont.cells) {
+    for (record, row) in (1_u64..).zip(cont.rows()) {
         if cont.opt.tuples_only {
             out.extend_from_slice(b"\n  <tr><td colspan=\"2\">&nbsp;</td></tr>\n");
         } else {
@@ -341,7 +341,7 @@ pub(super) fn print_asciidoc_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         out.extend_from_slice(b"[cols=\"h,l\"");
         asciidoc_frame(&mut out, cont.opt.border);
     }
-    for (record, row) in (1_u64..).zip(&cont.cells) {
+    for (record, row) in (1_u64..).zip(cont.rows()) {
         if cont.opt.tuples_only {
             out.extend_from_slice(b"2+|\n");
         } else {
@@ -642,7 +642,7 @@ pub(super) fn print_latex_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         });
         out.extend_from_slice(b"}\n");
     }
-    for (record, row) in (1_u64..).zip(&cont.cells) {
+    for (record, row) in (1_u64..).zip(cont.rows()) {
         if !tuples_only {
             if border == 2 {
                 out.extend_from_slice(b"\\hline\n");
@@ -782,7 +782,7 @@ pub(super) fn print_troff_ms_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         // Assume tuples were printed already.
         current = TroffFormat::Body;
     }
-    for (record, row) in (1_u64..).zip(&cont.cells) {
+    for (record, row) in (1_u64..).zip(cont.rows()) {
         if !tuples_only {
             if current != TroffFormat::Header {
                 if border == 2 && record > 1 {
@@ -941,6 +941,66 @@ mod tests {
         assert!(text(print_asciidoc_text(&cont)).ends_with("|x\\y |1\n|====\n"));
         assert!(text(print_latex_text(&cont)).ends_with("\\end{tabular}\n\n\\noindent \n"));
         assert!(text(print_troff_ms_text(&cont)).ends_with(".TE\n.DS L\n.DE\n"));
+    }
+
+    #[test]
+    fn rows_without_columns_print_no_row_markup_but_are_counted() {
+        // `SELECT FROM generate_series(1,2)`: `cont->cells` is empty, so no
+        // printer loop runs (`print.c:2035`, `:2112`, `:2340`, `:2754`,
+        // `:2960`), while `footers_with_default()` still says `(2 rows)`.
+        type Printer = fn(&TableContent<'_>) -> Vec<u8>;
+        let printers: [(&str, Printer); 11] = [
+            ("csv", print_csv_text),
+            ("csv x", print_csv_vertical),
+            ("html", print_html_text),
+            ("html x", print_html_vertical),
+            ("asciidoc", print_asciidoc_text),
+            ("asciidoc x", print_asciidoc_vertical),
+            ("latex", print_latex_text),
+            ("latex-longtable", print_latex_longtable_text),
+            ("latex x", print_latex_vertical),
+            ("troff-ms", print_troff_ms_text),
+            ("troff-ms x", print_troff_ms_vertical),
+        ];
+        for border in 0..=3 {
+            for tuples_only in [false, true] {
+                let opt = TableOpt {
+                    border,
+                    tuples_only,
+                    ..TableOpt::default()
+                };
+                let empty = |cells| TableContent {
+                    headers: vec![],
+                    cells,
+                    aligns: vec![],
+                    ..table(&opt, None)
+                };
+                let none = empty(vec![]);
+                let two = empty(vec![vec![], vec![]]);
+                for (name, print) in printers {
+                    assert_eq!(
+                        text(print(&two)),
+                        text(print(&none)).replace("(0 rows)", "(2 rows)"),
+                        "{name}, border {border}, tuples_only {tuples_only}"
+                    );
+                }
+            }
+        }
+        let opt = TableOpt::default();
+        let two = TableContent {
+            headers: vec![],
+            cells: vec![vec![], vec![]],
+            aligns: vec![],
+            ..table(&opt, None)
+        };
+        assert_eq!(
+            text(print_html_text(&two)),
+            "<table border=\"1\">\n  <tr>\n  </tr>\n</table>\n<p>(2 rows)<br />\n</p>\n"
+        );
+        assert_eq!(
+            text(print_html_vertical(&two)),
+            "<table border=\"1\">\n</table>\n\n"
+        );
     }
 
     #[test]

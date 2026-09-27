@@ -14,21 +14,26 @@ use rlibpq::QueryResult;
 
 use crate::common::{Executor, LogLevel, log_prefix, psql_exec};
 use crate::describe::{
-    DescribeCommand, DescribeFlags, FUNC_MAX_ARGS, PartitionTypes, Refusal, ServerContext,
-    TableTypes, db_role_settings_not_found, describe_access_methods_query,
+    DescribeCommand, DescribeFlags, FUNC_MAX_ARGS, PartitionTypes, PatternError, Refusal,
+    ServerContext, TableTypes, db_role_settings_not_found, describe_access_methods_query,
     describe_aggregates_query, describe_configuration_parameters_query, describe_functions_query,
-    describe_operators_query, describe_publication_table, describe_publications_query,
-    describe_role_grants_query, describe_roles_headers, describe_roles_query, describe_roles_row,
-    describe_subscriptions_query, describe_tablespaces_query, describe_types_query,
-    extension_contents_title, extensions_not_found, list_casts_query, list_collations_query,
-    list_conversions_query, list_db_role_settings_query, list_default_acls_query,
-    list_domains_query, list_event_triggers_query, list_extended_stats_query,
-    list_extension_contents_query, list_extensions_query, list_languages_query,
-    list_large_objects_query, list_one_extension_contents_query, list_partitioned_tables_query,
-    list_publications_query, list_schemas_query, list_tables_query, object_description_query,
+    describe_one_ts_config_query, describe_one_ts_parser_query, describe_operators_query,
+    describe_publication_table, describe_publications_query, describe_role_grants_query,
+    describe_roles_headers, describe_roles_query, describe_roles_row, describe_subscriptions_query,
+    describe_tablespaces_query, describe_types_query, extension_contents_title,
+    extensions_not_found, list_casts_query, list_collations_query, list_conversions_query,
+    list_db_role_settings_query, list_default_acls_query, list_domains_query,
+    list_event_triggers_query, list_extended_stats_query, list_extension_contents_query,
+    list_extensions_query, list_foreign_data_wrappers_query, list_foreign_servers_query,
+    list_foreign_tables_query, list_languages_query, list_large_objects_query,
+    list_one_extension_contents_query, list_partitioned_tables_query, list_publications_query,
+    list_schemas_query, list_tables_query, list_ts_configs_query, list_ts_configs_verbose_query,
+    list_ts_dictionaries_query, list_ts_parsers_query, list_ts_parsers_verbose_query,
+    list_ts_templates_query, list_user_mappings_query, object_description_query,
     permissions_list_query, publication_footers, publication_schemas_query,
     publication_tables_query, publications_not_found, schema_publication_footers,
-    schema_publications_query,
+    schema_publications_query, text_search_not_found, ts_config_title, ts_parser_titles,
+    ts_parser_token_types_query,
 };
 use crate::print::{Align, print_query, print_table};
 use crate::scan::{Scanner, VariableSource};
@@ -307,10 +312,6 @@ fn exec_command_d(
             not_yet(&pset, cmd, "describeTableDetails", stderr);
             false
         }
-        DescribeCommand::NotYet(function) => {
-            not_yet(&pset, cmd, function, stderr);
-            false
-        }
         DescribeCommand::Roles => {
             describe_roles(pattern, flags, server, &pset, ctx.executor, stdout, stderr)
         }
@@ -340,6 +341,14 @@ fn exec_command_d(
         }
         DescribeCommand::Schemas => {
             list_schemas(pattern, flags, server, &pset, ctx.executor, stdout, stderr)
+        }
+        // `describe.c:5333`, `:5710`: `+` describes each parser or
+        // configuration instead.
+        DescribeCommand::TextSearchParsers if flags.verbose => {
+            list_ts_parsers_verbose(pattern, server, &pset, ctx.executor, stdout, stderr)
+        }
+        DescribeCommand::TextSearchConfigs if flags.verbose => {
+            list_ts_configs_verbose(pattern, server, &pset, ctx.executor, stdout, stderr)
         }
         listing => {
             let (query, title) = listing_query(&listing, pattern, options, flags, server);
@@ -460,9 +469,9 @@ fn listing_query(
     }
 }
 
-/// [`listing_query`] of the listings NAT-401's sixth slice brings, whose
-/// query takes no more than the pattern and the flags; `None` for any other
-/// command.
+/// [`listing_query`] of the listings NAT-401's sixth and seventh slices
+/// bring, whose query takes no more than the pattern and the flags; `None`
+/// for any other command.
 fn catalog_listing_query(
     command: &DescribeCommand,
     pattern: Option<&str>,
@@ -508,6 +517,39 @@ fn catalog_listing_query(
         DescribeCommand::EventTriggers => (
             list_event_triggers_query(pattern, flags.verbose, server),
             "List of event triggers",
+        ),
+        // Without `+`: [`exec_command_d`] takes `\dF+` and `\dFp+` itself.
+        DescribeCommand::TextSearchConfigs => (
+            list_ts_configs_query(pattern, server).map_err(Refusal::from),
+            "List of text search configurations",
+        ),
+        DescribeCommand::TextSearchParsers => (
+            list_ts_parsers_query(pattern, server).map_err(Refusal::from),
+            "List of text search parsers",
+        ),
+        DescribeCommand::TextSearchDictionaries => (
+            list_ts_dictionaries_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of text search dictionaries",
+        ),
+        DescribeCommand::TextSearchTemplates => (
+            list_ts_templates_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of text search templates",
+        ),
+        DescribeCommand::ForeignServers => (
+            list_foreign_servers_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of foreign servers",
+        ),
+        DescribeCommand::UserMappings => (
+            list_user_mappings_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of user mappings",
+        ),
+        DescribeCommand::ForeignDataWrappers => (
+            list_foreign_data_wrappers_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of foreign-data wrappers",
+        ),
+        DescribeCommand::ForeignTables => (
+            list_foreign_tables_query(pattern, flags.verbose, server).map_err(Refusal::from),
+            "List of foreign tables",
         ),
         _ => return None,
     })
@@ -717,6 +759,140 @@ fn list_extension_contents(
         ) {
             return false;
         }
+    }
+    true
+}
+
+/// The rows of a `+` text search listing, its columns as `PQgetvalue` reads
+/// them: a null schema is `None`, any other null an empty string.
+fn text_search_rows(result: &QueryResult) -> Vec<Vec<Option<String>>> {
+    rows_with_nulls(result)
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| cell.map(|c| String::from_utf8_lossy(c).into_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+/// Run a `+` text search listing's query, and log `what` was not found when
+/// it matched nothing and psql is not quiet; `None` when the command then
+/// fails (`describe.c:5406`-`:5423`, `:5784`-`:5801`).
+fn text_search_objects(
+    query: Result<String, PatternError>,
+    what: &str,
+    pattern: Option<&str>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Option<Vec<Vec<Option<String>>>> {
+    let query = match query {
+        Ok(query) => query,
+        Err(err) => {
+            refuse(Refusal::Pattern(err), pset, stderr);
+            return None;
+        }
+    };
+    let result = psql_exec(executor, &query, pset, stdout, stderr)?;
+    if result.ntuples() == 0 {
+        if !pset.quiet {
+            let _ = writeln!(
+                stderr,
+                "{}{}",
+                log_prefix(pset, LogLevel::Error),
+                text_search_not_found(what, pattern)
+            );
+        }
+        return None;
+    }
+    Some(text_search_rows(&result))
+}
+
+/// `listTSParsersVerbose()` (`describe.c:5379`): each matching parser as
+/// `describeOneTSParser()` (`:5454`) shows it, its methods with no footer,
+/// then its token types with one.
+fn list_ts_parsers_verbose(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let Some(parsers) = text_search_objects(
+        list_ts_parsers_verbose_query(pattern, server),
+        "text search parser",
+        pattern,
+        pset,
+        executor,
+        stdout,
+        stderr,
+    ) else {
+        return false;
+    };
+    for parser in &parsers {
+        let cell = |i: usize| parser.get(i).cloned().flatten();
+        let oid = cell(0).unwrap_or_default();
+        let (methods_title, tokens_title) =
+            ts_parser_titles(cell(1).as_deref(), &cell(2).unwrap_or_default());
+        // `describe.c:5519`-`:5522`, `:5554`-`:5558`: the footer is off for
+        // the methods and on for the token types, whatever `\pset footer`
+        // says.
+        for (query, title, default_footer) in [
+            (describe_one_ts_parser_query(&oid), methods_title, false),
+            (ts_parser_token_types_query(&oid), tokens_title, true),
+        ] {
+            let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+                return false;
+            };
+            let mut opt = pset.popt.clone();
+            opt.title = Some(title);
+            opt.topt.default_footer = default_footer;
+            print_with(&result, &opt, pset, stdout, stderr);
+        }
+    }
+    true
+}
+
+/// `listTSConfigsVerbose()` (`describe.c:5753`): each matching configuration
+/// as `describeOneTSConfig()` (`:5837`) shows it, its token types'
+/// dictionaries under a two-line title, with no footer.
+fn list_ts_configs_verbose(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let Some(configs) = text_search_objects(
+        list_ts_configs_verbose_query(pattern, server),
+        "text search configuration",
+        pattern,
+        pset,
+        executor,
+        stdout,
+        stderr,
+    ) else {
+        return false;
+    };
+    for config in &configs {
+        let cell = |i: usize| config.get(i).cloned().flatten();
+        let query = describe_one_ts_config_query(&cell(0).unwrap_or_default());
+        let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+            return false;
+        };
+        let mut opt = pset.popt.clone();
+        opt.title = Some(ts_config_title(
+            cell(2).as_deref(),
+            &cell(1).unwrap_or_default(),
+            cell(4).as_deref(),
+            &cell(3).unwrap_or_default(),
+        ));
+        opt.topt.default_footer = false;
+        print_with(&result, &opt, pset, stdout, stderr);
     }
     true
 }
@@ -1763,6 +1939,117 @@ mod tests {
     }
 
     #[test]
+    fn df_plus_describes_each_configuration_under_a_two_line_title_with_no_footer() {
+        let configs = relations(
+            &["oid", "cfgname", "nspname", "prsname", "pnspname"],
+            &[
+                &["1", "c1", "s", "p", "pg_catalog"],
+                &["2", "c2", "s", "p", "s"],
+            ],
+        );
+        let tokens = || relations(&["Token", "Dictionaries"], &[&["word", "simple"]]);
+        let (run, seen) = run_with("\\dF+ s.*", pg18(), Some(vec![configs, tokens(), tokens()]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].contains("WHERE c.oid = '1' AND m.mapcfg = c.oid"));
+        assert!(seen[2].contains("WHERE c.oid = '2' AND m.mapcfg = c.oid"));
+        assert_eq!(
+            run.stdout,
+            "Text search configuration \"s.c1\"\n\
+             Parser: \"pg_catalog.p\"\n \
+             Token | Dictionaries \n\
+             -------+--------------\n \
+             word  | simple\n\n\
+             Text search configuration \"s.c2\"\n\
+             Parser: \"s.p\"\n \
+             Token | Dictionaries \n\
+             -------+--------------\n \
+             word  | simple\n\n"
+        );
+    }
+
+    #[test]
+    fn dfp_plus_forces_the_footer_off_for_methods_and_on_for_token_types() {
+        let parsers = relations(&["oid", "nspname", "prsname"], &[&["7", "s", "p"]]);
+        let methods = relations(
+            &["Method", "Function", "Description"],
+            &[&["Start parse", "prsd_start", ""]],
+        );
+        let tokens = relations(&["Token name", "Description"], &[&["word", "Word"]]);
+        let mut pset = pg18();
+        pset.popt.topt.default_footer = false;
+        let (run, seen) = run_with("\\dFp+", pset, Some(vec![parsers, methods, tokens]));
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].ends_with("WHERE p.oid = '7';"));
+        assert!(seen[2].contains("ts_token_type( '7'::pg_catalog.oid )"));
+        assert!(
+            run.stdout
+                .trim_start()
+                .starts_with("Text search parser \"s.p\"\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(run.stdout.contains("Token types for parser \"s.p\"\n"));
+        assert_eq!(run.stdout.matches("(1 row)").count(), 1, "{}", run.stdout);
+        assert!(run.stdout.ends_with("(1 row)\n\n"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn a_verbose_text_search_listing_that_finds_nothing_fails() {
+        for (cmd, message) in [
+            (
+                "\\dF+ x",
+                "Did not find any text search configuration named \"x\".",
+            ),
+            ("\\dFp+", "Did not find any text search parsers."),
+        ] {
+            let (run, seen) = run_with(cmd, pg18(), Some(vec![relations(&["oid"], &[])]));
+            assert_eq!(run.result, CommandResult::Error, "{cmd}");
+            assert_eq!(seen.len(), 1, "{cmd}");
+            assert_eq!(run.stdout, "", "{cmd}");
+            assert_eq!(run.stderr, format!("psql: error: {message}\n"), "{cmd}");
+            // Quiet, nothing is said, and the command still fails.
+            let quiet = PsqlSettings {
+                quiet: true,
+                ..pg18()
+            };
+            let (run, _) = run_with(cmd, quiet, Some(vec![relations(&["oid"], &[])]));
+            assert_eq!(run.result, CommandResult::Error, "{cmd}");
+            assert_eq!(run.stderr, "", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn the_text_search_and_foreign_data_listings_print_under_their_titles() {
+        for (cmd, title) in [
+            ("\\dF", "List of text search configurations"),
+            ("\\dFp", "List of text search parsers"),
+            ("\\dFd+", "List of text search dictionaries"),
+            ("\\dFt+", "List of text search templates"),
+            ("\\des+", "List of foreign servers"),
+            ("\\deu+", "List of user mappings"),
+            ("\\dew+", "List of foreign-data wrappers"),
+            ("\\det+", "List of foreign tables"),
+        ] {
+            let answer = relations(&["Name"], &[]);
+            let (run, seen) = run_with(cmd, pg18(), Some(vec![answer]));
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert_eq!(seen.len(), 1, "{cmd}");
+            assert!(run.stdout.starts_with(title), "{cmd}: {}", run.stdout);
+            assert_eq!(run.stderr, "", "{cmd}");
+        }
+        // A wrapper, a server and a mapping have no schema.
+        let (run, seen) = run_with("\\dew a.b", pg18(), Some(vec![]));
+        assert_eq!(run.result, CommandResult::Error);
+        assert!(seen.is_empty());
+        assert_eq!(
+            run.stderr,
+            "psql: error: improper qualified name (too many dotted names): a.b\n"
+        );
+    }
+
+    #[test]
     fn z_is_dp_in_exactly_five_spellings() {
         let answer = || Some(vec![relations(&["Schema", "Name"], &[&["public", "t"]])]);
         for cmd in ["\\z", "\\zS", "\\zx", "\\zSx", "\\zxS"] {
@@ -1805,13 +2092,8 @@ mod tests {
 
     #[test]
     fn an_unported_d_command_is_refused_by_name_and_an_unknown_one_is_invalid() {
-        let refused = run("\\dFp");
-        assert_eq!(refused.result, CommandResult::Error);
-        assert_eq!(
-            refused.stderr,
-            "psql: error: \\dFp: listTSParsers is not implemented yet (Linear NAT-401)\n"
-        );
         let details = run("\\d t");
+        assert_eq!(details.result, CommandResult::Error);
         assert_eq!(
             details.stderr,
             "psql: error: \\d: describeTableDetails is not implemented yet (Linear NAT-401)\n"

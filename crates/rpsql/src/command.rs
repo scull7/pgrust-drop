@@ -15,11 +15,14 @@ use rlibpq::QueryResult;
 use crate::common::{Executor, LogLevel, log_prefix, psql_exec};
 use crate::describe::{
     DescribeCommand, DescribeFlags, FUNC_MAX_ARGS, PartitionTypes, Refusal, ServerContext,
-    TableTypes, describe_access_methods_query, describe_aggregates_query,
-    describe_configuration_parameters_query, describe_functions_query, describe_operators_query,
-    describe_types_query, list_partitioned_tables_query, list_tables_query,
+    TableTypes, db_role_settings_not_found, describe_access_methods_query,
+    describe_aggregates_query, describe_configuration_parameters_query, describe_functions_query,
+    describe_operators_query, describe_role_grants_query, describe_roles_headers,
+    describe_roles_query, describe_roles_row, describe_types_query, list_db_role_settings_query,
+    list_default_acls_query, list_domains_query, list_partitioned_tables_query, list_tables_query,
+    permissions_list_query,
 };
-use crate::print::print_query;
+use crate::print::{Align, print_query, print_table};
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::{Expanded, PsqlSettings};
 use crate::slash::SlashOption;
@@ -181,7 +184,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "echo" | "qecho" | "warn" | "set" => return Vec::new(),
         "c" | "connect" => 4,
         "pset" => 2,
-        "unset" => 1,
+        "unset" | "z" | "zS" | "zx" | "zSx" | "zxS" => 1,
         // `exec_command_d` reads one pattern, or two for some `\dA`s.
         d if d.starts_with('d') => DescribeCommand::patterns_read(d, !options.is_empty()),
         _ => 0,
@@ -217,6 +220,9 @@ fn exec_command(
         "set" => exec_command_set(options, ctx, stdout, stderr),
         // `exec_command_d()` (`command.c:1021`).
         d if d.starts_with('d') => exec_command_d(d, options, ctx, stdout, stderr),
+        // `exec_command_z()` (`command.c:3548`), for exactly these spellings
+        // (`command.c:472`).
+        "z" | "zS" | "zx" | "zSx" | "zxS" => exec_command_z(cmd, options, ctx, stdout, stderr),
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
@@ -297,6 +303,25 @@ fn exec_command_d(
             not_yet(&pset, cmd, function, stderr);
             false
         }
+        DescribeCommand::Roles => {
+            describe_roles(pattern, flags, server, &pset, ctx.executor, stdout, stderr)
+        }
+        DescribeCommand::DbRoleSettings => {
+            // The second pattern is only read after a first (`command.c:1200`).
+            let pattern2 = options
+                .get(1)
+                .filter(|_| pattern.is_some())
+                .map(SlashOption::without_trailing_semicolons);
+            list_db_role_settings(
+                pattern,
+                pattern2.as_deref(),
+                server,
+                &pset,
+                ctx.executor,
+                stdout,
+                stderr,
+            )
+        }
         listing => {
             let (query, title) = listing_query(&listing, pattern, options, flags, server);
             run_listing(query, title, &pset, ctx.executor, stdout, stderr)
@@ -318,9 +343,6 @@ fn listing_query(
     flags: DescribeFlags,
     server: ServerContext<'_>,
 ) -> (Result<String, Refusal>, &'static str) {
-    // `\df` and `\do` read argument-type patterns after the first.
-    let arg_patterns = arg_patterns(pattern, options);
-    let arg_patterns: Vec<&str> = arg_patterns.iter().map(String::as_str).collect();
     match command {
         DescribeCommand::ListPartitionedTables(reltypes) => {
             let types = PartitionTypes::parse(reltypes);
@@ -350,34 +372,60 @@ fn listing_query(
             describe_aggregates_query(pattern, flags.system, server).map_err(Refusal::from),
             "List of aggregate functions",
         ),
-        DescribeCommand::Functions(functypes) => (
-            describe_functions_query(
-                functypes,
-                pattern,
-                &arg_patterns,
-                flags.verbose,
-                flags.system,
-                server,
-            ),
-            "List of functions",
-        ),
+        DescribeCommand::Functions(functypes) => {
+            let args = arg_patterns(pattern, options);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            (
+                describe_functions_query(
+                    functypes,
+                    pattern,
+                    &args,
+                    flags.verbose,
+                    flags.system,
+                    server,
+                ),
+                "List of functions",
+            )
+        }
         DescribeCommand::Types => (
             describe_types_query(pattern, flags.verbose, flags.system, server)
                 .map_err(Refusal::from),
             "List of data types",
         ),
-        DescribeCommand::Operators => (
-            describe_operators_query(pattern, &arg_patterns, flags.verbose, flags.system, server)
-                .map_err(Refusal::from),
-            "List of operators",
-        ),
+        DescribeCommand::Operators => {
+            let args = arg_patterns(pattern, options);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            (
+                describe_operators_query(pattern, &args, flags.verbose, flags.system, server)
+                    .map_err(Refusal::from),
+                "List of operators",
+            )
+        }
         DescribeCommand::ConfigurationParameters => {
             let (query, title) =
                 describe_configuration_parameters_query(pattern, flags.verbose, server);
             (Ok(query), title)
         }
+        DescribeCommand::Permissions => (
+            permissions_list_query(pattern, flags.system, server).map_err(Refusal::from),
+            "Access privileges",
+        ),
+        DescribeCommand::DefaultAcls => (
+            list_default_acls_query(pattern, server).map_err(Refusal::from),
+            "Default access privileges",
+        ),
+        DescribeCommand::RoleGrants => (
+            describe_role_grants_query(pattern, flags.system, server).map_err(Refusal::from),
+            "List of role grants",
+        ),
+        DescribeCommand::Domains => (
+            list_domains_query(pattern, flags.verbose, flags.system, server).map_err(Refusal::from),
+            "List of domains",
+        ),
         DescribeCommand::ListTables(_)
         | DescribeCommand::TableDetails
+        | DescribeCommand::Roles
+        | DescribeCommand::DbRoleSettings
         | DescribeCommand::NotYet(_) => {
             unreachable!("exec_command_d handles {command:?} itself")
         }
@@ -501,6 +549,127 @@ fn list_tables(
         return true;
     }
     print_titled(&result, types.title(), pset, stdout, stderr)
+}
+
+/// `describeRoles()` (`describe.c:3716`): run the query, then fold each row
+/// into a name, an "Attributes" cell and, with `+`, a description, and print
+/// them as a table of its own, with no footer (`describe.c:3729`).
+fn describe_roles(
+    pattern: Option<&str>,
+    flags: DescribeFlags,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match describe_roles_query(pattern, flags.verbose, flags.system, server) {
+        Ok(query) => query,
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{}", log_prefix(pset, LogLevel::Error), err.0);
+            return false;
+        }
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    let cells = (0..result.ntuples())
+        .map(|r| {
+            let row: Vec<&[u8]> = (0..result.nfields())
+                .map(|c| result.value(r, c).unwrap_or_default())
+                .collect();
+            describe_roles_row(&row, flags.verbose, server.sversion)
+        })
+        .collect();
+    let headers: Vec<(&str, Align)> = describe_roles_headers(flags.verbose)
+        .iter()
+        .map(|&h| (h, Align::Left))
+        .collect();
+    let mut opt = pset.popt.topt.clone();
+    opt.default_footer = false;
+    match print_table(&opt, Some("List of roles"), &headers, cells) {
+        Ok(text) => {
+            let _ = stdout.write_all(&text);
+            true
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
+            false
+        }
+    }
+}
+
+/// `listDbRoleSettings()` (`describe.c:3863`): print the settings under
+/// their title — or, when nothing matched and psql is not quiet, say so
+/// instead (`describe.c:3900`).
+#[allow(clippy::too_many_arguments)]
+fn list_db_role_settings(
+    pattern: Option<&str>,
+    pattern2: Option<&str>,
+    server: ServerContext<'_>,
+    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let query = match list_db_role_settings_query(pattern, pattern2, server) {
+        Ok(query) => query,
+        Err(err) => {
+            let _ = writeln!(stderr, "{}{}", log_prefix(pset, LogLevel::Error), err.0);
+            return false;
+        }
+    };
+    let Some(result) = psql_exec(executor, &query, pset, stdout, stderr) else {
+        return false;
+    };
+    if result.ntuples() == 0 && !pset.quiet {
+        let _ = writeln!(
+            stderr,
+            "{}{}",
+            log_prefix(pset, LogLevel::Error),
+            db_role_settings_not_found(pattern, pattern2)
+        );
+        return true;
+    }
+    print_titled(&result, "List of settings", pset, stdout, stderr)
+}
+
+/// `exec_command_z()` (`command.c:3548`): `permissionsList()`, as `\dp`,
+/// with `S` for system objects and `x` for expanded output this once.
+fn exec_command_z(
+    cmd: &str,
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let pattern = options
+        .first()
+        .map(SlashOption::without_trailing_semicolons);
+    let mut pset = ctx.pset.clone();
+    if cmd.contains('x') {
+        pset.popt.topt.expanded = Expanded::On;
+    }
+    let db = ctx.executor.db().map(str::to_owned);
+    let server = ServerContext {
+        sversion: pset.sversion,
+        hide_tableam: pset.hide_tableam,
+        db: db.as_deref(),
+    };
+    let query = permissions_list_query(pattern.as_deref(), cmd.contains('S'), server)
+        .map_err(Refusal::from);
+    if run_listing(
+        query,
+        "Access privileges",
+        &pset,
+        ctx.executor,
+        stdout,
+        stderr,
+    ) {
+        CommandResult::SkipLine
+    } else {
+        CommandResult::Error
+    }
 }
 
 /// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
@@ -1204,6 +1373,160 @@ mod tests {
             Some(vec![relations(&["Name"], &[])]),
         );
         assert!(seen[0].contains("'^(work_mem)$'"), "{}", seen[0]);
+    }
+
+    /// `describeRoles()`'s columns at 18, without `+`.
+    const ROLE_COLUMNS: [&str; 10] = [
+        "rolname",
+        "rolsuper",
+        "rolinherit",
+        "rolcreaterole",
+        "rolcreatedb",
+        "rolcanlogin",
+        "rolconnlimit",
+        "rolvaliduntil",
+        "rolreplication",
+        "rolbypassrls",
+    ];
+
+    #[test]
+    fn du_and_dg_fold_each_role_into_attributes_and_print_no_footer() {
+        for cmd in ["\\du regress_du_role*", "\\dg regress_du_role*"] {
+            let answer = relations(
+                &ROLE_COLUMNS,
+                &[
+                    &[
+                        "regress_du_role0",
+                        "f",
+                        "t",
+                        "f",
+                        "f",
+                        "f",
+                        "-1",
+                        "",
+                        "f",
+                        "f",
+                    ],
+                    &["su", "t", "t", "f", "f", "t", "2", "", "f", "t"],
+                ],
+            );
+            let (run, seen) = run_with(cmd, pg18(), Some(vec![answer]));
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert!(seen[0].starts_with("SELECT r.rolname,"), "{}", seen[0]);
+            assert_eq!(
+                run.stdout,
+                "              List of roles\n    \
+                 Role name     |      Attributes       \n\
+                 ------------------+-----------------------\n \
+                 regress_du_role0 | Cannot login\n \
+                 su               | Superuser, Bypass RLS+\n  \
+                 \x20               | 2 connections\n\n",
+                "{cmd}"
+            );
+            assert_eq!(run.stderr, "", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_dotted_role_pattern_fails_du_without_a_query() {
+        let (run, seen) = run_with("\\du a.b", pg18(), Some(vec![]));
+        assert!(seen.is_empty());
+        assert_eq!(run.result, CommandResult::Error);
+        assert_eq!(
+            run.stderr,
+            "psql: error: improper qualified name (too many dotted names): a.b\n"
+        );
+    }
+
+    #[test]
+    fn drds_reads_a_second_pattern_and_says_when_nothing_matched() {
+        let empty = || Some(vec![relations(&["Role", "Database", "Settings"], &[])]);
+        let (run, seen) = run_with("\\drds r d; extra", pg18(), empty());
+        assert!(seen[0].contains("'^(d)$'"), "{}", seen[0]);
+        assert_eq!(run.result, CommandResult::SkipLine);
+        assert_eq!(run.stdout, "");
+        assert_eq!(
+            run.stderr,
+            "psql: error: Did not find any settings for role \"r\" and database \"d\".\n\
+             psql: warning: \\drds: extra argument \"extra\" ignored\n"
+        );
+        let (run, _) = run_with("\\drds r", pg18(), empty());
+        assert_eq!(
+            run.stderr,
+            "psql: error: Did not find any settings for role \"r\".\n"
+        );
+        let (run, _) = run_with("\\drds", pg18(), empty());
+        assert_eq!(run.stderr, "psql: error: Did not find any settings.\n");
+        // Quiet, the empty table is printed instead.
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..pg18()
+        };
+        let (run, _) = run_with("\\drds", quiet, empty());
+        assert!(
+            run.stdout.starts_with("      List of settings\n"),
+            "{}",
+            run.stdout
+        );
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn dp_ddp_drg_and_dd_print_under_their_titles() {
+        for (cmd, title) in [
+            ("\\dp", "Access privileges"),
+            ("\\ddp", "Default access privileges"),
+            ("\\drg", "List of role grants"),
+            ("\\dD+", "List of domains"),
+        ] {
+            let answer = relations(&["Name"], &[]);
+            let (run, seen) = run_with(cmd, pg18(), Some(vec![answer]));
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert_eq!(seen.len(), 1, "{cmd}");
+            assert!(run.stdout.starts_with(title), "{cmd}: {}", run.stdout);
+            assert_eq!(run.stderr, "", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn z_is_dp_in_exactly_five_spellings() {
+        let answer = || Some(vec![relations(&["Schema", "Name"], &[&["public", "t"]])]);
+        for cmd in ["\\z", "\\zS", "\\zx", "\\zSx", "\\zxS"] {
+            let (run, seen) = run_with(&format!("{cmd} t; u"), pg18(), answer());
+            assert_eq!(run.result, CommandResult::SkipLine, "{cmd}");
+            assert!(seen[0].contains("'^(t)$'"), "{cmd}: {}", seen[0]);
+            // `S` only matters without a pattern.
+            let (_, seen) = run_with(cmd, pg18(), answer());
+            assert_eq!(
+                seen[0].contains("<> 'pg_catalog'"),
+                !cmd.contains('S'),
+                "{cmd}"
+            );
+            let expanded = run.stdout.contains("-[ RECORD 1 ]");
+            assert_eq!(expanded, cmd.contains('x'), "{cmd}: {}", run.stdout);
+            assert!(
+                run.stdout.starts_with("Access privileges\n")
+                    || run.stdout.starts_with(" Access privileges\n"),
+                "{cmd}: {}",
+                run.stdout
+            );
+            assert_eq!(
+                run.stderr,
+                format!(
+                    "psql: warning: \\{}: extra argument \"u\" ignored\n",
+                    &cmd[1..]
+                ),
+            );
+        }
+        for cmd in ["\\z+", "\\zSS", "\\zxx", "\\zp"] {
+            let run = run(cmd);
+            assert_eq!(run.result, CommandResult::Error, "{cmd}");
+            assert_eq!(
+                run.stderr,
+                format!("psql: error: invalid command {cmd}\n"),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]

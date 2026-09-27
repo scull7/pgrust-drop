@@ -498,38 +498,64 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
                 .collect()
         })
         .collect();
-    let cont = TableContent {
+    print_content(&TableContent {
         opt: &opt.topt,
         title: opt.title.as_deref(),
         headers,
         cells,
         aligns,
-    };
+    })
+}
 
-    // `printTable()`'s switch (`print.c:3472`). Only `expanded on` (C's `1`)
+/// `printTable()` (`print.c:3444`) of a table its caller built cell by cell
+/// with `printTableAddHeader` and `printTableAddCell`, as `describeRoles()`
+/// does: one `Vec` of cells per row, one cell per header, printed as given —
+/// no `\pset null`, no `numericlocale`, and a footer only if `opt` has its
+/// default one on.
+///
+/// # Errors
+/// As [`print_query`].
+pub fn print_table(
+    opt: &TableOpt,
+    title: Option<&str>,
+    headers: &[(&str, Align)],
+    cells: Vec<Vec<Vec<u8>>>,
+) -> Result<Vec<u8>, PrintError> {
+    print_content(&TableContent {
+        opt,
+        title,
+        headers: headers.iter().map(|(h, _)| h.as_bytes().to_vec()).collect(),
+        cells,
+        aligns: headers.iter().map(|&(_, a)| a).collect(),
+    })
+}
+
+/// `printTable()`'s switch (`print.c:3472`) over the printers.
+fn print_content(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
+    // Only `expanded on` (C's `1`)
     // selects a vertical printer here; `auto` is decided inside
     // `print_aligned_text`, since the pager that would force it
     // (`print.c:3488`) is not ported. Every other format prints `auto` as
     // `off`, as upstream's does.
-    let vertical = opt.topt.expanded == Expanded::On;
-    match opt.topt.format {
-        PrintFormat::Unaligned if vertical => Ok(print_unaligned_vertical(&cont)),
-        PrintFormat::Unaligned => Ok(print_unaligned_text(&cont)),
-        PrintFormat::Aligned | PrintFormat::Wrapped if vertical => print_aligned_vertical(&cont),
-        PrintFormat::Aligned | PrintFormat::Wrapped => print_aligned_text(&cont),
-        PrintFormat::Csv if vertical => Ok(markup::print_csv_vertical(&cont)),
-        PrintFormat::Csv => Ok(markup::print_csv_text(&cont)),
-        PrintFormat::Html if vertical => Ok(markup::print_html_vertical(&cont)),
-        PrintFormat::Html => Ok(markup::print_html_text(&cont)),
-        PrintFormat::Asciidoc if vertical => Ok(markup::print_asciidoc_vertical(&cont)),
-        PrintFormat::Asciidoc => Ok(markup::print_asciidoc_text(&cont)),
+    let vertical = cont.opt.expanded == Expanded::On;
+    match cont.opt.format {
+        PrintFormat::Unaligned if vertical => Ok(print_unaligned_vertical(cont)),
+        PrintFormat::Unaligned => Ok(print_unaligned_text(cont)),
+        PrintFormat::Aligned | PrintFormat::Wrapped if vertical => print_aligned_vertical(cont),
+        PrintFormat::Aligned | PrintFormat::Wrapped => print_aligned_text(cont),
+        PrintFormat::Csv if vertical => Ok(markup::print_csv_vertical(cont)),
+        PrintFormat::Csv => Ok(markup::print_csv_text(cont)),
+        PrintFormat::Html if vertical => Ok(markup::print_html_vertical(cont)),
+        PrintFormat::Html => Ok(markup::print_html_text(cont)),
+        PrintFormat::Asciidoc if vertical => Ok(markup::print_asciidoc_vertical(cont)),
+        PrintFormat::Asciidoc => Ok(markup::print_asciidoc_text(cont)),
         PrintFormat::Latex | PrintFormat::LatexLongtable if vertical => {
-            Ok(markup::print_latex_vertical(&cont))
+            Ok(markup::print_latex_vertical(cont))
         }
-        PrintFormat::Latex => Ok(markup::print_latex_text(&cont)),
-        PrintFormat::LatexLongtable => Ok(markup::print_latex_longtable_text(&cont)),
-        PrintFormat::TroffMs if vertical => Ok(markup::print_troff_ms_vertical(&cont)),
-        PrintFormat::TroffMs => Ok(markup::print_troff_ms_text(&cont)),
+        PrintFormat::Latex => Ok(markup::print_latex_text(cont)),
+        PrintFormat::LatexLongtable => Ok(markup::print_latex_longtable_text(cont)),
+        PrintFormat::TroffMs if vertical => Ok(markup::print_troff_ms_vertical(cont)),
+        PrintFormat::TroffMs => Ok(markup::print_troff_ms_text(cont)),
     }
 }
 

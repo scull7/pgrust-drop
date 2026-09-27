@@ -1326,6 +1326,15 @@ impl<S: Read + Write> Connection<S> {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// `PQserverVersion`, `fe-connect.c:7628`: the last `server_version` the
+    /// server reported, in numeric form (`180006` for `18.6`), or `0` when
+    /// there was none or it did not parse.
+    #[must_use]
+    pub fn server_version(&self) -> i32 {
+        self.parameter_status(b"server_version")
+            .map_or(0, parse_server_version)
+    }
+
     /// `PQbackendPID`, `fe-connect.c:7674`.
     #[must_use]
     pub fn backend_pid(&self) -> i32 {
@@ -1382,6 +1391,46 @@ pub fn text_field(name: &[u8]) -> FieldDescription {
         typlen: -1,
         atttypmod: -1,
         format: 0,
+    }
+}
+
+/// The numeric form `pqSaveParameterStatus` gives `server_version`
+/// (`fe-exec.c:1158`-`:1192`): `sscanf(value, "%d.%d.%d", …)`, read as old
+/// style (`9.6.1`) with three numbers, new style (`10.1`) with two and a
+/// major of 10 or more, and `0` when not even one number parses.
+#[must_use]
+pub fn parse_server_version(value: &[u8]) -> i32 {
+    // Each `%d` skips white space, then takes an optional sign and digits;
+    // a `.` must follow a number for the next one to be tried.
+    let mut numbers: Vec<i32> = Vec::with_capacity(3);
+    let mut rest = value;
+    while numbers.len() < 3 {
+        if !numbers.is_empty() {
+            match rest.split_first() {
+                Some((b'.', tail)) => rest = tail,
+                _ => break,
+            }
+        }
+        let start = rest.iter().take_while(|c| c.is_ascii_whitespace()).count();
+        rest = &rest[start..];
+        let sign = usize::from(matches!(rest.first(), Some(b'-' | b'+')));
+        let digits = rest[sign..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            break;
+        }
+        let text = std::str::from_utf8(&rest[..sign + digits]).unwrap_or("0");
+        numbers.push(text.parse().unwrap_or(0));
+        rest = &rest[sign + digits..];
+    }
+    match numbers[..] {
+        [vmaj, vmin, vrev] => (100 * vmaj + vmin) * 100 + vrev,
+        [vmaj, vmin] if vmaj >= 10 => 100 * 100 * vmaj + vmin,
+        [vmaj, vmin] => (100 * vmaj + vmin) * 100,
+        [vmaj] => 100 * 100 * vmaj,
+        _ => 0,
     }
 }
 
@@ -2554,5 +2603,18 @@ mod tests {
             rows += 1;
         }
         assert_eq!(rows, 1000);
+    }
+
+    #[test]
+    fn server_version_is_read_as_pq_save_parameter_status_reads_it() {
+        // fe-exec.c:1166-:1192, one case per branch.
+        assert_eq!(parse_server_version(b"18.6"), 180_006);
+        assert_eq!(parse_server_version(b"10.1 (Debian 10.1-1)"), 100_001);
+        assert_eq!(parse_server_version(b"9.6.1"), 90_601);
+        assert_eq!(parse_server_version(b"9.6devel"), 90_600);
+        assert_eq!(parse_server_version(b"19devel"), 190_000);
+        assert_eq!(parse_server_version(b"18beta1"), 180_000);
+        assert_eq!(parse_server_version(b"devel"), 0);
+        assert_eq!(parse_server_version(b""), 0);
     }
 }

@@ -20,6 +20,9 @@ publish = false
 # All CLIs use usage-rs (owner decision, 2026-09-16). Aliased to `usage` in each crate.
 usage = { package = "usage-rs", version = "6" }
 thiserror = "2"
+# rpsql's line editor (ADR-0005; owner, 2026-09-16). Aliased to `liner`, its
+# library name.
+liner = { package = "redox_liner", version = "0.5" }
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

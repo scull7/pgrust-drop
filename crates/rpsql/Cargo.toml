@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 rlibpq = { workspace = true }
+liner = { workspace = true }
 usage = { workspace = true }
 
 [dev-dependencies]

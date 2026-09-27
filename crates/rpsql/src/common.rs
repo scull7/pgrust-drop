@@ -72,6 +72,12 @@ pub trait Executor {
 
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
+
+    /// What `get_prompt` reads from `pset.db` (`prompt.c:68`). The default
+    /// is no connection at all.
+    fn prompt_facts(&self) -> crate::prompt::PromptFacts {
+        crate::prompt::PromptFacts::default()
+    }
 }
 
 /// What `ECHO` prints before a query runs, or `None`.

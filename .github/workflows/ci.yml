@@ -1,8 +1,11 @@
 name: ci
 
 # Lane order is deliberate (ADR-0007): musl is the product's primary target and
-# runs on every push; gnu and apple only run on pull requests, and only once
-# musl is green.
+# runs first; gnu and apple only start once musl is green. All three run on a
+# pull request, on a push to main and on the schedule below (ADR-0007,
+# amendment of 2026-09-26): a pull request can restore only its own caches and
+# main's, so a lane main never runs has no cache any new pull request can use,
+# and it compiled pgrust from scratch on every one (NAT-598).
 #
 # Job names are the status-check names the `main` ruleset requires, so they stay
 # plain and stable: musl, apple, gnu. All three are required, not only gnu --
@@ -29,13 +32,22 @@ name: ci
 # 3-4 minutes of compilation per build flavour (clippy's check and the test
 # build are separate) on a 4-core runner, plus the clone; warm, every lane
 # restores ~/.cargo (registry + git) and target/ from Swatinem/rust-cache and
-# compiles none of it. Budget: a cold lane ~15 minutes, a warm one no more than
-# before pgrust arrived plus a few seconds of cache restore.
+# compiles none of it. Budget (NAT-598): every lane under 5 minutes warm. A
+# cold lane cannot meet that on a standard runner -- two build flavours of the
+# pgrust tree are 4-6 minutes of compilation alone -- so the caches are kept
+# from going cold instead: main saves one per lane, a pull request that does
+# not change a manifest restores it by exact key and saves nothing, and the
+# schedule restores them often enough that GitHub's 7-day eviction never fires.
 
 on:
   push:
     branches: [main]
   pull_request:
+  # Keep-warm (NAT-598): GitHub evicts a cache nobody has restored for 7 days.
+  # A scheduled run is on main, restores main's three caches by exact key and
+  # so saves nothing; twice a week keeps every gap under 7 days.
+  schedule:
+    - cron: '17 5 * * 1,4'
 
 env:
   CARGO_TERM_COLOR: always
@@ -124,7 +136,6 @@ jobs:
 
   apple:
     needs: musl
-    if: github.event_name == 'pull_request'
     runs-on: macos-15
     env:
       PGDROP_REF_BIN_APPLE: /opt/homebrew/opt/postgresql@18/bin
@@ -156,7 +167,6 @@ jobs:
 
   gnu:
     needs: musl
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       PGDROP_REF_BIN_GNU: /usr/lib/postgresql/18/bin

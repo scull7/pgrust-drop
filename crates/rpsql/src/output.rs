@@ -300,12 +300,25 @@ pub fn wait_result_to_str(exit_status: i32, errno_text: &str) -> String {
 }
 
 /// `pg_strsignal()` (`src/port/pgstrsignal.c`), which is `strsignal`, for
-/// the signals whose description glibc, musl and macOS agree on. The rest
-/// read `unrecognized signal`, `pg_strsignal`'s own fallback; see
+/// the signals whose description glibc, musl and macOS agree on; macOS's
+/// `strsignal` appends the number (`Terminated: 15`). The rest read
+/// `unrecognized signal`, `pg_strsignal`'s own fallback; see
 /// `docs/divergences.md`.
 #[must_use]
-pub fn pg_strsignal(signal: i32) -> &'static str {
-    match signal {
+pub fn pg_strsignal(signal: i32) -> String {
+    let Some(description) = signal_description(signal) else {
+        return "unrecognized signal".to_owned();
+    };
+    if cfg!(target_os = "macos") {
+        format!("{description}: {signal}")
+    } else {
+        description.to_owned()
+    }
+}
+
+/// The text the C libraries share for `signal`, if it is one of the eight.
+fn signal_description(signal: i32) -> Option<&'static str> {
+    Some(match signal {
         1 => "Hangup",
         2 => "Interrupt",
         3 => "Quit",
@@ -314,8 +327,8 @@ pub fn pg_strsignal(signal: i32) -> &'static str {
         13 => "Broken pipe",
         14 => "Alarm clock",
         15 => "Terminated",
-        _ => "unrecognized signal",
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -348,10 +361,12 @@ mod tests {
             "command not executable"
         );
         assert_eq!(wait_result_to_str(exited(127), ""), "command not found");
-        assert_eq!(
-            wait_result_to_str(15, ""),
+        let terminated = if cfg!(target_os = "macos") {
+            "child process was terminated by signal 15: Terminated: 15"
+        } else {
             "child process was terminated by signal 15: Terminated"
-        );
+        };
+        assert_eq!(wait_result_to_str(15, ""), terminated);
         assert_eq!(
             wait_result_to_str(-1, "No child processes"),
             "No child processes"

@@ -1,7 +1,7 @@
-//! The harness for the stolen `src/test/regress/sql/psql.sql` and
-//! `psql_crosstab.sql`: the vendored scripts and their expected output, the
-//! splitter that cuts `psql.sql` into sections, and a PostgreSQL 18 cluster
-//! to run a section or a whole script against.
+//! The harness for the stolen `src/test/regress/sql/psql.sql`,
+//! `psql_crosstab.sql` and `psql_pipeline.sql`: the vendored scripts and
+//! their expected output, the splitter that cuts a script into sections, and
+//! a PostgreSQL 18 cluster to run a section or a whole script against.
 //!
 //! `psql.sql` is one 2,000-line script. Gated whole, one wrong byte anywhere
 //! fails everything and the diff is unreviewable, so it is cut into the
@@ -44,6 +44,17 @@ pub const PSQL_CROSSTAB_SQL_SHA256: &str =
 /// See [`PSQL_SQL_SHA256`].
 pub const PSQL_CROSSTAB_OUT_SHA256: &str =
     "44039026efc4430898aaae7b35f4da5a72ac83bab67130dac9158b7b2dec4502";
+
+/// `src/test/regress/sql/psql_pipeline.sql` at `REL_18_6`, byte for byte.
+pub const PSQL_PIPELINE_SQL: &str = include_str!("psql_pipeline.sql");
+/// `src/test/regress/expected/psql_pipeline.out` at `REL_18_6`, byte for byte.
+pub const PSQL_PIPELINE_OUT: &str = include_str!("expected/psql_pipeline.out");
+/// See [`PSQL_SQL_SHA256`].
+pub const PSQL_PIPELINE_SQL_SHA256: &str =
+    "71e10a1e728d50199b5e5e0db27a08c0dc17ebd75f6345fd6f2c71202d9847de";
+/// See [`PSQL_SQL_SHA256`].
+pub const PSQL_PIPELINE_OUT_SHA256: &str =
+    "6b73b8e27cb811d7ca8c8f5d603b456f3db9d07c727b9a82ab20dd74556f24d5";
 
 /// Lower-case hex of `bytes`' SHA-256, to hold a vendored file to its digest.
 pub fn sha256_hex(bytes: &[u8]) -> String {

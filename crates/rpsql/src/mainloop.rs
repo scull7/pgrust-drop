@@ -191,7 +191,14 @@ pub fn main_loop(
             if scan_result == ScanResult::Semicolon
                 || (scan_result == ScanResult::Eol && session.pset.singleline)
             {
-                success = send_query(executor, &query_buf, session.pset, stdout, stderr);
+                success = send_query(
+                    executor,
+                    &query_buf,
+                    session.pset,
+                    session.vars,
+                    stdout,
+                    stderr,
+                );
                 slash_status = if success {
                     CommandResult::Send
                 } else {
@@ -209,8 +216,14 @@ pub fn main_loop(
                 }
                 added_nl_pos = None;
 
-                slash_status =
-                    dispatch_slash(&mut scanner, session.pset, session.vars, stdout, stderr);
+                slash_status = dispatch_slash(
+                    &mut scanner,
+                    session.pset,
+                    session.vars,
+                    executor.pipeline_status(),
+                    stdout,
+                    stderr,
+                );
                 success = slash_status != CommandResult::Error;
                 session.pset.stmt_lineno = 1;
 
@@ -223,7 +236,14 @@ pub fn main_loop(
                         if query_buf.is_empty() {
                             query_buf.clone_from(&previous_buf);
                         }
-                        success = send_query(executor, &query_buf, session.pset, stdout, stderr);
+                        success = send_query(
+                            executor,
+                            &query_buf,
+                            session.pset,
+                            session.vars,
+                            stdout,
+                            stderr,
+                        );
                         std::mem::swap(&mut previous_buf, &mut query_buf);
                         query_buf.clear();
                     }
@@ -256,7 +276,14 @@ pub fn main_loop(
     // (`mainloop.c:598`).
     if !query_buf.is_empty() && !session.pset.cur_cmd_interactive && success_result == EXIT_SUCCESS
     {
-        let ok = send_query(executor, &query_buf, session.pset, stdout, stderr);
+        let ok = send_query(
+            executor,
+            &query_buf,
+            session.pset,
+            session.vars,
+            stdout,
+            stderr,
+        );
         if !ok && die_on_error {
             success_result = EXIT_USER;
         } else if !executor.connected() {
@@ -332,6 +359,10 @@ mod tests {
 
         fn connected(&self) -> bool {
             self.connected
+        }
+
+        fn abandon(&mut self) {
+            self.connected = false;
         }
     }
 

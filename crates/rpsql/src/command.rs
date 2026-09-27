@@ -4,7 +4,8 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code, and
-//! NAT-400 adds `\pset`. Everything
+//! NAT-400 adds `\pset` and the shorthands that call its `do_pset`: `\a`,
+//! `\C`, `\f`, `\H`, `\t`, `\T` and `\x`. Everything
 //! else is [`CommandResult::Unknown`], which renders upstream's
 //! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
 
@@ -12,7 +13,7 @@ use std::io::Write;
 
 use crate::common::{LogLevel, log_prefix};
 use crate::scan::{Scanner, VariableSource};
-use crate::settings::PsqlSettings;
+use crate::settings::{PrintFormat, PsqlSettings};
 use crate::slash::SlashOption;
 use crate::variables::{VarView, VariableSpace};
 
@@ -143,10 +144,14 @@ pub fn handle_slash_cmds(
         status
     };
 
-    // Eat any remaining arguments after a valid command (`command.c:271`).
-    // `slash_options` above already consumed them, so what is left is the
-    // warning upstream prints for the ones a command did not use.
-    if status != CommandResult::Error {
+    if status == CommandResult::Error {
+        // "silently throw away rest of line after an erroneous command"
+        // (`command.c:288`), so a `\\` after it starts nothing.
+        scanner.slash_discard_line();
+    } else {
+        // Eat any remaining arguments after a valid command (`command.c:271`).
+        // `slash_options` above already consumed them, so what is left is the
+        // warning upstream prints for the ones a command did not use.
         for extra in extra_arguments(&cmd, &options) {
             let _ = writeln!(
                 stderr,
@@ -168,7 +173,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "echo" | "qecho" | "warn" | "set" => return Vec::new(),
         "c" | "connect" => 4,
         "pset" => 2,
-        "unset" => 1,
+        "unset" | "C" | "f" | "t" | "T" | "x" => 1,
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -186,6 +191,64 @@ fn exec_command(
     stderr: &mut dyn Write,
 ) -> CommandResult {
     match cmd {
+        // `exec_command_a()` (`command.c:501`): toggle aligned and unaligned.
+        "a" => {
+            let format = if ctx.pset.popt.topt.format == PrintFormat::Aligned {
+                "unaligned"
+            } else {
+                "aligned"
+            };
+            do_pset_command("format", Some(format), ctx, stdout, stderr)
+        }
+        // `exec_command_C()` (`command.c:605`).
+        "C" => do_pset_command(
+            "title",
+            options.first().map(SlashOption::semicolon_stripped),
+            ctx,
+            stdout,
+            stderr,
+        ),
+        // `exec_command_f()` (`command.c:1673`), which keeps its semicolons.
+        "f" => do_pset_command(
+            "fieldsep",
+            options.first().map(|o| o.value.as_str()),
+            ctx,
+            stdout,
+            stderr,
+        ),
+        // `exec_command_html()` (`command.c:2044`): toggle html and aligned.
+        "H" | "html" => {
+            let format = if ctx.pset.popt.topt.format == PrintFormat::Html {
+                "aligned"
+            } else {
+                "html"
+            };
+            do_pset_command("format", Some(format), ctx, stdout, stderr)
+        }
+        // `exec_command_t()` (`command.c:3122`).
+        "t" => do_pset_command(
+            "tuples_only",
+            options.first().map(SlashOption::semicolon_stripped),
+            ctx,
+            stdout,
+            stderr,
+        ),
+        // `exec_command_T()` (`command.c:3144`), which keeps its semicolons.
+        "T" => do_pset_command(
+            "tableattr",
+            options.first().map(|o| o.value.as_str()),
+            ctx,
+            stdout,
+            stderr,
+        ),
+        // `exec_command_x()` (`command.c:3526`).
+        "x" => do_pset_command(
+            "expanded",
+            options.first().map(SlashOption::semicolon_stripped),
+            ctx,
+            stdout,
+            stderr,
+        ),
         // `exec_command_quit()` (`command.c:2750`).
         "q" | "quit" => CommandResult::Terminate,
         // `exec_command_connect()` (`command.c:638`).
@@ -266,8 +329,21 @@ fn exec_command_pset(
         return CommandResult::SkipLine;
     };
     let value = options.get(1).map(|o| o.value.as_str());
+    do_pset_command(&param.value, value, ctx, stdout, stderr)
+}
+
+/// `do_pset(param, value, &pset.popt, pset.quiet)` as every command that
+/// calls it reports the outcome: the new state on stdout unless quiet, or the
+/// error, which turns the command into `PSQL_CMD_ERROR`.
+fn do_pset_command(
+    param: &str,
+    value: Option<&str>,
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
     let quiet = ctx.pset.quiet;
-    match crate::pset::do_pset(&param.value, value, &mut ctx.pset.popt, quiet) {
+    match crate::pset::do_pset(param, value, &mut ctx.pset.popt, quiet) {
         Ok(info) => {
             if let Some(info) = info {
                 let _ = stdout.write_all(info.as_bytes());
@@ -322,8 +398,12 @@ mod tests {
     }
 
     fn run(line: &str) -> Run {
+        run_in(&mut PsqlSettings::default(), line)
+    }
+
+    /// [`run`], on settings an earlier command may have changed.
+    fn run_in(pset: &mut PsqlSettings, line: &str) -> Run {
         let mut vars = VariableSpace::new();
-        let mut pset = PsqlSettings::default();
         let mut scanner = Scanner::new();
         scanner.setup(line.as_bytes(), true);
         let mut buf = Vec::new();
@@ -333,7 +413,7 @@ mod tests {
         let mut stderr = Vec::new();
         let result = {
             let mut ctx = CommandContext {
-                pset: &mut pset,
+                pset,
                 vars: &mut vars,
             };
             handle_slash_cmds(
@@ -442,6 +522,37 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_command_throws_away_the_rest_of_the_line() {
+        // `command.c:288`: the `\t` after `\\` never runs, and whatever follows
+        // on the line draws no "extra argument" warning either.
+        let mut scanner = Scanner::new();
+        scanner.setup(b"\\x nope extra \\\\ \\t\nselect 1;", true);
+        assert_eq!(
+            scanner.scan(&mut Vec::new(), &NoVariables).0,
+            ScanResult::Backslash
+        );
+        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
+        let mut stderr = Vec::new();
+        let result = handle_slash_cmds(
+            &mut scanner,
+            &mut CommandContext {
+                pset: &mut pset,
+                vars: &mut vars,
+            },
+            &NoVariables,
+            &mut Vec::new(),
+            &mut stderr,
+        );
+        assert_eq!(result, CommandResult::Error);
+        assert!(scanner.rest().is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "psql: error: unrecognized value \"nope\" for \"expanded\"\n\
+             Available values are: on, off, auto.\n"
+        );
+    }
+
+    #[test]
     fn extra_arguments_draw_a_warning() {
         // `command.c:282`.
         let run = run("\\q one");
@@ -510,6 +621,92 @@ mod tests {
     }
 
     #[test]
+    fn a_and_h_toggle_the_format_the_way_exec_command_a_and_html_do() {
+        // `command.c:507`, `:2050`: anything but aligned (or html) goes to
+        // aligned (or html), so from csv both land on the one they name.
+        let mut pset = PsqlSettings::default();
+        let steps = [
+            ("\\a", "Output format is unaligned.\n"),
+            ("\\a", "Output format is aligned.\n"),
+            ("\\H", "Output format is html.\n"),
+            ("\\html", "Output format is aligned.\n"),
+            ("\\pset format csv", "Output format is csv.\n"),
+            ("\\a", "Output format is aligned.\n"),
+            ("\\pset format csv", "Output format is csv.\n"),
+            ("\\H", "Output format is html.\n"),
+        ];
+        for (line, stdout) in steps {
+            let run = run_in(&mut pset, line);
+            assert_eq!(run.result, CommandResult::SkipLine, "{line}");
+            assert_eq!(run.stdout, stdout, "{line}");
+        }
+        let extra = run("\\a on");
+        assert_eq!(
+            extra.stderr,
+            "psql: warning: \\a: extra argument \"on\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn t_and_x_toggle_or_set_and_strip_an_unquoted_semicolon() {
+        let mut pset = PsqlSettings::default();
+        let steps = [
+            ("\\t", "Tuples only is on.\n"),
+            ("\\t", "Tuples only is off.\n"),
+            // With a value, `do_pset` returns before it reports
+            // (`command.c:5340`): `\t on` is silent.
+            ("\\t on;", ""),
+            ("\\t", "Tuples only is off.\n"),
+            ("\\x", "Expanded display is on.\n"),
+            ("\\x auto;;", "Expanded display is used automatically.\n"),
+            ("\\x 'off';", "Expanded display is off.\n"),
+        ];
+        for (line, stdout) in steps {
+            let run = run_in(&mut pset, line);
+            assert_eq!(
+                (run.result, run.stdout.as_str()),
+                (CommandResult::SkipLine, stdout),
+                "{line}"
+            );
+        }
+        // A quoted semicolon is part of the value (`psqlscanslash.l:604`).
+        let quoted = run("\\x 'on;'");
+        assert_eq!(quoted.result, CommandResult::Error);
+        assert_eq!(
+            quoted.stderr,
+            "psql: error: unrecognized value \"on;\" for \"expanded\"\n\
+             Available values are: on, off, auto.\n"
+        );
+    }
+
+    #[test]
+    fn c_f_and_capital_t_set_title_fieldsep_and_tableattr() {
+        let mut pset = PsqlSettings::default();
+        let steps = [
+            ("\\C 'my title';", "Title is \"my title\".\n"),
+            ("\\C", "Title is unset.\n"),
+            // `\f` and `\T` pass `semicolon = false` (`command.c:1681`, `:3152`).
+            ("\\f ;", "Field separator is \";\".\n"),
+            ("\\f", "Field separator is \";\".\n"),
+            ("\\T border=1;", "Table attributes are \"border=1;\".\n"),
+            ("\\T", "Table attributes unset.\n"),
+        ];
+        for (line, stdout) in steps {
+            let run = run_in(&mut pset, line);
+            assert_eq!(
+                (run.result, run.stdout.as_str()),
+                (CommandResult::SkipLine, stdout),
+                "{line}"
+            );
+        }
+        let extra = run("\\C a b");
+        assert_eq!(
+            extra.stderr,
+            "psql: warning: \\C: extra argument \"b\" ignored\n"
+        );
+    }
+
+    #[test]
     fn a_connect_is_refused_with_one_message_for_every_caller() {
         // The two dispatch sites used to each spell this string themselves,
         // which in a port judged by byte-identical output is a drift waiting
@@ -540,6 +737,7 @@ mod tests {
         let opt = |value: &str, quote| SlashOption {
             value: value.to_string(),
             quote,
+            unquoted_semicolons: 0,
         };
         assert_eq!(echo_text(&[opt("a", None), opt("b", None)]), b"a b\n");
         assert_eq!(echo_text(&[opt("-n", None), opt("a", None)]), b"a");

@@ -308,6 +308,7 @@ const NUMERICLOCALE_PORT: u16 = 55_493;
 const UNICODE_LINE_STYLE_PORT: u16 = 55_494;
 const DISPLAY_WIDTH_PORT: u16 = 55_495;
 const DASH_P_PORT: u16 = 55_496;
+const PSET_SHORTHANDS_PORT: u16 = 55_590;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -652,6 +653,80 @@ fn dash_p_matches_c_psql() {
             None => reference::skip("psql"),
         }
     }
+}
+
+/// The meta-commands that are `do_pset` under another name, against C psql:
+/// `\a` (`command.c:501`), `\C` (`:605`), `\f` (`:1673`), `\H`/`\html`
+/// (`:2044`), `\t` (`:3122`), `\T` (`:3144`) and `\x` (`:3526`). Each toggles
+/// or sets, reports the new state unless quiet, strips an unquoted trailing
+/// semicolon when it passes `semicolon = true`, and warns about a second
+/// argument; every one of them is followed by a query printed under it.
+#[test]
+fn the_pset_shorthands_match_c_psql() {
+    let Some(cluster) = Cluster::start(PSET_SHORTHANDS_PORT) else {
+        return;
+    };
+    let script = r"\set QUIET off
+select 1 as one, 'a;b' as two;
+\a
+select 1 as one, 'a;b' as two;
+\a
+\H
+select 1 as one;
+\html
+\pset format csv
+\a
+\pset format csv
+\H
+\H
+\t
+select 1 as one;
+\t on;
+\t
+\t 'on';
+\t off
+\t 'on;'
+\x
+select 1 as one, 2 as two;
+\x auto;
+\x 'off';
+\x on;;
+select 1 as one;
+\x 'on;'
+\x nope
+\x
+\C 'a title';
+select 1 as one;
+\C
+\C a b
+\f ;
+\a
+select 1 as one, 2 as two;
+\f
+\f '|';
+\a
+\T border=1;
+\H
+select 1 as one;
+\T
+\H
+\a on
+\H junk
+\f , extra
+\T x y
+\t x y
+\x on \\ \t \\ \a
+\x nope \\ \t
+select 1 as one, 2 as two;
+\set QUIET on
+\a
+\x
+\t
+\C quiet
+\f :
+select 1 as one, 2 as two;
+";
+    diff_against_c_psql(&cluster, "the \\pset shorthands", script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

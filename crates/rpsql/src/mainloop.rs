@@ -343,6 +343,28 @@ pub fn main_loop(
                         // `mainloop.c:529`.
                         scanner.reset();
                     }
+                    CommandResult::Watch(args) => {
+                        // `exec_command_watch()` (`command.c:3504`-`:3514`):
+                        // an empty buffer watches the previous query; then,
+                        // whether or not the arguments were accepted, the
+                        // buffer is reset as though for `\r`, and the
+                        // previous query is left as it was.
+                        success = args.is_some_and(|args| {
+                            if query_buf.is_empty() {
+                                query_buf.extend_from_slice(&previous_buf);
+                            }
+                            crate::watch::do_watch(
+                                &query_buf, args, executor, session, source, out, stderr,
+                            )
+                        });
+                        query_buf.clear();
+                        scanner.reset();
+                        slash_status = if success {
+                            CommandResult::SkipLine
+                        } else {
+                            CommandResult::Error
+                        };
+                    }
                     CommandResult::Terminate => break,
                     _ => {}
                 }
@@ -1115,5 +1137,84 @@ mod tests {
         let out = run("select 1;\n\\g\nselect 2 \\g\n", PsqlSettings::default());
         assert_eq!(out.seen, ["select 1;", "select 1;", "select 2 "]);
         assert_eq!(out.stderr, "");
+    }
+
+    #[test]
+    fn watch_runs_the_buffer_count_times_and_ends_with_a_newline() {
+        // `do_watch()` (`command.c:5873`): each run prints its result, and
+        // the loop a newline to stdout (`command.c:6093`).
+        let out = run("select 1 \\watch c=3 i=0\n", PsqlSettings::default());
+        assert_eq!(out.seen, ["select 1 ", "select 1 ", "select 1 "]);
+        assert_eq!(out.stdout, "OK\nOK\nOK\n\n");
+        assert_eq!(out.stderr, "");
+        assert_eq!(out.code, EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn watch_on_an_empty_buffer_watches_the_previous_query_and_leaves_it() {
+        // `command.c:3504`-`:3514`: `copy_previous_query`, then the buffer
+        // is reset, and `previous_buf` is what it was.
+        let out = run("select 2;\n\\watch c=2 i=0\n\\g\n", PsqlSettings::default());
+        assert_eq!(out.seen, ["select 2;"; 4]);
+        assert_eq!(out.stderr, "");
+    }
+
+    #[test]
+    fn watch_with_nothing_to_watch_is_an_error() {
+        let out = run("\\watch c=2\n", PsqlSettings::default());
+        assert!(out.seen.is_empty());
+        assert_eq!(
+            out.stderr,
+            "psql: error: \\watch cannot be used with an empty query\n"
+        );
+    }
+
+    #[test]
+    fn a_bad_watch_argument_runs_nothing_and_still_resets_the_buffer() {
+        let out = run("select 3 \\watch m=x\n;\n", PsqlSettings::default());
+        assert_eq!(
+            out.stderr,
+            "psql: error: \\watch: incorrect minimum row count \"x\"\n"
+        );
+        // The buffer is reset all the same (`command.c:3513`), so the `;`
+        // on the next line is sent alone.
+        assert_eq!(out.seen, [";"]);
+    }
+
+    #[test]
+    fn watch_stops_at_a_short_result_or_a_failure() {
+        // `min_rows` (`common.c:1813`): a CommandComplete has no rows.
+        let out = run("select 1 \\watch m=1 i=0\n", PsqlSettings::default());
+        assert_eq!(out.seen.len(), 1);
+        assert_eq!(out.code, EXIT_SUCCESS);
+        assert_eq!(out.stderr, "");
+
+        let mut pset = PsqlSettings {
+            on_error_stop: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(false);
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
+        };
+        let mut executor = Recorder::new();
+        executor.fail = vec![true];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = main_loop(
+            &mut CommandSource::file(&mut &b"select 1 \\watch c=3 i=0\n"[..]),
+            None,
+            &mut session,
+            &mut executor,
+            &mut Output::new(&mut stdout),
+            &mut stderr,
+        );
+        // A failed run ends the loop and fails `\\watch`.
+        assert_eq!(executor.seen.len(), 1);
+        assert_eq!(code, EXIT_USER);
+        assert_eq!(stdout, b"\n");
     }
 }

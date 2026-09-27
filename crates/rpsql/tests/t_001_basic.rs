@@ -8,10 +8,11 @@
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
 //! (lines 86-108), `\errverbose with no previous error` (159-164),
 //! `\errverbose after normal query with error` (170-181), the multiple
-//! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367) and
-//! `\g` output piped into a program (457-486). The `\copyright`, `\help`,
-//! `ENCODING`, notification, crash and remaining `\errverbose` cases, and the
-//! rest of the file, land with Linear NAT-400 … NAT-405.
+//! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367),
+//! `\watch` and `WATCH_INTERVAL` (369-443) and `\g` output piped into a
+//! program (457-486). The `\copyright`, `\help`, `ENCODING`, notification,
+//! crash and remaining `\errverbose` cases, and the rest of the file, land
+//! with Linear NAT-400 … NAT-405.
 //!
 //! The byte-diff gate NAT-398's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the
@@ -86,6 +87,11 @@ const COPY_FROM_WITH_DEFAULT_PORT: u16 = 55_406;
 const COPY_ROUND_TRIP_PORT: u16 = 55_407;
 const G_PIPE_PORT: u16 = 55_408;
 const OUTPUT_REDIRECTION_PORT: u16 = 55_409;
+// 55_410 and 55_411 are `t_010_tab_completion`'s.
+const CHECK_WATCH_PORT: u16 = 55_413;
+const CHECK_WATCH_INTERVAL_PORT: u16 = 55_414;
+const WATCH_GATE_PORT: u16 = 55_415;
+const WATCH_SIGINT_PORT: u16 = 55_416;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -483,6 +489,138 @@ fn psql_like_with(
     assert_like(&stdout, expected_stdout, &format!("{name}: matches"));
 }
 
+/// `psql_fails_like()` — 001_basic.pl:33: a nonzero exit, and stderr like
+/// the pattern, through every psql in turn.
+fn psql_fails_like(cluster: &Cluster, sql: &str, expected_stderr: &str, test_name: &str) {
+    for psql in every_psql(cluster) {
+        let PsqlOutcome { ret, stderr, .. } = cluster.psql(&psql, sql, true);
+        let name = format!("{test_name} ({})", psql.display());
+        assert_ne!(ret, 0, "{name}: exit code not 0");
+        assert_like(&stderr, expected_stderr, &format!("{name}: matches"));
+    }
+}
+
+/// `# Check \watch`, `# Check \watch minimum row count` and `# Check \watch
+/// errors` — 001_basic.pl:369-423. Upstream's `sprintf('%g', …)` is
+/// written out: `0.01`, `0.0001` and `0.5`.
+#[test]
+fn check_watch() {
+    let Some(cluster) = Cluster::start(CHECK_WATCH_PORT) else {
+        return;
+    };
+    // Note: the interval value is parsed with locale-aware strtod()
+    psql_like(
+        &cluster,
+        "SELECT 1 \\watch c=3 i=0.01",
+        "1\n1\n1",
+        "\\watch with 3 iterations, interval of 0.01",
+    );
+
+    // Sub-millisecond wait works, equivalent to 0.
+    psql_like(
+        &cluster,
+        "SELECT 1 \\watch c=3 i=0.0001",
+        "1\n1\n1",
+        "\\watch with 3 iterations, interval of 0.0001",
+    );
+
+    // Test zero interval
+    psql_like(
+        &cluster,
+        "\\set WATCH_INTERVAL 0\nSELECT 1 \\watch c=3",
+        "1\n1\n1",
+        "\\watch with 3 iterations, interval of 0",
+    );
+
+    // Check \watch minimum row count
+    psql_fails_like(
+        &cluster,
+        "SELECT 3 \\watch m=x",
+        "incorrect minimum row count",
+        "\\watch, invalid minimum row setting",
+    );
+
+    psql_fails_like(
+        &cluster,
+        "SELECT 3 \\watch m=1 min_rows=2",
+        "minimum row count specified more than once",
+        "\\watch, minimum rows is specified more than once",
+    );
+
+    psql_like(
+        &cluster,
+        "with x as (
+\t\tselect now()-backend_start AS howlong
+\t\tfrom pg_stat_activity
+\t\twhere pid = pg_backend_pid()
+\t  ) select 123 from x where howlong < '2 seconds' \\watch i=0.5 m=2",
+        "^123$",
+        "\\watch, 2 minimum rows",
+    );
+
+    // Check \watch errors
+    psql_fails_like(
+        &cluster,
+        "SELECT 1 \\watch -10",
+        "incorrect interval value \"-10\"",
+        "\\watch, negative interval",
+    );
+    psql_fails_like(
+        &cluster,
+        "SELECT 1 \\watch 10ab",
+        "incorrect interval value \"10ab\"",
+        "\\watch, incorrect interval",
+    );
+    psql_fails_like(
+        &cluster,
+        "SELECT 1 \\watch 10e400",
+        "incorrect interval value \"10e400\"",
+        "\\watch, out-of-range interval",
+    );
+    psql_fails_like(
+        &cluster,
+        "SELECT 1 \\watch 1 1",
+        "interval value is specified more than once",
+        "\\watch, interval value is specified more than once",
+    );
+    psql_fails_like(
+        &cluster,
+        "SELECT 1 \\watch c=1 c=1",
+        "iteration count is specified more than once",
+        "\\watch, iteration count is specified more than once",
+    );
+}
+
+/// `# Check WATCH_INTERVAL` — 001_basic.pl:425-443.
+#[test]
+fn check_watch_interval() {
+    let Some(cluster) = Cluster::start(CHECK_WATCH_INTERVAL_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "\\echo :WATCH_INTERVAL
+\\set WATCH_INTERVAL 10
+\\echo :WATCH_INTERVAL
+\\unset WATCH_INTERVAL
+\\echo :WATCH_INTERVAL",
+        "(?m)^2$\n^10$\n^2$",
+        "WATCH_INTERVAL variable is set and updated",
+    );
+    psql_fails_like(
+        &cluster,
+        "\\set WATCH_INTERVAL 1e500",
+        "is out of range",
+        "WATCH_INTERVAL variable is out of range",
+    );
+    psql_like(
+        &cluster,
+        "\\echo :WATCH_INTERVAL",
+        "(?m)^2$",
+        "WATCH_INTERVAL variable was not altered",
+    );
+}
+
 /// `# Test \g output piped into a program.` — 001_basic.pl:457-486.
 ///
 /// "The program is perl -pe '' to simply copy the input to the output"
@@ -764,6 +902,189 @@ fn output_redirection_matches_c_psql() {
             String::from_utf8_lossy(ours),
             String::from_utf8_lossy(theirs)
         );
+    }
+}
+
+/// The script [`watch_matches_c_psql`] runs: `\\watch` over tuples, a
+/// title, a command tag, a `COPY … TO STDOUT` and `\\;`; each way it stops
+/// (count, `min_rows`, a failure, and `min_rows` over a failure); the
+/// previous query and the empty buffer; every argument error; hexadecimal
+/// intervals; and `WATCH_INTERVAL`'s own errors and default. Every `\\watch`
+/// has a count or stops at once, and no interval is longer than a quarter
+/// of a second, so the whole script takes about a second.
+const WATCH_SQL: &str = r"select 1 as one \watch c=2 i=0
+\pset title 'my title'
+select 'a' as x, 2 as y \watch count=2 interval=0.001
+\pset title
+select 1 as short \watch m=5 i=0
+\watch c=1
+select 2 as two;
+\watch c=2 i=0
+select 1/0 \watch c=3 i=0
+select 1/0 \watch c=3 m=1 i=0
+copy (values (1),(2)) to stdout \watch c=2 i=0
+create temp table w (x int);
+insert into w values (1) returning x \watch c=2 i=0
+select 1 \; select 2 as second \watch c=1
+\pset tuples_only on
+select 'tuples only' \watch c=2 i=0
+\pset tuples_only off
+select 1 \watch -10
+select 1 \watch 10ab
+select 1 \watch 10e400
+select 1 \watch 1 1
+select 1 \watch c=1 c=1
+select 1 \watch m=1 min_rows=2
+select 1 \watch i=1 2
+select 1 \watch m=0
+select 1 \watch c=0
+select 1 \watch c=99999999999
+select 1 \watch x=1
+select 1 as empty_interval \watch interval= c=1
+select 'hex' \watch 0x10 c=1
+select 'eighth' \watch 0x1p-3 c=2
+\set WATCH_INTERVAL 1e500
+\set WATCH_INTERVAL 1e-400
+\set WATCH_INTERVAL -1
+\set WATCH_INTERVAL 1000001
+\set WATCH_INTERVAL ''
+\set WATCH_INTERVAL abc
+\echo :WATCH_INTERVAL
+\set WATCH_INTERVAL 0.25
+select 'quarter' \watch c=2
+\unset WATCH_INTERVAL
+\echo :WATCH_INTERVAL
+select 1 \watch c=1 c=
+";
+
+/// `do_watch`'s title carries the wall-clock time (`command.c:5991`), the
+/// one thing the two runs cannot share: each `%c` time in front of
+/// ` (every …s)` becomes `<time>`, after checking that it has `%c`'s shape
+/// in the C locale, `Www Mmm dd hh:mm:ss yyyy`.
+fn normalize_watch_time(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let Some(at) = line.find(" (every ") else {
+            out.push_str(line);
+            continue;
+        };
+        let start = at.checked_sub(24).expect("a time before (every");
+        let time = &line[start..at];
+        let shape: String = time
+            .chars()
+            .map(|c| match c {
+                'A'..='Z' => 'A',
+                'a'..='z' => 'a',
+                '0'..='9' => '9',
+                other => other,
+            })
+            .collect();
+        assert!(
+            shape == "Aaa Aaa 99 99:99:99 9999" || shape == "Aaa Aaa  9 99:99:99 9999",
+            "not a C-locale %c time: {time:?}"
+        );
+        out.push_str(&line[..start]);
+        out.push_str("<time>");
+        out.push_str(&line[at..]);
+    }
+    out
+}
+
+/// `\\watch` and `WATCH_INTERVAL` against PGDG psql: [`WATCH_SQL`] through
+/// both, in UTC and the C locale, and stdout, stderr and the exit status
+/// must be the same bytes once each title's time is [`normalize_watch_time`]d.
+/// Not an upstream test — upstream has no psql to compare against — but it
+/// covers `001_basic.pl:369`-`:443` and the output those cases do not look
+/// at: titles, status lines and COPY data under `\\watch`.
+#[test]
+fn watch_matches_c_psql() {
+    let Some(cluster) = Cluster::start(WATCH_GATE_PORT) else {
+        return;
+    };
+    let Some(reference) = cluster.reference_psql() else {
+        reference::skip("psql");
+        return;
+    };
+    let run = |psql: &Path| {
+        let mut command = cluster.command(psql);
+        command
+            .args(["-X", "-f", "-"])
+            .env("TZ", "UTC")
+            .env("LC_ALL", "C");
+        regress::run(command, WATCH_SQL.as_bytes())
+    };
+    let ours = run(Path::new(RPSQL));
+    let theirs = run(&reference);
+    assert_eq!(
+        ours.ret, theirs.ret,
+        "exit status; rpsql stderr {:?}",
+        ours.stderr
+    );
+    assert_eq!(ours.stderr, theirs.stderr, "stderr");
+    let (ours, theirs) = (
+        normalize_watch_time(&ours.stdout),
+        normalize_watch_time(&theirs.stdout),
+    );
+    if let Some(diff) = regress::first_difference(theirs.as_bytes(), ours.as_bytes()) {
+        panic!("stdout differs from C psql's:\n{diff}\n--- rpsql:\n{ours}");
+    }
+}
+
+/// Pins a divergence (`docs/divergences.md`): nothing in rpsql catches
+/// SIGINT yet (NAT-405), so `^C` during a `\\watch` without a count ends the
+/// process, where C psql exits on its own terms. Which terms is a race in C:
+/// a SIGINT that `do_watch`'s `sigwait` takes (`command.c:6054`) ends only
+/// the `\\watch`, and the script carries on to exit 0; one that arrives while
+/// the query runs sets `cancel_pressed`, and `MainLoop` stops the script with
+/// `EXIT_USER` (`mainloop.c:88`-`:96`). The interval is a second and the query
+/// takes a millisecond, so it is almost always the first, but either passes.
+#[test]
+fn watch_ends_at_sigint_the_whole_process_for_now() {
+    use std::io::Write as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Stdio;
+
+    let Some(cluster) = Cluster::start(WATCH_SIGINT_PORT) else {
+        return;
+    };
+    let interrupt = |psql: &Path| {
+        let mut child = cluster
+            .command(psql)
+            .args(["-X", "-q", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("psql starts");
+        child
+            .stdin
+            .take()
+            .expect("a stdin pipe")
+            .write_all(b"select 1 \\watch i=1\n\\echo after\n")
+            .expect("the script is fed");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let kill = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(kill.success(), "kill -INT");
+        child.wait_with_output().expect("psql's output is read")
+    };
+    let ours = interrupt(Path::new(RPSQL));
+    assert_eq!(ours.status.signal(), Some(2), "rpsql dies of SIGINT");
+    if let Some(reference) = cluster.reference_psql() {
+        let theirs = interrupt(&reference);
+        let stdout = String::from_utf8_lossy(&theirs.stdout);
+        match theirs.status.code() {
+            Some(0) => assert!(
+                stdout.ends_with("\nafter\n"),
+                "C psql ends the \\watch and runs the rest of the script: {stdout:?}"
+            ),
+            Some(3) => assert!(!stdout.contains("after"), "{stdout:?}"),
+            other => panic!("C psql exits 0 or 3, not {other:?} ({})", theirs.status),
+        }
+    } else {
+        reference::skip("psql");
     }
 }
 

@@ -31,10 +31,13 @@ use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultErr
 use crate::copy::{handle_copy_in, handle_copy_out};
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::logging;
+use crate::mainloop::Session;
 use crate::output::{Opened, Output, OutputFile, set_shell_result_variables};
 use crate::print::print_query;
 use crate::scan::{NoVariables, Scanner};
-use crate::settings::{EXIT_BADCONN, Echo, PipelineCounters, PsqlSettings, SendMode};
+use crate::settings::{
+    EXIT_BADCONN, Echo, PipelineCounters, PrintQueryOpt, PsqlSettings, SendMode,
+};
 use crate::variables::VariableSpace;
 
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
@@ -534,7 +537,7 @@ fn send_query_simple(
 
     // `common.c:1128`: whether to time is decided before the query runs.
     let timing = pset.timing;
-    let (ok, elapsed_msec) = exec_query_and_process_results(
+    let processed = exec_query_and_process_results(
         executor,
         query,
         mode,
@@ -542,6 +545,7 @@ fn send_query_simple(
         pset,
         vars,
         io,
+        None,
         out,
         stderr,
         Instant::now(),
@@ -550,9 +554,72 @@ fn send_query_simple(
     // `common.c:1286`: the timing line follows success and failure alike,
     // which is what `001_basic.pl:95` tests. `PrintTiming` writes to stdout.
     if timing {
-        let _ = out.stdout.write_all(timing_line(elapsed_msec).as_bytes());
+        let _ = out
+            .stdout
+            .write_all(timing_line(processed.elapsed_msec).as_bytes());
     }
-    ok
+    processed.success
+}
+
+/// `PSQLexecWatch()` (`common.c:712`): one run of `\watch`'s query, printed
+/// with `opt`, and its timing line when `\timing` is on.
+///
+/// Returns 1 when the query ran, 0 when it cannot be repeated — no
+/// connection, or a first result with fewer than `min_rows` rows — and -1
+/// when it failed.
+// Upstream's signature, plus the session and streams its globals hold.
+#[allow(clippy::too_many_arguments)]
+pub fn psql_exec_watch(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    opt: &PrintQueryOpt,
+    min_rows: i32,
+    session: &mut Session<'_>,
+    source: &mut CommandSource<'_>,
+    out: &mut Output<'_>,
+    stderr: &mut dyn Write,
+) -> i32 {
+    if !executor.connected() {
+        logging::error(
+            session.pset,
+            "You are currently not connected to a database.",
+            stderr,
+        );
+        return 0;
+    }
+    let timing = session.pset.timing;
+    let mut io = CopyIo {
+        source,
+        stream: CopyStream::Default,
+        copy_from_stdin: None,
+    };
+    let processed = exec_query_and_process_results(
+        executor,
+        query,
+        &SendMode::Query,
+        None,
+        session.pset,
+        session.vars,
+        &mut io,
+        Some(Watch { min_rows, opt }),
+        out,
+        stderr,
+        Instant::now(),
+    );
+    // Possible microtiming output (`common.c:735`).
+    if timing {
+        let _ = out
+            .stdout
+            .write_all(timing_line(processed.elapsed_msec).as_bytes());
+    }
+    // `common.c:2311`-`:2314`.
+    if processed.return_early {
+        0
+    } else if processed.success {
+        1
+    } else {
+        -1
+    }
 }
 
 /// The results of one query in the order `PQgetResult` hands them out:
@@ -666,13 +733,32 @@ impl GFile {
     }
 }
 
+/// `is_watch`, `min_rows` and `opt` in `ExecQueryAndProcessResults`: a run
+/// of `\watch`'s, printed with `do_watch`'s options and title.
+#[derive(Clone, Copy)]
+struct Watch<'o> {
+    /// Fewer rows than this in the first result ends the `\watch`.
+    min_rows: i32,
+    /// The print options, title included.
+    opt: &'o PrintQueryOpt,
+}
+
+/// What one `ExecQueryAndProcessResults` leaves behind.
+struct Processed {
+    /// Every result was accepted and printed.
+    success: bool,
+    /// The milliseconds from `before` to the last result, taken before that
+    /// result is printed (`common.c:2197`).
+    elapsed_msec: f64,
+    /// `return_early`: `\watch`'s first result had fewer than `min_rows`
+    /// rows (`common.c:1813`).
+    return_early: bool,
+}
+
 /// `ExecQueryAndProcessResults()` (`common.c:1581`), outside a pipeline and
-/// without `FETCH_COUNT`, `\gset`, `\gexec` and `\watch`, which are later
-/// slices. `mode` and `crosstab` are the one-shot requests
-/// [`send_query_with`] took.
-///
-/// Returns the success and the milliseconds from `before` to the last
-/// result, taken before that result is printed (`common.c:2197`).
+/// without `FETCH_COUNT`, `\gset` and `\gexec`, which are later slices.
+/// `mode` and `crosstab` are the one-shot requests [`send_query_with`] took;
+/// `watch` is `is_watch` with `min_rows` and `opt`.
 // Upstream reads the one-shot requests and the COPY streams from `pset`;
 // passing them separately keeps each borrow visible at the call site.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -684,10 +770,11 @@ fn exec_query_and_process_results(
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
     io: &mut CopyIo<'_, '_>,
+    watch: Option<Watch<'_>>,
     out: &mut Output<'_>,
     stderr: &mut dyn Write,
     before: Instant,
-) -> (bool, f64) {
+) -> Processed {
     let now = || before.elapsed().as_secs_f64() * 1000.0;
     let mut copy_from_stdin = match io.copy_from_stdin {
         Some(n) => n,
@@ -704,7 +791,11 @@ fn exec_query_and_process_results(
         // `psql:<stdin>:2: server closed the connection unexpectedly`.
         Err(err) => {
             logging::info(pset, err.as_bytes(), stderr);
-            return (false, now());
+            return Processed {
+                success: false,
+                elapsed_msec: now(),
+                return_early: false,
+            };
         }
     };
     let mut results = Results::new(first);
@@ -713,6 +804,10 @@ fn exec_query_and_process_results(
     let mut gfile = GFile::Unopened;
 
     let mut result = results.next(executor, pset, stderr, &mut success);
+    // `common.c:1813`: `PQntuples` of the first result, 0 for none or for
+    // an error.
+    let min_rows = watch.map_or(0, |w| usize::try_from(w.min_rows).unwrap_or(0));
+    let return_early = min_rows > 0 && result.as_ref().map_or(0, QueryResult::ntuples) < min_rows;
     while let Some(current) = result {
         let status = current.status();
         if !accept_result(status) {
@@ -754,7 +849,7 @@ fn exec_query_and_process_results(
                 copy_from_stdin -= 1;
             }
             let (ok, final_result) = if status == ExecStatus::CopyOut {
-                copy_out(executor, pset, io, &mut gfile, out, stderr)
+                copy_out(executor, pset, io, watch.is_some(), &mut gfile, out, stderr)
             } else {
                 copy_in(executor, &copy_result, pset, io, stderr)
             };
@@ -772,8 +867,9 @@ fn exec_query_and_process_results(
                 success &= gfile.setup(pset, out, stderr);
             }
             if success {
+                let opt = watch.map_or(&pset.popt, |w| w.opt);
                 success &=
-                    print_query_result(current, last, crosstab, pset, &mut gfile, out, stderr);
+                    print_query_result(current, last, crosstab, pset, opt, &mut gfile, out, stderr);
             }
             clear_or_save_result(current, pset);
         }
@@ -785,7 +881,11 @@ fn exec_query_and_process_results(
 
     // `common.c:2290`: may need this to recover from conn loss during COPY.
     if !executor.connected() {
-        return (false, elapsed_msec);
+        return Processed {
+            success: false,
+            elapsed_msec,
+            return_early: false,
+        };
     }
 
     // `common.c:2294`-`:2309`: a COPY FROM STDIN the server refused still has
@@ -806,7 +906,11 @@ fn exec_query_and_process_results(
         copy_from_stdin -= 1;
     }
 
-    (success, elapsed_msec)
+    Processed {
+        success,
+        elapsed_msec,
+        return_early,
+    }
 }
 
 /// `exit(EXIT_BADCONN)` after `pg_log_info(message)`, which is how
@@ -826,19 +930,27 @@ fn abort_connection(
 
 /// `HandleCopyResult()` (`common.c:942`) for a COPY OUT: send the data to
 /// the sink `ExecQueryAndProcessResults` picks (`common.c:1947`-`:1976`) —
-/// `\copy`'s stream, else `\g`'s file, else `pset.queryFout` — and hand
-/// back the COPY command's own result, or `None` when its status line would
-/// go where the data just went (`common.c:965`).
+/// `pset.queryFout` under `\watch`, else `\copy`'s stream, else `\g`'s
+/// file, else `pset.queryFout` — and hand back the COPY command's own
+/// result, or `None` when its status line would go where the data just went
+/// (`common.c:965`).
 fn copy_out(
     executor: &mut dyn Executor,
     pset: &PsqlSettings,
     io: &mut CopyIo<'_, '_>,
+    is_watch: bool,
     gfile: &mut GFile,
     out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> (bool, Option<QueryResult>) {
     let mut opened = true;
     let (ok, copy_result, to_query_fout) = match &mut io.stream {
+        // `common.c:1955`: `printQueryFout`, which is `NULL` without a
+        // pager, so `pset.queryFout`.
+        _ if is_watch => {
+            let (ok, r) = handle_copy_out(executor, Some(out.query_fout()), pset, stderr);
+            (ok, r, true)
+        }
         CopyStream::Write(sink) => {
             let (ok, r) = handle_copy_out(executor, Some(&mut **sink), pset, stderr);
             (ok, r, false)
@@ -957,6 +1069,7 @@ fn print_query_result(
     last: bool,
     crosstab: Option<&CtvArgs>,
     pset: &PsqlSettings,
+    opt: &PrintQueryOpt,
     gfile: &mut GFile,
     out: &mut Output<'_>,
     stderr: &mut dyn Write,
@@ -977,7 +1090,7 @@ fn print_query_result(
                         false
                     }
                 },
-                _ => match print_query(result, &pset.popt) {
+                _ => match print_query(result, opt) {
                     // `PrintQueryTuples()` (`common.c:785`-`:791`): print,
                     // flush, and report a stream that failed — a `\g` or
                     // `\o` pipe whose command has exited, say.
@@ -1274,6 +1387,7 @@ fn exec_pipelined(
                 last,
                 crosstab,
                 pset,
+                &pset.popt,
                 &mut GFile::Unopened,
                 out,
                 stderr,

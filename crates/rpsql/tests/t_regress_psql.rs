@@ -313,6 +313,8 @@ const RELATION_LISTINGS_PORT: u16 = 55_497;
 const PARTITIONED_RELATIONS_PORT: u16 = 55_498;
 const ACCESS_METHODS_PORT: u16 = 55_499;
 const PARTITION_AND_AM_LISTINGS_PORT: u16 = 55_500;
+const FUNCTIONS_AND_OPERATORS_PORT: u16 = 55_501;
+const FUNCTION_TYPE_OPERATOR_LISTINGS_PORT: u16 = 55_502;
 
 /// Run `section` through rpsql against `cluster`, and through C psql when this
 /// lane has one, and require both to print exactly `psql.out`'s slice.
@@ -405,22 +407,38 @@ fn every_execute_q_block_matches_psql_out() {
     }
 }
 
-/// The same two sections and `-- expanded output with short-width columns`
-/// (`psql.sql:486`), live: `prepare`, `execute` and a table of `int`s through
-/// rpsql against a server. They run as one script because the third starts
-/// from the `\pset` state the second leaves (wrapped, old-ascii, `\pset
-/// columns 20`).
+/// The same two sections, `-- expanded output with short-width columns`
+/// (`psql.sql:486`), `-- support table for output-format tests` (`:500`) and
+/// `-- test header/footer/tuples_only behavior in aligned/unaligned/wrapped
+/// cases` (`:504`), live: `prepare`, `execute`, a table of `int`s, and `\df
+/// exp` and `\dfx exp` under `tuples_only` in aligned, unaligned and
+/// wrapped, normal and expanded, through rpsql against a server. They run as
+/// one script because each starts from the `\pset` state the one before
+/// leaves (wrapped, old-ascii, `\pset columns 20`).
+///
+/// The last section also prints `\d psql_serial_tab_id_seq` six times. That
+/// is `describeTableDetails`, a later NAT-401 slice, and nothing else reads
+/// what it prints, so those lines are cut from both files ([`without`]).
 #[test]
 fn the_output_format_sections_run_live() {
     let Some(cluster) = Cluster::start(OUTPUT_FORMAT_SECTIONS_PORT) else {
         return;
     };
-    gate_section(
+    let run = sections(
+        "-- test multi-line headers, wrapping, and newline indicators",
+        "-- test header/footer/tuples_only behavior in aligned/unaligned/wrapped cases",
+    );
+    let (sql, expected) = without(&run, &["\\d psql_serial_tab_id_seq"]);
+    gate_text(
         &cluster,
-        &sections(
-            "-- test multi-line headers, wrapping, and newline indicators",
-            "-- expanded output with short-width columns",
+        &format!(
+            "psql.sql:{} vs psql.out:{} ({} …, without \\d <sequence>)",
+            run.sql_line, run.out_line, run.header
         ),
+        &sql,
+        &expected,
+        // The support table, so that C psql can make it again.
+        Some("drop table psql_serial_tab;\n"),
     );
 }
 
@@ -445,37 +463,42 @@ fn every_document_format_block_matches_psql_out() {
     }
 }
 
-/// The same six sections live, from each one's `prepare q as` on, with
-/// `-- special cases` and `-- illegal csv separators` after csv's and then
-/// `-- check ambiguous format requests` (`psql.sql:879`), all against one
-/// cluster.
+/// The same six sections live, with `-- special cases` and `-- illegal csv
+/// separators` after csv's and then `-- check ambiguous format requests`
+/// (`psql.sql:879`), all against one cluster: each prints `\df exp` under
+/// `tuples_only`, normal and expanded, in its format, then `q`.
 ///
-/// Each section's head (`\d psql_serial_tab_id_seq`, `\df exp`) needs
-/// `\d` (NAT-401), so the gate starts at `prepare q as` with the one piece
-/// of state the head leaves that the tail depends on, `\pset format`, set
-/// by a preamble.
+/// Each section also prints `\d psql_serial_tab_id_seq` twice. That is
+/// `describeTableDetails`, a later NAT-401 slice, and nothing else reads what
+/// it prints, so those lines are cut from both files ([`without`]).
 #[test]
 fn the_document_format_sections_run_live() {
     let Some(cluster) = Cluster::start(DOCUMENT_FORMAT_SECTIONS_PORT) else {
         return;
     };
-    for (header, format) in [
-        ("-- test asciidoc output format", "asciidoc"),
-        ("-- test csv output format", "csv"),
-        ("-- test html output format", "html"),
-        ("-- test latex output format", "latex"),
-        ("-- test latex-longtable output format", "latex-longtable"),
-        ("-- test troff-ms output format", "troff-ms"),
+    for header in [
+        "-- test asciidoc output format",
+        "-- test csv output format",
+        "-- test html output format",
+        "-- test latex output format",
+        "-- test latex-longtable output format",
+        "-- test troff-ms output format",
     ] {
-        let whole = if format == "csv" {
+        let whole = if header == "-- test csv output format" {
             sections(header, "-- illegal csv separators")
         } else {
             section(header)
         };
-        gate_script(
+        let (sql, expected) = without(&whole, &["\\d psql_serial_tab_id_seq"]);
+        gate_text(
             &cluster,
-            &tail(&whole, "prepare q as"),
-            &format!("\\pset format {format}\n"),
+            &format!(
+                "psql.sql:{} vs psql.out:{} ({}, without \\d <sequence>)",
+                whole.sql_line, whole.out_line, whole.header
+            ),
+            &sql,
+            &expected,
+            None,
         );
     }
     gate_section(&cluster, &section("-- check ambiguous format requests"));
@@ -821,6 +844,105 @@ fn the_partition_and_access_method_listings_match_c_psql() {
         drop schema s2 cascade;\n\
         \\dP\n";
     diff_against_c_psql(&cluster, "partition and access method listings", script);
+}
+
+/// `-- check \dconfig`, `-- check \df, \do with argument specifications`
+/// and `-- check \df+` (`psql.sql:1350`, `:1356`, `:1370`), live: `\dconfig`
+/// with and without `+`, `\df` with argument-type patterns (a wildcard, a
+/// schema-qualified type, an array type, `-` for "no such argument"),
+/// `\dfa`, `\do` with one argument type and with two, and `\df+` over
+/// three functions a fresh role owns, in one transaction the section rolls
+/// back. The last section drops its role again, so C psql starts where
+/// rpsql did.
+#[test]
+fn the_dconfig_df_and_do_sections_run_live() {
+    let Some(cluster) = Cluster::start(FUNCTIONS_AND_OPERATORS_PORT) else {
+        return;
+    };
+    gate_section(&cluster, &sections("-- check \\dconfig", "-- check \\df+"));
+}
+
+/// `\da`, `\df`, `\dT`, `\do` and `\dconfig` beyond what `psql.sql`
+/// exercises, against C psql, with `ECHO_HIDDEN` on so each catalog query is
+/// compared byte for byte: every `\df` kind letter alone and mixed, `S`, `+`
+/// and `x`; argument patterns past the first, `-`, and the type names
+/// `map_typename_pattern` rewrites; `\dT` with `+` over an enum (its
+/// elements one per line), a composite and a domain, with and without `[]`;
+/// `\do` with no, one, two and three argument types and `+`; `\dconfig`
+/// with no pattern, a qualified one and `+`; and the refusals: a letter
+/// `\df` does not take, too many dots, another database.
+#[test]
+fn the_function_type_and_operator_listings_match_c_psql() {
+    let Some(cluster) = Cluster::start(FUNCTION_TYPE_OPERATOR_LISTINGS_PORT) else {
+        return;
+    };
+    let script = "\\set QUIET off\n\
+        create schema s3;\n\
+        create type s3.mood as enum ('sad', 'ok', 'happy');\n\
+        create type s3.pair as (a int, b text);\n\
+        create domain s3.posint as int check (value > 0);\n\
+        comment on type s3.mood is 'how it feels';\n\
+        create function s3.f(int, s3.mood) returns int language sql as 'select $1';\n\
+        create function s3.trig() returns trigger language plpgsql as 'begin return null; end';\n\
+        create procedure s3.p(int) language sql as 'select 1';\n\
+        create aggregate s3.mysum(int) (sfunc = int4pl, stype = int);\n\
+        create function s3.w() returns int window language internal as 'window_row_number';\n\
+        create operator s3.=== (leftarg = int, rightarg = s3.mood, function = s3.f);\n\
+        create operator s3.!!! (rightarg = int, function = int4um);\n\
+        set work_mem = 20480;\n\
+        \\set ECHO_HIDDEN on\n\
+        \\da\n\
+        \\da s3.*\n\
+        \\daS sum\n\
+        \\df\n\
+        \\df+ s3.*\n\
+        \\dfa s3.*\n\
+        \\dfn s3.*\n\
+        \\dfp\n\
+        \\dft\n\
+        \\dfw s3.*\n\
+        \\dfnt s3.*\n\
+        \\dfap s3.*\n\
+        \\dfx s3.f\n\
+        \\dfS int4pl\n\
+        \\df s3.f int s3.mood\n\
+        \\df s3.f integer -;\n\
+        \\df int4pl int int\n\
+        \\df array_* INT[] -\n\
+        \\df numeric decimal\n\
+        \\dT\n\
+        \\dT+ s3.*\n\
+        \\dTS int4\n\
+        \\dT float\n\
+        \\dT pg_catalog.int4[]\n\
+        \\dT varchar[]\n\
+        \\dT+ s3.pair\n\
+        \\do\n\
+        \\do+ s3.*\n\
+        \\do s3.=== int\n\
+        \\do s3.=== int s3.mood\n\
+        \\do s3.!!! - int\n\
+        \\do s3.!!! int\n\
+        \\do + int int extra\n\
+        \\doS ~~\n\
+        \\dconfig\n\
+        \\dconfig+\n\
+        \\dconfig work_*\n\
+        \\dconfig+ s.work_mem\n\
+        \\dconfigx+ WORK_MEM\n\
+        \\set ECHO_HIDDEN off\n\
+        \\dfz\n\
+        \\dfnq s3.*\n\
+        \\df a.b.c.d\n\
+        \\df postgres.s3.f\n\
+        \\da a.b.c.d\n\
+        \\dT nonesuch.s3.mood\n\
+        \\do a.b.c.d\n\
+        \\df s3.f a.b.c.d\n\
+        reset work_mem;\n\
+        set client_min_messages = warning;\n\
+        drop schema s3 cascade;\n";
+    diff_against_c_psql(&cluster, "function, type and operator listings", script);
 }
 
 /// A script `psql.out` has no expected output for: rpsql must render all of

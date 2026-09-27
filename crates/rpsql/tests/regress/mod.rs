@@ -240,13 +240,17 @@ pub fn head(section: &Section<'static>, line: &str) -> Section<'static> {
 
 /// `section` with some of its input lines taken out, as owned text: each
 /// line equal to one of `commands` leaves the script, and leaves the
-/// expected output together with what it printed, through the empty line
-/// that ends a printed table. It is for a section that mixes commands this
-/// port has with ones a later slice brings, when the ones it has do not
-/// depend on the others: the rest of the section is still gated whole.
+/// expected output together with what it printed, up to the echo of the
+/// next input line. It is for a section that mixes commands this port has
+/// with ones a later slice brings, when the ones it has do not depend on the
+/// others: the rest of the section is still gated whole.
+///
+/// `-a` echoes every input line but an empty one (`mainloop.c:222`), so the
+/// echoes split `psql.out` into each line's output, whatever the format —
+/// unaligned output has no empty line to end a table.
 ///
 /// # Panics
-/// When a command is not in the section, or its output has no end.
+/// When a command is not in the section, or an input line has no echo.
 pub fn without(section: &Section<'_>, commands: &[&str]) -> (String, String) {
     let is_cut = |line: &str| commands.contains(&line.trim_end_matches('\n'));
     let sql: String = section
@@ -256,30 +260,33 @@ pub fn without(section: &Section<'_>, commands: &[&str]) -> (String, String) {
         .collect();
 
     let mut expected = String::new();
+    let mut out = section.expected.split_inclusive('\n');
+    // Whether the output being read belongs to a cut line.
+    let mut cutting = false;
     let mut cut = 0;
-    let mut lines = section.expected.split_inclusive('\n');
-    while let Some(line) = lines.next() {
-        if is_cut(line) {
+    for input in section.sql.split_inclusive('\n').filter(|l| *l != "\n") {
+        loop {
+            let line = out
+                .next()
+                .unwrap_or_else(|| panic!("{:?}: no echo of {input:?}", section.header));
+            if line == input {
+                break;
+            }
+            if !cutting {
+                expected.push_str(line);
+            }
+        }
+        cutting = is_cut(input);
+        if cutting {
             cut += 1;
-            assert!(
-                lines.any(|l| l == "\n"),
-                "{:?}: the output of {line:?} has no end",
-                section.header
-            );
         } else {
-            expected.push_str(line);
+            expected.push_str(input);
         }
     }
-    let wanted = section
-        .sql
-        .split_inclusive('\n')
-        .filter(|l| is_cut(l))
-        .count();
-    assert!(
-        wanted > 0 && cut == wanted,
-        "{:?}: cut {cut} of {wanted} lines naming {commands:?}",
-        section.header
-    );
+    if !cutting {
+        expected.extend(out);
+    }
+    assert!(cut > 0, "{:?}: no line naming {commands:?}", section.header);
     (sql, expected)
 }
 

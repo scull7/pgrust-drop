@@ -19,6 +19,13 @@ path = "src/lib.rs"
 name = "pgdrop"
 path = "src/main.rs"
 
+# NAT-410: startup time and binary size. `harness = false`: it prints a
+# report rather than running tests. CI runs it with `cargo test --bench
+# startup`, which builds it in the test (dev) profile it measures.
+[[bench]]
+name = "startup"
+harness = false
+
 [dependencies]
 usage = { workspace = true }
 rinitdb = { workspace = true }

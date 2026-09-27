@@ -30,6 +30,7 @@ use crate::encoding::Encoding;
 use crate::error::ConnError;
 use crate::escape::{self, EscapeError, EscapedString};
 use crate::extended::{self, ArgumentError, Params, Plan, TypedCommand};
+use crate::lobj::LoFuncs;
 use crate::message::{
     Backend, Frame, Frontend, PROTOCOL_VERSION_3_0, ProtocolError, Target, TransactionStatus,
     next_copy_frame, next_frame,
@@ -499,6 +500,9 @@ pub struct Connection<S = Stream> {
     /// was opened (`fe-connect.c:3249`), so nothing the peer does later
     /// changes it. `None` for a stream [`Connection::start_up`] was handed.
     raddr: Option<Peer>,
+    /// `conn->lobjfuncs`: the large-object function OIDs, looked up by the
+    /// first `lo_*` call (`lo_initialize`, `fe-lobj.c:843`).
+    pub(crate) lobjfuncs: Option<LoFuncs>,
 }
 
 impl Connection<Stream> {
@@ -602,6 +606,7 @@ impl<S: Read + Write> Connection<S> {
             notifications: Vec::new(),
             trace: None,
             raddr: None,
+            lobjfuncs: None,
         };
 
         loop {
@@ -1508,6 +1513,116 @@ impl<S: Read + Write> Connection<S> {
         query.extend_from_slice(encoding);
         query.push(b'\'');
         Ok(self.exec(&query)?.pop())
+    }
+}
+
+/// What `PQfn` hands back: the PGresult, COMMAND_OK or FATAL_ERROR, and
+/// the function's value (`result_buf` and `*result_len`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnResult {
+    pub result: QueryResult,
+    /// The FunctionCallResponse's bytes, in network order. `None` for a
+    /// NULL result, and when no FunctionCallResponse arrived.
+    pub value: Option<Vec<u8>>,
+}
+
+impl<S: Read + Write> Connection<S> {
+    /// `PQfn`, `fe-exec.c:2997`: call the function whose OID is `fnid`
+    /// through the fast-path interface, every argument and the result in
+    /// binary. `None` in `args` is SQL NULL.
+    ///
+    /// The result is COMMAND_OK when a value came back, or the server's
+    /// error as FATAL_ERROR; a ReadyForQuery with neither is libpq's own
+    /// "protocol error: no function result" (`fe-protocol3.c:2361`).
+    ///
+    /// # Errors
+    /// In pipeline mode or while another command runs (nothing is sent),
+    /// the connection broke, or the server's reply broke the protocol.
+    pub fn fn_call(
+        &mut self,
+        fnid: u32,
+        args: &[Option<&[u8]>],
+    ) -> Result<FnResult, ConnectionError> {
+        self.nfn(fnid, args, None)
+    }
+
+    /// `PQnfn`, `fe-exec.c:3016`, and `pqFunctionCall3`,
+    /// `fe-protocol3.c:2165`: [`Connection::fn_call`], refusing a value
+    /// longer than `buf_size` as "server returned too much data".
+    pub(crate) fn nfn(
+        &mut self,
+        fnid: u32,
+        args: &[Option<&[u8]>],
+        buf_size: Option<usize>,
+    ) -> Result<FnResult, ConnectionError> {
+        self.state.begin_fn()?;
+        self.put_message(&Frontend::FunctionCall {
+            fnid,
+            args: args.iter().map(|arg| arg.map(<[u8]>::to_vec)).collect(),
+        });
+        self.flush()?;
+
+        let mut value = None;
+        let mut status = ExecStatus::FatalError;
+        let mut error = None;
+        loop {
+            let (id, body) = match next_frame(&self.inbuf[self.start..]) {
+                Frame::Incomplete => {
+                    self.read_more()?;
+                    continue;
+                }
+                Frame::SyncLoss { id, length } => {
+                    return Err(ProtocolError::LostSynchronization { id, length }.into());
+                }
+                Frame::Message { id, body } => (id, body),
+            };
+            // fe-protocol3.c:2301 — checked before the value is consumed.
+            if id == b'V'
+                && let Some(limit) = buf_size
+                && body.len().saturating_sub(4) > limit
+            {
+                return Err(ProtocolError::TooMuchData.into());
+            }
+            // fe-protocol3.c:2283 — V or E is the answer, N, A and S may come
+            // first, and the final Z must be swallowed before returning.
+            match self.parse_frame(id, body)? {
+                Backend::FunctionCallResponse(v) => {
+                    value = v;
+                    status = ExecStatus::CommandOk;
+                }
+                // pqGetErrorNotice3(conn, true) — the error replaces any
+                // result being built.
+                Backend::ErrorResponse(fields) => {
+                    error = Some(QueryResult::with_error(ExecStatus::FatalError, fields));
+                    status = ExecStatus::FatalError;
+                }
+                Backend::NotificationResponse {
+                    pid,
+                    channel,
+                    payload,
+                } => self.notifications.push((pid, channel, payload)),
+                Backend::NoticeResponse(notice) => self.notices.push(notice),
+                Backend::ParameterStatus { name, value } => self.parameters.push((name, value)),
+                Backend::ReadyForQuery(xact) => {
+                    self.transaction_status = xact;
+                    // fe-protocol3.c:2348 — a result already made (the
+                    // error) wins; otherwise COMMAND_OK if a value came.
+                    let result = match error {
+                        Some(result) => result,
+                        None if status == ExecStatus::CommandOk => QueryResult::new(status),
+                        None => QueryResult::with_error(
+                            ExecStatus::FatalError,
+                            ResultError::new(vec![(
+                                crate::result::diag::MESSAGE_PRIMARY,
+                                b"protocol error: no function result".to_vec(),
+                            )]),
+                        ),
+                    };
+                    return Ok(FnResult { result, value });
+                }
+                _ => return Err(ProtocolError::FunctionCallProtocol(id).into()),
+            }
+        }
     }
 }
 
@@ -2767,5 +2882,133 @@ mod tests {
         // 128 < 28 + 101: one byte too many for qbuf.
         assert!(conn.set_client_encoding(&[b'x'; 101]).unwrap().is_none());
         assert_eq!(conn.stream.to_server.len(), sent);
+    }
+
+    fn function_result(value: Option<&[u8]>) -> Vec<u8> {
+        let mut body = match value {
+            Some(v) => i32::try_from(v.len()).unwrap().to_be_bytes().to_vec(),
+            None => (-1i32).to_be_bytes().to_vec(),
+        };
+        body.extend_from_slice(value.unwrap_or_default());
+        message(b'V', &body)
+    }
+
+    fn fn_conn(reply: Vec<u8>) -> Connection<Scripted> {
+        let mut script = auth_ok();
+        script.extend(ready(b'I'));
+        script.extend(reply);
+        Connection::start_up(Scripted::new(script), &conninfo("user=alice"), &[0; 18]).unwrap()
+    }
+
+    /// `pqFunctionCall3`, `fe-protocol3.c:2165`: one FunctionCall out; a
+    /// notice and a notification before the value are dealt with as they
+    /// come, and the ReadyForQuery is swallowed before returning.
+    #[test]
+    fn a_function_call_returns_its_value_after_the_messages_before_it() {
+        let mut reply = message(b'N', b"SNOTICE\0Mhello\0\0");
+        let mut notify = 7i32.to_be_bytes().to_vec();
+        notify.extend_from_slice(b"chan\0payload\0");
+        reply.extend(message(b'A', &notify));
+        reply.extend(function_result(Some(&3i32.to_be_bytes())));
+        reply.extend(ready(b'T'));
+        let mut conn = fn_conn(reply);
+        let sent = conn.stream.to_server.len();
+
+        let call = conn
+            .fn_call(952, &[Some(&42u32.to_be_bytes()), None])
+            .unwrap();
+        assert_eq!(call.result.status(), ExecStatus::CommandOk);
+        assert_eq!(call.value, Some(3i32.to_be_bytes().to_vec()));
+        assert_eq!(conn.notices().len(), 1);
+        assert_eq!(
+            conn.notifications(),
+            [(7, b"chan".to_vec(), b"payload".to_vec())]
+        );
+        assert_eq!(conn.transaction_status(), TransactionStatus::InTransaction);
+        assert_eq!(
+            conn.stream.to_server[sent..],
+            Frontend::FunctionCall {
+                fnid: 952,
+                args: vec![Some(42u32.to_be_bytes().to_vec()), None],
+            }
+            .encode()
+        );
+    }
+
+    /// `fe-protocol3.c:2320` and `:2348`: an ErrorResponse is the result.
+    #[test]
+    fn a_refused_function_call_is_a_fatal_error_result() {
+        let mut reply = message(b'E', b"SERROR\0C42704\0Mlarge object 42 does not exist\0\0");
+        reply.extend(ready(b'E'));
+        let mut conn = fn_conn(reply);
+        let call = conn.fn_call(952, &[]).unwrap();
+        assert_eq!(call.result.status(), ExecStatus::FatalError);
+        assert_eq!(call.value, None);
+        assert_eq!(
+            call.result.error_message(),
+            b"ERROR:  large object 42 does not exist\n"
+        );
+        assert_eq!(conn.transaction_status(), TransactionStatus::InError);
+    }
+
+    /// `fe-protocol3.c:2361`: a ReadyForQuery with no value and no error.
+    #[test]
+    fn a_ready_for_query_without_a_value_is_no_function_result() {
+        let mut conn = fn_conn(ready(b'I'));
+        let call = conn.fn_call(952, &[]).unwrap();
+        assert_eq!(call.result.status(), ExecStatus::FatalError);
+        assert_eq!(
+            call.result.error_message(),
+            b"protocol error: no function result\n"
+        );
+    }
+
+    /// A NULL result is a -1 length and still COMMAND_OK.
+    #[test]
+    fn a_null_function_result_is_command_ok_without_a_value() {
+        let mut reply = function_result(None);
+        reply.extend(ready(b'I'));
+        let mut conn = fn_conn(reply);
+        let call = conn.fn_call(952, &[]).unwrap();
+        assert_eq!(call.result.status(), ExecStatus::CommandOk);
+        assert_eq!(call.value, None);
+    }
+
+    /// `PQnfn`'s buffer check, `fe-protocol3.c:2306`, and the `default`
+    /// case, `:2373`.
+    #[test]
+    fn too_much_data_and_a_stray_message_break_the_call() {
+        let mut reply = function_result(Some(b"abcde"));
+        reply.extend(ready(b'I'));
+        let mut conn = fn_conn(reply);
+        let err = conn.nfn(954, &[], Some(4)).unwrap_err();
+        assert_eq!(err.message(), b"server returned too much data");
+
+        let mut reply = message(b'C', b"SELECT 1\0");
+        reply.extend(ready(b'I'));
+        let mut conn = fn_conn(reply);
+        let err = conn.fn_call(952, &[]).unwrap_err();
+        assert_eq!(err.message(), b"protocol error: id=0x43");
+    }
+
+    /// `PQnfn`'s refusals, `fe-exec.c:3032`-`:3043`: nothing is sent.
+    #[test]
+    fn a_function_call_is_refused_in_pipeline_mode_and_mid_command() {
+        let mut conn = fn_conn(Vec::new());
+        let sent = conn.stream.to_server.len();
+        conn.enter_pipeline_mode().unwrap();
+        assert_eq!(
+            conn.fn_call(952, &[]).unwrap_err().message(),
+            b"PQfn not allowed in pipeline mode"
+        );
+        conn.exit_pipeline_mode().unwrap();
+        conn.send_query(b"select 1").unwrap();
+        let sent_query = conn.stream.to_server.len();
+        assert!(sent_query > sent);
+        assert_eq!(
+            conn.fn_call(952, &[]).unwrap_err().message(),
+            b"connection in wrong state"
+        );
+        assert_eq!(conn.stream.to_server.len(), sent_query);
     }
 }

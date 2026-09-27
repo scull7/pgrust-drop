@@ -49,7 +49,7 @@ use std::process::ExitCode;
 use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
 use crate::command::{CommandResult, dispatch_slash};
-use crate::common::{ErrorMessage, Executor, send_query};
+use crate::common::{ErrorMessage, Executor, LogLevel, log_prefix, send_query};
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
@@ -323,34 +323,52 @@ fn run_action(
                 EXIT_SUCCESS
             }
         }
-        // `ACT_FILE` (`startup.c:418`): `None` is stdin.
+        // `ACT_FILE` (`startup.c:418`) and `process_file()` (`command.c:4920`):
+        // `None` is stdin with no file name, and `-` is stdin by the name
+        // `<stdin>`.
         Action::File(name) => {
-            let read = if let Some(name) = name {
-                std::fs::read(name).map_err(|err| format!("{name}: {err}"))
-            } else {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
-                    .map(|_| bytes)
-                    .map_err(|err| err.to_string())
+            let (read, inputfile) = match name.as_deref() {
+                Some("-") | None => {
+                    let mut bytes = Vec::new();
+                    let read = std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                        .map(|_| bytes)
+                        .map_err(|err| err.to_string());
+                    (read, name.as_ref().map(|_| "<stdin>".to_string()))
+                }
+                Some(name) => (
+                    std::fs::read(name).map_err(|err| format!("{name}: {err}")),
+                    Some(name.to_string()),
+                ),
             };
             let input = match read {
                 Ok(bytes) => bytes,
                 Err(message) => {
-                    let _ = writeln!(stderr, "psql: error: {message}");
+                    let _ = writeln!(
+                        stderr,
+                        "{}{message}",
+                        log_prefix(&session.pset, LogLevel::Error)
+                    );
                     return EXIT_FAILURE;
                 }
             };
+            // `command.c:4967`-`:4979`: name the file in every message while
+            // it runs, terse when there is none, and restore both after.
+            let outer = std::mem::replace(&mut session.pset.inputfile, inputfile);
+            session.pset.log_terse = session.pset.inputfile.is_none();
             let mut loop_session = LoopSession {
                 pset: &mut session.pset,
                 vars: &mut session.vars,
             };
-            main_loop(
+            let code = main_loop(
                 &mut Lines::new(&input),
                 &mut loop_session,
                 executor,
                 stdout,
                 stderr,
-            )
+            );
+            session.pset.inputfile = outer;
+            session.pset.log_terse = session.pset.inputfile.is_none();
+            code
         }
     }
 }

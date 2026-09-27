@@ -12,6 +12,47 @@ use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 use crate::print::print_query;
 use crate::settings::{Echo, PsqlSettings};
 
+/// A `pg_log_*` level psql reports at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// `pg_log_error`
+    Error,
+    /// `pg_log_warning`
+    Warning,
+}
+
+/// What `pg_log_generic_v()` (`logging.c:219`) writes before a message, with
+/// psql's locus callback (`startup.c:99`) naming the script being read.
+///
+/// Reading a file, that is `psql:<file>:<line>: error: `. Reading stdin with
+/// no `-f` (`process_file(NULL)`, `command.c:4970`) the logging is terse and
+/// there is no file, so there is no prefix at all: that is why `psql.out`
+/// shows `\pset: …` bare. Outside the main loop it is `psql: error: `.
+#[must_use]
+pub fn log_prefix(pset: &PsqlSettings, level: LogLevel) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !pset.log_terse || pset.inputfile.is_some() {
+        if !pset.log_terse {
+            let _ = write!(out, "{}:", pset.progname);
+        }
+        if let Some(file) = &pset.inputfile {
+            let _ = write!(out, "{file}:");
+            if pset.lineno > 0 {
+                let _ = write!(out, "{}:", pset.lineno);
+            }
+        }
+        out.push(' ');
+    }
+    if !pset.log_terse {
+        out.push_str(match level {
+            LogLevel::Error => "error: ",
+            LogLevel::Warning => "warning: ",
+        });
+    }
+    out
+}
+
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
 ///
 /// `PQerrorMessage()` hands back a `char *` that psql writes with `%s`, so a
@@ -151,7 +192,7 @@ pub fn send_query(
                         let _ = stdout.write_all(&text);
                     }
                     Err(err) => {
-                        let _ = writeln!(stderr, "psql: error: {err}");
+                        let _ = writeln!(stderr, "{}{err}", log_prefix(pset, LogLevel::Error));
                         ok = false;
                     }
                 }

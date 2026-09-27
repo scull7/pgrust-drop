@@ -403,6 +403,11 @@ pub struct PsqlSettings {
     pub inputfile: Option<String>,
     /// `lineno`
     pub lineno: u64,
+    /// `PG_LOG_FLAG_TERSE` in `logging.c`'s `log_flags`: no program name and
+    /// no level in a message. `process_file` sets it while reading stdin
+    /// without `-f` (`command.c:4970`). It is `pg_logging`'s one piece of
+    /// state psql changes, so it lives here beside `inputfile`.
+    pub log_terse: bool,
     /// `stmt_lineno`: line number inside the current statement.
     pub stmt_lineno: u64,
     /// `timing`
@@ -470,6 +475,7 @@ impl Default for PsqlSettings {
             progname: "psql".to_string(),
             inputfile: None,
             lineno: 0,
+            log_terse: false,
             stmt_lineno: 1,
             timing: false,
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.

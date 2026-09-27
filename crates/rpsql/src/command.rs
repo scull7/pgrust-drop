@@ -10,6 +10,7 @@
 
 use std::io::Write;
 
+use crate::common::{LogLevel, log_prefix};
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::PsqlSettings;
 use crate::slash::SlashOption;
@@ -108,7 +109,8 @@ pub fn dispatch_slash(
     if matches!(status, CommandResult::Connect(_)) {
         let _ = writeln!(
             stderr,
-            "psql: error: \\connect is not implemented yet (Linear NAT-405)"
+            "{}\\connect is not implemented yet (Linear NAT-405)",
+            log_prefix(pset, LogLevel::Error)
         );
         return CommandResult::Error;
     }
@@ -131,7 +133,11 @@ pub fn handle_slash_cmds(
     let status = exec_command(&cmd, &options, ctx, stdout, stderr);
 
     let status = if status == CommandResult::Unknown {
-        let _ = writeln!(stderr, "psql: error: invalid command \\{cmd}");
+        let _ = writeln!(
+            stderr,
+            "{}invalid command \\{cmd}",
+            log_prefix(ctx.pset, LogLevel::Error)
+        );
         CommandResult::Error
     } else {
         status
@@ -144,7 +150,8 @@ pub fn handle_slash_cmds(
         for extra in extra_arguments(&cmd, &options) {
             let _ = writeln!(
                 stderr,
-                "psql: warning: \\{cmd}: extra argument \"{extra}\" ignored"
+                "{}\\{cmd}: extra argument \"{extra}\" ignored",
+                log_prefix(ctx.pset, LogLevel::Warning)
             );
         }
     }
@@ -196,13 +203,22 @@ fn exec_command(
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
-                let _ = writeln!(stderr, "psql: error: \\unset: missing required argument");
+                let _ = writeln!(
+                    stderr,
+                    "{}\\unset: missing required argument",
+                    log_prefix(ctx.pset, LogLevel::Error)
+                );
                 return CommandResult::Error;
             };
             match ctx.vars.delete(&name.value) {
                 Ok(()) => CommandResult::SkipLine,
                 Err(err) => {
-                    let _ = writeln!(stderr, "psql: error: {}", err.message);
+                    let _ = writeln!(
+                        stderr,
+                        "{}{}",
+                        log_prefix(ctx.pset, LogLevel::Error),
+                        err.message
+                    );
                     CommandResult::Error
                 }
             }
@@ -259,7 +275,7 @@ fn exec_command_pset(
             CommandResult::SkipLine
         }
         Err(err) => {
-            let _ = writeln!(stderr, "psql: error: {err}");
+            let _ = writeln!(stderr, "{}{err}", log_prefix(ctx.pset, LogLevel::Error));
             CommandResult::Error
         }
     }
@@ -282,7 +298,12 @@ fn exec_command_set(
     match ctx.vars.set(&name.value, Some(&value)) {
         Ok(()) => CommandResult::SkipLine,
         Err(err) => {
-            let _ = writeln!(stderr, "psql: error: {}", err.message);
+            let _ = writeln!(
+                stderr,
+                "{}{}",
+                log_prefix(ctx.pset, LogLevel::Error),
+                err.message
+            );
             CommandResult::Error
         }
     }

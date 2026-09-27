@@ -22,8 +22,12 @@
 //! [`list_default_acls_query`], `\ddp`; [`describe_roles_query`], `\du` and
 //! `\dg`; [`list_db_role_settings_query`], `\drds`;
 //! [`describe_role_grants_query`], `\drg`) and [`list_domains_query`],
-//! `\dD`. Every other command the switch recognizes is refused by name until
-//! its slice lands.
+//! `\dD`; and slice 5's publications, subscriptions and extensions
+//! ([`list_publications_query`], `\dRp`; [`describe_publications_query`],
+//! `\dRp+`; [`describe_subscriptions_query`], `\dRs`;
+//! [`list_extensions_query`], `\dx`; [`list_extension_contents_query`],
+//! `\dx+`). Every other command the switch recognizes is refused by name
+//! until its slice lands.
 //!
 //! Queries are built as `String`: a pattern arrives as a slash option, which
 //! the lexer has already made UTF-8. That is also why the multibyte steps of
@@ -75,6 +79,14 @@ pub enum DescribeCommand {
     RoleGrants,
     /// `listDomains()` (`describe.c:4552`): `\dD`.
     Domains,
+    /// `listPublications()` (`describe.c:6400`): `\dRp`, and with `+`
+    /// `describePublications()` (`describe.c:6531`).
+    Publications,
+    /// `describeSubscriptions()` (`describe.c:6746`): `\dRs`.
+    Subscriptions,
+    /// `listExtensions()` (`describe.c:6182`): `\dx`, and with `+`
+    /// `listExtensionContents()` (`describe.c:6236`).
+    Extensions,
     /// A command the switch recognizes whose port has not landed yet; the
     /// name is its `describe.c` function.
     NotYet(&'static str),
@@ -162,8 +174,8 @@ impl DescribeCommand {
                 _ => None,
             },
             b'R' => match at(2) {
-                b'p' => not_yet("describePublications"),
-                b's' => not_yet("describeSubscriptions"),
+                b'p' => Some(Self::Publications),
+                b's' => Some(Self::Subscriptions),
                 _ => None,
             },
             b'F' => match at(2) {
@@ -180,7 +192,7 @@ impl DescribeCommand {
                 b't' => not_yet("listForeignTables"),
                 _ => None,
             },
-            b'x' => not_yet("listExtensions"),
+            b'x' => Some(Self::Extensions),
             b'X' => not_yet("listExtendedStats"),
             b'y' => not_yet("listEventTriggers"),
             _ => None,
@@ -2418,6 +2430,452 @@ pub fn list_domains_query(
     Ok(buf)
 }
 
+/// The query half of `listExtensions()` (`describe.c:6182`-`:6214`), for
+/// `\dx`, whose title is "List of installed extensions".
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_extensions_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from(concat!(
+        "SELECT e.extname AS \"Name\", ",
+        "e.extversion AS \"Version\", ae.default_version AS \"Default version\",",
+        "n.nspname AS \"Schema\", d.description AS \"Description\"\n",
+        "FROM pg_catalog.pg_extension e ",
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace ",
+        "LEFT JOIN pg_catalog.pg_description d ON d.objoid = e.oid ",
+        "AND d.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass ",
+        "LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ",
+        "ON ae.name = e.extname\n",
+    ));
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("e.extname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The query half of `listExtensionContents()` (`describe.c:6236`-`:6257`),
+/// for `\dx+`: each matching extension's name and OID, whose contents
+/// [`list_one_extension_contents_query`] then lists.
+///
+/// # Errors
+/// The pattern failed `validateSQLNamePattern`.
+pub fn list_extension_contents_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, PatternError> {
+    let mut buf = String::from("SELECT e.extname, e.oid\nFROM pg_catalog.pg_extension e\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("e.extname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// What `listExtensionContents()` logs, when not quiet, for no extension at
+/// all (`describe.c:6264`-`:6273`).
+#[must_use]
+pub fn extensions_not_found(pattern: Option<&str>) -> String {
+    match pattern {
+        Some(pattern) => format!("Did not find any extension named \"{pattern}\"."),
+        None => "Did not find any extensions.".to_string(),
+    }
+}
+
+/// The query of `listOneExtensionContents()` (`describe.c:6303`):
+/// the objects that depend on extension `oid` as its members. `oid` is
+/// pasted in as the server sent it, as upstream does.
+#[must_use]
+pub fn list_one_extension_contents_query(oid: &str) -> String {
+    format!(
+        "SELECT pg_catalog.pg_describe_object(classid, objid, 0) AS \"Object description\"\n\
+         FROM pg_catalog.pg_depend\n\
+         WHERE refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass \
+         AND refobjid = '{oid}' AND deptype = 'e'\n\
+         ORDER BY 1;"
+    )
+}
+
+/// `listOneExtensionContents()`'s title (`describe.c:6325`).
+#[must_use]
+pub fn extension_contents_title(extname: &str) -> String {
+    format!("Objects in extension \"{extname}\"")
+}
+
+/// `PUBLISH_GENCOLS_NONE` and `PUBLISH_GENCOLS_STORED`
+/// (`pg_publication.h:118`, `:121`), as `listPublications()` and
+/// `describePublications()` spell them into their queries.
+const PUBLISH_GENCOLS_CASE: &str = "(CASE pubgencols\n    \
+                                    WHEN 'n' THEN 'none'\n    \
+                                    WHEN 's' THEN 'stored'\n   \
+                                    END) AS \"Generated columns\"";
+
+/// The message `listPublications()` and `describePublications()` log for a
+/// server before 10 (`describe.c:6411`, `:6547`), which `\dRs` shares with
+/// "subscriptions" (`:6759`).
+fn does_not_support(sversion: i32, what: &str) -> Refusal {
+    Refusal::ServerTooOld(format!(
+        "The server (version {}) does not support {what}.",
+        format_pg_version_number(sversion, false)
+    ))
+}
+
+/// The query half of `listPublications()` (`describe.c:6400`-`:6462`), for
+/// `\dRp`, whose title is "List of publications".
+///
+/// # Errors
+/// A server before 10, or a pattern that failed `validateSQLNamePattern`.
+pub fn list_publications_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    if server.sversion < 100_000 {
+        return Err(does_not_support(server.sversion, "publications"));
+    }
+    let mut buf = String::from(concat!(
+        "SELECT pubname AS \"Name\",\n",
+        "  pg_catalog.pg_get_userbyid(pubowner) AS \"Owner\",\n",
+        "  puballtables AS \"All tables\",\n",
+        "  pubinsert AS \"Inserts\",\n",
+        "  pubupdate AS \"Updates\",\n",
+        "  pubdelete AS \"Deletes\"",
+    ));
+    if server.sversion >= 110_000 {
+        buf.push_str(",\n  pubtruncate AS \"Truncates\"");
+    }
+    if server.sversion >= 180_000 {
+        buf.push_str(",\n ");
+        buf.push_str(PUBLISH_GENCOLS_CASE);
+    }
+    if server.sversion >= 130_000 {
+        buf.push_str(",\n  pubviaroot AS \"Via root\"");
+    }
+    buf.push_str("\nFROM pg_catalog.pg_publication\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("pubname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
+/// The query half of `describePublications()` (`describe.c:6531`-`:6602`),
+/// for `\dRp+`: one row per publication, whose columns
+/// [`describe_publication_table`] reads by position. A server that predates
+/// a column gets a constant in its place, so the positions never move.
+///
+/// # Errors
+/// A server before 10, or a pattern that failed `validateSQLNamePattern`.
+pub fn describe_publications_query(
+    pattern: Option<&str>,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    if server.sversion < 100_000 {
+        return Err(does_not_support(server.sversion, "publications"));
+    }
+    let mut buf = String::from(concat!(
+        "SELECT oid, pubname,\n",
+        "  pg_catalog.pg_get_userbyid(pubowner) AS owner,\n",
+        "  puballtables, pubinsert, pubupdate, pubdelete",
+    ));
+    buf.push_str(if server.sversion >= 110_000 {
+        ", pubtruncate"
+    } else {
+        ", false AS pubtruncate"
+    });
+    if server.sversion >= 180_000 {
+        buf.push_str(", ");
+        buf.push_str(PUBLISH_GENCOLS_CASE);
+        buf.push('\n');
+    } else {
+        buf.push_str(", 'none' AS pubgencols");
+    }
+    buf.push_str(if server.sversion >= 130_000 {
+        ", pubviaroot"
+    } else {
+        ", false AS pubviaroot"
+    });
+    buf.push_str("\nFROM pg_catalog.pg_publication\n");
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        false,
+        false,
+        PatternVars {
+            namevar: Some("pubname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 2;");
+    Ok(buf)
+}
+
+/// What `describePublications()` logs, when not quiet, for no publication
+/// at all (`describe.c:6610`-`:6619`).
+#[must_use]
+pub fn publications_not_found(pattern: Option<&str>) -> String {
+    match pattern {
+        Some(pattern) => format!("Did not find any publication named \"{pattern}\"."),
+        None => "Did not find any publications.".to_string(),
+    }
+}
+
+/// One publication as `describePublications()` lays it out
+/// (`describe.c:6626`-`:6670`): the title, the headers and the one row of
+/// cells, taken from a row of [`describe_publications_query`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationTable {
+    /// `pubid`: pasted into the footer queries.
+    pub oid: String,
+    /// "Publication %s".
+    pub title: String,
+    /// Left-aligned, one per cell.
+    pub headers: Vec<&'static str>,
+    /// The one row.
+    pub cells: Vec<Vec<u8>>,
+    /// `puballtables`: such a publication has no footers.
+    pub all_tables: bool,
+}
+
+/// `describePublications()`'s loop body up to the footers
+/// (`describe.c:6626`-`:6670`), over one row of
+/// [`describe_publications_query`]'s result. The truncate, generated-columns
+/// and via-root columns are only shown for a server that has them.
+#[must_use]
+pub fn describe_publication_table(row: &[&[u8]], sversion: i32) -> PublicationTable {
+    let cell = |i: usize| row.get(i).copied().unwrap_or_default();
+    let mut headers = vec!["Owner", "All tables", "Inserts", "Updates", "Deletes"];
+    let mut columns = vec![2, 3, 4, 5, 6];
+    for (since, header, column) in [
+        (110_000, "Truncates", 7),
+        (180_000, "Generated columns", 8),
+        (130_000, "Via root", 9),
+    ] {
+        if sversion >= since {
+            headers.push(header);
+            columns.push(column);
+        }
+    }
+    PublicationTable {
+        oid: String::from_utf8_lossy(cell(0)).into_owned(),
+        title: format!("Publication {}", String::from_utf8_lossy(cell(1))),
+        headers,
+        cells: columns.into_iter().map(|c| cell(c).to_vec()).collect(),
+        all_tables: cell(3) == b"t",
+    }
+}
+
+/// The query for a publication's "Tables:" footer (`describe.c:6674`-
+/// `:6701`): each table's schema and name, and from 15 its row filter and
+/// column list.
+#[must_use]
+pub fn publication_tables_query(pubid: &str, sversion: i32) -> String {
+    let mut buf = String::from("SELECT n.nspname, c.relname");
+    if sversion >= 150_000 {
+        buf.push_str(", pg_get_expr(pr.prqual, c.oid)");
+        buf.push_str(concat!(
+            ", (CASE WHEN pr.prattrs IS NOT NULL THEN\n",
+            "     pg_catalog.array_to_string(",
+            "      ARRAY(SELECT attname\n",
+            "              FROM\n",
+            "                pg_catalog.generate_series(0, ",
+            "pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,\n",
+            "                pg_catalog.pg_attribute\n",
+            "        WHERE attrelid = c.oid AND attnum = prattrs[s]), ', ')\n",
+            "       ELSE NULL END)",
+        ));
+    } else {
+        buf.push_str(", NULL, NULL");
+    }
+    let _ = write!(
+        buf,
+        "\nFROM pg_catalog.pg_class c,\n     \
+         pg_catalog.pg_namespace n,\n     \
+         pg_catalog.pg_publication_rel pr\n\
+         WHERE c.relnamespace = n.oid\n  \
+         AND c.oid = pr.prrelid\n  \
+         AND pr.prpubid = '{pubid}'\n\
+         ORDER BY 1,2"
+    );
+    buf
+}
+
+/// The query for a publication's "Tables from schemas:" footer, from 15
+/// (`describe.c:6707`-`:6713`).
+#[must_use]
+pub fn publication_schemas_query(pubid: &str) -> String {
+    format!(
+        "SELECT n.nspname\n\
+         FROM pg_catalog.pg_namespace n\n     \
+         JOIN pg_catalog.pg_publication_namespace pn ON n.oid = pn.pnnspid\n\
+         WHERE pn.pnpubid = '{pubid}'\n\
+         ORDER BY 1"
+    )
+}
+
+/// `addFooterToPublicationDesc()` (`describe.c:6485`) past its query: the
+/// footers one result adds, `footermsg` first, or none for no rows. A row is
+/// `"schema"` when `as_schema`, else `"schema.table"`, then ` (columns)` and
+/// ` WHERE filter` for whichever of columns 3 and 2 is not null.
+#[must_use]
+pub fn publication_footers(
+    footermsg: &str,
+    as_schema: bool,
+    rows: &[Vec<Option<&[u8]>>],
+) -> Vec<Vec<u8>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut footers = vec![footermsg.as_bytes().to_vec()];
+    for row in rows {
+        let cell = |i: usize| row.get(i).copied().flatten();
+        let mut footer = b"    \"".to_vec();
+        footer.extend_from_slice(cell(0).unwrap_or_default());
+        if !as_schema {
+            footer.push(b'.');
+            footer.extend_from_slice(cell(1).unwrap_or_default());
+        }
+        footer.push(b'"');
+        if !as_schema {
+            if let Some(columns) = cell(3) {
+                footer.extend_from_slice(b" (");
+                footer.extend_from_slice(columns);
+                footer.push(b')');
+            }
+            if let Some(filter) = cell(2) {
+                footer.extend_from_slice(b" WHERE ");
+                footer.extend_from_slice(filter);
+            }
+        }
+        footers.push(footer);
+    }
+    footers
+}
+
+/// The query half of `describeSubscriptions()` (`describe.c:6746`-`:6851`),
+/// for `\dRs`, whose title is "List of subscriptions". Only the current
+/// database's subscriptions are listed; `+` adds each option the server has.
+///
+/// # Errors
+/// A server before 10, or a pattern that failed `validateSQLNamePattern`.
+pub fn describe_subscriptions_query(
+    pattern: Option<&str>,
+    verbose: bool,
+    server: ServerContext<'_>,
+) -> Result<String, Refusal> {
+    let sversion = server.sversion;
+    if sversion < 100_000 {
+        return Err(does_not_support(sversion, "subscriptions"));
+    }
+    let mut buf = String::from(concat!(
+        "SELECT subname AS \"Name\"\n",
+        ",  pg_catalog.pg_get_userbyid(subowner) AS \"Owner\"\n",
+        ",  subenabled AS \"Enabled\"\n",
+        ",  subpublications AS \"Publication\"\n",
+    ));
+    if verbose {
+        // Binary mode and streaming are only supported in v14 and higher.
+        if sversion >= 140_000 {
+            buf.push_str(", subbinary AS \"Binary\"\n");
+            // `LOGICALREP_STREAM_OFF`, `_ON` and `_PARALLEL`
+            // (`pg_subscription.h:165`-`:177`).
+            buf.push_str(if sversion >= 160_000 {
+                concat!(
+                    ", (CASE substream\n",
+                    "    WHEN 'f' THEN 'off'\n",
+                    "    WHEN 't' THEN 'on'\n",
+                    "    WHEN 'p' THEN 'parallel'\n",
+                    "   END) AS \"Streaming\"\n",
+                )
+            } else {
+                ", substream AS \"Streaming\"\n"
+            });
+        }
+        // Two_phase and disable_on_error are only supported in v15 and higher.
+        if sversion >= 150_000 {
+            buf.push_str(concat!(
+                ", subtwophasestate AS \"Two-phase commit\"\n",
+                ", subdisableonerr AS \"Disable on error\"\n",
+            ));
+        }
+        if sversion >= 160_000 {
+            buf.push_str(concat!(
+                ", suborigin AS \"Origin\"\n",
+                ", subpasswordrequired AS \"Password required\"\n",
+                ", subrunasowner AS \"Run as owner?\"\n",
+            ));
+        }
+        if sversion >= 170_000 {
+            buf.push_str(", subfailover AS \"Failover\"\n");
+        }
+        buf.push_str(concat!(
+            ",  subsynccommit AS \"Synchronous commit\"\n",
+            ",  subconninfo AS \"Conninfo\"\n",
+        ));
+        // Skip LSN is only supported in v15 and higher.
+        if sversion >= 150_000 {
+            buf.push_str(", subskiplsn AS \"Skip LSN\"\n");
+        }
+    }
+    // Only display subscriptions in current database.
+    buf.push_str(concat!(
+        "FROM pg_catalog.pg_subscription\n",
+        "WHERE subdbid = (SELECT oid\n",
+        "                 FROM pg_catalog.pg_database\n",
+        "                 WHERE datname = pg_catalog.current_database())",
+    ));
+    validate_sql_name_pattern(
+        &mut buf,
+        pattern,
+        true,
+        false,
+        PatternVars {
+            namevar: Some("subname"),
+            ..PatternVars::default()
+        },
+        1,
+        server.sversion,
+        server.db,
+    )?;
+    buf.push_str("ORDER BY 1;");
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2651,9 +3109,14 @@ mod tests {
             Some(DescribeCommand::NotYet("listConversions"))
         );
         assert_eq!(
-            p("dx", false),
-            Some(DescribeCommand::NotYet("listExtensions"))
+            p("dy", false),
+            Some(DescribeCommand::NotYet("listEventTriggers"))
         );
+        assert_eq!(p("dx+", false), Some(DescribeCommand::Extensions));
+        assert_eq!(p("dRp+x", true), Some(DescribeCommand::Publications));
+        assert_eq!(p("dRs", false), Some(DescribeCommand::Subscriptions));
+        assert_eq!(p("dR", false), None);
+        assert_eq!(p("dRx", false), None);
         assert_eq!(p("dA+", true), Some(DescribeCommand::AccessMethods));
         assert_eq!(p("dAx", false), Some(DescribeCommand::AccessMethods));
         assert_eq!(
@@ -3800,6 +4263,244 @@ mod tests {
                  ORDER BY 1, 2;"
             ),
             "{q}"
+        );
+    }
+
+    #[test]
+    fn publications_and_subscriptions_need_a_server_of_10() {
+        let v96 = ServerContext {
+            sversion: 90_624,
+            ..PG18
+        };
+        let refused = |what: &str| {
+            Err(Refusal::ServerTooOld(format!(
+                "The server (version 9.6) does not support {what}."
+            )))
+        };
+        assert_eq!(list_publications_query(None, v96), refused("publications"));
+        assert_eq!(
+            describe_publications_query(None, v96),
+            refused("publications")
+        );
+        assert_eq!(
+            describe_subscriptions_query(None, true, v96),
+            refused("subscriptions")
+        );
+    }
+
+    #[test]
+    fn a_publication_listing_shows_the_columns_its_server_has() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        let q = list_publications_query(None, at(100_000)).unwrap();
+        assert!(
+            q.ends_with("  pubdelete AS \"Deletes\"\nFROM pg_catalog.pg_publication\nORDER BY 1;"),
+            "{q}"
+        );
+        let q = list_publications_query(Some("p"), at(130_000)).unwrap();
+        assert!(
+            q.ends_with(
+                "  pubdelete AS \"Deletes\",\n  pubtruncate AS \"Truncates\",\n  \
+                 pubviaroot AS \"Via root\"\nFROM pg_catalog.pg_publication\n\
+                 WHERE pubname OPERATOR(pg_catalog.~) '^(p)$' COLLATE pg_catalog.default\n\
+                 ORDER BY 1;"
+            ),
+            "{q}"
+        );
+        let q = list_publications_query(None, PG18).unwrap();
+        assert!(
+            q.contains(
+                "  pubtruncate AS \"Truncates\",\n (CASE pubgencols\n    \
+                 WHEN 'n' THEN 'none'\n    WHEN 's' THEN 'stored'\n   \
+                 END) AS \"Generated columns\",\n  pubviaroot AS \"Via root\"\n"
+            ),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn a_publication_description_keeps_its_column_positions_on_any_server() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        assert_eq!(
+            describe_publications_query(None, at(100_000)).unwrap(),
+            "SELECT oid, pubname,\n  pg_catalog.pg_get_userbyid(pubowner) AS owner,\n  \
+             puballtables, pubinsert, pubupdate, pubdelete, false AS pubtruncate, \
+             'none' AS pubgencols, false AS pubviaroot\n\
+             FROM pg_catalog.pg_publication\nORDER BY 2;"
+        );
+        let q = describe_publications_query(None, PG18).unwrap();
+        assert!(
+            q.contains(
+                "pubdelete, pubtruncate, (CASE pubgencols\n    WHEN 'n' THEN 'none'\n    \
+                 WHEN 's' THEN 'stored'\n   END) AS \"Generated columns\"\n, pubviaroot\n\
+                 FROM pg_catalog.pg_publication\n"
+            ),
+            "{q}"
+        );
+
+        let row: Vec<&[u8]> = vec![
+            b"16390", b"p", b"alice", b"f", b"t", b"t", b"f", b"t", b"none", b"f",
+        ];
+        let t10 = describe_publication_table(&row, 100_000);
+        assert_eq!(
+            t10.headers,
+            ["Owner", "All tables", "Inserts", "Updates", "Deletes"]
+        );
+        assert_eq!(t10.cells, [&b"alice"[..], b"f", b"t", b"t", b"f"]);
+        assert_eq!(
+            (t10.oid.as_str(), t10.title.as_str()),
+            ("16390", "Publication p")
+        );
+        assert!(!t10.all_tables);
+        let t13 = describe_publication_table(&row, 130_000);
+        assert_eq!(
+            t13.headers,
+            [
+                "Owner",
+                "All tables",
+                "Inserts",
+                "Updates",
+                "Deletes",
+                "Truncates",
+                "Via root"
+            ]
+        );
+        assert_eq!(t13.cells[5..], [b"t".to_vec(), b"f".to_vec()]);
+        let t18 = describe_publication_table(&row, 180_000);
+        assert_eq!(
+            t18.headers[5..],
+            ["Truncates", "Generated columns", "Via root"]
+        );
+        assert_eq!(t18.cells[6], b"none");
+    }
+
+    #[test]
+    fn a_publication_before_15_has_no_filters_columns_or_schemas_to_show() {
+        let q = publication_tables_query("16390", 140_000);
+        assert!(
+            q.starts_with("SELECT n.nspname, c.relname, NULL, NULL\nFROM pg_catalog.pg_class c,\n"),
+            "{q}"
+        );
+        assert!(
+            q.ends_with("  AND pr.prpubid = '16390'\nORDER BY 1,2"),
+            "{q}"
+        );
+        assert!(
+            publication_tables_query("16390", 150_000)
+                .starts_with("SELECT n.nspname, c.relname, pg_get_expr(pr.prqual, c.oid), (CASE")
+        );
+    }
+
+    #[test]
+    fn publication_footers_quote_each_name_then_add_columns_then_the_filter() {
+        assert!(publication_footers("Tables:", false, &[]).is_empty());
+        let rows: Vec<Vec<Option<&[u8]>>> = vec![
+            vec![Some(b"s"), Some(b"t"), Some(b"(a > 1)"), Some(b"a, c")],
+            vec![Some(b"s"), Some(b"u"), None, None],
+        ];
+        assert_eq!(
+            publication_footers("Tables:", false, &rows),
+            [
+                b"Tables:".to_vec(),
+                b"    \"s.t\" (a, c) WHERE (a > 1)".to_vec(),
+                b"    \"s.u\"".to_vec(),
+            ]
+        );
+        let schemas: Vec<Vec<Option<&[u8]>>> = vec![vec![Some(b"s5")]];
+        assert_eq!(
+            publication_footers("Tables from schemas:", true, &schemas),
+            [b"Tables from schemas:".to_vec(), b"    \"s5\"".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_verbose_subscription_listing_shows_the_options_its_server_has() {
+        let at = |sversion| ServerContext { sversion, ..PG18 };
+        let columns = |sversion| {
+            describe_subscriptions_query(None, true, at(sversion))
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    l.rsplit_once(" AS \"")
+                        .map(|(_, c)| c.trim_end_matches('"').to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        let base = ["Name", "Owner", "Enabled", "Publication"];
+        assert_eq!(
+            columns(100_000),
+            [&base[..], &["Synchronous commit", "Conninfo"]].concat()
+        );
+        assert_eq!(
+            columns(140_000),
+            [
+                &base[..],
+                &["Binary", "Streaming", "Synchronous commit", "Conninfo"]
+            ]
+            .concat()
+        );
+        assert!(
+            describe_subscriptions_query(None, true, at(150_000))
+                .unwrap()
+                .contains(", substream AS \"Streaming\"\n")
+        );
+        assert_eq!(
+            columns(170_000),
+            [
+                &base[..],
+                &[
+                    "Binary",
+                    "Streaming",
+                    "Two-phase commit",
+                    "Disable on error",
+                    "Origin",
+                    "Password required",
+                    "Run as owner?",
+                    "Failover",
+                    "Synchronous commit",
+                    "Conninfo",
+                    "Skip LSN",
+                ]
+            ]
+            .concat()
+        );
+        // No newline after the database clause: a pattern's `  AND` follows it
+        // on the same line, and so does the `ORDER BY` without one.
+        assert!(
+            describe_subscriptions_query(None, false, PG18)
+                .unwrap()
+                .ends_with("WHERE datname = pg_catalog.current_database())ORDER BY 1;")
+        );
+    }
+
+    #[test]
+    fn extension_listings_take_a_bare_name_and_say_what_was_not_found() {
+        assert_eq!(
+            list_extension_contents_query(Some("plpgsql"), PG18).unwrap(),
+            "SELECT e.extname, e.oid\nFROM pg_catalog.pg_extension e\n\
+             WHERE e.extname OPERATOR(pg_catalog.~) '^(plpgsql)$' COLLATE pg_catalog.default\n\
+             ORDER BY 1;"
+        );
+        assert_eq!(
+            list_extensions_query(Some("a.b"), PG18),
+            Err(PatternError(
+                "improper qualified name (too many dotted names): a.b".to_string()
+            ))
+        );
+        assert_eq!(
+            list_one_extension_contents_query("13000"),
+            "SELECT pg_catalog.pg_describe_object(classid, objid, 0) AS \"Object description\"\n\
+             FROM pg_catalog.pg_depend\n\
+             WHERE refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass \
+             AND refobjid = '13000' AND deptype = 'e'\nORDER BY 1;"
+        );
+        assert_eq!(
+            extension_contents_title("plpgsql"),
+            "Objects in extension \"plpgsql\""
+        );
+        assert_eq!(extensions_not_found(None), "Did not find any extensions.");
+        assert_eq!(
+            publications_not_found(Some("p")),
+            "Did not find any publication named \"p\"."
         );
     }
 }

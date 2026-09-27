@@ -8,8 +8,9 @@
 //! Footers follow upstream's split. The `_text` printers print
 //! `footers_with_default()`, which is the `(n rows)` line for a query result;
 //! the `_vertical` printers read `cont->footers` directly, which `printQuery`
-//! leaves `NULL`, so an expanded table has no footer at all.
-//! `print_latex_longtable_text` prints none either way.
+//! leaves `NULL`, so an expanded query result has no footer at all, and only
+//! a table built with `printTableAddFooter` has one.
+//! `print_latex_longtable_text` and csv print none either way.
 //!
 //! `cont->opt->prior_records` is always 0 here (`FETCH_COUNT` is not ported),
 //! so the first record is `Record 1`.
@@ -156,14 +157,15 @@ fn html_cell(out: &mut Vec<u8>, align: Align, cell: &[u8]) {
 }
 
 /// The `</table>` and the footer paragraph both HTML printers close with.
-fn html_table_stop(out: &mut Vec<u8>, cont: &TableContent<'_>, footer: Option<&str>) {
+fn html_table_stop(out: &mut Vec<u8>, cont: &TableContent<'_>, footers: &[Vec<u8>]) {
     out.extend_from_slice(b"</table>\n");
-    if let Some(footer) = footer
-        && !cont.opt.tuples_only
-    {
+    if !footers.is_empty() && !cont.opt.tuples_only {
         out.extend_from_slice(b"<p>");
-        html_escaped_print(out, footer.as_bytes());
-        out.extend_from_slice(b"<br />\n</p>");
+        for footer in footers {
+            html_escaped_print(out, footer);
+            out.extend_from_slice(b"<br />\n");
+        }
+        out.extend_from_slice(b"</p>");
     }
     out.push(b'\n');
 }
@@ -191,7 +193,7 @@ pub(super) fn print_html_text(cont: &TableContent<'_>) -> Vec<u8> {
         out.extend_from_slice(b"  </tr>\n");
     }
     if cont.opt.stop_table {
-        html_table_stop(&mut out, cont, cont.default_footer().as_deref());
+        html_table_stop(&mut out, cont, &cont.footers_with_default());
     }
     out
 }
@@ -221,7 +223,7 @@ pub(super) fn print_html_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     if cont.opt.stop_table {
-        html_table_stop(&mut out, cont, None);
+        html_table_stop(&mut out, cont, &cont.footers);
     }
     out
 }
@@ -263,11 +265,18 @@ fn asciidoc_frame(out: &mut Vec<u8>, border: u16) {
     out.extend_from_slice(b"]\n|====\n");
 }
 
-/// The literal block of footers asciidoc closes a table with.
-fn asciidoc_footer(out: &mut Vec<u8>, footer: &str) {
+/// The literal block of footers asciidoc closes a table with, if it has any
+/// and tuples are not all it prints.
+fn asciidoc_footers(out: &mut Vec<u8>, footers: &[Vec<u8>], tuples_only: bool) {
+    if footers.is_empty() || tuples_only {
+        return;
+    }
     out.extend_from_slice(b"\n....\n");
-    out.extend_from_slice(footer.as_bytes());
-    out.extend_from_slice(b"\n....\n");
+    for footer in footers {
+        out.extend_from_slice(footer);
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"....\n");
 }
 
 /// `print_asciidoc_text()` (`print.c:2187`).
@@ -324,11 +333,8 @@ pub(super) fn print_asciidoc_text(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     out.extend_from_slice(b"|====\n");
-    if cont.opt.stop_table
-        && let Some(footer) = cont.default_footer()
-        && !tuples_only
-    {
-        asciidoc_footer(&mut out, &footer);
+    if cont.opt.stop_table {
+        asciidoc_footers(&mut out, &cont.footers_with_default(), tuples_only);
     }
     out
 }
@@ -363,6 +369,9 @@ pub(super) fn print_asciidoc_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     out.extend_from_slice(b"|====\n");
+    if cont.opt.stop_table {
+        asciidoc_footers(&mut out, &cont.footers, cont.opt.tuples_only);
+    }
     out
 }
 
@@ -403,16 +412,16 @@ fn latex_title(out: &mut Vec<u8>, cont: &TableContent<'_>) {
 }
 
 /// The `tabular` close and the footers after it.
-fn latex_tabular_stop(out: &mut Vec<u8>, border: u16, footer: Option<&str>, tuples_only: bool) {
+fn latex_tabular_stop(out: &mut Vec<u8>, border: u16, footers: &[Vec<u8>], tuples_only: bool) {
     if border == 2 {
         out.extend_from_slice(b"\\hline\n");
     }
     out.extend_from_slice(b"\\end{tabular}\n\n\\noindent ");
-    if let Some(footer) = footer
-        && !tuples_only
-    {
-        latex_escaped_print(out, footer.as_bytes());
-        out.extend_from_slice(b" \\\\\n");
+    if !tuples_only {
+        for footer in footers {
+            latex_escaped_print(out, footer);
+            out.extend_from_slice(b" \\\\\n");
+        }
     }
     out.push(b'\n');
 }
@@ -468,12 +477,7 @@ pub(super) fn print_latex_text(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     if cont.opt.stop_table {
-        latex_tabular_stop(
-            &mut out,
-            border,
-            cont.default_footer().as_deref(),
-            tuples_only,
-        );
+        latex_tabular_stop(&mut out, border, &cont.footers_with_default(), tuples_only);
     }
     out
 }
@@ -668,7 +672,7 @@ pub(super) fn print_latex_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     if cont.opt.stop_table {
-        latex_tabular_stop(&mut out, border, None, tuples_only);
+        latex_tabular_stop(&mut out, border, &cont.footers, tuples_only);
     }
     out
 }
@@ -702,13 +706,13 @@ fn troff_ms_table_start(out: &mut Vec<u8>, cont: &TableContent<'_>, border: u16)
 }
 
 /// The `.TE` close and the footer display after it.
-fn troff_ms_table_stop(out: &mut Vec<u8>, footer: Option<&str>, tuples_only: bool) {
+fn troff_ms_table_stop(out: &mut Vec<u8>, footers: &[Vec<u8>], tuples_only: bool) {
     out.extend_from_slice(b".TE\n.DS L\n");
-    if let Some(footer) = footer
-        && !tuples_only
-    {
-        troff_ms_escaped_print(out, footer.as_bytes());
-        out.push(b'\n');
+    if !tuples_only {
+        for footer in footers {
+            troff_ms_escaped_print(out, footer);
+            out.push(b'\n');
+        }
     }
     out.extend_from_slice(b".DE\n");
 }
@@ -747,7 +751,7 @@ pub(super) fn print_troff_ms_text(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     if cont.opt.stop_table {
-        troff_ms_table_stop(&mut out, cont.default_footer().as_deref(), tuples_only);
+        troff_ms_table_stop(&mut out, &cont.footers_with_default(), tuples_only);
     }
     out
 }
@@ -818,7 +822,7 @@ pub(super) fn print_troff_ms_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
     if cont.opt.stop_table {
-        troff_ms_table_stop(&mut out, None, tuples_only);
+        troff_ms_table_stop(&mut out, &cont.footers, tuples_only);
     }
     out
 }
@@ -840,6 +844,7 @@ mod tests {
             headers: vec![b"a<b".to_vec(), b"n".to_vec()],
             cells: vec![vec![b"x\\y".to_vec(), b"1".to_vec()]],
             aligns: vec![Align::Left, Align::Right],
+            footers: vec![],
         }
     }
 
@@ -941,6 +946,32 @@ mod tests {
         assert!(text(print_asciidoc_text(&cont)).ends_with("|x\\y |1\n|====\n"));
         assert!(text(print_latex_text(&cont)).ends_with("\\end{tabular}\n\n\\noindent \n"));
         assert!(text(print_troff_ms_text(&cont)).ends_with(".TE\n.DS L\n.DE\n"));
+    }
+
+    #[test]
+    fn added_footers_replace_the_row_count_and_reach_the_vertical_printers() {
+        // `printTableAddFooter`, as `describePublications()` uses it: the
+        // `_text` printers print these instead of `(1 row)`, and the
+        // `_vertical` ones, which never print the default, print these.
+        let opt = TableOpt::default();
+        let cont = TableContent {
+            footers: vec![b"Tables:".to_vec(), b"    \"s.t<u\"".to_vec()],
+            ..table(&opt, None)
+        };
+        // `html_escaped_print` protects leading spaces (`print.c:1978`).
+        let html = "</table>\n<p>Tables:<br />\n&nbsp;&nbsp;&nbsp;&nbsp;&quot;s.t&lt;u&quot;<br />\n</p>\n";
+        assert!(text(print_html_text(&cont)).ends_with(html));
+        assert!(text(print_html_vertical(&cont)).ends_with(html));
+        let asciidoc = "|====\n\n....\nTables:\n    \"s.t<u\"\n....\n";
+        assert!(text(print_asciidoc_text(&cont)).ends_with(asciidoc));
+        assert!(text(print_asciidoc_vertical(&cont)).ends_with(asciidoc));
+        let latex = "\\noindent Tables: \\\\\n    \"s.t\\textless{}u\" \\\\\n\n";
+        assert!(text(print_latex_text(&cont)).ends_with(latex));
+        assert!(text(print_latex_vertical(&cont)).ends_with(latex));
+        assert!(text(print_latex_longtable_text(&cont)).ends_with("\\end{longtable}\n"));
+        let troff = ".DS L\nTables:\n    \"s.t<u\"\n.DE\n";
+        assert!(text(print_troff_ms_text(&cont)).ends_with(troff));
+        assert!(text(print_troff_ms_vertical(&cont)).ends_with(troff));
     }
 
     #[test]

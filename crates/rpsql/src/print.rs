@@ -425,8 +425,7 @@ fn line_style(opt: &TableOpt) -> TextFormat {
     }
 }
 
-/// `printTableContent` (`print.h:163`), as `printQuery` fills it: no footers
-/// but the default one, and no translation.
+/// `printTableContent` (`print.h:163`), with no translation.
 struct TableContent<'a> {
     opt: &'a TableOpt,
     title: Option<&'a str>,
@@ -434,6 +433,9 @@ struct TableContent<'a> {
     /// One `Vec` per row, one cell per column.
     cells: Vec<Vec<Vec<u8>>>,
     aligns: Vec<Align>,
+    /// `cont->footers`, in `printTableAddFooter` order: empty is `NULL`,
+    /// as `printQuery` leaves it.
+    footers: Vec<Vec<u8>>,
 }
 
 impl TableContent<'_> {
@@ -449,17 +451,20 @@ impl TableContent<'_> {
         }
     }
 
-    /// `footers_with_default()` (`print.c:398`): the `(n rows)` line, or
-    /// nothing under `\pset footer off`.
-    fn default_footer(&self) -> Option<String> {
-        self.opt.default_footer.then(|| {
-            let n = self.cells.len();
-            if n == 1 {
-                format!("({n} row)")
-            } else {
-                format!("({n} rows)")
-            }
-        })
+    /// `footers_with_default()` (`print.c:398`): the footers the caller
+    /// added, or else the `(n rows)` line, or nothing under
+    /// `\pset footer off`.
+    fn footers_with_default(&self) -> Vec<Vec<u8>> {
+        if !self.footers.is_empty() || !self.opt.default_footer {
+            return self.footers.clone();
+        }
+        let n = self.cells.len();
+        let footer = if n == 1 {
+            format!("({n} row)")
+        } else {
+            format!("({n} rows)")
+        };
+        vec![footer.into_bytes()]
     }
 }
 
@@ -504,14 +509,16 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
         headers,
         cells,
         aligns,
+        footers: Vec::new(),
     })
 }
 
 /// `printTable()` (`print.c:3444`) of a table its caller built cell by cell
-/// with `printTableAddHeader` and `printTableAddCell`, as `describeRoles()`
-/// does: one `Vec` of cells per row, one cell per header, printed as given —
-/// no `\pset null`, no `numericlocale`, and a footer only if `opt` has its
-/// default one on.
+/// with `printTableAddHeader`, `printTableAddCell` and `printTableAddFooter`,
+/// as `describeRoles()` and `describePublications()` do: one `Vec` of cells
+/// per row, one cell per header, printed as given — no `\pset null`, no
+/// `numericlocale`. With no `footers`, the default one is printed if `opt`
+/// has it on.
 ///
 /// # Errors
 /// As [`print_query`].
@@ -520,6 +527,7 @@ pub fn print_table(
     title: Option<&str>,
     headers: &[(&str, Align)],
     cells: Vec<Vec<Vec<u8>>>,
+    footers: Vec<Vec<u8>>,
 ) -> Result<Vec<u8>, PrintError> {
     print_content(&TableContent {
         opt,
@@ -527,6 +535,7 @@ pub fn print_table(
         headers: headers.iter().map(|(h, _)| h.as_bytes().to_vec()).collect(),
         cells,
         aligns: headers.iter().map(|&(_, a)| a).collect(),
+        footers,
     })
 }
 
@@ -1037,11 +1046,11 @@ fn print_aligned_text(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
         if opt_border == 2 {
             print_horizontal_line(&mut out, &width_wrap, opt_border, Rule::Bottom, format);
         }
-        if let Some(footer) = cont.default_footer()
-            && !opt_tuples_only
-        {
-            out.extend_from_slice(footer.as_bytes());
-            out.push(b'\n');
+        if !opt_tuples_only {
+            for footer in cont.footers_with_default() {
+                out.extend_from_slice(&footer);
+                out.push(b'\n');
+            }
         }
         out.push(b'\n');
     }
@@ -1161,8 +1170,8 @@ fn print_aligned_vertical_line(
 /// `print_aligned_vertical()` (`print.c:1324`): expanded output, one
 /// `header | value` line per cell, each record under a `[ RECORD n ]` rule.
 ///
-/// Only `printQuery`'s tables reach it, so `cont->footers` is `NULL` and no
-/// footer is printed except the `(0 rows)` of an empty result. Record numbers
+/// It prints `cont->footers`, which `printQuery` leaves `NULL`, so a query
+/// result has no footer but the `(0 rows)` of an empty one. Record numbers
 /// start at 1: `prior_records` belongs to `FETCH_COUNT`, which is not ported.
 #[allow(clippy::too_many_lines)]
 fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError> {
@@ -1178,11 +1187,11 @@ fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError
 
     // No cells at all: just the footer (`print.c:1354`).
     if (col_count == 0 || cont.cells.is_empty()) && opt.start_table && opt.stop_table {
-        if let Some(footer) = cont.default_footer()
-            && !opt_tuples_only
-        {
-            out.extend_from_slice(footer.as_bytes());
-            out.push(b'\n');
+        if !opt_tuples_only {
+            for footer in cont.footers_with_default() {
+                out.extend_from_slice(&footer);
+                out.push(b'\n');
+            }
         }
         out.push(b'\n');
         return Ok(out);
@@ -1443,8 +1452,16 @@ fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError
                 Rule::Bottom,
             );
         }
-        // `cont->footers` is `NULL` under `printQuery`: nothing to print
-        // but the blank line.
+        // `cont->footers`, not `footers_with_default()` (`print.c:1812`).
+        if !opt_tuples_only && !cont.footers.is_empty() {
+            if opt_border < 2 {
+                out.push(b'\n');
+            }
+            for footer in &cont.footers {
+                out.extend_from_slice(footer);
+                out.push(b'\n');
+            }
+        }
         out.push(b'\n');
     }
 
@@ -1501,14 +1518,14 @@ fn print_unaligned_text(cont: &TableContent<'_>) -> Vec<u8> {
     }
 
     if opt.stop_table {
-        if let Some(footer) = cont.default_footer()
-            && !opt_tuples_only
-        {
-            if need_recordsep {
-                print_separator(&mut out, &opt.record_sep);
+        if !opt_tuples_only {
+            for footer in cont.footers_with_default() {
+                if need_recordsep {
+                    print_separator(&mut out, &opt.record_sep);
+                }
+                out.extend_from_slice(&footer);
+                need_recordsep = true;
             }
-            out.extend_from_slice(footer.as_bytes());
-            need_recordsep = true;
         }
         // The last record ends in a newline whatever the record separator,
         // unless that separator is the zero byte (`print.c:497`).
@@ -1527,8 +1544,8 @@ fn print_unaligned_text(cont: &TableContent<'_>) -> Vec<u8> {
 /// `print_unaligned_vertical()` (`print.c:513`): one `header<fieldsep>value`
 /// per cell, records apart by two record separators. Cells are written raw.
 ///
-/// Only `printQuery`'s tables reach it, so `cont->footers` is `NULL` and no
-/// footer is printed, not even the default one.
+/// It prints `cont->footers`, not `footers_with_default()`, so a query
+/// result has no footer, not even the default one.
 fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
     let opt = cont.opt;
     let mut out = Vec::new();
@@ -1565,12 +1582,22 @@ fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
 
-    // As in `print_unaligned_text` (`print.c:575`).
-    if opt.stop_table && need_recordsep {
-        if opt.record_sep.separator_zero {
+    if opt.stop_table {
+        // `print.c:562`: a separator, then one before each footer.
+        if !opt.tuples_only && !cont.footers.is_empty() {
             print_separator(&mut out, &opt.record_sep);
-        } else {
-            out.push(b'\n');
+            for footer in &cont.footers {
+                print_separator(&mut out, &opt.record_sep);
+                out.extend_from_slice(footer);
+            }
+        }
+        // As in `print_unaligned_text` (`print.c:575`).
+        if need_recordsep {
+            if opt.record_sep.separator_zero {
+                print_separator(&mut out, &opt.record_sep);
+            } else {
+                out.push(b'\n');
+            }
         }
     }
 

@@ -238,6 +238,35 @@ pub fn sections(first: &str, last: &str) -> Section<'static> {
     }
 }
 
+/// The part of `section` from its first line that reads `line` on: the same
+/// cut in both files, since `-a` echoes that line too. It is for a section
+/// whose head needs what this port does not have yet (`\d`, for one), and
+/// whose tail runs on its own once the state the head left is restored.
+///
+/// # Panics
+/// When either file has no such line in `section`.
+pub fn tail(section: &Section<'static>, line: &str) -> Section<'static> {
+    let cut = |text: &'static str, what: &str| -> (&'static str, usize) {
+        let mut at = 0;
+        for (n, l) in text.split_inclusive('\n').enumerate() {
+            if l.trim_end_matches('\n') == line {
+                return (&text[at..], n);
+            }
+            at += l.len();
+        }
+        panic!("{what} of {:?} has no line {line:?}", section.header);
+    };
+    let (sql, sql_skip) = cut(section.sql, "psql.sql");
+    let (expected, out_skip) = cut(section.expected, "psql.out");
+    Section {
+        header: section.header,
+        sql,
+        expected,
+        sql_line: section.sql_line + sql_skip,
+        out_line: section.out_line + out_skip,
+    }
+}
+
 /// The C tools a cluster is started with. `psql` is not among them: the
 /// section gate compares rpsql against `psql.out` with only a server, and
 /// against C psql when that is present too.

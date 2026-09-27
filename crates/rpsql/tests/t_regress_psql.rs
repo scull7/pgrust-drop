@@ -33,6 +33,7 @@ use rpsql::settings::{PrintQueryOpt, PsqlSettings};
 
 use regress::{
     Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, sha256_hex, split,
+    tail,
 };
 
 const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
@@ -91,25 +92,32 @@ fn a_header_psql_out_never_echoes_is_an_error_not_a_silent_merge() {
     assert_eq!(sections.len(), 1);
 }
 
-fn text_field(name: &str) -> FieldDescription {
+/// `text`'s OID, and `int4`'s, which right-aligns (`print.c:3615`).
+const TEXT: u32 = 25;
+const INT4: u32 = 23;
+
+fn field(name: &str, typid: u32) -> FieldDescription {
     FieldDescription {
         name: name.as_bytes().to_vec(),
         tableid: 0,
         columnid: 0,
-        typid: 25,
-        typlen: -1,
+        typid,
+        typlen: if typid == INT4 { 4 } else { -1 },
         atttypmod: -1,
         format: 0,
     }
 }
 
-/// A `text`-only result, fed through the protocol state machine as a server
-/// would send it.
-fn text_result(headers: &[&str], rows: &[Vec<String>]) -> QueryResult {
+/// A result fed through the protocol state machine as a server would send
+/// it: one `(name, type)` per column and every cell in text format.
+fn result(columns: &[(&str, u32)], rows: &[Vec<String>]) -> QueryResult {
     let mut runner = QueryRunner::new();
     runner
         .push(Backend::RowDescription(
-            headers.iter().map(|h| text_field(h)).collect(),
+            columns
+                .iter()
+                .map(|&(name, typid)| field(name, typid))
+                .collect(),
         ))
         .unwrap();
     for row in rows {
@@ -128,6 +136,12 @@ fn text_result(headers: &[&str], rows: &[Vec<String>]) -> QueryResult {
         .push(Backend::ReadyForQuery(TransactionStatus::Idle))
         .unwrap();
     runner.into_results().remove(0)
+}
+
+/// A `text`-only result.
+fn text_result(headers: &[&str], rows: &[Vec<String>]) -> QueryResult {
+    let columns: Vec<(&str, u32)> = headers.iter().map(|&h| (h, TEXT)).collect();
+    result(&columns, rows)
 }
 
 /// `psql.sql:224`-`:227`'s `q`: two rows, `n = 1` and `n = 2 … 10` grouped,
@@ -154,6 +168,62 @@ fn single_line_q() -> QueryResult {
         .map(|n| vec!["x".repeat(2 * n), "y".repeat(20 - 2 * n)])
         .collect();
     text_result(&["0123456789abcdef", "0123456789"], &rows)
+}
+
+/// The `q` a document-format section prepares: `text` columns, one value
+/// each, then `n as int` over `generate_series(1,2)`.
+fn document_q(text_columns: &[(&str, &str)]) -> QueryResult {
+    let mut columns: Vec<(&str, u32)> = text_columns.iter().map(|&(h, _)| (h, TEXT)).collect();
+    columns.push(("int", INT4));
+    let rows: Vec<Vec<String>> = (1..=2)
+        .map(|n| {
+            let mut row: Vec<String> = text_columns.iter().map(|&(_, v)| v.to_string()).collect();
+            row.push(n.to_string());
+            row
+        })
+        .collect();
+    result(&columns, &rows)
+}
+
+/// The document-format sections, in file order, each with its `q`:
+/// `psql.sql:611`, `:653`, `:701`, `:746`, `:795` and `:852`, and the number
+/// of `execute q;` blocks each has.
+fn document_sections() -> [(&'static str, QueryResult, usize); 6] {
+    let junk = ("junk", "  <foo>\n<bar>");
+    let latex_junk = ("junk", "  #<foo>%&^~|\n{bar}");
+    let empty = ("empty", "   ");
+    [
+        (
+            "-- test asciidoc output format",
+            document_q(&[("a|title", "some|text"), ("empty ", "        ")]),
+            6,
+        ),
+        (
+            "-- test csv output format",
+            document_q(&[("a\"title", "some\"text"), junk, empty]),
+            2,
+        ),
+        (
+            "-- test html output format",
+            document_q(&[("a&title", "some\"text"), junk, empty]),
+            6,
+        ),
+        (
+            "-- test latex output format",
+            document_q(&[("a$title", "some\\more_text"), latex_junk, empty]),
+            8,
+        ),
+        (
+            "-- test latex-longtable output format",
+            document_q(&[("a$title", "some\\more_text"), latex_junk, empty]),
+            10,
+        ),
+        (
+            "-- test troff-ms output format",
+            document_q(&[("a\\title", "some\\text"), junk, empty]),
+            6,
+        ),
+    ]
 }
 
 /// What replaying one section's `execute q;` blocks came to.
@@ -185,8 +255,10 @@ fn replay(section: &Section<'_>, q: &QueryResult, popt: &mut PrintQueryOpt) -> R
                 .unwrap_or_else(|e| panic!("psql.out:{}: {line}: {e}", section.out_line + i - 1));
         } else if line == "execute q;" {
             let first = i;
+            // The block runs to the next echoed input line. Output never
+            // starts with `\pset ` (though latex's starts with `\`).
             while i < lines.len()
-                && !lines[i].starts_with('\\')
+                && !lines[i].starts_with("\\pset ")
                 && lines[i] != "execute q;\n"
                 && lines[i] != "deallocate q;\n"
             {
@@ -228,6 +300,7 @@ const G_AND_GX_PORT: u16 = 55_494;
 const EXTENDED_QUERY_SECTIONS_PORT: u16 = 55_495;
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
+const DOCUMENT_FORMAT_SECTIONS_PORT: u16 = 55_492;
 
 /// [`regress::gate_section`] for rpsql.
 fn gate_section(cluster: &Cluster, section: &Section<'_>) {
@@ -278,6 +351,25 @@ fn the_extended_query_sections() {
     gate_section(
         &cluster,
         &sections("-- \\parse (extended query protocol)", "-- errors"),
+    );
+}
+
+/// [`gate_section`], with `preamble` run first: input lines that restore the
+/// state an earlier part of the file left. `-a -q` echoes them and prints
+/// nothing else for them, so they are expected back verbatim.
+fn gate_script(cluster: &Cluster, section: &Section<'_>, preamble: &str) {
+    let header = format!("{}, after {preamble:?}", section.header);
+    let sql = format!("{preamble}{}", section.sql);
+    let expected = format!("{preamble}{}", section.expected);
+    gate_section(
+        cluster,
+        &Section {
+            header: &header,
+            sql: &sql,
+            expected: &expected,
+            sql_line: section.sql_line,
+            out_line: section.out_line,
+        },
     );
 }
 
@@ -341,4 +433,61 @@ fn the_output_format_sections_run_live() {
             "-- expanded output with short-width columns",
         ),
     );
+}
+
+/// `-- test asciidoc output format` through `-- test troff-ms output format`
+/// (`psql.sql:595`-`:877`), replayed server-free in file order.
+///
+/// Each section prints `q` in its format, normal and expanded, at the borders
+/// and `tableattr`s it lists: 38 `execute q;` blocks, all of which must
+/// render and match. The sections' `\d` and `\df` blocks wait for NAT-401.
+#[test]
+fn every_document_format_block_matches_psql_out() {
+    let mut popt = startup_popt();
+    for (header, q, blocks) in document_sections() {
+        let r = replay(&section(header), &q, &mut popt);
+        assert_eq!(
+            (r.matched, r.deferred.len()),
+            (blocks, 0),
+            "{header}: matched {} and deferred {:#?}",
+            r.matched,
+            r.deferred
+        );
+    }
+}
+
+/// The same six sections live, from each one's `prepare q as` on, with
+/// `-- special cases` and `-- illegal csv separators` after csv's and then
+/// `-- check ambiguous format requests` (`psql.sql:879`), all against one
+/// cluster.
+///
+/// Each section's head (`\d psql_serial_tab_id_seq`, `\df exp`) needs
+/// `\d` (NAT-401), so the gate starts at `prepare q as` with the one piece
+/// of state the head leaves that the tail depends on, `\pset format`, set
+/// by a preamble.
+#[test]
+fn the_document_format_sections_run_live() {
+    let Some(cluster) = Cluster::start(DOCUMENT_FORMAT_SECTIONS_PORT) else {
+        return;
+    };
+    for (header, format) in [
+        ("-- test asciidoc output format", "asciidoc"),
+        ("-- test csv output format", "csv"),
+        ("-- test html output format", "html"),
+        ("-- test latex output format", "latex"),
+        ("-- test latex-longtable output format", "latex-longtable"),
+        ("-- test troff-ms output format", "troff-ms"),
+    ] {
+        let whole = if format == "csv" {
+            sections(header, "-- illegal csv separators")
+        } else {
+            section(header)
+        };
+        gate_script(
+            &cluster,
+            &tail(&whole, "prepare q as"),
+            &format!("\\pset format {format}\n"),
+        );
+    }
+    gate_section(&cluster, &section("-- check ambiguous format requests"));
 }

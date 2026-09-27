@@ -32,7 +32,9 @@
 
 pub mod command;
 pub mod common;
+pub mod conditional;
 pub mod help;
+pub mod logging;
 pub mod mainloop;
 pub mod print;
 pub mod prompt;
@@ -51,6 +53,7 @@ use rlibpq::{Connection, Env, ExecStatus, QueryResult, Stream, conndefaults};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
+use crate::conditional::ConditionalStack;
 use crate::mainloop::{Lines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
@@ -302,6 +305,7 @@ fn run_action(
     match action {
         // `ACT_SINGLE_QUERY` (`startup.c:382`).
         Action::SingleQuery(sql) => {
+            session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
             }
@@ -313,6 +317,7 @@ fn run_action(
         }
         // `ACT_SINGLE_SLASH` (`startup.c:392`).
         Action::SingleSlash(text) => {
+            session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{text}");
             }
@@ -321,11 +326,16 @@ fn run_action(
             let mut buf = Vec::new();
             let opens_a_command =
                 scanner.scan(&mut buf, &VarView(&session.vars)).0 == ScanResult::Backslash;
+            // A fresh `\if` stack per command, and no query buffers
+            // (`startup.c:405`-`:411`).
+            let mut cond_stack = ConditionalStack::new();
             let status = if opens_a_command {
                 dispatch_slash(
                     &mut scanner,
                     &mut session.pset,
                     &mut session.vars,
+                    &mut cond_stack,
+                    None,
                     stdout,
                     stderr,
                 )
@@ -338,9 +348,15 @@ fn run_action(
                 EXIT_SUCCESS
             }
         }
-        // `ACT_FILE` (`startup.c:418`): `None` is stdin.
+        // `ACT_FILE` (`startup.c:418`) is `process_file()` (`command.c:4920`):
+        // `None` is stdin with no file name, `-` is stdin named `<stdin>`.
         Action::File(name) => {
-            let read = if let Some(name) = name {
+            let inputfile = match name.as_deref() {
+                None => None,
+                Some("-") => Some("<stdin>".to_string()),
+                Some(name) => Some(name.to_string()),
+            };
+            let read = if let Some(name) = name.as_deref().filter(|&n| n != "-") {
                 std::fs::read(name).map_err(|err| format!("{name}: {err}"))
             } else {
                 let mut bytes = Vec::new();
@@ -355,17 +371,24 @@ fn run_action(
                     return EXIT_FAILURE;
                 }
             };
+            // `command.c:4967`-`:4979`: the file names the log locus while it
+            // runs, and logging is terse exactly when there is no file.
+            let outer = std::mem::replace(&mut session.pset.inputfile, inputfile);
+            session.pset.log_terse = session.pset.inputfile.is_none();
             let mut loop_session = LoopSession {
                 pset: &mut session.pset,
                 vars: &mut session.vars,
             };
-            main_loop(
+            let code = main_loop(
                 &mut Lines::new(&input),
                 &mut loop_session,
                 executor,
                 stdout,
                 stderr,
-            )
+            );
+            session.pset.inputfile = outer;
+            session.pset.log_terse = session.pset.inputfile.is_none();
+            code
         }
     }
 }

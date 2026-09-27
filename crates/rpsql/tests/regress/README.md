@@ -26,6 +26,11 @@ against them on every `cargo test`. Recompute them from upstream with
 
 ## Sections
 
+`crates/rpsql/src/mainloop.rs` also reads both files: its unit test
+`the_server_free_blocks_of_the_if_section_match_psql_out` runs the blocks of
+the `\if` tests that send no query through `main_loop` in-process, on every
+`cargo test`, with no server.
+
 `mod.rs` cuts both files into sections at the comment headers `psql.sql`
 opens its topics with (a `--` line after an empty line), so each is gated
 against its own slice of `psql.out`. See `regress::split`.

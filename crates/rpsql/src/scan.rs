@@ -13,8 +13,6 @@
 //! touches is the [`VariableSource`] callback, which stands in for upstream's
 //! `PsqlScanCallbacks.get_variable` (`psqlscan.h:68`).
 
-use crate::variables::{escape_identifier, escape_literal};
-
 /// `yylex()`'s return values (`psqlscan.l:57`-`:59`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexRes {
@@ -135,7 +133,7 @@ pub enum StartState {
 // --- character classes, from the definitions section (`psqlscan.l:153`-`:374`)
 
 /// `space  [ \t\n\r\f\v]`
-const fn is_space(c: u8) -> bool {
+pub(crate) const fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
 }
 
@@ -267,6 +265,20 @@ pub struct ScanState {
     pub std_strings: bool,
 }
 
+/// `PsqlScanStateSave` (`psqlscan_int.h:149`): the lexer state an `\if`
+/// branch saves at its start and restores when its text is thrown away.
+///
+/// Saving happens only while a backslash command is being processed, so no
+/// comment or literal state needs keeping (`psqlscan_int.h:140`-`:147`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexStateSave {
+    paren_depth: i32,
+    begin_depth: i32,
+    copy_stdin_count: i32,
+    init_idents_count: usize,
+    init_idents: [u8; 8],
+}
+
 /// The lexer, holding both the cross-line [`ScanState`] and the buffers being
 /// read (`PsqlScanStateData`, `psqlscan_int.h:84`).
 #[derive(Debug, Clone)]
@@ -312,15 +324,16 @@ impl Scanner {
         self.stack.clear();
     }
 
-    /// `psql_scan_reset()` (`psqlscan.l:1381`): forget everything but
-    /// `std_strings`, which `psql_scan_setup` sets afresh each line.
+    /// `psql_scan_reset()` (`psqlscan.l:1381`): forget the cross-line state
+    /// but `std_strings`, which `psql_scan_setup` sets afresh each line. The
+    /// input is untouched: `MainLoop` resets after sending a statement and
+    /// then goes on lexing the rest of the same line (`mainloop.c:453`).
     pub fn reset(&mut self) {
         let std_strings = self.state.std_strings;
         self.state = ScanState {
             std_strings,
             ..ScanState::default()
         };
-        self.stack.clear();
     }
 
     /// `psql_scan_count_copy_from_stdin()` (`psqlscan.l:1422`): the number of
@@ -340,6 +353,27 @@ impl Scanner {
             self.state.init_idents_count = 0;
         }
         self.state.copy_stdin_count
+    }
+
+    /// `psql_scan_get_lex_state()` (`psqlscanslash.l:714`).
+    #[must_use]
+    pub fn lex_state(&self) -> LexStateSave {
+        LexStateSave {
+            paren_depth: self.state.paren_depth,
+            begin_depth: self.state.begin_depth,
+            copy_stdin_count: self.state.copy_stdin_count,
+            init_idents_count: self.state.init_idents_count,
+            init_idents: self.state.init_idents,
+        }
+    }
+
+    /// `psql_scan_set_lex_state()` (`psqlscanslash.l:733`).
+    pub fn set_lex_state(&mut self, saved: &LexStateSave) {
+        self.state.paren_depth = saved.paren_depth;
+        self.state.begin_depth = saved.begin_depth;
+        self.state.copy_stdin_count = saved.copy_stdin_count;
+        self.state.init_idents_count = saved.init_idents_count;
+        self.state.init_idents = saved.init_idents;
     }
 
     /// `psql_scan_in_quote()` (`psqlscan.l:1443`).
@@ -811,17 +845,15 @@ impl Scanner {
                 } else {
                     QuoteType::SqlIdent
                 };
-                let value = vars.get_variable(&name, quote).unwrap_or_else(|| {
-                    // `psqlscan_escape_variable` emits the *name*, quoted, when
-                    // the variable is unset (`psqlscan.l:1735`).
-                    if delim == b'\'' {
-                        escape_literal("")
-                    } else {
-                        escape_identifier(&name)
+                // `psqlscan_escape_variable` emits the value, or the original
+                // token as-is when the variable is unset (`psqlscan.l:1727`-`:1737`).
+                match vars.get_variable(&name, quote) {
+                    Some(value) => {
+                        self.skip(3 + name_len);
+                        out.extend_from_slice(value.as_bytes());
                     }
-                });
-                self.skip(3 + name_len);
-                out.extend_from_slice(value.as_bytes());
+                    None => self.echo(3 + name_len, out),
+                }
                 return;
             }
             // No-backup rule: throw back everything but the colon.
@@ -1183,6 +1215,7 @@ fn match_number(rest: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::variables::{escape_identifier, escape_literal};
 
     /// Run one line through the lexer, returning every scan result and the
     /// query buffer at the point each one fired.
@@ -1489,6 +1522,44 @@ mod tests {
         let mut out = Vec::new();
         scanner.scan(&mut out, &OneVar("n", "a'b"));
         assert_eq!(String::from_utf8_lossy(&out), "select 'a''b', \"a'b\";");
+    }
+
+    #[test]
+    fn unset_quoted_variables_are_copied_through_as_typed() {
+        // `psqlscan_escape_variable` emits the original token when the
+        // callback returns NULL (`psqlscan.l:1733`-`:1737`) — which is also
+        // what an inactive `\if` branch sees (`common.c:197`).
+        let mut scanner = Scanner::new();
+        scanner.setup(b"select :'n', :\"n\";", true);
+        let mut out = Vec::new();
+        scanner.scan(&mut out, &NoVariables);
+        assert_eq!(String::from_utf8_lossy(&out), "select :'n', :\"n\";");
+    }
+
+    #[test]
+    fn an_unterminated_quoted_variable_keeps_only_its_colon_special() {
+        // The no-backup rules `:'{variable_char}*` and `:\"{variable_char}*`
+        // throw back everything but the colon (`psqlscan.l:782`-`:798`); the
+        // quote then opens an ordinary literal.
+        let mut scanner = Scanner::new();
+        scanner.setup(b"select :'n", true);
+        let mut out = Vec::new();
+        let (res, _) = scanner.scan(&mut out, &OneVar("n", "1"));
+        assert_eq!(res, ScanResult::Incomplete);
+        assert_eq!(String::from_utf8_lossy(&out), "select :'n");
+        assert_eq!(scanner.start_state(), StartState::Xq);
+    }
+
+    #[test]
+    fn a_saved_lex_state_restores_the_paren_and_begin_depth() {
+        let mut scanner = Scanner::new();
+        scanner.setup(b"select (", true);
+        let mut out = Vec::new();
+        let saved = scanner.lex_state();
+        scanner.scan(&mut out, &NoVariables);
+        assert_eq!(scanner.paren_depth(), 1);
+        scanner.set_lex_state(&saved);
+        assert_eq!(scanner.paren_depth(), 0);
     }
 
     #[test]

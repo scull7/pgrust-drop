@@ -9,9 +9,11 @@
 
 use std::io::Write;
 
-use crate::command::{CommandResult, dispatch_slash};
+use crate::command::{CommandResult, QueryBuffers, dispatch_slash};
 use crate::common::{Executor, send_query};
-use crate::scan::{PromptStatus, ScanResult, Scanner};
+use crate::conditional::ConditionalStack;
+use crate::logging::{Level, log};
+use crate::scan::{NoVariables, PromptStatus, ScanResult, Scanner, VariableSource};
 use crate::settings::{EXIT_BADCONN, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
 use crate::variables::{VarView, VariableSpace};
 
@@ -69,6 +71,7 @@ pub fn main_loop(
     stderr: &mut dyn Write,
 ) -> u8 {
     let mut scanner = Scanner::new();
+    let mut cond_stack = ConditionalStack::new();
     let mut query_buf: Vec<u8> = Vec::new();
     let mut previous_buf: Vec<u8> = Vec::new();
     let mut success_result = EXIT_SUCCESS;
@@ -124,7 +127,15 @@ pub fn main_loop(
         success = true;
 
         while success || !die_on_error {
-            let scan_result = scanner.scan(&mut query_buf, &VarView(session.vars)).0;
+            // In an inactive `\if` branch nothing is substituted
+            // (`common.c:197`).
+            let substituting = VarView(session.vars);
+            let vars: &dyn VariableSource = if cond_stack.active() {
+                &substituting
+            } else {
+                &NoVariables
+            };
+            let scan_result = scanner.scan(&mut query_buf, vars).0;
             if scan_result == ScanResult::Eol {
                 session.pset.stmt_lineno += 1;
             }
@@ -132,16 +143,35 @@ pub fn main_loop(
             if scan_result == ScanResult::Semicolon
                 || (scan_result == ScanResult::Eol && session.pset.singleline)
             {
-                success = send_query(executor, &query_buf, session.pset, stdout, stderr);
-                slash_status = if success {
-                    CommandResult::Send
+                // Execute the query unless we're in an inactive `\if`
+                // branch (`mainloop.c:436`).
+                if cond_stack.active() {
+                    success = send_query(executor, &query_buf, session.pset, stdout, stderr);
+                    slash_status = if success {
+                        CommandResult::Send
+                    } else {
+                        CommandResult::Error
+                    };
+                    session.pset.stmt_lineno = 1;
+                    std::mem::swap(&mut previous_buf, &mut query_buf);
+                    query_buf.clear();
+                    scanner.reset();
+                    added_nl_pos = None;
                 } else {
-                    CommandResult::Error
-                };
-                session.pset.stmt_lineno = 1;
-                std::mem::swap(&mut previous_buf, &mut query_buf);
-                query_buf.clear();
-                added_nl_pos = None;
+                    if session.pset.cur_cmd_interactive {
+                        log(
+                            stderr,
+                            session.pset,
+                            Level::Error,
+                            "query ignored; use \\endif or Ctrl-C to exit current \\if block",
+                        );
+                    }
+                    // Fake an OK result for the loop's checks; the query
+                    // buffer keeps its text for `\endif` to discard.
+                    success = true;
+                    slash_status = CommandResult::Send;
+                    session.pset.stmt_lineno = 1;
+                }
             } else if scan_result == ScanResult::Backslash {
                 // A line holding only a backslash command leaves the query
                 // buffer untouched (`mainloop.c:475`).
@@ -150,8 +180,18 @@ pub fn main_loop(
                 }
                 added_nl_pos = None;
 
-                slash_status =
-                    dispatch_slash(&mut scanner, session.pset, session.vars, stdout, stderr);
+                slash_status = dispatch_slash(
+                    &mut scanner,
+                    session.pset,
+                    session.vars,
+                    &mut cond_stack,
+                    Some(QueryBuffers {
+                        query: &mut query_buf,
+                        previous: &previous_buf,
+                    }),
+                    stdout,
+                    stderr,
+                );
                 success = slash_status != CommandResult::Error;
                 session.pset.stmt_lineno = 1;
 
@@ -160,6 +200,7 @@ pub fn main_loop(
                         success = send_query(executor, &query_buf, session.pset, stdout, stderr);
                         std::mem::swap(&mut previous_buf, &mut query_buf);
                         query_buf.clear();
+                        scanner.reset();
                     }
                     CommandResult::Terminate => break,
                     _ => {}
@@ -190,11 +231,33 @@ pub fn main_loop(
     // (`mainloop.c:598`).
     if !query_buf.is_empty() && !session.pset.cur_cmd_interactive && success_result == EXIT_SUCCESS
     {
-        let ok = send_query(executor, &query_buf, session.pset, stdout, stderr);
+        // Unless we're in an inactive `\if` branch (`mainloop.c:613`).
+        let ok = if cond_stack.active() {
+            send_query(executor, &query_buf, session.pset, stdout, stderr)
+        } else {
+            true
+        };
         if !ok && die_on_error {
             success_result = EXIT_USER;
         } else if !executor.connected() {
             success_result = EXIT_BADCONN;
+        }
+    }
+
+    // Check for unbalanced `\if`-`\endif`s unless the user explicitly quit
+    // or the script is erroring out (`mainloop.c:635`).
+    if slash_status != CommandResult::Terminate
+        && success_result != EXIT_USER
+        && !cond_stack.is_empty()
+    {
+        log(
+            stderr,
+            session.pset,
+            Level::Error,
+            "reached EOF without finding closing \\endif(s)",
+        );
+        if die_on_error && !session.pset.cur_cmd_interactive {
+            success_result = EXIT_USER;
         }
     }
 
@@ -433,5 +496,195 @@ mod tests {
     fn blank_lines_are_skipped_but_not_inside_a_literal() {
         let out = run("select 'a\n\nb';\n", PsqlSettings::default());
         assert_eq!(out.seen, ["select 'a\n\nb';"]);
+    }
+
+    /// Two handles on one buffer, so stdout and stderr interleave the way
+    /// pg_regress's `2>&1` does.
+    #[derive(Clone)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `psql.sql` and its expected output, vendored from REL_18_6; their
+    /// digests are pinned by `tests/t_regress_psql.rs` (see
+    /// `tests/regress/README.md`).
+    const PSQL_SQL: &str = include_str!("../tests/regress/psql.sql");
+    const PSQL_OUT: &str = include_str!("../tests/regress/expected/psql.out");
+
+    /// The lines of `text` from the one starting `from` up to, not including,
+    /// the one starting `to`.
+    fn block<'t>(text: &'t str, from: &str, to: &str) -> &'t str {
+        let start = 1 + text
+            .find(&format!("\n{from}"))
+            .unwrap_or_else(|| panic!("no line starts {from:?}"));
+        let end = start
+            + 1
+            + text[start..]
+                .find(&format!("\n{to}"))
+                .unwrap_or_else(|| panic!("no line starts {to:?}"));
+        &text[start..end]
+    }
+
+    /// `psql -X -a -q` reading a pipe, as pg_regress runs it
+    /// (`pg_regress_main.c:74`): echo all, quiet, terse logging, no file.
+    fn run_like_pg_regress(input: &str) -> (String, Vec<String>) {
+        let mut pset = PsqlSettings {
+            echo: crate::settings::Echo::All,
+            quiet: true,
+            log_terse: true,
+            notty: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        vars.set("ECHO", Some("all")).unwrap();
+        vars.set("QUIET", Some("on")).unwrap();
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+        };
+        let mut executor = Recorder::new();
+        let out = Shared(std::rc::Rc::default());
+        let code = main_loop(
+            &mut Lines::new(input.as_bytes()),
+            &mut session,
+            &mut executor,
+            &mut out.clone(),
+            &mut out.clone(),
+        );
+        assert_eq!(code, EXIT_SUCCESS);
+        let bytes = out.0.borrow().clone();
+        (String::from_utf8(bytes).unwrap(), executor.seen)
+    }
+
+    /// The blocks of psql.sql's `\if` section that send no query, compared
+    /// with `expected/psql.out` byte for byte. The rest of the section needs
+    /// a server and runs in `tests/t_regress_psql.rs` against C psql.
+    #[test]
+    fn the_server_free_blocks_of_the_if_section_match_psql_out() {
+        for (from, to) in [
+            // psql.sql:932-1029: nested true-equivalents, false-equivalents
+            // in if/elif/else, an invalid expression, and every misplaced
+            // \elif, \else and \endif.
+            (
+                "-- test a large nested if",
+                "-- show that vars and backticks are not expanded when ignoring",
+            ),
+            // psql.sql:1036-1111: every command upstream has, inside
+            // `\if false`, consuming exactly its own arguments.
+            (
+                "-- show that vars and backticks are not expanded and commands",
+                "-- test that begin/end matching",
+            ),
+            // psql.sql:1124-1136: `:{?name}` as an `\if` expression.
+            ("-- :{?...} defined variable test", "SELECT :{?i}"),
+        ] {
+            let (out, seen) = run_like_pg_regress(block(PSQL_SQL, from, to));
+            assert_eq!(out, block(PSQL_OUT, from, to), "block {from:?}");
+            assert!(seen.is_empty(), "block {from:?} sent {seen:?}");
+        }
+    }
+
+    #[test]
+    fn an_inactive_branch_keeps_its_text_out_of_the_statement() {
+        // psql.sql:921-930 without the server: the text of the false branch,
+        // unbalanced paren and all, never reaches the statement. The indent
+        // before each `\if`/`\else` stays: whitespace is only suppressed
+        // while the buffer is empty (`psqlscan.l:406`), and a line that is
+        // not *only* a backslash command keeps its newline (`mainloop.c:475`).
+        let (_, seen) = run_like_pg_regress(
+            "select\n  \\if true\n    42\n  \\else\n    (bogus\n  \\endif\n  forty_two;\n\
+             select \\if false \\\\ (bogus \\else \\\\ 42 \\endif \\\\ forty_two;\n",
+        );
+        assert_eq!(
+            seen,
+            [
+                "select\n  \n    42\n  \n  forty_two;",
+                "select  42  forty_two;"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_in_an_inactive_branch_sends_nothing_and_g_resends() {
+        // psql.sql:910-919: the `\else` branch's statements are discarded at
+        // `\endif`, so `\g` finds an empty buffer and sends the previous one.
+        let (_, seen) = run_like_pg_regress(
+            "\\if true\n  select 'okay';\n  select 'still okay';\n\\else\n  not okay;\n\
+             \x20 still not okay\n\\endif\n\\g\n",
+        );
+        assert_eq!(
+            seen,
+            [
+                "select 'okay';",
+                "select 'still okay';",
+                "select 'still okay';"
+            ]
+        );
+    }
+
+    #[test]
+    fn begin_end_depth_inside_an_inactive_branch_is_forgotten() {
+        // psql.sql:1114-1120: the `end` inside `\if false` must not close
+        // the `begin atomic`, or the `;` after `\endif` would end the
+        // statement early.
+        let (_, seen) = run_like_pg_regress(
+            "create function f(int) returns int\nbegin atomic select $1;\n\\if false\nend\n\
+             \\endif\n;\nend;\n",
+        );
+        assert_eq!(
+            seen,
+            ["create function f(int) returns int\nbegin atomic select $1;\n;\nend;"]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_if_at_end_of_input_is_reported() {
+        // `mainloop.c:635`.
+        let (out, _) = run_like_pg_regress("\\if true\n");
+        assert_eq!(
+            out,
+            "\\if true\nreached EOF without finding closing \\endif(s)\n"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_if_under_on_error_stop_exits_with_exit_user() {
+        let mut pset = PsqlSettings {
+            on_error_stop: true,
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+        };
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let code = main_loop(
+            &mut Lines::new(b"\\if false\n"),
+            &mut session,
+            &mut Recorder::new(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, EXIT_USER);
+        assert_eq!(stderr, b"reached EOF without finding closing \\endif(s)\n");
+    }
+
+    #[test]
+    fn variables_are_not_substituted_in_an_inactive_branch() {
+        // `psql_get_variable` returns NULL there (`common.c:197`), so the
+        // lexer copies `:x` through; the text is then discarded.
+        let (_, seen) =
+            run_like_pg_regress("\\set x 1\nselect :x;\n\\if false\nselect :x;\n\\endif\n");
+        assert_eq!(seen, ["select 1;"]);
     }
 }

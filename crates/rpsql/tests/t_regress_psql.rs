@@ -299,3 +299,105 @@ fn the_aligned_and_unaligned_blocks_match_psql_out() {
         );
     }
 }
+
+/// Ports of the `\if` gates below.
+const IF_SECTIONS_PORT: u16 = 55_491;
+const BEGIN_END_MATCHING_PORT: u16 = 55_492;
+
+/// The sections from the one opening with `from` up to, not including, the
+/// one opening with `to`, joined into one: `psql.sql` separates the topics of
+/// its `\if` tests with blank lines, but they share state — `\g` resends the
+/// previous section's query, `:foo` is set in one and read in the next — so
+/// they only pass as the one script `pg_regress` runs. `skip` names sections
+/// left out whole.
+fn joined_sections(from: &str, to: &str, skip: &[&str]) -> (String, String, Section<'static>) {
+    let all = split(PSQL_SQL, PSQL_OUT).expect("the vendored files split");
+    let start = all
+        .iter()
+        .position(|s| s.header == from)
+        .unwrap_or_else(|| panic!("no section {from:?}"));
+    let end = all
+        .iter()
+        .position(|s| s.header == to)
+        .unwrap_or_else(|| panic!("no section {to:?}"));
+    for header in skip {
+        assert!(
+            all[start..end].iter().any(|s| s.header == *header),
+            "skipped section {header:?} must lie between {from:?} and {to:?}"
+        );
+    }
+    let kept: Vec<&Section<'_>> = all[start..end]
+        .iter()
+        .filter(|s| !skip.contains(&s.header))
+        .collect();
+    let sql = kept.iter().map(|s| s.sql).collect();
+    let out = kept.iter().map(|s| s.expected).collect();
+    (sql, out, all[start].clone())
+}
+
+/// `-- tests for \if ... \endif` (`psql.sql:908`-`:1140`): `\if`, `\elif`,
+/// `\else` and `\endif`, `:{?name}`, and every backslash command upstream
+/// has, skipped inside `\if false` — against `psql.out` and against C psql.
+///
+/// One of the topics, `-- test that begin/end matching ignores to-be-ignored
+/// text`, ends in `\sf`, which this port does not have yet; it is gated by
+/// itself in [`if_begin_end_matching_matches_psql_out_but_for_sf`].
+#[test]
+fn if_sections_match_psql_out() {
+    let (sql, expected, first) = joined_sections(
+        "-- tests for \\if ... \\endif",
+        "-- SHOW_CONTEXT",
+        &["-- test that begin/end matching ignores to-be-ignored text"],
+    );
+    let Some(cluster) = Cluster::start(IF_SECTIONS_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &Section {
+            sql: &sql,
+            expected: &expected,
+            ..first
+        },
+    );
+}
+
+/// `-- test that begin/end matching ignores to-be-ignored text`
+/// (`psql.sql:1113`-`:1122`): an `end` inside `\if false` must not close the
+/// `begin atomic` around it.
+///
+/// The section's `\sf silly_function(int)` (`:1121`) is `exec_command_sf_sv`
+/// (`command.c:2982`), which no slice has ported yet, so that one line is cut
+/// from the script and exactly the lines it prints from `psql.out`; both cuts
+/// must match exactly once, so the gate cannot quietly widen.
+#[test]
+fn if_begin_end_matching_matches_psql_out_but_for_sf() {
+    let section = section("-- test that begin/end matching ignores to-be-ignored text");
+    let sf = "\\sf silly_function(int)\n";
+    let sf_output = "\\sf silly_function(int)\n\
+                     CREATE OR REPLACE FUNCTION public.silly_function(integer)\n \
+                     RETURNS integer\n \
+                     LANGUAGE sql\n\
+                     BEGIN ATOMIC\n \
+                     SELECT $1;\n\
+                     END\n";
+    assert_eq!(section.sql.matches(sf).count(), 1, "the \\sf line to cut");
+    assert_eq!(
+        section.expected.matches(sf_output).count(),
+        1,
+        "the \\sf output to cut"
+    );
+    let sql = section.sql.replacen(sf, "", 1);
+    let expected = section.expected.replacen(sf_output, "", 1);
+    let Some(cluster) = Cluster::start(BEGIN_END_MATCHING_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &Section {
+            sql: &sql,
+            expected: &expected,
+            ..section
+        },
+    );
+}

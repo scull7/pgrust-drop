@@ -299,6 +299,7 @@ mod tests {
     use super::*;
     use crate::common::Reply;
     use rlibpq::{Backend, QueryRunner, TransactionStatus};
+    use std::num::NonZeroUsize;
 
     /// An executor that records the queries it was asked to run and answers
     /// each with a CommandComplete.
@@ -308,6 +309,8 @@ mod tests {
         /// Results to answer with, in order, before falling back to a
         /// CommandComplete.
         answers: Vec<rlibpq::QueryResult>,
+        /// Whether each query was asked for in chunks, and of how many rows.
+        chunk_rows: Vec<Option<NonZeroUsize>>,
         connected: bool,
     }
 
@@ -317,16 +320,29 @@ mod tests {
                 seen: Vec::new(),
                 fail: Vec::new(),
                 answers: Vec::new(),
+                chunk_rows: Vec::new(),
                 connected: true,
             }
         }
     }
 
     impl Executor for Recorder {
-        fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
+        fn exec(&mut self, query: &[u8], chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
+            self.chunk_rows.push(chunk_rows);
             if !self.answers.is_empty() {
-                return vec![Reply::Result(self.answers.remove(0))];
+                // A chunked answer is every chunk up to and including the
+                // result that ends it.
+                let mut replies = Vec::new();
+                while !self.answers.is_empty() {
+                    let result = self.answers.remove(0);
+                    let chunk = result.status() == rlibpq::ExecStatus::TuplesChunk;
+                    replies.push(Reply::Result(result));
+                    if !chunk {
+                        break;
+                    }
+                }
+                return replies;
             }
             let fails = self.fail.first().copied().unwrap_or(false);
             if !self.fail.is_empty() {
@@ -592,6 +608,15 @@ mod tests {
         input: &str,
         answers: Vec<rlibpq::QueryResult>,
     ) -> (String, Vec<String>) {
+        let (out, executor) = run_like_pg_regress_with(input, answers);
+        (out, executor.seen)
+    }
+
+    /// [`run_like_pg_regress_answering`], handing back the whole executor.
+    fn run_like_pg_regress_with(
+        input: &str,
+        answers: Vec<rlibpq::QueryResult>,
+    ) -> (String, Recorder) {
         let mut pset = PsqlSettings {
             echo: crate::settings::Echo::All,
             quiet: true,
@@ -602,6 +627,8 @@ mod tests {
         let mut vars = VariableSpace::new();
         vars.set("ECHO", Some("all")).unwrap();
         vars.set("QUIET", Some("on")).unwrap();
+        // As `main` sets it at startup (`startup.c:206`).
+        vars.set_bool("SHOW_ALL_RESULTS").unwrap();
         let mut session = Session {
             pset: &mut pset,
             vars: &mut vars,
@@ -618,7 +645,7 @@ mod tests {
         );
         assert_eq!(code, EXIT_SUCCESS);
         let bytes = out.0.borrow().clone();
-        (String::from_utf8(bytes).unwrap(), executor.seen)
+        (String::from_utf8(bytes).unwrap(), executor)
     }
 
     /// The blocks of psql.sql's `\if` section that send no query, compared
@@ -843,6 +870,100 @@ mod tests {
                 &format!("Parse: {second}"),
                 "Describe",
                 second,
+            ]
+        );
+    }
+
+    /// The server's replies to one `SELECT` of `values` into one `int4`
+    /// column, `name`, in chunks of `chunk_rows` — and, with `error`, that
+    /// error once every value has been sent.
+    fn chunked(
+        name: &str,
+        values: &[&str],
+        chunk_rows: usize,
+        error: Option<&[(u8, &[u8])]>,
+    ) -> Vec<rlibpq::QueryResult> {
+        let mut runner = QueryRunner::new();
+        assert!(runner.set_chunked_rows_mode(chunk_rows));
+        let mut column = crate::common::tests::column(name.as_bytes(), 23, -1);
+        column.typlen = 4;
+        runner.push(Backend::RowDescription(vec![column])).unwrap();
+        for value in values {
+            runner
+                .push(Backend::DataRow(vec![Some(value.as_bytes().to_vec())]))
+                .unwrap();
+        }
+        runner
+            .push(match error {
+                Some(fields) => Backend::ErrorResponse(rlibpq::ResultError::new(
+                    fields.iter().map(|(c, v)| (*c, v.to_vec())).collect(),
+                )),
+                None => Backend::CommandComplete(format!("SELECT {}", values.len()).into_bytes()),
+            })
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results()
+    }
+
+    /// psql.sql:1239-1256, `-- check row count for a query with chunked
+    /// results` and `-- chunked results with an error after the first
+    /// chunk`, against `expected/psql.out` byte for byte, the server's
+    /// replies played back: under `FETCH_COUNT 10` each query is fetched in
+    /// chunks, one table is printed across them with the rows of all
+    /// counted in its footer and `ROW_COUNT`, and an error after the first
+    /// chunk leaves that chunk printed, then the error. The live gate in
+    /// `tests/t_regress_psql.rs` runs the same against a server and C psql.
+    #[test]
+    fn fetch_count_prints_one_table_across_the_chunks() {
+        let (from, to) = (
+            "-- check row count for a query with chunked results",
+            "\\unset FETCH_COUNT",
+        );
+        let unique2: Vec<String> = (0..19).map(|n| n.to_string()).collect();
+        let unique2: Vec<&str> = unique2.iter().map(String::as_str).collect();
+        let mut answers = chunked("unique2", &unique2, 10, None);
+        answers.extend(chunked(
+            "?column?",
+            &[&["0"; 14][..], &["1"]].concat(),
+            10,
+            Some(&[
+                (b'S', b"ERROR"),
+                (b'V', b"ERROR"),
+                (b'C', b"22012"),
+                (b'M', b"division by zero"),
+            ]),
+        ));
+        let set = answers.len() - 2;
+        let set_tag = {
+            let mut runner = QueryRunner::new();
+            runner
+                .push(Backend::CommandComplete(b"SET".to_vec()))
+                .unwrap();
+            runner.into_results().remove(0)
+        };
+        answers.insert(set, set_tag);
+        let (out, executor) = run_like_pg_regress_with(block(PSQL_SQL, from, to), answers);
+        assert_eq!(out, block(PSQL_OUT, from, to));
+        let ten = NonZeroUsize::new(10);
+        assert_eq!(
+            executor
+                .seen
+                .iter()
+                .zip(&executor.chunk_rows)
+                .collect::<Vec<_>>(),
+            [
+                (
+                    &"select unique2 from tenk1 order by unique2 limit 19;".to_string(),
+                    &ten
+                ),
+                (&"set debug_parallel_query = off;".to_string(), &ten),
+                (
+                    &"select 1/(15-unique2) from tenk1 order by unique2 limit 19;".to_string(),
+                    &ten
+                ),
+                (&"reset debug_parallel_query;".to_string(), &ten),
             ]
         );
     }

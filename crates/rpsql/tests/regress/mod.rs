@@ -235,10 +235,34 @@ impl Cluster {
     /// # Panics
     /// When `psql` cannot be started or its output read.
     pub fn run_script(&self, psql: &Path, script: &str) -> Vec<u8> {
+        self.run(psql, &["-a"], script).1
+    }
+
+    /// Action: load the tables a gate's script reads, as `pg_regress`'s
+    /// earlier tests would have: `script` run through `psql`, stopping at
+    /// the first error.
+    ///
+    /// # Panics
+    /// When `script` fails or prints anything.
+    pub fn load_fixture(&self, psql: &Path, script: &str) {
+        let (ok, output) = self.run(psql, &["-v", "ON_ERROR_STOP=1"], script);
+        assert!(
+            ok && output.is_empty(),
+            "the fixture failed: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    /// `psql -X -q -d postgres` with `args`, `script` on stdin, as
+    /// `pg_regress` runs it: whether it exited 0, and stdout and stderr as
+    /// the one stream `2>&1` makes of them.
+    fn run(&self, psql: &Path, args: &[&str], script: &str) -> (bool, Vec<u8>) {
         let (mut reader, writer) = std::io::pipe().expect("a pipe for 2>&1");
         let mut command = Command::new(psql);
         command
-            .args(["-X", "-a", "-q", "-d", "postgres"])
+            .args(["-X"])
+            .args(args)
+            .args(["-q", "-d", "postgres"])
             .args(["-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"])
             // `pg_regress` names the server through the environment, too.
             .env("PGHOST", &self.dir)
@@ -271,8 +295,8 @@ impl Cluster {
             .read_to_end(&mut output)
             .expect("psql's output is read");
         feeder.join().expect("the script is fed");
-        child.wait().expect("psql exits");
-        output
+        let status = child.wait().expect("psql exits");
+        (status.success(), output)
     }
 
     /// The reference `psql` beside `initdb`, if this lane's installation has

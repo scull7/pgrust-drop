@@ -1008,6 +1008,15 @@ impl QueryRunner {
         }
     }
 
+    /// `PQsetChunkedRowsMode` right after the send (`fe-exec.c:1982`): the
+    /// rows are collected in `PGRES_TUPLES_CHUNK` results of at most
+    /// `chunk_size`, as a server's replies would reach a caller that asked
+    /// for them so. Refused, as libpq refuses it, for a chunk of no rows or
+    /// once a result has begun.
+    pub fn set_chunked_rows_mode(&mut self, chunk_size: usize) -> bool {
+        self.state.set_chunked_rows_mode(chunk_size)
+    }
+
     /// One message in. A COPY result ends the fold as it ends `PQexecFinish`
     /// (`fe-exec.c:2448`): the data transfer is the caller's, so the runner
     /// is [`Flow::Done`] from then on and takes nothing more.
@@ -2098,6 +2107,71 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].value(0, 0), Some(&b"x"[..]));
         assert_eq!(results[1].fname(0), Some(&b"b"[..]));
+    }
+
+    /// In chunked mode the runner collects what psql's `FETCH_COUNT` loop
+    /// sees (`common.c:2014`-`:2116`): full chunks, the partial last one,
+    /// then the empty `TUPLES_OK` behind them — and when an error comes
+    /// after a chunk, the rows since it are dropped with the error
+    /// (`pqClearAsyncResult` in `pqGetErrorNotice3`, `fe-protocol3.c:916`).
+    #[test]
+    fn a_chunked_query_runner_hands_over_chunks_then_the_end_or_the_error() {
+        let row = |v: &[u8]| Backend::DataRow(vec![Some(v.to_vec())]);
+        let mut runner = QueryRunner::new();
+        assert!(
+            !runner.clone().set_chunked_rows_mode(0),
+            "a chunk of no rows"
+        );
+        assert!(runner.set_chunked_rows_mode(2));
+        runner
+            .push(Backend::RowDescription(vec![text_field(b"a")]))
+            .unwrap();
+        for v in [b"1", b"2", b"3"] {
+            runner.push(row(v)).unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(b"SELECT 3".to_vec()))
+            .unwrap();
+        assert_eq!(runner.push(ready(TransactionStatus::Idle)), Ok(Flow::Done));
+        let shape: Vec<_> = runner
+            .results()
+            .iter()
+            .map(|r| (r.status(), r.ntuples()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (ExecStatus::TuplesChunk, 2),
+                (ExecStatus::TuplesChunk, 1),
+                (ExecStatus::TuplesOk, 0)
+            ]
+        );
+        // The tag goes to whatever result is current (`fe-protocol3.c:218`):
+        // the partial chunk, not the empty result behind it.
+        assert_eq!(runner.results()[1].command_status(), b"SELECT 3");
+        assert_eq!(runner.results()[2].command_status(), b"");
+
+        let mut runner = QueryRunner::new();
+        assert!(runner.set_chunked_rows_mode(2));
+        runner
+            .push(Backend::RowDescription(vec![text_field(b"a")]))
+            .unwrap();
+        for v in [b"1", b"2", b"3"] {
+            runner.push(row(v)).unwrap();
+        }
+        runner
+            .push(Backend::ErrorResponse(error(b"22012")))
+            .unwrap();
+        runner.push(ready(TransactionStatus::Idle)).unwrap();
+        let shape: Vec<_> = runner
+            .results()
+            .iter()
+            .map(|r| (r.status(), r.ntuples()))
+            .collect();
+        assert_eq!(
+            shape,
+            [(ExecStatus::TuplesChunk, 2), (ExecStatus::FatalError, 0)]
+        );
     }
 
     fn copy_format(columns: &[i16]) -> CopyFormat {

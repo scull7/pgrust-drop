@@ -47,6 +47,7 @@ pub mod variables;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use rlibpq::{
@@ -101,9 +102,19 @@ impl LiveExecutor {
     /// taking the notices parsed along the way before each result. It stops
     /// at a COPY result, whose data this port does not transfer yet; the next
     /// query's `PQexecStart` ends that COPY.
-    fn replies(&mut self, query: &[u8], replies: &mut Vec<Reply>) -> Result<(), ConnectionError> {
+    fn replies(
+        &mut self,
+        query: &[u8],
+        chunk_rows: Option<NonZeroUsize>,
+        replies: &mut Vec<Reply>,
+    ) -> Result<(), ConnectionError> {
         self.connection.exec_start()?;
         self.connection.send_query(query)?;
+        if let Some(rows) = chunk_rows {
+            // Cannot be refused right after the send (`Executor::exec`).
+            let chunked = self.connection.set_chunked_rows_mode(rows.get());
+            debug_assert!(chunked, "PQsetChunkedRowsMode right after PQsendQuery");
+        }
         while let Some(result) = self.connection.get_result()? {
             replies.extend(self.notices());
             let copy = matches!(
@@ -146,9 +157,9 @@ impl LiveExecutor {
 }
 
 impl Executor for LiveExecutor {
-    fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
+    fn exec(&mut self, query: &[u8], chunk_rows: Option<NonZeroUsize>) -> Vec<Reply> {
         let mut replies = Vec::new();
-        if let Err(err) = self.replies(query, &mut replies) {
+        if let Err(err) = self.replies(query, chunk_rows, &mut replies) {
             self.alive = false;
             replies.extend(self.notices());
             replies.push(Reply::Broken(err.into()));
@@ -355,7 +366,7 @@ fn psql_exec(
     stderr: &mut impl Write,
 ) -> bool {
     let mut ok = true;
-    for reply in executor.exec(query) {
+    for reply in executor.exec(query, None) {
         match reply {
             Reply::Notice(notice) => notice_processor(&notice, pset, stderr),
             Reply::Result(result) => {

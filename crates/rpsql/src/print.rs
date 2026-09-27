@@ -198,10 +198,11 @@ struct TableContent<'a> {
 
 impl TableContent<'_> {
     /// `footers_with_default()` (`print.c:398`): the `(n rows)` line, or
-    /// nothing under `\pset footer off`.
+    /// nothing under `\pset footer off`. `n` counts the rows of earlier
+    /// chunks too (`print.c:404`).
     fn default_footer(&self) -> Option<String> {
         self.opt.default_footer.then(|| {
-            let n = self.cells.len();
+            let n = self.opt.prior_records + self.cells.len() as u64;
             if n == 1 {
                 format!("({n} row)")
             } else {
@@ -816,6 +817,41 @@ mod tests {
     fn no_rows_still_prints_the_header_and_footer() {
         let res = result(vec![int4_field("n")], vec![]);
         assert_eq!(rendered(&res), " n \n---\n(0 rows)\n\n");
+    }
+
+    /// A chunked result as `ExecQueryAndProcessResults` prints it
+    /// (`common.c:2014`-`:2107`): the header with the first chunk only, each
+    /// chunk measured by itself, and the footer from the empty result behind
+    /// the chunks, counting every row before it.
+    #[test]
+    fn a_chunked_result_prints_one_header_and_one_footer_counting_every_row() {
+        let chunks = [
+            result(
+                vec![int4_field("n")],
+                vec![vec![Some("1")], vec![Some("2")]],
+            ),
+            result(vec![int4_field("n")], vec![vec![Some("300")]]),
+            result(vec![int4_field("n")], vec![]),
+        ];
+        for (format, expected) in [
+            (PrintFormat::Aligned, " n \n---\n 1\n 2\n 300\n(3 rows)\n\n"),
+            (PrintFormat::Unaligned, "n\n1\n2\n300\n(3 rows)\n"),
+        ] {
+            let mut opt = PrintQueryOpt::default();
+            opt.topt.format = format;
+            opt.topt.field_sep.separator = Some("|".to_string());
+            opt.topt.record_sep.separator = Some("\n".to_string());
+            opt.topt.start_table = true;
+            opt.topt.stop_table = false;
+            let mut out = Vec::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                opt.topt.stop_table = i + 1 == chunks.len();
+                out.extend(print_query(chunk, &opt).unwrap());
+                opt.topt.start_table = false;
+                opt.topt.prior_records += chunk.ntuples() as u64;
+            }
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "{format:?}");
+        }
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
-//! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, NAT-404
-//! `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
+//! NAT-400 adds `\pset`, NAT-403 `\timing`, `\errverbose` and `\copy`,
+//! NAT-404 `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
 //! `\bind`, `\bind_named` and `\close_prepared`, and the pipeline commands
 //! `\startpipeline`, `\sendpipeline`, `\syncpipeline`, `\flush`,
 //! `\flushrequest`, `\getresults` and `\endpipeline`, and NAT-396 the
@@ -17,7 +17,7 @@ use std::io::Write;
 
 use rlibpq::{ContextVisibility, PipelineStatus, Verbosity};
 
-use crate::common::Executor;
+use crate::common::{CommandSource, Executor};
 use crate::crosstab::CtvArgs;
 use crate::logging;
 use crate::scan::{Scanner, VariableSource};
@@ -40,6 +40,9 @@ pub enum CommandResult {
     Error,
     /// `\c`'s reconnection, `do_connect`, which the caller performs (`command.c:3919`).
     Connect(Box<ConnectRequest>),
+    /// `\copy`'s whole line, for `do_copy`, which needs the connection and
+    /// so is performed by [`dispatch_slash`] (`command.c:963`).
+    Copy(Option<Vec<u8>>),
 }
 
 /// The four arguments `\connect` takes (`command.c:645`-`:648`).
@@ -96,13 +99,14 @@ pub struct CommandContext<'a> {
 /// Reconnection is an action no caller performs yet, so [`CommandResult`]
 /// never comes back as [`CommandResult::Connect`]: it is reported and turned
 /// into [`CommandResult::Error`] here. NAT-405 replaces that with the real
-/// thing.
+/// thing. [`CommandResult::Copy`] never comes back either: `\copy` runs here,
+/// over `executor`, with `source` as `pset.cur_cmd_source`.
 pub fn dispatch_slash(
     scanner: &mut Scanner,
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
-    pipeline: PipelineStatus,
     executor: &mut dyn Executor,
+    source: &mut CommandSource<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> CommandResult {
@@ -115,8 +119,8 @@ pub fn dispatch_slash(
         let mut ctx = CommandContext {
             pset: &mut working,
             vars,
-            pipeline,
-            executor,
+            pipeline: executor.pipeline_status(),
+            executor: &mut *executor,
         };
         handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
     };
@@ -131,6 +135,22 @@ pub fn dispatch_slash(
             stderr,
         );
         return CommandResult::Error;
+    }
+    if let CommandResult::Copy(args) = status {
+        // `exec_command_copy()` (`command.c:963`).
+        return if crate::copy::do_copy(
+            args.as_deref(),
+            executor,
+            pset,
+            vars,
+            source,
+            stdout,
+            stderr,
+        ) {
+            CommandResult::SkipLine
+        } else {
+            CommandResult::Error
+        };
     }
     status
 }
@@ -147,6 +167,14 @@ pub fn handle_slash_cmds(
     stderr: &mut dyn Write,
 ) -> CommandResult {
     let cmd = scanner.slash_command();
+    // `\copy`, in any case (`command.c:354`), takes its line whole
+    // (`OT_WHOLE_LINE`, `:970`); every other command here takes `OT_NORMAL`
+    // arguments.
+    if cmd.eq_ignore_ascii_case("copy") {
+        let line = scanner.slash_option_whole_line();
+        scanner.slash_command_end();
+        return CommandResult::Copy(line);
+    }
     let options = scanner.slash_options(vars_view);
     let status = exec_command(&cmd, &options, ctx, stdout, stderr);
 
@@ -665,8 +693,9 @@ mod tests {
     use super::*;
     use crate::common::ErrorMessage;
     use crate::scan::{NoVariables, ScanResult};
+    use rlibpq::QueryResult;
 
-    /// No connection: the commands here never reach the server.
+    /// No server: nothing here sends a query.
     struct NoServer;
 
     impl Executor for NoServer {
@@ -674,14 +703,33 @@ mod tests {
             &mut self,
             _query: &[u8],
             _mode: &SendMode,
-        ) -> Result<Vec<rlibpq::QueryResult>, ErrorMessage> {
-            Err(ErrorMessage::new("no connection"))
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            Err(ErrorMessage::new(b"no connection to the server".to_vec()))
         }
         fn connected(&self) -> bool {
             false
         }
-
         fn abandon(&mut self) {}
+    }
+
+    /// [`NoServer`], with its pipeline in a state a test chooses.
+    struct Piped(PipelineStatus);
+
+    impl Executor for Piped {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            NoServer.exec(query, mode)
+        }
+        fn connected(&self) -> bool {
+            false
+        }
+        fn abandon(&mut self) {}
+        fn pipeline_status(&self) -> PipelineStatus {
+            self.0
+        }
     }
 
     struct Run {
@@ -868,8 +916,8 @@ mod tests {
             &mut scanner,
             &mut pset,
             &mut vars,
-            PipelineStatus::Off,
             &mut NoServer,
+            &mut CommandSource::file(&mut &b""[..]),
             &mut stdout,
             &mut stderr,
         );
@@ -896,13 +944,25 @@ mod tests {
             &mut scanner,
             &mut pset,
             &mut vars,
-            PipelineStatus::Off,
             &mut NoServer,
+            &mut CommandSource::file(&mut &b""[..]),
             &mut stdout,
             &mut stderr,
         );
 
         (status, pset, String::from_utf8(stderr).unwrap())
+    }
+
+    #[test]
+    fn copy_takes_the_whole_line_in_any_case_and_reports_its_parse_errors() {
+        // `command.c:354` compares with `pg_strcasecmp`; `copy.c:98` and
+        // `:253` are the messages. Neither reaches the server.
+        let (status, _, stderr) = dispatch("\\COPY");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(stderr, "psql: error: \\copy: arguments required\n");
+        let (status, _, stderr) = dispatch("\\copy t sideways 'f' \\\\ \\echo x");
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(stderr, "psql: error: \\copy: parse error at \"sideways\"\n");
     }
 
     #[test]
@@ -995,8 +1055,8 @@ mod tests {
             &mut scanner,
             pset,
             &mut vars,
-            pipeline,
-            &mut NoServer,
+            &mut Piped(pipeline),
+            &mut CommandSource::file(&mut &b""[..]),
             &mut stdout,
             &mut stderr,
         );
@@ -1339,8 +1399,8 @@ mod tests {
             &mut scanner,
             &mut pset,
             &mut vars,
-            PipelineStatus::Off,
             &mut NoServer,
+            &mut CommandSource::file(&mut &b""[..]),
             &mut stdout,
             &mut stderr,
         );

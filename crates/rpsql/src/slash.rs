@@ -146,6 +146,24 @@ impl Scanner {
         })
     }
 
+    /// `psql_scan_slash_option(OT_WHOLE_LINE, NULL, false)`
+    /// (`psqlscanslash.l:423`, `:574`): the rest of the line, leading
+    /// whitespace dropped and nothing else touched — no quotes, no
+    /// variables, and no end at a backslash. `None` when nothing is left
+    /// (`:661`).
+    pub fn slash_option_whole_line(&mut self) -> Option<Vec<u8>> {
+        // `{space}` is `[ \t\n\r\f\v]` (`psqlscanslash.l:104`).
+        let skip = self
+            .rest()
+            .iter()
+            .take_while(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b))
+            .count();
+        self.skip(skip);
+        let line = self.rest().to_vec();
+        self.skip(line.len());
+        (!line.is_empty()).then_some(line)
+    }
+
     /// Every remaining argument, which is how `HandleSlashCmds` eats the tail
     /// of a command line (`command.c:278`).
     pub fn slash_options(&mut self, vars: &dyn VariableSource) -> Vec<SlashOption> {
@@ -417,5 +435,29 @@ mod tests {
             dequote_downcase_identifier(b"\"A\"B", false),
             b"AB".to_vec()
         );
+    }
+
+    fn whole_line(line: &str) -> Option<Vec<u8>> {
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        scanner.slash_command();
+        scanner.slash_option_whole_line()
+    }
+
+    #[test]
+    fn a_whole_line_argument_is_the_rest_of_the_line_as_typed() {
+        // `psqlscanslash.l:423`: leading whitespace goes, everything else —
+        // quotes, `:var`, backslashes, trailing blanks — stays.
+        assert_eq!(
+            whole_line("\\copy  t from 'a b' :x \\\\ \\echo  "),
+            Some(b"t from 'a b' :x \\\\ \\echo  ".to_vec())
+        );
+        assert_eq!(whole_line("\\copy \t "), None);
+        assert_eq!(whole_line("\\copy"), None);
     }
 }

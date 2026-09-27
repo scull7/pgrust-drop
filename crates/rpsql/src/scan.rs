@@ -312,15 +312,18 @@ impl Scanner {
         self.stack.clear();
     }
 
-    /// `psql_scan_reset()` (`psqlscan.l:1381`): forget everything but
-    /// `std_strings`, which `psql_scan_setup` sets afresh each line.
+    /// `psql_scan_reset()` (`psqlscan.l:1381`): forget the statement lexed
+    /// so far. The input buffers are left alone, as upstream leaves them:
+    /// `MainLoop` resets after sending a statement and goes on lexing the
+    /// rest of the same line.
     pub fn reset(&mut self) {
-        let std_strings = self.state.std_strings;
-        self.state = ScanState {
-            std_strings,
-            ..ScanState::default()
-        };
-        self.stack.clear();
+        self.state.start_state = StartState::default();
+        self.state.paren_depth = 0;
+        self.state.xcdepth = 0;
+        self.state.dolqstart = None;
+        self.state.begin_depth = 0;
+        self.state.copy_stdin_count = 0;
+        self.state.init_idents_count = 0;
     }
 
     /// `psql_scan_count_copy_from_stdin()` (`psqlscan.l:1422`): the number of
@@ -1441,6 +1444,29 @@ mod tests {
         assert_eq!(scanner.count_copy_from_stdin(), 1);
         scanner.reset();
         assert_eq!(scanner.count_copy_from_stdin(), 0);
+    }
+
+    /// `psqlscan.l:1381` resets the lexing state and nothing else: after
+    /// `MainLoop` sends `select 1;` and resets, the rest of the same line is
+    /// still there to lex.
+    #[test]
+    fn a_reset_keeps_the_rest_of_the_line() {
+        let mut scanner = Scanner::new();
+        scanner.setup(b"select 1; select 2;", true);
+        let mut out = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut out, &NoVariables).0,
+            ScanResult::Semicolon
+        );
+        assert_eq!(out, b"select 1;");
+        scanner.reset();
+        let mut rest = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut rest, &NoVariables).0,
+            ScanResult::Semicolon
+        );
+        // Leading whitespace is not collected into an empty buffer.
+        assert_eq!(rest, b"select 2;");
     }
 
     struct OneVar(&'static str, &'static str);

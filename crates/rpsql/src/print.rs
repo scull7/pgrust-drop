@@ -1,11 +1,11 @@
 //! Result rendering: `src/fe_utils/print.c`.
 //!
-//! Scope, so far. `PRINT_ALIGNED`, `PRINT_WRAPPED` and `PRINT_UNALIGNED`,
-//! each at every border (0, 1, 2) in the ascii and old-ascii line styles,
-//! normal and expanded (`\pset expanded on`, and `auto` under a `\pset
-//! columns` target). NAT-400 owns the rest of the matrix and delivers it in
-//! slices: csv, html, latex, latex-longtable, troff-ms and asciidoc next, then
-//! the unicode line style and `numericlocale`. Until then each of those is
+//! Scope, so far. Every output format, normal and expanded: `PRINT_ALIGNED`,
+//! `PRINT_WRAPPED` and `PRINT_UNALIGNED` here, at every border (0, 1, 2) in
+//! the ascii and old-ascii line styles (`expanded auto` under a `\pset
+//! columns` target), and the document formats (csv, html, asciidoc, latex,
+//! latex-longtable, troff-ms) in [`markup`]. NAT-400 still owns the unicode
+//! line style and `numericlocale`; until they land each is
 //! [`PrintError::Unsupported`], which the caller reports rather than printing
 //! something that only looks right. So is a table whose layout depends on the
 //! terminal's width, which is never read (see [`Unsupported::TerminalWidth`]).
@@ -17,11 +17,11 @@ use rlibpq::QueryResult;
 
 use crate::settings::{Expanded, LineStyle, PrintFormat, PrintQueryOpt, TableOpt, XheaderWidth};
 
+mod markup;
+
 /// What this port cannot render yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An output format a later slice of NAT-400 ports.
-    Format(PrintFormat),
     /// A layout that depends on the target width while `\pset columns` is 0.
     /// C then takes the terminal's width when stdout is one (`print.c:803`-
     /// `:818`); this port never reads it, so it refuses rather than guess.
@@ -45,7 +45,6 @@ impl std::fmt::Display for PrintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self::Unsupported(what) = self;
         match what {
-            Unsupported::Format(format) => write!(f, "output format {}", format.name())?,
             Unsupported::TerminalWidth => {
                 f.write_str("a target width taken from the terminal (\\pset columns 0)")?;
             }
@@ -263,14 +262,27 @@ pub fn print_query(result: &QueryResult, opt: &PrintQueryOpt) -> Result<Vec<u8>,
     // `printTable()`'s switch (`print.c:3472`). Only `expanded on` (C's `1`)
     // selects a vertical printer here; `auto` is decided inside
     // `print_aligned_text`, since the pager that would force it
-    // (`print.c:3488`) is not ported.
+    // (`print.c:3488`) is not ported. Every other format prints `auto` as
+    // `off`, as upstream's does.
     let vertical = opt.topt.expanded == Expanded::On;
     match opt.topt.format {
         PrintFormat::Unaligned if vertical => Ok(print_unaligned_vertical(&cont)),
         PrintFormat::Unaligned => Ok(print_unaligned_text(&cont)),
         PrintFormat::Aligned | PrintFormat::Wrapped if vertical => print_aligned_vertical(&cont),
         PrintFormat::Aligned | PrintFormat::Wrapped => print_aligned_text(&cont),
-        other => Err(PrintError::Unsupported(Unsupported::Format(other))),
+        PrintFormat::Csv if vertical => Ok(markup::print_csv_vertical(&cont)),
+        PrintFormat::Csv => Ok(markup::print_csv_text(&cont)),
+        PrintFormat::Html if vertical => Ok(markup::print_html_vertical(&cont)),
+        PrintFormat::Html => Ok(markup::print_html_text(&cont)),
+        PrintFormat::Asciidoc if vertical => Ok(markup::print_asciidoc_vertical(&cont)),
+        PrintFormat::Asciidoc => Ok(markup::print_asciidoc_text(&cont)),
+        PrintFormat::Latex | PrintFormat::LatexLongtable if vertical => {
+            Ok(markup::print_latex_vertical(&cont))
+        }
+        PrintFormat::Latex => Ok(markup::print_latex_text(&cont)),
+        PrintFormat::LatexLongtable => Ok(markup::print_latex_longtable_text(&cont)),
+        PrintFormat::TroffMs if vertical => Ok(markup::print_troff_ms_vertical(&cont)),
+        PrintFormat::TroffMs => Ok(markup::print_troff_ms_text(&cont)),
     }
 }
 
@@ -1472,31 +1484,6 @@ mod tests {
     }
 
     #[test]
-    fn a_format_this_slice_does_not_render_is_refused_not_faked() {
-        let res = result(vec![int4_field("n")], vec![vec![Some("1")]]);
-        for format in [
-            PrintFormat::Csv,
-            PrintFormat::Html,
-            PrintFormat::Latex,
-            PrintFormat::LatexLongtable,
-            PrintFormat::Asciidoc,
-            PrintFormat::TroffMs,
-        ] {
-            let mut opt = PrintQueryOpt::default();
-            opt.topt = TableOpt { format, ..opt.topt };
-            let err = print_query(&res, &opt)
-                .expect_err("a format this port cannot render must be refused");
-            assert_eq!(err, PrintError::Unsupported(Unsupported::Format(format)));
-            // The message names the issue that implements it, so the refusal
-            // is actionable rather than a bare failure.
-            assert!(
-                err.to_string().contains("NAT-400"),
-                "the refusal must name the issue: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn unicode_numericlocale_and_the_terminal_width_are_refused_not_faked() {
         let res = result(
             vec![int4_field("n"), text_field("s")],
@@ -1507,9 +1494,13 @@ mod tests {
             edit(&mut opt);
             print_query(&res, &opt).expect_err("must be refused")
         };
-        assert_eq!(
-            refused(&|o| o.topt.line_style = LineStyle::Unicode),
-            PrintError::Unsupported(Unsupported::Unicode)
+        let unicode = refused(&|o| o.topt.line_style = LineStyle::Unicode);
+        assert_eq!(unicode, PrintError::Unsupported(Unsupported::Unicode));
+        // The message names the issue that implements it, so the refusal is
+        // actionable rather than a bare failure.
+        assert!(
+            unicode.to_string().contains("NAT-400"),
+            "the refusal must name the issue: {unicode}"
         );
         assert_eq!(
             refused(&|o| o.topt.numeric_locale = true),

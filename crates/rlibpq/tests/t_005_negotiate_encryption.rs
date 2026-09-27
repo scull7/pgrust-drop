@@ -18,12 +18,8 @@
 //! for a client built without them (`:289`, `:367`-`:368`, `:478`-`:481`),
 //! and so does this port, by not having them yet.
 //!
-//! Three deliberate differences from the Perl, none of which touches what
+//! Two deliberate differences from the Perl, none of which touches what
 //! is compared:
-//! - upstream connects with `host=enc-test-localhost.postgresql.example.com
-//!   hostaddr=127.0.0.1` (`:99`-`:100`, `:655`); `rlibpq` does not read `hostaddr`
-//!   yet, so this port says `host=127.0.0.1`. Both dial the same address, and
-//!   no row here verifies a certificate against the host name;
 //! - the port is in the connection string, where `$node->psql` puts it in
 //!   `PGPORT`;
 //! - upstream runs only under `PG_TEST_EXTRA=libpq_encryption` (`:80`)
@@ -47,6 +43,9 @@ use rlibpq::{Build, Connection, ExecStatus, Filesystem};
 mod common;
 
 use common::{Cluster, only};
+
+/// `$host`, `:99`: never resolved, because `hostaddr` is given with it.
+const HOST: &str = "enc-test-localhost.postgresql.example.com";
 
 /// `$hostaddr`, `:100`.
 const HOSTADDR: &str = "127.0.0.1";
@@ -294,7 +293,8 @@ fn connect_test(
     let host = if connstr.contains("host=") {
         String::new()
     } else {
-        format!("host={HOSTADDR} ")
+        // :655
+        format!("host={HOST} hostaddr={HOSTADDR} ")
     };
     let connstr_full = format!("{dbname}{host}port={} {connstr}", cluster.port);
 

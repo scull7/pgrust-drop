@@ -74,6 +74,20 @@ impl Cluster {
         listen_addresses: &str,
         conf: &str,
     ) -> Option<Self> {
+        Cluster::start_node("", auth_method, port, listen_addresses, conf)
+    }
+
+    /// [`Cluster::start_configured`] for one of several nodes that may share
+    /// a port — `PostgreSQL::Test::Cluster->new($name, port => …,
+    /// own_host => 1)`. `name` keeps each node's directory, and so its
+    /// socket directory, its own.
+    pub fn start_node(
+        name: &str,
+        auth_method: &str,
+        port: u16,
+        listen_addresses: &str,
+        conf: &str,
+    ) -> Option<Self> {
         let Some(initdb) = reference::find(TOOLS[0]) else {
             reference::skip(TOOLS[0]);
             return None;
@@ -86,7 +100,8 @@ impl Cluster {
             }
         };
 
-        let dir = std::env::temp_dir().join(format!("rlibpq-gate-{port}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rlibpq-gate-{name}{port}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let data = dir.join("data");
         std::fs::create_dir_all(&dir).ok()?;
@@ -142,6 +157,23 @@ impl Cluster {
         assert!(start.status.success(), "reference pg_ctl start failed");
 
         Some(Cluster { bin, dir, port })
+    }
+
+    /// The server log, whole — `$node->log_content`.
+    pub fn log_content(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(self.dir.join("log")).unwrap_or_default())
+            .into_owned()
+    }
+
+    /// `$node->stop`: a fast shutdown, waited for.
+    pub fn stop(&self) {
+        let out = Command::new(self.bin.join("pg_ctl"))
+            .args(["-D".as_ref(), self.dir.join("data").as_os_str()])
+            .args(["-w", "-m", "fast", "stop"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("reference pg_ctl runs");
+        assert!(out.status.success(), "reference pg_ctl stop failed");
     }
 
     /// The conninfo string both sides connect with.

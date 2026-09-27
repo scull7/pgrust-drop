@@ -6,21 +6,30 @@
 //! runs, and [`crate::print::print_query`], which renders the result.
 //!
 //! `ExecQueryAndProcessResults` (`common.c:1581`) has two halves here. Outside
-//! a pipeline a query is one blocking [`Executor::exec`] and its results are
-//! printed afterwards. In a pipeline, and for the commands that drive one,
-//! [`exec_pipelined`] ports the `PQsend…` / `PQgetResult` loop itself,
-//! because there the counters psql keeps (`settings.h:126`) decide how many
-//! results to read, and reading one too many would block.
+//! a pipeline a query is one blocking [`Executor::exec`], up to its first
+//! COPY, and [`Executor::get_result`] after it. In a pipeline, and for the
+//! commands that drive one, [`exec_pipelined`] ports the `PQsend…` /
+//! `PQgetResult` loop itself, because there the counters psql keeps
+//! (`settings.h:126`) decide how many results to read, and reading one too
+//! many would block.
+//!
+//! A COPY in the query hands the data transfer to [`crate::copy`]'s
+//! `handleCopyOut` / `handleCopyIn` from the middle of the result loop
+//! (`common.c:1912`-`:2011`), with the data going to or coming from the
+//! stream [`CopyIo`] names.
 
-use std::io::Write;
+use std::collections::VecDeque;
+use std::io::{BufRead, Write};
 use std::time::Instant;
 
 use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultError};
 
+use crate::copy::{handle_copy_in, handle_copy_out};
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::logging;
 use crate::print::print_query;
-use crate::settings::{Echo, PipelineCounters, PsqlSettings, SendMode};
+use crate::scan::{NoVariables, Scanner};
+use crate::settings::{EXIT_BADCONN, Echo, PipelineCounters, PsqlSettings, SendMode};
 use crate::variables::VariableSpace;
 
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
@@ -68,17 +77,28 @@ impl From<ConnectionError> for ErrorMessage {
     }
 }
 
+/// libpq's `no COPY in progress` (`fe-exec.c:2719`), which is what an
+/// [`Executor`] that never starts a COPY answers every COPY call with.
+fn no_copy_in_progress() -> ErrorMessage {
+    ErrorMessage::new(b"no COPY in progress".to_vec())
+}
+
 /// What psql can do with a query. An [`Executor`] is the only thing in the
 /// crate that holds a connection, which keeps every other module testable
 /// without a server.
 ///
-/// [`Executor::exec`] is the whole of a query outside a pipeline. The rest
-/// are the libpq calls a pipeline is driven with, one for one; their default
-/// bodies are an executor that never enters pipeline mode.
+/// [`Executor::exec`] is the whole of a query outside a pipeline, up to its
+/// first COPY. The rest are the libpq calls a COPY's data transfer and a
+/// pipeline are driven with, one for one; their default bodies are a
+/// connection on which no COPY ever starts and no pipeline is entered, so a
+/// test double that needs neither implements [`Executor::exec`],
+/// [`Executor::connected`] and [`Executor::abandon`] alone.
 pub trait Executor {
     /// `ExecQueryAndProcessResults` (`common.c:1581`), minus the printing: send
-    /// `query` the way `mode` says (`common.c:1602`) and hand back every
-    /// result it produced. `\close_prepared` sends no query text, and the
+    /// `query` the way `mode` says (`common.c:1602`) and hand back its results
+    /// up to and including the first COPY result, if there is one. The
+    /// results after a COPY come from [`Executor::get_result`] once its data
+    /// has been transferred. `\close_prepared` sends no query text, and the
     /// query is then ignored.
     ///
     /// # Errors
@@ -86,6 +106,45 @@ pub trait Executor {
     /// *failed query* is not an error: it comes back as a `PGRES_FATAL_ERROR`
     /// result, as in libpq.
     fn exec(&mut self, query: &[u8], mode: &SendMode) -> Result<Vec<QueryResult>, ErrorMessage>;
+
+    /// `PQgetResult`: the next result, or `None` for the NULL that ends a
+    /// command.
+    ///
+    /// # Errors
+    /// The connection broke.
+    fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+        Ok(None)
+    }
+    /// `PQgetCopyData(conn, &buf, 0)`: the next row of a COPY OUT, or `None`
+    /// once it is over (`-1`).
+    ///
+    /// # Errors
+    /// `-2`: no COPY OUT is running, or the connection broke.
+    fn get_copy_data(&mut self) -> Result<Option<Vec<u8>>, ErrorMessage> {
+        Err(no_copy_in_progress())
+    }
+
+    /// `PQputCopyData`: send `data` to a COPY IN.
+    ///
+    /// # Errors
+    /// No COPY IN is running, or the connection broke (`<= 0`).
+    fn put_copy_data(&mut self, _data: &[u8]) -> Result<(), ErrorMessage> {
+        Err(no_copy_in_progress())
+    }
+
+    /// `PQputCopyEnd`: end a COPY IN, or fail it with `error`.
+    ///
+    /// # Errors
+    /// No COPY IN is running, or the connection broke (`<= 0`).
+    fn put_copy_end(&mut self, _error: Option<&[u8]>) -> Result<(), ErrorMessage> {
+        Err(no_copy_in_progress())
+    }
+
+    /// `standard_strings()` (`common.c:2621`): is `standard_conforming_strings`
+    /// on? `\copy` quotes by it (`copy.c:94`).
+    fn standard_strings(&self) -> bool {
+        true
+    }
 
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
@@ -118,15 +177,6 @@ pub trait Executor {
         ))
     }
 
-    /// `PQgetResult`: the next result, or `None` for the NULL that ends a
-    /// command.
-    ///
-    /// # Errors
-    /// The connection broke.
-    fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
-        Ok(None)
-    }
-
     /// `PQexitPipelineMode`.
     ///
     /// # Errors
@@ -147,6 +197,64 @@ pub trait Executor {
     fn large_objects(&mut self) -> Option<&mut dyn crate::large_obj::LargeObjects> {
         None
     }
+}
+
+/// `pset.cur_cmd_source`: the stream commands are read from, which is also
+/// where a `COPY … FROM STDIN` among them reads its data (`common.c:2001`),
+/// so that data inlined in a script is consumed and never run as commands.
+pub struct CommandSource<'a> {
+    /// The stream itself.
+    pub reader: &'a mut dyn BufRead,
+    /// `cur_cmd_source == stdin`: then `\copy … from pstdin` reads this same
+    /// stream (`copy.c:301`), with nothing buffered ahead of it lost.
+    pub is_stdin: bool,
+    /// `isatty(fileno(cur_cmd_source))` (`copy.c:520`).
+    pub is_tty: bool,
+}
+
+impl<'a> CommandSource<'a> {
+    /// A source that is neither stdin nor a terminal: a file, or a test's
+    /// bytes.
+    pub fn file(reader: &'a mut dyn BufRead) -> Self {
+        Self {
+            reader,
+            is_stdin: false,
+            is_tty: false,
+        }
+    }
+}
+
+/// `pset.copyStream` (`settings.h:108`): where `\copy` sends a COPY's data
+/// or takes it from, instead of the default places.
+pub enum CopyStream<'a> {
+    /// `NULL`, or a stream that *is* the default place: COPY OUT writes to
+    /// `pset.queryFout` and COPY IN reads [`CommandSource`]. `\copy … to
+    /// stdout` and `\copy … from stdin` set `copyStream` to those very
+    /// streams (`copy.c:299`, `:318`), which behaves the same in every test
+    /// upstream makes of it.
+    Default,
+    /// A file or `pstdin` that COPY IN reads.
+    Read {
+        /// The stream.
+        reader: &'a mut dyn BufRead,
+        /// `isatty(fileno(copystream))` (`copy.c:520`).
+        is_tty: bool,
+    },
+    /// A file that COPY OUT writes.
+    Write(&'a mut dyn Write),
+}
+
+/// The COPY half of `SendQuery`'s arguments and of the `pset` members it
+/// reads: the command source, `pset.copyStream`, and `num_copy_from_stdin`.
+pub struct CopyIo<'s, 'a> {
+    /// `pset.cur_cmd_source`
+    pub source: &'s mut CommandSource<'a>,
+    /// `pset.copyStream`
+    pub stream: CopyStream<'s>,
+    /// `num_copy_from_stdin`: how many `COPY … FROM STDIN` the query holds,
+    /// or `None` for upstream's `-1`, "count them yourself"
+    /// (`common.c:1789`).
+    pub copy_from_stdin: Option<usize>,
 }
 
 /// What `ECHO` prints before a query runs, or `None`.
@@ -276,7 +384,8 @@ pub fn accept_result(status: ExecStatus) -> bool {
 /// `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering of a failed
 /// result at the configured verbosity (`common.c:1831`). Empty for a
 /// `PGRES_PIPELINE_ABORTED` result, which carries no error.
-fn result_error_message(result: &QueryResult, pset: &PsqlSettings) -> Vec<u8> {
+#[must_use]
+pub fn result_error_message(result: &QueryResult, pset: &PsqlSettings) -> Vec<u8> {
     match result.error() {
         Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
         None => result.error_message(),
@@ -292,11 +401,14 @@ fn print_notices(executor: &mut dyn Executor, pset: &PsqlSettings, stderr: &mut 
     }
 }
 
-/// `SendQuery()` (`common.c:1126`).
+/// `SendQuery()` (`common.c:1126`), with the command source as the only COPY
+/// stream.
 ///
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
-/// `\errverbose`.
+/// `\errverbose`, and because a `COPY … FROM STDIN` that reads its data from
+/// the command source moves `pset.lineno` on (`copy.c:652`).
+/// `copy_from_stdin` is `SendQuery`'s `num_copy_from_stdin`.
 ///
 /// The one-shot requests a backslash command leaves for this query —
 /// `\crosstabview`'s, `\bind`'s and its siblings' send mode, and the print
@@ -304,11 +416,35 @@ fn print_notices(executor: &mut dyn Executor, pset: &PsqlSettings, stderr: &mut 
 /// happened (`common.c:1311`-`:1341`). Here the first two are taken on the
 /// way in, which nothing between the two can tell apart, and the saved print
 /// options are put back on the way out.
+// `SendQuery`'s one argument plus the `pset` members it reads, each borrow
+// visible at the call site.
+#[allow(clippy::too_many_arguments)]
 pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
+    source: &mut CommandSource<'_>,
+    copy_from_stdin: Option<usize>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let mut io = CopyIo {
+        source,
+        stream: CopyStream::Default,
+        copy_from_stdin,
+    };
+    send_query_with(executor, query, pset, vars, &mut io, stdout, stderr)
+}
+
+/// `SendQuery()` (`common.c:1126`) with `pset.copyStream` set, which is how
+/// `do_copy` runs its COPY (`copy.c:369`).
+pub fn send_query_with(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    io: &mut CopyIo<'_, '_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
@@ -330,12 +466,13 @@ pub fn send_query(
             stderr,
         )
     } else {
-        send_query_with(
+        send_query_simple(
             executor,
             query,
             &mode,
             crosstab.as_ref(),
             pset,
+            io,
             stdout,
             stderr,
         )
@@ -347,13 +484,16 @@ pub fn send_query(
     ok
 }
 
-/// [`send_query`] once its one-shot requests are taken, outside a pipeline.
-fn send_query_with(
+/// [`send_query_with`] once its one-shot requests are taken, outside a
+/// pipeline.
+#[allow(clippy::too_many_arguments)]
+fn send_query_simple(
     executor: &mut dyn Executor,
     query: &[u8],
     mode: &SendMode,
     crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
+    io: &mut CopyIo<'_, '_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
@@ -370,25 +510,17 @@ fn send_query_with(
 
     // `common.c:1128`: whether to time is decided before the query runs.
     let timing = pset.timing;
-    // `ExecQueryAndProcessResults` takes its "after" once the last result has
-    // arrived and before it is printed (`common.c:2197`); `exec` returns only
-    // when every result has arrived, so this is the same interval.
-    let before = Instant::now();
-    let results = executor.exec(query, mode);
-    let elapsed_msec = before.elapsed().as_secs_f64() * 1000.0;
-    // The whole query has been read, so every notice it drew comes first.
-    print_notices(executor, pset, stderr);
-
-    let ok = match results {
-        Ok(results) => process_results(&results, crosstab, pset, stdout, stderr),
-        // libpq's message, at info level like the server's errors
-        // (`common.c:1834`): `001_basic.pl:147` expects
-        // `psql:<stdin>:2: server closed the connection unexpectedly`.
-        Err(err) => {
-            logging::info(pset, err.as_bytes(), stderr);
-            false
-        }
-    };
+    let (ok, elapsed_msec) = exec_query_and_process_results(
+        executor,
+        query,
+        mode,
+        crosstab,
+        pset,
+        io,
+        stdout,
+        stderr,
+        Instant::now(),
+    );
 
     // `common.c:1286`: the timing line follows success and failure alike,
     // which is what `001_basic.pl:95` tests.
@@ -398,33 +530,297 @@ fn send_query_with(
     ok
 }
 
-/// The printing half of `ExecQueryAndProcessResults()` (`common.c:1581`).
-fn process_results(
-    results: &[QueryResult],
+/// The results of one query in the order `PQgetResult` hands them out:
+/// first what [`Executor::exec`] collected, then — if that stopped at a COPY
+/// — whatever [`Executor::get_result`] has after the data transfer.
+struct Results {
+    queue: VecDeque<QueryResult>,
+    more: bool,
+}
+
+impl Results {
+    fn new(first: Vec<QueryResult>) -> Self {
+        let more = first
+            .last()
+            .is_some_and(|r| matches!(r.status(), ExecStatus::CopyIn | ExecStatus::CopyOut));
+        Self {
+            queue: first.into(),
+            more,
+        }
+    }
+
+    /// `PQgetResult()`. A broken connection is logged as libpq's message
+    /// and ends the results, as the NULL that follows libpq's error result
+    /// does.
+    fn next(
+        &mut self,
+        executor: &mut dyn Executor,
+        pset: &PsqlSettings,
+        stderr: &mut dyn Write,
+        ok: &mut bool,
+    ) -> Option<QueryResult> {
+        if let Some(result) = self.queue.pop_front() {
+            return Some(result);
+        }
+        if !self.more {
+            return None;
+        }
+        let result = executor.get_result();
+        // The notices parsing it drew come first, as psql's notice processor
+        // prints them when libpq meets them.
+        print_notices(executor, pset, stderr);
+        match result {
+            Ok(result) => result,
+            Err(err) => {
+                logging::info(pset, err.as_bytes(), stderr);
+                *ok = false;
+                self.more = false;
+                None
+            }
+        }
+    }
+}
+
+/// How many `COPY … FROM STDIN` `query` holds, when the caller did not say
+/// (`common.c:1789`-`:1806`): one scan, then the count, as upstream does.
+fn count_copy_from_stdin(query: &[u8], std_strings: bool) -> usize {
+    let mut scanner = Scanner::new();
+    scanner.setup(query, std_strings);
+    let mut buf = Vec::new();
+    // Upstream scans with psql's variable callbacks; the query has already
+    // been substituted, and the count reads only the leading keywords.
+    let _ = scanner.scan(&mut buf, &NoVariables);
+    usize::try_from(scanner.count_copy_from_stdin()).unwrap_or(0)
+}
+
+/// `ExecQueryAndProcessResults()` (`common.c:1581`), outside a pipeline and
+/// without `FETCH_COUNT`, `\g`, `\gset`, `\gexec` and `\watch`, which are
+/// later slices. `mode` and `crosstab` are the one-shot requests
+/// [`send_query_with`] took.
+///
+/// Returns the success and the milliseconds from `before` to the last
+/// result, taken before that result is printed (`common.c:2197`).
+// Upstream reads the one-shot requests and the COPY streams from `pset`;
+// passing them separately keeps each borrow visible at the call site.
+#[allow(clippy::too_many_arguments)]
+fn exec_query_and_process_results(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    mode: &SendMode,
     crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
+    io: &mut CopyIo<'_, '_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> bool {
-    let mut ok = true;
-    let last = results.len().saturating_sub(1);
-    for (i, result) in results.iter().enumerate() {
-        let is_last = i == last;
-        if accept_result(result.status()) {
-            ok &= print_query_result(result, is_last, crosstab, pset, stdout, stderr);
-        } else {
+    before: Instant,
+) -> (bool, f64) {
+    let now = || before.elapsed().as_secs_f64() * 1000.0;
+    let mut copy_from_stdin = match io.copy_from_stdin {
+        Some(n) => n,
+        None => count_copy_from_stdin(query, executor.standard_strings()),
+    };
+
+    let first = executor.exec(query, mode);
+    // Every notice drawn up to here comes before the first result.
+    print_notices(executor, pset, stderr);
+    let first = match first {
+        Ok(first) => first,
+        // libpq's message, at info level like the server's errors
+        // (`common.c:1834`): `001_basic.pl:147` expects
+        // `psql:<stdin>:2: server closed the connection unexpectedly`.
+        Err(err) => {
+            logging::info(pset, err.as_bytes(), stderr);
+            return (false, now());
+        }
+    };
+    let mut results = Results::new(first);
+    let mut success = true;
+    let mut elapsed_msec = 0.0;
+
+    let mut result = results.next(executor, pset, stderr, &mut success);
+    while let Some(current) = result {
+        let status = current.status();
+        if !accept_result(status) {
             // `common.c:1825`-`:1843`: an error is reported whether or not it
             // is the last result, as `PQresultErrorMessage` renders it at the
             // configured verbosity, and kept for `\errverbose`.
-            let message = result_error_message(result, pset);
+            let message = result_error_message(&current, pset);
             if !message.is_empty() {
                 logging::info(pset, &message, stderr);
             }
-            clear_or_save_result(result, pset);
-            ok = false;
+            clear_or_save_result(&current, pset);
+            success = false;
+            // `common.c:1851`: a COPY BOTH ends the loop; anything else moves
+            // on to the next result.
+            result = if status == ExecStatus::CopyBoth {
+                None
+            } else {
+                results.next(executor, pset, stderr, &mut success)
+            };
+            elapsed_msec = now();
+            continue;
         }
+
+        // `common.c:1912`: handle a COPY before moving past its result.
+        let mut current = Some(current);
+        if matches!(status, ExecStatus::CopyIn | ExecStatus::CopyOut) {
+            let copy_result = current.take().expect("the COPY result is here");
+            if status == ExecStatus::CopyIn {
+                if copy_from_stdin == 0 {
+                    // `common.c:1980`: we sent no COPY FROM STDIN, so the
+                    // server is broken or malicious.
+                    abort_connection(
+                        pset,
+                        "unexpected COPY_IN result, aborting connection",
+                        stdout,
+                        stderr,
+                    );
+                }
+                copy_from_stdin -= 1;
+            }
+            let (ok, final_result) =
+                handle_copy_result(executor, &copy_result, pset, io, stdout, stderr);
+            success &= ok;
+            current = final_result;
+        }
+
+        let next = results.next(executor, pset, stderr, &mut success);
+        let last = next.is_none();
+        elapsed_msec = now();
+
+        if let Some(current) = &current {
+            if success {
+                success &= print_query_result(current, last, crosstab, pset, stdout, stderr);
+            }
+            clear_or_save_result(current, pset);
+        }
+        result = next;
     }
-    ok
+
+    // `common.c:2290`: may need this to recover from conn loss during COPY.
+    if !executor.connected() {
+        return (false, elapsed_msec);
+    }
+
+    // `common.c:2294`-`:2309`: a COPY FROM STDIN the server refused still has
+    // its data in the command source; eat it, so that it is not run as
+    // commands.
+    while copy_from_stdin > 0 {
+        if matches!(io.stream, CopyStream::Default) {
+            let _ = handle_copy_in(
+                None,
+                io.source.reader,
+                true,
+                io.source.is_tty,
+                false,
+                pset,
+                stderr,
+            );
+        }
+        copy_from_stdin -= 1;
+    }
+
+    (success, elapsed_msec)
+}
+
+/// `exit(EXIT_BADCONN)` after `pg_log_info(message)`, which is how
+/// `ExecQueryAndProcessResults` gives up on a connection whose protocol state
+/// it can no longer trust (`common.c:1942`, `:1989`).
+fn abort_connection(
+    pset: &PsqlSettings,
+    message: &str,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ! {
+    logging::info(pset, message, stderr);
+    let _ = stdout.flush();
+    let _ = stderr.flush();
+    std::process::exit(i32::from(EXIT_BADCONN))
+}
+
+/// `HandleCopyResult()` (`common.c:942`): move a COPY's data between the
+/// connection and the stream `ExecQueryAndProcessResults` picked
+/// (`common.c:1946`-`:2010`), and hand back the COPY command's own result in
+/// place of the COPY result — or `None` when its status would go to the
+/// place the data just went.
+fn handle_copy_result(
+    executor: &mut dyn Executor,
+    result: &QueryResult,
+    pset: &mut PsqlSettings,
+    io: &mut CopyIo<'_, '_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> (bool, Option<QueryResult>) {
+    if result.status() == ExecStatus::CopyOut {
+        // `common.c:1947`-`:1970`: `\copy`'s stream, else `pset.queryFout`.
+        let (ok, copy_result) = match &mut io.stream {
+            CopyStream::Write(sink) => handle_copy_out(executor, Some(&mut **sink), pset, stderr),
+            CopyStream::Default => handle_copy_out(executor, Some(stdout), pset, stderr),
+            // A `\copy … from` whose query the server ran as a COPY TO: C
+            // writes to a stream opened for reading, which fails.
+            CopyStream::Read { .. } => handle_copy_out(executor, Some(&mut ReadOnly), pset, stderr),
+        };
+        // `common.c:961`: no status line where the data went.
+        let copy_result = if matches!(io.stream, CopyStream::Default) {
+            None
+        } else {
+            copy_result
+        };
+        return (ok, copy_result);
+    }
+
+    // COPY IN: `\copy`'s stream, else the command source (`common.c:1999`).
+    let binary = result.binary_tuples();
+    match &mut io.stream {
+        CopyStream::Read { reader, is_tty } => handle_copy_in(
+            Some(executor),
+            &mut **reader,
+            false,
+            *is_tty,
+            binary,
+            pset,
+            stderr,
+        ),
+        CopyStream::Default => handle_copy_in(
+            Some(executor),
+            io.source.reader,
+            true,
+            io.source.is_tty,
+            binary,
+            pset,
+            stderr,
+        ),
+        // A `\copy … to` whose query the server ran as a COPY FROM: C reads
+        // a stream opened for writing, which fails.
+        CopyStream::Write(_) => handle_copy_in(
+            Some(executor),
+            &mut std::io::BufReader::new(ReadOnly),
+            false,
+            false,
+            binary,
+            pset,
+            stderr,
+        ),
+    }
+}
+
+/// A stream opened for the wrong direction: every read and write fails with
+/// `EBADF`, as `fwrite` on a `"r"` stream and `fgets` on a `"w"` one do.
+struct ReadOnly;
+
+impl std::io::Read for ReadOnly {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(9))
+    }
+}
+
+impl Write for ReadOnly {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(9))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// `PrintQueryResult()` (`common.c:1043`), for a result `AcceptResult`
@@ -767,6 +1163,29 @@ fn exec_pipelined(
 mod tests {
     use super::*;
     use rlibpq::{Backend, FieldDescription, QueryRunner, ResultError, TransactionStatus};
+    use std::collections::VecDeque;
+
+    /// `send_query` over a command source with nothing in it.
+    fn send(
+        executor: &mut dyn Executor,
+        query: &[u8],
+        pset: &mut PsqlSettings,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> bool {
+        let mut empty: &[u8] = b"";
+        let mut source = CommandSource::file(&mut empty);
+        send_query(
+            executor,
+            query,
+            pset,
+            &mut VariableSpace::new(),
+            &mut source,
+            None,
+            stdout,
+            stderr,
+        )
+    }
 
     struct Replay(Vec<Vec<QueryResult>>);
 
@@ -824,14 +1243,8 @@ mod tests {
         let mut executor = Replay(vec![results]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let ok = send_query(
-            &mut executor,
-            b"select 1",
-            &mut pset.clone(),
-            &mut VariableSpace::new(),
-            &mut out,
-            &mut err,
-        );
+        let mut pset = pset.clone();
+        let ok = send(&mut executor, b"select 1", &mut pset, &mut out, &mut err);
         (
             ok,
             String::from_utf8(out).unwrap(),
@@ -967,11 +1380,10 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let ok = send_query(
+        let ok = send(
             &mut Broken,
             b"select 1",
             &mut PsqlSettings::default(),
-            &mut VariableSpace::new(),
             &mut out,
             &mut err,
         );
@@ -1024,11 +1436,10 @@ mod tests {
         }
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert!(send_query(
+        assert!(send(
             &mut Never,
             b"  \n ",
             &mut PsqlSettings::default(),
-            &mut VariableSpace::new(),
             &mut out,
             &mut err
         ));
@@ -1101,23 +1512,20 @@ mod tests {
         // with another error.
         let mut executor = Replay(vec![select_error(), one_row()]);
         let mut pset = PsqlSettings::default();
-        let mut vars = VariableSpace::new();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        assert!(!send_query(
+        assert!(!send(
             &mut executor,
             b"select error",
             &mut pset,
-            &mut vars,
             &mut out,
             &mut err
         ));
         let saved = pset.last_error_result.clone().expect("the error is kept");
         assert_eq!(saved.status(), ExecStatus::FatalError);
-        assert!(send_query(
+        assert!(send(
             &mut executor,
             b"select 1",
             &mut pset,
-            &mut vars,
             &mut out,
             &mut err
         ));
@@ -1138,6 +1546,181 @@ mod tests {
             err,
             "psql:<stdin>:1: ERROR:  column \"error\" does not exist\n"
         );
+    }
+
+    /// A server that answers a query with `first`, runs one COPY — rows out,
+    /// or data in — and then has `after` for `PQgetResult`.
+    struct CopyReplay {
+        first: Vec<QueryResult>,
+        rows: VecDeque<Vec<u8>>,
+        received: Vec<u8>,
+        after: VecDeque<QueryResult>,
+        seen: Vec<Vec<u8>>,
+    }
+
+    impl CopyReplay {
+        fn new(first: Vec<QueryResult>, after: Vec<QueryResult>) -> Self {
+            Self {
+                first,
+                rows: VecDeque::new(),
+                received: Vec::new(),
+                after: after.into(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl Executor for CopyReplay {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            self.seen.push(query.to_vec());
+            Ok(std::mem::take(&mut self.first))
+        }
+        fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+            Ok(self.after.pop_front())
+        }
+        fn get_copy_data(&mut self) -> Result<Option<Vec<u8>>, ErrorMessage> {
+            Ok(self.rows.pop_front())
+        }
+        fn put_copy_data(&mut self, data: &[u8]) -> Result<(), ErrorMessage> {
+            self.received.extend_from_slice(data);
+            Ok(())
+        }
+        fn put_copy_end(&mut self, _error: Option<&[u8]>) -> Result<(), ErrorMessage> {
+            Ok(())
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+        fn abandon(&mut self) {}
+    }
+
+    fn tag(tag: &str) -> QueryResult {
+        command_ok(tag).remove(0)
+    }
+
+    fn with_source(
+        executor: &mut dyn Executor,
+        query: &[u8],
+        input: &mut &[u8],
+        copy_from_stdin: Option<usize>,
+    ) -> (bool, String, String, PsqlSettings) {
+        let mut source = CommandSource::file(input);
+        let mut pset = PsqlSettings::default();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ok = send_query(
+            executor,
+            query,
+            &mut pset,
+            &mut VariableSpace::new(),
+            &mut source,
+            copy_from_stdin,
+            &mut out,
+            &mut err,
+        );
+        (
+            ok,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            pset,
+        )
+    }
+
+    #[test]
+    fn copy_to_stdout_prints_the_data_and_no_status_then_the_next_result() {
+        // `common.c:961`: no status where the data went; the SELECT after
+        // it in the same string still prints.
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyOut)],
+            vec![tag("COPY 2"), one_row().remove(0)],
+        );
+        server.rows = VecDeque::from([b"a\n".to_vec(), b"b\n".to_vec()]);
+        let (ok, out, err, _) = with_source(
+            &mut server,
+            b"copy t to stdout ; select 1",
+            &mut &b""[..],
+            None,
+        );
+        assert!(ok, "{err}");
+        assert_eq!(out, "a\nb\n ?column? \n----------\n        1\n(1 row)\n\n");
+    }
+
+    #[test]
+    fn copy_from_stdin_reads_the_command_source_and_prints_the_status() {
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyIn)],
+            vec![tag("COPY 2")],
+        );
+        let mut input: &[u8] = b"1\n2\n\\.\nselect 2;\n";
+        let (ok, out, _, pset) =
+            with_source(&mut server, b"copy t from stdin;", &mut input, Some(1));
+        assert!(ok);
+        assert_eq!(out, "COPY 2\n");
+        assert_eq!(server.received, b"1\n2\n");
+        assert_eq!(input, b"select 2;\n");
+        assert_eq!(pset.lineno, 3);
+    }
+
+    #[test]
+    fn a_refused_copy_from_stdin_still_eats_its_data() {
+        // `common.c:2294`: the server's error came instead of COPY IN.
+        let mut server = CopyReplay::new(select_error(), vec![]);
+        let mut input: &[u8] = b"foo\n\\echo no\n\\.\n\\echo yes\n";
+        let (ok, _, err, _) =
+            with_source(&mut server, b"copy nope from stdin;", &mut input, Some(1));
+        assert!(!ok);
+        assert!(
+            err.contains("ERROR:  column \"error\" does not exist"),
+            "{err}"
+        );
+        assert_eq!(input, b"\\echo yes\n");
+    }
+
+    #[test]
+    fn the_copies_are_counted_when_the_caller_did_not_say() {
+        // `common.c:1789`: `-c 'copy t from stdin'` passes -1.
+        let mut server = CopyReplay::new(select_error(), vec![]);
+        let mut input: &[u8] = b"data\n\\.\nafter\n";
+        let _ = with_source(&mut server, b"copy nope from stdin", &mut input, None);
+        assert_eq!(input, b"after\n");
+
+        assert_eq!(count_copy_from_stdin(b"COPY t FROM STDIN", true), 1);
+        assert_eq!(count_copy_from_stdin(b"copy t to stdout", true), 0);
+        assert_eq!(count_copy_from_stdin(b"select 1", true), 0);
+    }
+
+    #[test]
+    fn copy_out_to_a_copy_stream_prints_the_status_line() {
+        // `\copy … to 'file'`: the status is not suppressed, because it goes
+        // to stdout and the data does not.
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyOut)],
+            vec![tag("COPY 1")],
+        );
+        server.rows = VecDeque::from([b"x\n".to_vec()]);
+        let mut file = Vec::new();
+        let mut input: &[u8] = b"";
+        let mut source = CommandSource::file(&mut input);
+        let mut io = CopyIo {
+            source: &mut source,
+            stream: CopyStream::Write(&mut file),
+            copy_from_stdin: Some(0),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query_with(
+            &mut server,
+            b"COPY  t TO STDOUT ",
+            &mut PsqlSettings::default(),
+            &mut VariableSpace::new(),
+            &mut io,
+            &mut out,
+            &mut err,
+        ));
+        assert_eq!(file, b"x\n");
+        assert_eq!(out, b"COPY 1\n");
     }
 
     fn three_columns(rows: &[[&str; 3]]) -> Vec<QueryResult> {
@@ -1210,6 +1793,8 @@ mod tests {
             b"SELECT $1 ",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));
@@ -1218,6 +1803,8 @@ mod tests {
             b"SELECT 1",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));
@@ -1250,6 +1837,8 @@ mod tests {
             b"",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));
@@ -1258,6 +1847,8 @@ mod tests {
             b"",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));
@@ -1279,6 +1870,8 @@ mod tests {
             b"select 1",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));
@@ -1303,14 +1896,7 @@ mod tests {
         ]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert!(send_query(
-            &mut executor,
-            b"q",
-            &mut pset,
-            &mut VariableSpace::new(),
-            &mut out,
-            &mut err
-        ));
+        assert!(send(&mut executor, b"q", &mut pset, &mut out, &mut err));
         assert_eq!(
             String::from_utf8(out).unwrap(),
             " x | a  | b  \n---+----+----\n 1 | *a | *b\n(1 row)\n\n"
@@ -1318,14 +1904,7 @@ mod tests {
         assert_eq!(pset.crosstab, None);
 
         let mut out = Vec::new();
-        assert!(send_query(
-            &mut executor,
-            b"q",
-            &mut pset,
-            &mut VariableSpace::new(),
-            &mut out,
-            &mut err
-        ));
+        assert!(send(&mut executor, b"q", &mut pset, &mut out, &mut err));
         assert_eq!(
             String::from_utf8(out).unwrap(),
             " x | y | v  \n---+---+----\n 1 | a | *a\n(1 row)\n\n"
@@ -1343,14 +1922,7 @@ mod tests {
         let mut executor = Replay(vec![three_columns(&[["1", "a", "*"], ["1", "a", "*a"]])]);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert!(!send_query(
-            &mut executor,
-            b"q",
-            &mut pset,
-            &mut VariableSpace::new(),
-            &mut out,
-            &mut err
-        ));
+        assert!(!send(&mut executor, b"q", &mut pset, &mut out, &mut err));
         assert!(out.is_empty());
         assert_eq!(
             String::from_utf8(err).unwrap(),
@@ -1431,7 +2003,16 @@ mod tests {
         pset.log_terse = true;
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let ok = send_query(executor, b"SELECT $1 ", pset, vars, &mut out, &mut err);
+        let ok = send_query(
+            executor,
+            b"SELECT $1 ",
+            pset,
+            vars,
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
+            &mut out,
+            &mut err,
+        );
         (
             ok,
             String::from_utf8(out).unwrap(),
@@ -1692,6 +2273,8 @@ mod tests {
             b"select 1",
             &mut pset,
             &mut VariableSpace::new(),
+            &mut CommandSource::file(&mut &b""[..]),
+            None,
             &mut out,
             &mut err
         ));

@@ -16,8 +16,8 @@
 //!   `pg_ctl`; without them the gate prints `SKIP (flagged, not silent)`.
 //!
 //! Sections are cut by `regress::split`, keyed by `psql.sql`'s own comment
-//! headers. They are ported in NAT-400's slices; a section with no gate here
-//! yet is one a later slice owns.
+//! headers. They are ported in NAT-400's slices, and NAT-403's for `\copy`; a
+//! section with no gate here yet is one a later slice owns.
 
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
@@ -228,6 +228,7 @@ const G_AND_GX_PORT: u16 = 55_494;
 const EXTENDED_QUERY_SECTIONS_PORT: u16 = 55_495;
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
+const COPY_MUST_SKIP_IN_LINE_DATA_PORT: u16 = 55_492;
 
 /// [`regress::gate_section`] for rpsql.
 fn gate_section(cluster: &Cluster, section: &Section<'_>) {
@@ -340,5 +341,20 @@ fn the_output_format_sections_run_live() {
             "-- test multi-line headers, wrapping, and newline indicators",
             "-- expanded output with short-width columns",
         ),
+    );
+}
+
+/// `-- \copy must skip in-line data, even if the issued COPY command fails.`
+/// (`psql.sql:1570`): the server refuses the COPY, and the data inlined
+/// after it — which contains backslash commands — is read and dropped up to
+/// its `\.`, not run.
+#[test]
+fn copy_must_skip_in_line_data_even_if_the_issued_copy_command_fails() {
+    let Some(cluster) = Cluster::start(COPY_MUST_SKIP_IN_LINE_DATA_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &section("-- \\copy must skip in-line data, even if the issued COPY command fails."),
     );
 }

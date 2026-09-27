@@ -382,54 +382,47 @@ impl Cluster {
     /// (`src/test/perl/PostgreSQL/Test/Cluster.pm:2116`) through `psql`:
     /// `--no-psqlrc --no-align --tuples-only --quiet --file -` with `sql` on
     /// stdin, and `--variable ON_ERROR_STOP=1` unless `on_error_stop` is
-    /// false (`:2163`). Like upstream, one trailing newline is chomped from
-    /// each stream (`:2228`-`:2236`).
+    /// false (`:2163`).
     ///
     /// # Panics
-    /// When `psql` cannot be started, or is killed by a signal, which
-    /// upstream also dies on (`:2244`).
+    /// As [`run`].
     pub fn psql(&self, psql: &Path, sql: &str, on_error_stop: bool) -> PsqlOutcome {
-        let mut command = Command::new(psql);
+        let mut command = self.command(psql);
         command
             .args(["--no-psqlrc", "--no-align", "--tuples-only", "--quiet"])
             .args(["--dbname", "postgres", "--file", "-"]);
         if on_error_stop {
             command.args(["--variable", "ON_ERROR_STOP=1"]);
         }
-        command
-            .env("PGHOST", &self.dir)
-            .env("PGPORT", self.port.to_string())
-            .env("PGUSER", "regress")
-            .env("LC_ALL", "C")
-            .env_remove("PGOPTIONS")
-            .env_remove("PGSERVICE")
-            .env_remove("PSQLRC")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("psql starts");
-        let mut stdin = child.stdin.take().expect("a stdin pipe");
-        let sql = sql.to_owned();
-        let feeder = std::thread::spawn(move || {
-            let _ = stdin.write_all(sql.as_bytes());
-        });
-        let output = child.wait_with_output().expect("psql's output is read");
-        feeder.join().expect("the script is fed");
-        let chomp = |bytes: Vec<u8>| {
-            let mut text = String::from_utf8(bytes).expect("psql writes UTF-8 here");
-            if text.ends_with('\n') {
-                text.pop();
-            }
-            text
-        };
-        PsqlOutcome {
-            ret: output
-                .status
-                .code()
-                .unwrap_or_else(|| panic!("psql exited with {}", output.status)),
-            stdout: chomp(output.stdout),
-            stderr: chomp(output.stderr),
-        }
+        run(command, sql.as_bytes())
+    }
+
+    /// Action: `$node->safe_psql('postgres', $sql)` (`Cluster.pm:1997`):
+    /// [`Cluster::psql`] with `ON_ERROR_STOP`, which must succeed; its
+    /// stdout.
+    ///
+    /// # Panics
+    /// When psql fails, as upstream's `die`s.
+    pub fn safe_psql(&self, psql: &Path, sql: &str) -> String {
+        let outcome = self.psql(psql, sql, true);
+        assert_eq!(
+            outcome.ret, 0,
+            "safe_psql {sql:?} failed: {}",
+            outcome.stderr
+        );
+        outcome.stdout
+    }
+
+    /// A directory of the cluster's own for a test's files, like
+    /// `PostgreSQL::Test::Utils::tempdir`; removed with the cluster.
+    ///
+    /// # Panics
+    /// When the directory cannot be created.
+    pub fn tempdir(&self, name: &str) -> PathBuf {
+        let dir = self.dir.join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the tempdir is created");
+        dir
     }
 
     /// A `psql` command aimed at this cluster through the environment, as
@@ -486,6 +479,43 @@ impl Drop for Cluster {
             .args(["-m", "immediate", "stop"])
             .output();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Action: run `command` with `stdin` fed to it, and return its exit
+/// status and both streams, one trailing newline chomped from each as
+/// `Cluster.pm` does (`Cluster.pm:2228`-`:2236`).
+///
+/// # Panics
+/// When the command cannot be started, or is killed by a signal, which
+/// upstream also dies on (`Cluster.pm:2244`).
+pub fn run(mut command: Command, stdin: &[u8]) -> PsqlOutcome {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("psql starts");
+    let mut pipe = child.stdin.take().expect("a stdin pipe");
+    let input = stdin.to_owned();
+    let feeder = std::thread::spawn(move || {
+        let _ = pipe.write_all(&input);
+    });
+    let output = child.wait_with_output().expect("psql's output is read");
+    feeder.join().expect("the input is fed");
+    let chomp = |bytes: Vec<u8>| {
+        let mut text = String::from_utf8(bytes).expect("psql writes UTF-8 here");
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        text
+    };
+    PsqlOutcome {
+        ret: output
+            .status
+            .code()
+            .unwrap_or_else(|| panic!("psql exited with {}", output.status)),
+        stdout: chomp(output.stdout),
+        stderr: chomp(output.stderr),
     }
 }
 

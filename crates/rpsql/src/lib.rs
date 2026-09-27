@@ -16,8 +16,9 @@
 //! `prompt.c`), enough of `print.c` to render the default aligned output, and
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
-//! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`
-//! and `\errverbose`. NAT-404 adds `\crosstabview` ([`crosstab`],
+//! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
+//! `\errverbose`, and `copy.c` ([`copy`]): `\copy` and the COPY data transfer.
+//! NAT-404 adds `\crosstabview` ([`crosstab`],
 //! `crosstabview.c`), `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
 //! ([`settings::SendMode`]), and the pipeline commands `\startpipeline`,
@@ -44,6 +45,7 @@
 pub mod cancel;
 pub mod command;
 pub mod common;
+pub mod copy;
 pub mod crosstab;
 pub mod help;
 pub mod large_obj;
@@ -63,13 +65,13 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, LoError, Params,
+    ConnInfo, Connection, ConnectionError, CopyRead, Env, ExecStatus, Filesystem, LoError, Params,
     PipelineStatus, QueryResult, ResultError, Stream,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
-use crate::common::{ErrorMessage, Executor, send_query};
-use crate::mainloop::{LineSource, Lines, ReadLines, Session as LoopSession, main_loop};
+use crate::common::{CommandSource, ErrorMessage, Executor, send_query};
+use crate::mainloop::{Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
@@ -112,7 +114,10 @@ struct LiveExecutor {
 
 impl LiveExecutor {
     /// `err` as psql sees it: an argument or state refused before anything
-    /// was sent leaves the connection as it was; anything else broke it.
+    /// was sent leaves the connection as it was; anything else broke it. A
+    /// `PQputCopyData` after the server has already ended a COPY IN with an
+    /// error is `no COPY in progress` (`fe-exec.c:2719`), and the connection
+    /// is fine.
     fn failed(&mut self, err: ConnectionError) -> ErrorMessage {
         if !matches!(
             err,
@@ -167,6 +172,37 @@ impl Executor for LiveExecutor {
         };
         cancel::reset_cancel_conn();
         outcome.map_err(|err| self.failed(err))
+    }
+
+    fn get_copy_data(&mut self) -> Result<Option<Vec<u8>>, ErrorMessage> {
+        // Under `SendQuery`'s `SetCancelConn` (`common.c:1173`), as
+        // [`Executor::get_result`] is: a Ctrl-C while rows are awaited cancels.
+        cancel::set_cancel_conn(self.connection.get_cancel());
+        let outcome = self.connection.get_copy_data(false);
+        cancel::reset_cancel_conn();
+        match outcome {
+            Ok(CopyRead::Row(row)) => Ok(Some(row)),
+            // A blocking read never answers WouldBlock.
+            Ok(CopyRead::End | CopyRead::WouldBlock) => Ok(None),
+            Err(err) => Err(self.failed(err)),
+        }
+    }
+
+    fn put_copy_data(&mut self, data: &[u8]) -> Result<(), ErrorMessage> {
+        let sent = self.connection.put_copy_data(data);
+        sent.map_err(|err| self.failed(err))
+    }
+
+    fn put_copy_end(&mut self, error: Option<&[u8]>) -> Result<(), ErrorMessage> {
+        let sent = self.connection.put_copy_end(error);
+        sent.map_err(|err| self.failed(err))
+    }
+
+    fn standard_strings(&self) -> bool {
+        // `common.c:2628`.
+        self.connection
+            .parameter_status(b"standard_conforming_strings")
+            .is_some_and(|v| v == b"on")
     }
 
     fn connected(&self) -> bool {
@@ -505,6 +541,10 @@ fn run_action(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> u8 {
+    // `startup.c:162`: outside `-f`, the command source is stdin, which a
+    // `COPY … FROM STDIN` under `-c` reads its data from.
+    let stdin = std::io::stdin();
+    let is_tty = stdin.is_terminal();
     match action {
         // `ACT_SINGLE_QUERY` (`startup.c:382`).
         Action::SingleQuery(sql) => {
@@ -512,11 +552,19 @@ fn run_action(
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
             }
+            let mut lock = stdin.lock();
+            let mut source = CommandSource {
+                reader: &mut lock,
+                is_stdin: true,
+                is_tty,
+            };
             if send_query(
                 executor,
                 sql.as_bytes(),
                 &mut session.pset,
                 &mut session.vars,
+                &mut source,
+                None,
                 stdout,
                 stderr,
             ) {
@@ -537,12 +585,18 @@ fn run_action(
             let opens_a_command =
                 scanner.scan(&mut buf, &VarView(&session.vars)).0 == ScanResult::Backslash;
             let status = if opens_a_command {
+                let mut lock = stdin.lock();
+                let mut source = CommandSource {
+                    reader: &mut lock,
+                    is_stdin: true,
+                    is_tty,
+                };
                 dispatch_slash(
                     &mut scanner,
                     &mut session.pset,
                     &mut session.vars,
-                    executor.pipeline_status(),
                     executor,
+                    &mut source,
                     stdout,
                     stderr,
                 )
@@ -626,19 +680,21 @@ fn process_file(
     // `command.c:4970`.
     session.pset.log_terse = session.pset.inputfile.is_none();
     let result = if let Some(bytes) = bytes {
-        run_main_loop(&mut Lines::new(&bytes), session, executor, stdout, stderr)
+        // Read whole beforehand, so never a terminal to prompt on.
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut source = CommandSource::file(&mut reader);
+        run_main_loop(&mut source, session, executor, stdout, stderr)
     } else {
-        let mut source = ReadLines::new(std::io::stdin().lock());
-        let code = run_main_loop(&mut source, session, executor, stdout, stderr);
-        if let Some(err) = source.take_error() {
-            // `input.c:215`, inside `MainLoop`, so under this input's name.
-            logging::error(
-                &session.pset,
-                format!("could not read from input file: {err}"),
-                stderr,
-            );
-        }
-        code
+        // Stdin, which `\copy … from pstdin` then reads too (`copy.c:301`).
+        let stdin = std::io::stdin();
+        let is_tty = stdin.is_terminal();
+        let mut lock = stdin.lock();
+        let mut source = CommandSource {
+            reader: &mut lock,
+            is_stdin: true,
+            is_tty,
+        };
+        run_main_loop(&mut source, session, executor, stdout, stderr)
     };
     session.pset.inputfile = old;
     // `command.c:4979`.
@@ -649,7 +705,7 @@ fn process_file(
 /// `MainLoop` over `source` in this session, with the process's
 /// `cancel_pressed`.
 fn run_main_loop(
-    source: &mut dyn LineSource,
+    source: &mut CommandSource<'_>,
     session: &mut Session,
     executor: &mut LiveExecutor,
     stdout: &mut impl Write,

@@ -2,97 +2,38 @@
 //!
 //! `MainLoop()` (`mainloop.c:33`) reads lines, feeds them to the lexer, and
 //! sends a statement whenever the lexer finds a semicolon. This port keeps the
-//! same shape with two substitutions: lines come from a [`LineSource`] rather
-//! than a `FILE *`, and queries go to a [`crate::common::Executor`]. A Ctrl-C
-//! stops a script (`mainloop.c:88`, through [`Session::cancel_pressed`]);
-//! readline history and the SIGINT `siglongjmp` out of waiting for input are
-//! interactive mode's (NAT-405) and are absent, not stubbed.
+//! same shape: lines come from a [`CommandSource`], which a `COPY … FROM
+//! STDIN` reads its inlined data from as well, one `gets_fromFile` per line so
+//! that a script on a pipe runs statement by statement while the pipe is
+//! still open (`020_cancel.pl` never closes psql's stdin), and queries go to
+//! a [`crate::common::Executor`]. A Ctrl-C stops a script (`mainloop.c:88`,
+//! through [`Session::cancel_pressed`]); readline history and the SIGINT
+//! `siglongjmp` out of waiting for input are interactive mode's (NAT-405) and
+//! are absent, not stubbed.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::{CommandResult, dispatch_slash};
-use crate::common::{Executor, send_query};
+use crate::common::{CommandSource, Executor, send_query};
 use crate::scan::{PromptStatus, ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
 use crate::variables::{VarView, VariableSpace};
 
-/// Where `MainLoop` gets its lines. `None` is end of input.
-pub trait LineSource {
-    /// One line, with its terminator already stripped (`gets_fromFile`,
-    /// `input.c:186`).
-    fn next_line(&mut self) -> Option<Vec<u8>>;
-}
-
-/// A [`LineSource`] over bytes already in memory, which is what `-f -` and the
-/// tests both need.
-pub struct Lines {
-    lines: std::vec::IntoIter<Vec<u8>>,
-}
-
-impl Lines {
-    /// Split `input` on `\n`, dropping a trailing empty piece so that a file
-    /// ending in a newline does not produce one extra empty line.
-    #[must_use]
-    pub fn new(input: &[u8]) -> Self {
-        let mut lines: Vec<Vec<u8>> = input.split(|&c| c == b'\n').map(<[u8]>::to_vec).collect();
-        if lines.last().is_some_and(Vec::is_empty) {
-            lines.pop();
-        }
-        Self {
-            lines: lines.into_iter(),
-        }
+/// `gets_fromFile()` (`input.c:186`): one line with its newline stripped, or
+/// `None` at end of input. A last line without a newline is still a line.
+///
+/// # Errors
+/// The read failed (`input.c:215`).
+pub fn gets_from_file(source: &mut dyn BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    if source.read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
     }
-}
-
-impl LineSource for Lines {
-    fn next_line(&mut self) -> Option<Vec<u8>> {
-        self.lines.next()
+    if line.last() == Some(&b'\n') {
+        line.pop();
     }
-}
-
-/// A [`LineSource`] that reads as it goes, one `gets_fromFile` (`input.c:186`)
-/// per line, so that a script on a pipe runs statement by statement while the
-/// pipe is still open — `020_cancel.pl` never closes psql's stdin.
-pub struct ReadLines<R> {
-    reader: R,
-    error: Option<std::io::Error>,
-}
-
-impl<R: BufRead> ReadLines<R> {
-    #[must_use]
-    pub fn new(reader: R) -> Self {
-        Self {
-            reader,
-            error: None,
-        }
-    }
-
-    /// The read error that ended the input early, if one did: `gets_fromFile`
-    /// reports it (`input.c:213`-`:215`) and then answers end of file.
-    pub fn take_error(&mut self) -> Option<std::io::Error> {
-        self.error.take()
-    }
-}
-
-impl<R: BufRead> LineSource for ReadLines<R> {
-    fn next_line(&mut self) -> Option<Vec<u8>> {
-        let mut line = Vec::new();
-        match self.reader.read_until(b'\n', &mut line) {
-            Ok(0) => None,
-            Ok(_) => {
-                // Only the one `\n` goes (`input.c:230`).
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                Some(line)
-            }
-            Err(err) => {
-                self.error = Some(err);
-                None
-            }
-        }
-    }
+    Ok(Some(line))
 }
 
 /// The session state `MainLoop` mutates as it goes.
@@ -111,7 +52,7 @@ pub struct Session<'a> {
 // it up would hide that correspondence without removing a single branch.
 #[allow(clippy::too_many_lines)]
 pub fn main_loop(
-    source: &mut dyn LineSource,
+    source: &mut CommandSource<'_>,
     session: &mut Session<'_>,
     executor: &mut dyn Executor,
     stdout: &mut dyn Write,
@@ -139,8 +80,23 @@ pub fn main_loop(
             session.cancel_pressed.store(false, Ordering::SeqCst);
         }
 
-        let Some(line) = source.next_line() else {
-            break;
+        let line = match gets_from_file(source.reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            // `input.c:215`, then `mainloop.c:173`: logged, and the end of
+            // input with a failure.
+            Err(err) => {
+                crate::logging::error(
+                    session.pset,
+                    format!(
+                        "could not read from input file: {}",
+                        crate::copy::strerror(&err)
+                    ),
+                    stderr,
+                );
+                success_result = crate::settings::EXIT_FAILURE;
+                break;
+            }
         };
         session.pset.lineno += 1;
 
@@ -191,11 +147,16 @@ pub fn main_loop(
             if scan_result == ScanResult::Semicolon
                 || (scan_result == ScanResult::Eol && session.pset.singleline)
             {
+                // `mainloop.c:439`: "count_copy_from_stdin should be
+                // reliable here".
+                let copies = copy_count(&mut scanner);
                 success = send_query(
                     executor,
                     &query_buf,
                     session.pset,
                     session.vars,
+                    source,
+                    Some(copies),
                     stdout,
                     stderr,
                 );
@@ -207,6 +168,8 @@ pub fn main_loop(
                 session.pset.stmt_lineno = 1;
                 std::mem::swap(&mut previous_buf, &mut query_buf);
                 query_buf.clear();
+                // `mainloop.c:453`: reset parsing state, too.
+                scanner.reset();
                 added_nl_pos = None;
             } else if scan_result == ScanResult::Backslash {
                 // A line holding only a backslash command leaves the query
@@ -220,8 +183,8 @@ pub fn main_loop(
                     &mut scanner,
                     session.pset,
                     session.vars,
-                    executor.pipeline_status(),
                     executor,
+                    source,
                     stdout,
                     stderr,
                 );
@@ -242,11 +205,15 @@ pub fn main_loop(
                             &query_buf,
                             session.pset,
                             session.vars,
+                            source,
+                            None,
                             stdout,
                             stderr,
                         );
                         std::mem::swap(&mut previous_buf, &mut query_buf);
                         query_buf.clear();
+                        // `mainloop.c:529`.
+                        scanner.reset();
                     }
                     CommandResult::Terminate => break,
                     _ => {}
@@ -277,11 +244,14 @@ pub fn main_loop(
     // (`mainloop.c:598`).
     if !query_buf.is_empty() && !session.pset.cur_cmd_interactive && success_result == EXIT_SUCCESS
     {
+        let copies = copy_count(&mut scanner);
         let ok = send_query(
             executor,
             &query_buf,
             session.pset,
             session.vars,
+            source,
+            Some(copies),
             stdout,
             stderr,
         );
@@ -293,6 +263,11 @@ pub fn main_loop(
     }
 
     success_result
+}
+
+/// `psql_scan_count_copy_from_stdin()` as a `usize`.
+fn copy_count(scanner: &mut Scanner) -> usize {
+    usize::try_from(scanner.count_copy_from_stdin()).unwrap_or(0)
 }
 
 /// The prompt the loop would show, for the interactive mode NAT-405 adds.
@@ -387,7 +362,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = main_loop(
-            &mut Lines::new(input.as_bytes()),
+            &mut CommandSource::file(&mut input.as_bytes()),
             &mut session,
             &mut executor,
             &mut stdout,
@@ -466,7 +441,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = main_loop(
-            &mut Lines::new(b"select 1;\nselect 2;\nselect 3;\n"),
+            &mut CommandSource::file(&mut &b"select 1;\nselect 2;\nselect 3;\n"[..]),
             &mut session,
             &mut executor,
             &mut stdout,
@@ -494,7 +469,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = main_loop(
-            &mut Lines::new(b"select 1;\nselect 2;\n"),
+            &mut CommandSource::file(&mut &b"select 1;\nselect 2;\n"[..]),
             &mut session,
             &mut executor,
             &mut stdout,
@@ -562,7 +537,7 @@ mod tests {
         };
         let mut executor = Recorder::new();
         let code = main_loop(
-            &mut Lines::new(b"select 1;\nselect 2"),
+            &mut CommandSource::file(&mut &b"select 1;\nselect 2"[..]),
             &mut session,
             &mut executor,
             &mut Vec::new(),
@@ -596,7 +571,7 @@ mod tests {
         };
         let mut executor = Recorder::new();
         let code = main_loop(
-            &mut Lines::new(b"select 1;\n"),
+            &mut CommandSource::file(&mut &b"select 1;\n"[..]),
             &mut session,
             &mut executor,
             &mut Vec::new(),
@@ -619,16 +594,17 @@ mod tests {
             b"a\r\nb\n",
             b"\n\nselect 1;\n\\q\n",
         ] {
-            let mut whole = Lines::new(input);
-            let mut streamed = ReadLines::new(input);
-            loop {
-                let (w, s) = (whole.next_line(), streamed.next_line());
-                assert_eq!(w, s, "{:?}", String::from_utf8_lossy(input));
-                if w.is_none() {
-                    break;
-                }
+            // Split on `\n`, less the empty piece after a final newline.
+            let mut whole: Vec<&[u8]> = input.split(|&c| c == b'\n').collect();
+            if whole.last().is_some_and(|l| l.is_empty()) {
+                whole.pop();
             }
-            assert!(streamed.take_error().is_none());
+            let mut reader = input;
+            let mut streamed = Vec::new();
+            while let Some(line) = gets_from_file(&mut reader).unwrap() {
+                streamed.push(line);
+            }
+            assert_eq!(streamed, whole, "{:?}", String::from_utf8_lossy(input));
         }
     }
 
@@ -644,28 +620,52 @@ mod tests {
                 Ok(line.len())
             }
         }
-        let mut source = ReadLines::new(std::io::BufReader::new(OneLineThenBlock(Some(
-            b"select pg_sleep(180);\n",
-        ))));
+        let mut source =
+            std::io::BufReader::new(OneLineThenBlock(Some(b"select pg_sleep(180);\n")));
         assert_eq!(
-            source.next_line().as_deref(),
+            gets_from_file(&mut source).unwrap().as_deref(),
             Some(&b"select pg_sleep(180);"[..])
         );
     }
 
     #[test]
-    fn a_read_error_ends_the_input_and_is_kept_for_the_report() {
-        struct Broken;
+    fn a_read_error_is_reported_and_ends_the_input_with_a_failure() {
+        // `input.c:213`-`:215`, then `mainloop.c:172`: logged where it
+        // happened, and nothing buffered is sent after it (`mainloop.c:598`).
+        struct Broken(bool);
         impl std::io::Read for Broken {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.0) {
+                    let line = b"select 1";
+                    buf[..line.len()].copy_from_slice(line);
+                    return Ok(line.len());
+                }
                 Err(std::io::Error::other("boom"))
             }
         }
-        let mut source = ReadLines::new(std::io::BufReader::new(Broken));
-        assert_eq!(source.next_line(), None);
+        let mut pset = PsqlSettings::default();
+        let mut vars = VariableSpace::new();
+        let cancel_pressed = AtomicBool::new(false);
+        let mut session = Session {
+            pset: &mut pset,
+            vars: &mut vars,
+            cancel_pressed: &cancel_pressed,
+        };
+        let mut executor = Recorder::new();
+        let mut stderr = Vec::new();
+        let mut reader = std::io::BufReader::new(Broken(true));
+        let code = main_loop(
+            &mut CommandSource::file(&mut reader),
+            &mut session,
+            &mut executor,
+            &mut Vec::new(),
+            &mut stderr,
+        );
+        assert_eq!(code, crate::settings::EXIT_FAILURE);
+        assert!(executor.seen.is_empty(), "{:?}", executor.seen);
         assert_eq!(
-            source.take_error().map(|e| e.to_string()).as_deref(),
-            Some("boom")
+            String::from_utf8(stderr).unwrap(),
+            "psql: error: could not read from input file: boom\n"
         );
     }
 

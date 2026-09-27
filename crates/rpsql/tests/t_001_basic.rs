@@ -6,8 +6,9 @@
 //! stolen assertion through rpsql and, when the lane has one, through C psql
 //! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
-//! (lines 86-108), `\errverbose with no previous error` (159-164) and
-//! `\errverbose after normal query with error` (170-181). The
+//! (lines 86-108), `\errverbose with no previous error` (159-164),
+//! `\errverbose after normal query with error` (170-181), the multiple
+//! `-c`/`-f` switches (212-343) and `\copy from with DEFAULT` (345-367). The
 //! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
 //! `\errverbose` cases, and the rest of the file, land with Linear
 //! NAT-400 … NAT-405.
@@ -80,6 +81,9 @@ const TIMING_WITH_SUCCESSFUL_QUERY_PORT: u16 = 55_401;
 const TIMING_WITH_QUERY_ERROR_PORT: u16 = 55_402;
 const ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT: u16 = 55_403;
 const ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT: u16 = 55_404;
+const MULTIPLE_C_AND_F_SWITCHES_PORT: u16 = 55_405;
+const COPY_FROM_WITH_DEFAULT_PORT: u16 = 55_406;
+const COPY_ROUND_TRIP_PORT: u16 = 55_407;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -201,6 +205,373 @@ fn errverbose_after_normal_query_with_error() {
             ),
         );
     }
+}
+
+/// `$node->command_ok([ 'psql', … ], $name)` or `command_fails`
+/// (`Cluster.pm:2743`, `:2763`): run `psql` with `args` against the node and
+/// require the exit status to be zero, or not.
+fn command_ok_or_fails(cluster: &Cluster, psql: &Path, args: &[&str], ok: bool, name: &str) {
+    let mut command = cluster.command(psql);
+    command.args(args);
+    let outcome = regress::run(command, b"");
+    let name = format!("{name} ({})", psql.display());
+    if ok {
+        assert_eq!(outcome.ret, 0, "{name}: stderr {:?}", outcome.stderr);
+    } else {
+        assert_ne!(outcome.ret, 0, "{name}");
+    }
+}
+
+/// `# Check behavior when using multiple -c and -f switches.` —
+/// 001_basic.pl:212-343, in order, through each psql in turn.
+///
+/// The row counts accumulate across the cases, so each psql starts from a
+/// fresh table: upstream's `CREATE TABLE` (`:217`) is preceded by a `DROP`
+/// here, which is the only change.
+#[test]
+// Upstream's eleven cases in upstream's order, one row count carried from
+// each to the next; split up, they would each need the state the one before
+// left.
+#[allow(clippy::too_many_lines)]
+fn check_behavior_when_using_multiple_c_and_f_switches() {
+    let Some(cluster) = Cluster::start(MULTIPLE_C_AND_F_SWITCHES_PORT) else {
+        return;
+    };
+    for psql in every_psql(&cluster) {
+        let tempdir = cluster.tempdir(&format!(
+            "multiple-{}",
+            psql.file_name().unwrap().to_string_lossy()
+        ));
+        let tempdir = tempdir.to_str().expect("a UTF-8 tempdir");
+        cluster.safe_psql(
+            &psql,
+            "DROP TABLE IF EXISTS tab_psql_single; CREATE TABLE tab_psql_single (a int);",
+        );
+        let row_count = || cluster.safe_psql(&psql, "SELECT count(*) FROM tab_psql_single");
+        let nonexistent = format!("\\copy tab_psql_single FROM '{tempdir}/nonexistent'");
+        let is = |got: String, expected: &str, name: &str| {
+            assert_eq!(got, expected, "{name} ({})", psql.display());
+        };
+
+        // Tests with ON_ERROR_STOP (`:219`).
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--command",
+                "INSERT INTO tab_psql_single VALUES (1)",
+                "--command",
+                "INSERT INTO tab_psql_single VALUES (2)",
+            ],
+            true,
+            "ON_ERROR_STOP, --single-transaction and multiple -c switches",
+        );
+        is(
+            row_count(),
+            "2",
+            "--single-transaction commits transaction, ON_ERROR_STOP and multiple -c switches",
+        );
+
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--command",
+                "INSERT INTO tab_psql_single VALUES (3)",
+                "--command",
+                &nonexistent,
+            ],
+            false,
+            "ON_ERROR_STOP, --single-transaction and multiple -c switches, error",
+        );
+        is(
+            row_count(),
+            "2",
+            "client-side error rolls back transaction, ON_ERROR_STOP and multiple -c switches",
+        );
+
+        // Tests mixing files and commands (`:252`).
+        let copy_sql_file = format!("{tempdir}/tab_copy.sql");
+        let insert_sql_file = format!("{tempdir}/tab_insert.sql");
+        std::fs::write(&copy_sql_file, format!("{nonexistent};")).unwrap();
+        std::fs::write(&insert_sql_file, "INSERT INTO tab_psql_single VALUES (4);").unwrap();
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--file",
+                &insert_sql_file,
+                "--file",
+                &insert_sql_file,
+            ],
+            true,
+            "ON_ERROR_STOP, --single-transaction and multiple -f switches",
+        );
+        is(
+            row_count(),
+            "4",
+            "--single-transaction commits transaction, ON_ERROR_STOP and multiple -f switches",
+        );
+
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--file",
+                &insert_sql_file,
+                "--file",
+                &copy_sql_file,
+            ],
+            false,
+            "ON_ERROR_STOP, --single-transaction and multiple -f switches, error",
+        );
+        is(
+            row_count(),
+            "4",
+            "client-side error rolls back transaction, ON_ERROR_STOP and multiple -f switches",
+        );
+
+        // Tests without ON_ERROR_STOP (`:290`). The last switch fails on
+        // \copy. The command returns a failure and the transaction commits.
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--file",
+                &insert_sql_file,
+                "--file",
+                &insert_sql_file,
+                "--command",
+                &nonexistent,
+            ],
+            false,
+            "no ON_ERROR_STOP, --single-transaction and multiple -f/-c switches",
+        );
+        is(
+            row_count(),
+            "6",
+            "client-side error commits transaction, no ON_ERROR_STOP and multiple -f/-c switches",
+        );
+
+        // The last switch fails on \copy coming from an input file. The
+        // command returns a success and the transaction commits (`:309`).
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--file",
+                &insert_sql_file,
+                "--file",
+                &insert_sql_file,
+                "--file",
+                &copy_sql_file,
+            ],
+            true,
+            "no ON_ERROR_STOP, --single-transaction and multiple -f switches",
+        );
+        is(
+            row_count(),
+            "8",
+            "client-side error commits transaction, no ON_ERROR_STOP and multiple -f switches",
+        );
+
+        // The last switch makes the command return a success, and the
+        // contents of the transaction commit even if there is a failure
+        // in-between (`:327`).
+        command_ok_or_fails(
+            &cluster,
+            &psql,
+            &[
+                "--no-psqlrc",
+                "--single-transaction",
+                "--command",
+                "INSERT INTO tab_psql_single VALUES (5)",
+                "--file",
+                &copy_sql_file,
+                "--command",
+                "INSERT INTO tab_psql_single VALUES (6)",
+            ],
+            true,
+            "no ON_ERROR_STOP, --single-transaction and multiple -c switches",
+        );
+        is(
+            row_count(),
+            "10",
+            "client-side error commits transaction, no ON_ERROR_STOP and multiple -c switches",
+        );
+    }
+}
+
+/// `# Test \copy from with DEFAULT option` — 001_basic.pl:345-367.
+#[test]
+fn copy_from_with_default() {
+    let Some(cluster) = Cluster::start(COPY_FROM_WITH_DEFAULT_PORT) else {
+        return;
+    };
+    let psql = PathBuf::from(RPSQL);
+    cluster.safe_psql(
+        &psql,
+        "CREATE TABLE copy_default (
+		id integer PRIMARY KEY,
+		text_value text NOT NULL DEFAULT 'test',
+		ts_value timestamp without time zone NOT NULL DEFAULT '2022-07-05'
+	)",
+    );
+    let tempdir = cluster.tempdir("copy-default");
+    let copy_default_sql_file = tempdir.join("copy_default.csv");
+    std::fs::write(
+        &copy_default_sql_file,
+        "1,value,2022-07-04\n2,placeholder,2022-07-03\n3,placeholder,placeholder\n",
+    )
+    .unwrap();
+    // Each psql loads the same three rows, so the table is emptied before
+    // each; upstream runs the one psql once.
+    for psql in every_psql(&cluster) {
+        cluster.safe_psql(&psql, "TRUNCATE copy_default");
+        let sql = format!(
+            "\\copy copy_default from {} with (format 'csv', default 'placeholder');\n\tSELECT * FROM copy_default",
+            copy_default_sql_file.display()
+        );
+        psql_like_with(
+            &cluster,
+            &psql,
+            &sql,
+            "1\\|value\\|2022-07-04 00:00:00\n2|test|2022-07-03 00:00:00\n3|test|2022-07-05 00:00:00",
+            "\\copy from with DEFAULT",
+        );
+    }
+}
+
+/// [`psql_like`] through one psql.
+fn psql_like_with(
+    cluster: &Cluster,
+    psql: &Path,
+    sql: &str,
+    expected_stdout: &str,
+    test_name: &str,
+) {
+    let PsqlOutcome {
+        ret,
+        stdout,
+        stderr,
+    } = cluster.psql(psql, sql, true);
+    let name = format!("{test_name} ({})", psql.display());
+    assert_eq!(ret, 0, "{name}: exit code 0; stderr {stderr:?}");
+    assert_eq!(stderr, "", "{name}: no stderr");
+    assert_like(&stdout, expected_stdout, &format!("{name}: matches"));
+}
+
+/// The script [`copy_round_trip_matches_c_psql`] runs, from the directory
+/// its files are written to. Rows carry every byte COPY's text and CSV
+/// formats escape — tab, newline, carriage return, backslash, a lone `\.`,
+/// quotes, the delimiter — plus NULL against the empty string, non-ASCII
+/// text, and a bytea with a zero byte.
+const COPY_ROUND_TRIP_SQL: &str = r#"SET timezone = 'UTC'; SET client_min_messages = warning;
+DROP TABLE IF EXISTS rt_src, rt_dst;
+CREATE TABLE rt_src (i int, t text, b bytea, n numeric, ts timestamptz, j jsonb, a int[]);
+INSERT INTO rt_src VALUES
+  (1, E'tab\there\nnewline\rcr\\backslash', '\x00ff10', 1.50, '2026-09-27 12:34:56.789+00', '{"k": [1, "v"]}', '{1,2,NULL}'),
+  (2, NULL, NULL, NULL, NULL, NULL, NULL),
+  (3, '', '\x', 0, 'infinity', '[]', '{}'),
+  (4, E'\\.', 'x', -1e-3, '1999-12-31 23:59:59+00', 'null', '{-1}'),
+  (5, 'é "quoted" ''single'' , comma', 'é', 123456789.123456789, '2000-01-01 00:00:00+00', '"s"', '{7}');
+COPY rt_src TO STDOUT;
+COPY rt_src TO STDOUT WITH (FORMAT csv, HEADER);
+\copy rt_src to 'text.out'
+\copy rt_src to 'csv.out' with (format csv, header, force_quote *)
+\copy rt_src to 'binary.out' with (format binary)
+\copy (select i, t from rt_src order by i desc) to 'query.out'
+CREATE TABLE rt_dst (LIKE rt_src);
+\copy rt_dst from 'text.out'
+\copy rt_dst from 'csv.out' with (format csv, header)
+\copy rt_dst from 'binary.out' with (format binary)
+\copy rt_dst (i, t) from 'query.out'
+COPY rt_dst (i, t) FROM STDIN;
+6	inline\tdata
+7	\N
+\.
+\copy rt_dst (i, t) from stdin with (format csv)
+8,"quoted
+line"
+\.
+\copy (select * from rt_dst order by i, t nulls first, b nulls first) to 'back.out'
+SELECT count(*), count(DISTINCT (i, t, b, n, ts, j, a)) FROM rt_dst;
+\copy rt_dst to stdout with (format csv)
+\copy rt_dst to pstdout
+"#;
+
+/// The files [`COPY_ROUND_TRIP_SQL`] writes.
+const COPY_ROUND_TRIP_FILES: [&str; 5] =
+    ["text.out", "csv.out", "binary.out", "query.out", "back.out"];
+
+/// NAT-403's Acceptance: "`\copy` round-trip identical bytes vs PGDG psql".
+///
+/// [`COPY_ROUND_TRIP_SQL`] copies a table out to files in the text, CSV and
+/// binary formats and from a query, loads every file back, copies inline data
+/// in through `COPY … FROM STDIN` and `\copy … from stdin`, and writes the
+/// result out once more. It runs through rpsql and through C psql, each in a
+/// directory of its own, and every file and both output streams must be the
+/// same bytes. Not an upstream test: upstream has no psql to compare against.
+#[test]
+fn copy_round_trip_matches_c_psql() {
+    let Some(cluster) = Cluster::start(COPY_ROUND_TRIP_PORT) else {
+        return;
+    };
+    let Some(reference) = cluster.reference_psql() else {
+        reference::skip("psql");
+        return;
+    };
+    let run = |psql: &Path, name: &str| {
+        let dir = cluster.tempdir(name);
+        let mut command = cluster.command(psql);
+        command.args(["-X", "-f", "-"]).current_dir(&dir);
+        let outcome = regress::run(command, COPY_ROUND_TRIP_SQL.as_bytes());
+        let files: Vec<Vec<u8>> = COPY_ROUND_TRIP_FILES
+            .iter()
+            .map(|f| std::fs::read(dir.join(f)).unwrap_or_else(|e| panic!("{name}: {f}: {e}")))
+            .collect();
+        (outcome, files)
+    };
+    let (ours, our_files) = run(Path::new(RPSQL), "round-trip-rpsql");
+    let (theirs, their_files) = run(&reference, "round-trip-psql");
+
+    assert_eq!(
+        ours.ret, theirs.ret,
+        "exit status; rpsql stderr {:?}",
+        ours.stderr
+    );
+    assert_eq!(ours.stderr, theirs.stderr, "stderr");
+    assert_eq!(ours.stdout, theirs.stdout, "stdout");
+    for ((name, ours), theirs) in COPY_ROUND_TRIP_FILES
+        .iter()
+        .zip(&our_files)
+        .zip(&their_files)
+    {
+        assert!(ours == theirs, "{name} differs from C psql's");
+    }
+    // The script ran to the end without an error on either side.
+    assert_eq!(ours.ret, 0, "stderr {:?}", ours.stderr);
+    assert_eq!(ours.stderr, "", "no stderr");
 }
 
 /// The Acceptance gate for `--help`, `--help=commands` and `--help=variables`:

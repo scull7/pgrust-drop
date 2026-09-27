@@ -53,6 +53,12 @@ pub enum ProtocolError {
     UnexpectedResponse(u8),
     /// `pqGetNegotiateProtocolVersion3`, `fe-protocol3.c:1475`.
     NegativeUnsupportedParameterCount,
+    /// `pqFunctionCall3`, `fe-protocol3.c:2306`: a function result longer
+    /// than the caller's buffer, after which libpq abandons the connection.
+    TooMuchData,
+    /// `pqFunctionCall3`'s `default` case, `fe-protocol3.c:2373`: a message
+    /// that has no place in a function call's reply.
+    FunctionCallProtocol(u8),
 }
 
 impl ProtocolError {
@@ -89,6 +95,10 @@ impl ProtocolError {
             ProtocolError::NegativeUnsupportedParameterCount => {
                 b"received invalid protocol negotiation message: server reported negative number of unsupported parameters"
                     .to_vec()
+            }
+            ProtocolError::TooMuchData => b"server returned too much data".to_vec(),
+            ProtocolError::FunctionCallProtocol(id) => {
+                format!("protocol error: id=0x{id:x}").into_bytes()
             }
         }
     }
@@ -358,8 +368,12 @@ pub enum Backend {
     CopyData(Vec<u8>),
     /// `PqMsg_CopyDone`, `protocol.h:64`.
     CopyDone,
-    /// Anything else this port does not interpret yet (FunctionCallResponse):
-    /// parsed as far as its type.
+    /// `PqMsg_FunctionCallResponse`, `protocol.h:53`, as `pqFunctionCall3`
+    /// reads it (`fe-protocol3.c:2288`): a length word, then that many bytes
+    /// of result. `None` is a -1 length, the function's NULL.
+    FunctionCallResponse(Option<Vec<u8>>),
+    /// Anything else, which no libpq path interprets: parsed as far as its
+    /// type.
     Other { id: u8, body: Vec<u8> },
 }
 
@@ -474,6 +488,7 @@ impl Backend {
             // pqGetCopyData3, fe-protocol3.c:1946 — the whole body is data.
             b'd' => Backend::CopyData(r.take(body.len())?.to_vec()),
             b'c' => Backend::CopyDone,
+            b'V' => decode_function_call_response(&mut r)?,
             _ => Backend::Other {
                 id,
                 body: body.to_vec(),
@@ -548,6 +563,17 @@ fn decode_copy_format(r: &mut Reader<'_>) -> Result<CopyFormat, ProtocolError> {
         overall,
         column_formats,
     })
+}
+
+/// `pqFunctionCall3`'s `'V'` case, `fe-protocol3.c:2288`: a length word,
+/// then that many bytes, or -1 for NULL.
+fn decode_function_call_response(r: &mut Reader<'_>) -> Result<Backend, ProtocolError> {
+    let len = r.i32()?;
+    if len < 0 {
+        return Ok(Backend::FunctionCallResponse(None));
+    }
+    let len = usize::try_from(len).expect("len is not negative here");
+    Ok(Backend::FunctionCallResponse(Some(r.take(len)?.to_vec())))
 }
 
 /// The field loop of `pqGetErrorNotice3`, `fe-protocol3.c:945`: one type byte
@@ -633,6 +659,18 @@ pub enum Frontend {
     /// (`:481`) lay it out. The key is as long as BackendKeyData made it —
     /// four bytes under protocol 3.0.
     CancelRequest { pid: i32, cancel_key: Vec<u8> },
+    /// `PqMsg_FunctionCall`, `protocol.h:23`, as `pqFunctionCall3` builds it
+    /// (`fe-protocol3.c:2182`-`:2211`): the function's OID, one format code
+    /// (binary) covering every argument, the arguments (`None` is SQL NULL,
+    /// sent as length -1), and a binary result format code.
+    ///
+    /// C's `PQArgBlock` says whether an argument is an integer only to pick
+    /// how to put it (`pqPutInt` or `pqPutnchar`); an integer's bytes are
+    /// its network-order value, so here every argument is bytes.
+    FunctionCall {
+        fnid: u32,
+        args: Vec<Option<Vec<u8>>>,
+    },
 }
 
 /// What a Describe or Close names: the `type` byte of `PQsendTypedCommand`
@@ -758,6 +796,7 @@ impl Frontend {
             Frontend::CopyData(data) => packet(b'd', data),
             Frontend::CopyDone => packet(b'c', b""),
             Frontend::CopyFail(message) => packet(b'f', &cstring(message)),
+            Frontend::FunctionCall { fnid, args } => packet(b'F', &function_call_body(*fnid, args)),
             Frontend::CancelRequest { pid, cancel_key } => {
                 let mut body = CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
                 body.extend_from_slice(&pid.to_be_bytes());
@@ -770,6 +809,29 @@ impl Frontend {
             }
         }
     }
+}
+
+/// The body of a FunctionCall, as `pqFunctionCall3` lays it out
+/// (`fe-protocol3.c:2182`-`:2211`).
+fn function_call_body(fnid: u32, args: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut body = fnid.to_be_bytes().to_vec();
+    // fe-protocol3.c:2184-:2185 — one format code, BINARY.
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.extend_from_slice(&count16(args.len()));
+    for arg in args {
+        match arg {
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(value) => {
+                let len = i32::try_from(value.len()).expect("an argument fits in its length word");
+                body.extend_from_slice(&len.to_be_bytes());
+                body.extend_from_slice(value);
+            }
+        }
+    }
+    // fe-protocol3.c:2211 — result format code: BINARY.
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body
 }
 
 /// The body of a Bind, as `PQsendQueryGuts` lays it out (`fe-exec.c:1823`-`:1887`).
@@ -1311,22 +1373,70 @@ mod tests {
         );
     }
 
-    /// A message this port does not interpret yet (FunctionCallResponse
-    /// here) keeps its bytes rather than failing to decode; refusing it is
-    /// the caller's decision (`fe-protocol3.c:447`).
+    /// A message no libpq path interprets keeps its bytes rather than
+    /// failing to decode; refusing it is the caller's decision
+    /// (`fe-protocol3.c:447`).
     #[test]
     fn an_unhandled_message_type_keeps_its_body() {
         assert_eq!(
-            Backend::decode(b'V', b"\xff\xff\xff\xff").unwrap(),
+            Backend::decode(b'x', b"\xff\xff\xff\xff").unwrap(),
             Backend::Other {
-                id: b'V',
+                id: b'x',
                 body: vec![0xff; 4]
             }
         );
         assert_eq!(
-            ProtocolError::UnexpectedResponse(b'V').message(),
-            b"unexpected response from server; first received character was \"V\"".to_vec()
+            ProtocolError::UnexpectedResponse(b'x').message(),
+            b"unexpected response from server; first received character was \"x\"".to_vec()
         );
+    }
+
+    /// `pqFunctionCall3`'s `'V'` case, `fe-protocol3.c:2288`: a length word
+    /// and that many bytes, or -1 for NULL; the length must account for the
+    /// whole body.
+    #[test]
+    fn a_function_call_response_carries_its_value_or_null() {
+        let mut body = 4i32.to_be_bytes().to_vec();
+        body.extend_from_slice(&7i32.to_be_bytes());
+        assert_eq!(
+            Backend::decode(b'V', &body).unwrap(),
+            Backend::FunctionCallResponse(Some(7i32.to_be_bytes().to_vec()))
+        );
+        assert_eq!(
+            Backend::decode(b'V', b"\xff\xff\xff\xff").unwrap(),
+            Backend::FunctionCallResponse(None)
+        );
+        assert_eq!(
+            Backend::decode(b'V', &[0, 0, 0, 8, 1, 2]),
+            Err(ProtocolError::InsufficientData(b'V'))
+        );
+        assert_eq!(
+            Backend::decode(b'V', &[0, 0, 0, 1, 1, 2]),
+            Err(ProtocolError::ContentsDoNotAgree(b'V'))
+        );
+    }
+
+    /// `pqFunctionCall3`, `fe-protocol3.c:2182`-`:2211`: the OID, one BINARY
+    /// format code, the arguments with their lengths (-1 for NULL), and a
+    /// BINARY result format.
+    #[test]
+    fn a_function_call_is_laid_out_as_pq_function_call3_puts_it() {
+        let call = Frontend::FunctionCall {
+            fnid: 952,
+            args: vec![
+                Some(42u32.to_be_bytes().to_vec()),
+                None,
+                Some(b"ab".to_vec()),
+            ],
+        };
+        let mut expected = b"F\0\0\0\x22".to_vec();
+        expected.extend_from_slice(&952u32.to_be_bytes());
+        expected.extend_from_slice(&[0, 1, 0, 1, 0, 3]);
+        expected.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 42]);
+        expected.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        expected.extend_from_slice(&[0, 0, 0, 2, b'a', b'b']);
+        expected.extend_from_slice(&[0, 1]);
+        assert_eq!(call.encode(), expected);
     }
 
     /// `getCopyStart`, `fe-protocol3.c:1707`: the overall format, then the

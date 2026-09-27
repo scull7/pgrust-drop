@@ -1,0 +1,28 @@
+[package]
+name = "rlibpq-ffi"
+description = "rlibpq's C ABI: a drop-in libpq for C callers, over the rlibpq crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[lib]
+# `pq`, so the archive is `libpq.a` and a C program links it with `-lpq`
+# exactly as it links C libpq. A `cdylib` (`libpq.so`) is not declared yet:
+# rustup's musl target links the C runtime statically and drops a `cdylib`
+# crate type, and musl is the lane CI gates first (ADR-0007). See
+# docs/libpq-abi.md.
+name = "pq"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rlibpq = { workspace = true }
+
+[dev-dependencies]
+testkit = { workspace = true }
+
+[lints]
+workspace = true

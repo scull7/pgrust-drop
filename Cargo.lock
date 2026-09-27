@@ -15178,6 +15178,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlibpq-ffi"
+version = "0.1.0"
+dependencies = [
+ "rlibpq",
+ "testkit",
+]
+
+[[package]]
 name = "rls"
 version = "0.0.0"
 source = "git+https://github.com/scull7/pgrust?rev=75f1d3985d9841de3ddfa8c139ca308df0f80fcd#75f1d3985d9841de3ddfa8c139ca308df0f80fcd"

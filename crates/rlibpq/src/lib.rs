@@ -73,7 +73,8 @@ pub mod uri;
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
 pub use cancel::{Cancel, CancelConn, CancelError, CancelStatus, CancelStep, Peer};
 pub use connection::{
-    Address, Connection, ConnectionError, CopyRead, FnResult, Stream, Tracer, socket_address,
+    Address, Connection, ConnectionError, CopyRead, FnResult, Notify, Stream, Tracer,
+    socket_address,
 };
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,

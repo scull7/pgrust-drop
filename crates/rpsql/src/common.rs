@@ -12,7 +12,7 @@ use rlibpq::{ConnectionError, ExecStatus, QueryResult};
 
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::print::print_query;
-use crate::settings::{Echo, PsqlSettings};
+use crate::settings::{Echo, PsqlSettings, SendMode};
 
 /// The bytes libpq left in `conn->errorMessage`, kept as bytes.
 ///
@@ -63,14 +63,16 @@ impl From<ConnectionError> for ErrorMessage {
 /// crate that holds a connection, which keeps every other module testable
 /// without a server.
 pub trait Executor {
-    /// `ExecQueryAndProcessResults` (`common.c:1581`), minus the printing: run
-    /// `query` and hand back every result it produced.
+    /// `ExecQueryAndProcessResults` (`common.c:1581`), minus the printing: send
+    /// `query` the way `mode` says (`common.c:1602`) and hand back every
+    /// result it produced. `\close_prepared` sends no query text, and the
+    /// query is then ignored.
     ///
     /// # Errors
     /// The connection broke, and [`ErrorMessage`] is libpq's error buffer. A
     /// *failed query* is not an error: it comes back as a `PGRES_FATAL_ERROR`
     /// result, as in libpq.
-    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage>;
+    fn exec(&mut self, query: &[u8], mode: &SendMode) -> Result<Vec<QueryResult>, ErrorMessage>;
 
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
@@ -165,9 +167,12 @@ pub fn clear_or_save_result(result: &QueryResult, pset: &mut PsqlSettings) {
 /// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
 /// `\errverbose`.
 ///
-/// A `\crosstabview` request is one-shot: upstream clears it on the way out
-/// whatever happened (`common.c:1341`); here it is taken on the way in, which
-/// nothing between the two can tell apart.
+/// The one-shot requests a backslash command leaves for this query —
+/// `\crosstabview`'s, `\bind`'s and its siblings' send mode, and the print
+/// options `\g (…)` or `\gx` saved — are cleared on the way out whatever
+/// happened (`common.c:1311`-`:1341`). Here the first two are taken on the
+/// way in, which nothing between the two can tell apart, and the saved print
+/// options are put back on the way out.
 pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
@@ -176,7 +181,37 @@ pub fn send_query(
     stderr: &mut dyn Write,
 ) -> bool {
     let crosstab = pset.crosstab.take();
-    if query.iter().all(u8::is_ascii_whitespace) {
+    let mode = std::mem::take(&mut pset.send_mode);
+    let ok = send_query_with(
+        executor,
+        query,
+        &mode,
+        crosstab.as_ref(),
+        pset,
+        stdout,
+        stderr,
+    );
+    // `restorePsetInfo` (`common.c:1319`).
+    if let Some(saved) = pset.gsavepopt.take() {
+        pset.popt = saved;
+    }
+    ok
+}
+
+/// [`send_query`] once its one-shot requests are taken.
+fn send_query_with(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    mode: &SendMode,
+    crosstab: Option<&CtvArgs>,
+    pset: &mut PsqlSettings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    // An empty simple query comes back as PGRES_EMPTY_QUERY, which prints
+    // nothing, so it is not sent. Every extended mode is: an empty Parse is
+    // still a statement, and `\close_prepared` sends no query at all.
+    if *mode == SendMode::Query && query.iter().all(u8::is_ascii_whitespace) {
         return true;
     }
     if let Some(line) = echo_line(query, pset) {
@@ -190,11 +225,11 @@ pub fn send_query(
     // arrived and before it is printed (`common.c:2197`); `exec` returns only
     // when every result has arrived, so this is the same interval.
     let before = Instant::now();
-    let results = executor.exec(query);
+    let results = executor.exec(query, mode);
     let elapsed_msec = before.elapsed().as_secs_f64() * 1000.0;
 
     let ok = match results {
-        Ok(results) => process_results(&results, crosstab.as_ref(), pset, stdout, stderr),
+        Ok(results) => process_results(&results, crosstab, pset, stdout, stderr),
         // libpq's message, at info level like the server's errors
         // (`common.c:1834`): `001_basic.pl:147` expects
         // `psql:<stdin>:2: server closed the connection unexpectedly`.
@@ -280,7 +315,11 @@ mod tests {
     struct Replay(Vec<Vec<QueryResult>>);
 
     impl Executor for Replay {
-        fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+        fn exec(
+            &mut self,
+            _query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
             Ok(self.0.remove(0))
         }
         fn connected(&self) -> bool {
@@ -450,7 +489,11 @@ mod tests {
         // anywhere between the socket and stderr turns them into U+FFFD.
         struct Broken;
         impl Executor for Broken {
-            fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+            fn exec(
+                &mut self,
+                _query: &[u8],
+                _mode: &SendMode,
+            ) -> Result<Vec<QueryResult>, ErrorMessage> {
                 Err(ErrorMessage::new(b"no such database \"\xc3\x28\"".to_vec()))
             }
             fn connected(&self) -> bool {
@@ -502,7 +545,11 @@ mod tests {
     fn an_all_whitespace_query_is_not_sent() {
         struct Never;
         impl Executor for Never {
-            fn exec(&mut self, _query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+            fn exec(
+                &mut self,
+                _query: &[u8],
+                _mode: &SendMode,
+            ) -> Result<Vec<QueryResult>, ErrorMessage> {
                 panic!("an empty query must not reach the server");
             }
             fn connected(&self) -> bool {
@@ -655,6 +702,116 @@ mod tests {
             .push(Backend::ReadyForQuery(TransactionStatus::Idle))
             .unwrap();
         runner.into_results()
+    }
+
+    /// Records the mode each query was sent in.
+    struct Modes(Vec<(Vec<u8>, SendMode)>);
+
+    impl Executor for Modes {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            self.0.push((query.to_vec(), mode.clone()));
+            Ok(command_ok(""))
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_send_mode_reaches_the_executor_once_and_is_then_reset() {
+        // `clean_extended_state()` in `SendQuery`'s cleanup (`common.c:1325`).
+        let bind = SendMode::ExtendedQueryParams {
+            params: vec!["foo".into()],
+        };
+        let mut pset = PsqlSettings {
+            send_mode: bind.clone(),
+            quiet: true,
+            ..PsqlSettings::default()
+        };
+        let mut executor = Modes(Vec::new());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query(
+            &mut executor,
+            b"SELECT $1 ",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert!(send_query(
+            &mut executor,
+            b"SELECT 1",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(
+            executor.0,
+            [
+                (b"SELECT $1 ".to_vec(), bind),
+                (b"SELECT 1".to_vec(), SendMode::Query)
+            ]
+        );
+        assert_eq!(pset.send_mode, SendMode::Query);
+    }
+
+    #[test]
+    fn an_extended_command_is_sent_even_with_an_empty_query() {
+        // `\close_prepared` sends no query text at all, and an empty Parse
+        // is still a statement; only an empty simple query stays home.
+        let close = SendMode::ExtendedClose {
+            statement: "stmt2".into(),
+        };
+        let mut pset = PsqlSettings {
+            send_mode: close.clone(),
+            quiet: true,
+            ..PsqlSettings::default()
+        };
+        let mut executor = Modes(Vec::new());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query(
+            &mut executor,
+            b"",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert!(send_query(
+            &mut executor,
+            b"",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(executor.0, [(Vec::new(), close)]);
+    }
+
+    #[test]
+    fn print_options_g_saved_are_restored_after_the_query() {
+        // `restorePsetInfo` in `SendQuery`'s cleanup (`common.c:1319`).
+        let saved = PsqlSettings::default().popt;
+        let mut pset = PsqlSettings::default();
+        pset.popt.topt.expanded = crate::settings::Expanded::On;
+        pset.gsavepopt = Some(saved.clone());
+        let mut executor = Replay(vec![one_row()]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert!(send_query(
+            &mut executor,
+            b"select 1",
+            &mut pset,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "-[ RECORD 1 ]\n?column? | 1\n\n"
+        );
+        assert_eq!(pset.popt, saved);
+        assert_eq!(pset.gsavepopt, None);
     }
 
     #[test]

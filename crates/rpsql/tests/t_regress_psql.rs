@@ -1,6 +1,6 @@
 //! Port of `src/test/regress/sql/psql.sql` (PostgreSQL 18.6), NAT-400's
-//! output-format sections, gated section by section against
-//! `expected/psql.out`.
+//! output-format sections and NAT-404's `\g` and extended-query sections,
+//! gated section by section against `expected/psql.out`.
 //!
 //! Two kinds of gate live here:
 //!
@@ -70,6 +70,9 @@ fn psql_sql_and_psql_out_split_into_the_same_sections_losslessly() {
         let s = section(header);
         (s.sql_line, s.out_line)
     };
+    assert_eq!(at("-- \\g and \\gx"), (24, 31));
+    assert_eq!(at("-- errors"), (88, 214));
+    assert_eq!(at("-- \\gset"), (99, 231));
     assert_eq!(at("-- show all pset options"), (219, 443));
     assert_eq!(
         at("-- test multi-line headers, wrapping, and newline indicators"),
@@ -221,12 +224,61 @@ fn startup_popt() -> PrintQueryOpt {
 }
 
 /// Ports used by the live gates here; each gate starts its own cluster.
+const G_AND_GX_PORT: u16 = 55_494;
+const EXTENDED_QUERY_SECTIONS_PORT: u16 = 55_495;
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 
 /// [`regress::gate_section`] for rpsql.
 fn gate_section(cluster: &Cluster, section: &Section<'_>) {
     regress::gate_section(cluster, Path::new(RPSQL), section);
+}
+
+/// `-- \g and \gx` (`psql.sql:24`) and `-- \gx should work in FETCH_COUNT
+/// mode too` (`psql.sql:31`): a bare `\g` or `\gx` sends the query before
+/// it, and `\gx` turns expanded output on for that one query.
+///
+/// `FETCH_COUNT` is not honoured yet (NAT-403): every result is fetched
+/// whole. The second section matches anyway, because a one-row result prints
+/// the same in one piece as in chunks of one row.
+///
+/// `-- \g/\gx with pset options` (`psql.sql:41`), between these and the
+/// next gate, is not gated here: its first block prints csv, which is
+/// NAT-400's (PR #42). `\g (…)` itself is pinned by `command.rs`'s unit tests.
+#[test]
+fn g_and_gx() {
+    let Some(cluster) = Cluster::start(G_AND_GX_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &sections(
+            "-- \\g and \\gx",
+            "-- \\gx should work in FETCH_COUNT mode too",
+        ),
+    );
+}
+
+/// `-- \parse (extended query protocol)` (`psql.sql:48`) through `-- errors`
+/// (`psql.sql:88`): `\parse`, `\bind_named`, `\close_prepared` and `\bind`
+/// through the extended query protocol, and the server's error for each
+/// kind of failure. They run as one script because `\bind_named` executes
+/// what `\parse` prepared, and its repeated-call block resends the last
+/// query `\parse` read.
+///
+/// Two of the errors carry a statement position, and so the syntax cursor
+/// `reportErrorPosition` (`fe-protocol3.c:1202`) draws: the simple query a
+/// bare `\g` resends (`psql.sql:65`), and a `\bind` whose Parse fails
+/// (`psql.sql:90`).
+#[test]
+fn the_extended_query_sections() {
+    let Some(cluster) = Cluster::start(EXTENDED_QUERY_SECTIONS_PORT) else {
+        return;
+    };
+    gate_section(
+        &cluster,
+        &sections("-- \\parse (extended query protocol)", "-- errors"),
+    );
 }
 
 /// `-- show all pset options` (`psql.sql:219`): a bare `\pset` lists every

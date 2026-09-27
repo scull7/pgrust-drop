@@ -18,9 +18,11 @@
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`
 //! and `\errverbose`. NAT-404 adds `\crosstabview` ([`crosstab`],
-//! `crosstabview.c`). NAT-405 adds Ctrl-C ([`cancel`], `fe_utils/cancel.c`):
-//! a SIGINT cancels the running query. `\d` is NAT-401's and interactive input
-//! is NAT-405's.
+//! `crosstabview.c`), and `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
+//! `\close_prepared` over the extended query protocol
+//! ([`settings::SendMode`]). NAT-405 adds Ctrl-C ([`cancel`],
+//! `fe_utils/cancel.c`): a SIGINT cancels the running query. `\d` is
+//! NAT-401's and interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`], the
@@ -55,14 +57,14 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, QueryResult, Stream,
+    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, Params, QueryResult, Stream,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
 use crate::mainloop::{LineSource, Lines, ReadLines, Session as LoopSession, main_loop};
 use crate::scan::{ScanResult, Scanner};
-use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER};
+use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
 use crate::variables::VarView;
 
@@ -100,20 +102,51 @@ struct LiveExecutor {
 }
 
 impl Executor for LiveExecutor {
-    fn exec(&mut self, query: &[u8]) -> Result<Vec<QueryResult>, ErrorMessage> {
+    /// The `switch (pset.send_mode)` of `ExecQueryAndProcessResults`
+    /// (`common.c:1602`), outside pipeline mode: each extended mode is the
+    /// blocking libpq call its `PQsend…` pairs with, and `\bind`'s
+    /// parameters are all text with no types given (`common.c:1616`).
+    fn exec(&mut self, query: &[u8], mode: &SendMode) -> Result<Vec<QueryResult>, ErrorMessage> {
+        let text = |params: &[String]| -> Vec<Option<Vec<u8>>> {
+            params.iter().map(|p| Some(p.as_bytes().to_vec())).collect()
+        };
         // `SetCancelConn(pset.db)` … `ResetCancelConn()` around the query, as
         // both `SendQuery` (`common.c:1173`, `:1309`) and `PSQLexec`
         // (`common.c:686`, `:690`) have it: a Ctrl-C meanwhile cancels it.
         cancel::set_cancel_conn(self.connection.get_cancel());
-        let outcome = self.connection.exec(query);
-        cancel::reset_cancel_conn();
-        match outcome {
-            Ok(results) => Ok(results),
-            Err(err) => {
-                self.alive = false;
-                Err(err.into())
+        let outcome = match mode {
+            SendMode::Query => self.connection.exec(query),
+            SendMode::ExtendedClose { statement } => {
+                self.connection.close_prepared(statement.as_bytes())
             }
-        }
+            SendMode::ExtendedParse { statement } => {
+                self.connection.prepare(statement.as_bytes(), query, &[])
+            }
+            SendMode::ExtendedQueryParams { params } => {
+                let owned = text(params);
+                let values: Vec<Option<&[u8]>> = owned.iter().map(Option::as_deref).collect();
+                self.connection
+                    .exec_params(query, &[], &Params::text(&values))
+            }
+            SendMode::ExtendedQueryPrepared { statement, params } => {
+                let owned = text(params);
+                let values: Vec<Option<&[u8]>> = owned.iter().map(Option::as_deref).collect();
+                self.connection
+                    .exec_prepared(statement.as_bytes(), &Params::text(&values))
+            }
+        };
+        cancel::reset_cancel_conn();
+        outcome.map_err(|err| {
+            // An argument or state refused before anything was sent leaves
+            // the connection as it was; anything else broke it.
+            if !matches!(
+                err,
+                ConnectionError::Argument(_) | ConnectionError::Pipeline(_)
+            ) {
+                self.alive = false;
+            }
+            err.into()
+        })
     }
 
     fn connected(&self) -> bool {
@@ -296,7 +329,7 @@ fn psql_exec(
     pset: &mut settings::PsqlSettings,
     stderr: &mut impl Write,
 ) -> bool {
-    match executor.exec(query) {
+    match executor.exec(query, &SendMode::Query) {
         Ok(results) => {
             let mut ok = true;
             for result in &results {

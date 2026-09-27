@@ -204,6 +204,18 @@ struct TableContent<'a> {
 }
 
 impl TableContent<'_> {
+    /// The rows a printer walks. Upstream walks `cont->cells` until a NULL,
+    /// and a result with rows but no columns has none (`print.c:3194`
+    /// allocates `ncolumns * nrows + 1` zeroed cells), so it prints no row at
+    /// all, while `(n rows)` still counts them.
+    fn rows(&self) -> &[Vec<Vec<u8>>] {
+        if self.headers.is_empty() {
+            &[]
+        } else {
+            &self.cells
+        }
+    }
+
     /// `footers_with_default()` (`print.c:398`): the `(n rows)` line, or
     /// nothing under `\pset footer off`.
     fn default_footer(&self) -> Option<String> {

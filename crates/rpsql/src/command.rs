@@ -3,7 +3,8 @@
 //! `HandleSlashCmds` (`command.c:231`) parses the command name, dispatches,
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
-//! plus the `\unset`, `\qecho` and `\warn` that share their code. Everything
+//! plus the `\unset`, `\qecho` and `\warn` that share their code, and
+//! NAT-400 adds `\pset`. Everything
 //! else is [`CommandResult::Unknown`], which renders upstream's
 //! `invalid command \%s`; NAT-401 … NAT-403 fill the table in.
 
@@ -63,8 +64,8 @@ impl ConnectRequest {
 /// Everything a backslash command may read or write, so the dispatcher stays
 /// one function of its inputs.
 pub struct CommandContext<'a> {
-    /// `pset`, for `quiet` and the print options.
-    pub pset: &'a PsqlSettings,
+    /// `pset`, for `quiet` and the print options `\pset` sets.
+    pub pset: &'a mut PsqlSettings,
     /// `pset.vars`.
     pub vars: &'a mut VariableSpace,
 }
@@ -92,15 +93,17 @@ pub fn dispatch_slash(
     // upstream aliases one global for both, so the read side works from a
     // snapshot taken before dispatch — the state the C lexer would have seen.
     let snapshot = vars.clone();
-    let before = pset.clone();
+    let mut working = pset.clone();
     let status = {
         let mut ctx = CommandContext {
-            pset: &before,
+            pset: &mut working,
             vars,
         };
         handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
     };
-    *pset = vars.settings(pset);
+    // `\pset` wrote `working.popt`; a `\set` of a hooked variable wrote the
+    // variable space, whose settings are re-derived on top.
+    *pset = vars.settings(&working);
 
     if matches!(status, CommandResult::Connect(_)) {
         let _ = writeln!(
@@ -157,6 +160,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         // `\echo` and friends take everything.
         "echo" | "qecho" | "warn" | "set" => return Vec::new(),
         "c" | "connect" => 4,
+        "pset" => 2,
         "unset" => 1,
         _ => 0,
     };
@@ -185,6 +189,8 @@ fn exec_command(
             let _ = sink.write_all(&echo_text(options));
             CommandResult::SkipLine
         }
+        // `exec_command_pset()` (`command.c:2695`).
+        "pset" => exec_command_pset(options, ctx, stdout, stderr),
         // `exec_command_set()` (`command.c:2881`).
         "set" => exec_command_set(options, ctx, stdout, stderr),
         // `exec_command_unset()` (`command.c:3238`).
@@ -231,6 +237,34 @@ pub fn echo_text(options: &[SlashOption]) -> Vec<u8> {
     out
 }
 
+/// `exec_command_pset()` (`command.c:2695`): list every print option, or
+/// `do_pset` the first argument to the second.
+fn exec_command_pset(
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let Some(param) = options.first() else {
+        let _ = stdout.write_all(crate::pset::list_all(&ctx.pset.popt).as_bytes());
+        return CommandResult::SkipLine;
+    };
+    let value = options.get(1).map(|o| o.value.as_str());
+    let quiet = ctx.pset.quiet;
+    match crate::pset::do_pset(&param.value, value, &mut ctx.pset.popt, quiet) {
+        Ok(info) => {
+            if let Some(info) = info {
+                let _ = stdout.write_all(info.as_bytes());
+            }
+            CommandResult::SkipLine
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "psql: error: {err}");
+            CommandResult::Error
+        }
+    }
+}
+
 fn exec_command_set(
     options: &[SlashOption],
     ctx: &mut CommandContext<'_>,
@@ -268,7 +302,7 @@ mod tests {
 
     fn run(line: &str) -> Run {
         let mut vars = VariableSpace::new();
-        let pset = PsqlSettings::default();
+        let mut pset = PsqlSettings::default();
         let mut scanner = Scanner::new();
         scanner.setup(line.as_bytes(), true);
         let mut buf = Vec::new();
@@ -278,7 +312,7 @@ mod tests {
         let mut stderr = Vec::new();
         let result = {
             let mut ctx = CommandContext {
-                pset: &pset,
+                pset: &mut pset,
                 vars: &mut vars,
             };
             handle_slash_cmds(
@@ -414,6 +448,44 @@ mod tests {
         let status = dispatch_slash(&mut scanner, &mut pset, &mut vars, &mut stdout, &mut stderr);
 
         (status, pset, String::from_utf8(stderr).unwrap())
+    }
+
+    #[test]
+    fn pset_sets_a_print_option_and_the_dispatcher_keeps_it() {
+        let (status, pset, stderr) = dispatch("\\pset border 2");
+        assert_eq!(status, CommandResult::SkipLine);
+        assert_eq!(stderr, "");
+        assert_eq!(pset.popt.topt.border, 2);
+    }
+
+    #[test]
+    fn pset_reports_the_new_state_and_lists_everything_without_arguments() {
+        assert_eq!(
+            run("\\pset format unaligned").stdout,
+            "Output format is unaligned.\n"
+        );
+        let listing = run("\\pset").stdout;
+        assert!(
+            listing.starts_with("border                   1\n"),
+            "{listing}"
+        );
+        assert_eq!(listing.lines().count(), crate::pset::PSET_LIST.len());
+    }
+
+    #[test]
+    fn a_refused_pset_is_an_error_and_a_third_argument_is_ignored_with_a_warning() {
+        let refused = run("\\pset nosuch");
+        assert_eq!(refused.result, CommandResult::Error);
+        assert_eq!(
+            refused.stderr,
+            "psql: error: \\pset: unknown option: nosuch\n"
+        );
+        let extra = run("\\pset border 0 extra");
+        assert_eq!(extra.result, CommandResult::SkipLine);
+        assert_eq!(
+            extra.stderr,
+            "psql: warning: \\pset: extra argument \"extra\" ignored\n"
+        );
     }
 
     #[test]

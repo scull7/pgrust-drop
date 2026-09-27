@@ -85,6 +85,22 @@ pub trait Executor {
     /// broken connection is a final [`Reply::Broken`].
     fn exec(&mut self, query: &[u8]) -> Vec<Reply>;
 
+    /// `PQprepare(pset.db, "", query, 0, NULL)` (`fe-exec.c:2323`): parse
+    /// `query` as the unnamed statement, without running it, and hand back
+    /// what came of it, as [`Executor::exec`] does.
+    fn prepare(&mut self, query: &[u8]) -> Vec<Reply>;
+
+    /// `PQdescribePrepared(pset.db, "")` (`fe-exec.c:2472`): the unnamed
+    /// statement's parameter and column types, as one `COMMAND_OK` result.
+    fn describe_prepared(&mut self) -> Vec<Reply>;
+
+    /// `PQescapeLiteral(pset.db, …)` (`fe-exec.c:4413`), in the
+    /// connection's client encoding; the error is libpq's buffer.
+    ///
+    /// # Errors
+    /// `value` is not valid in the client encoding.
+    fn escape_literal(&self, value: &[u8]) -> Result<Vec<u8>, ErrorMessage>;
+
     /// `pset.db != NULL` (`mainloop.c:592`).
     fn connected(&self) -> bool;
 }
@@ -335,13 +351,14 @@ fn print_query_result(
     success
 }
 
-/// `SendQuery()` (`common.c:1126`), for the simple-query path.
+/// `SendQuery()` (`common.c:1126`), for the simple-query path and
+/// `\gdesc`'s (`common.c:1212`-`:1224`).
 ///
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `ERROR`, `SQLSTATE`, `ROW_COUNT` and the `LAST_ERROR_*`
 /// pair are set in `vars` from the outcome, as upstream sets them for every
-/// query the user typed. Whatever happened, the one-shot `\gset` and
-/// `\gexec` triggers are cleared afterwards (`sendquery_cleanup`,
+/// query the user typed. Whatever happened, the one-shot `\gset`, `\gdesc`
+/// and `\gexec` triggers are cleared afterwards (`sendquery_cleanup`,
 /// `common.c:1328`-`:1339`).
 pub fn send_query(
     executor: &mut dyn Executor,
@@ -351,14 +368,169 @@ pub fn send_query(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
-    let success = exec_query_and_process_results(executor, query, pset, vars, stdout, stderr);
+    // Upstream sends even an empty buffer; skipping one is ours, and only
+    // for the simple-query path, because `\gdesc` on an empty buffer
+    // prepares "" and reports that it has no columns (`common.c:1212`).
+    let success = if !pset.gdesc_flag && query.iter().all(u8::is_ascii_whitespace) {
+        true
+    } else {
+        if let Some(line) = echo_line(query, pset) {
+            let _ = stdout.write_all(&line);
+            let _ = stdout.write_all(b"\n");
+        }
+        if pset.gdesc_flag {
+            describe_query(executor, query, pset, vars, stdout, stderr)
+        } else {
+            exec_query_and_process_results(executor, query, pset, vars, stdout, stderr)
+        }
+    };
     pset.gset_prefix = None;
+    pset.gdesc_flag = false;
     pset.gexec_flag = false;
     success
 }
 
-/// `ExecQueryAndProcessResults()` (`common.c:1581`), with the part of
-/// `SendQuery` that comes before it.
+/// The last result of one libpq call, what `PQexec` and its siblings
+/// return (`PQexecFinish`, `fe-exec.c:2427`), with each notice printed on
+/// the way. `Err` is a broken connection's error buffer, where libpq
+/// returns NULL.
+fn last_result(
+    replies: Vec<Reply>,
+    pset: &PsqlSettings,
+    stderr: &mut dyn Write,
+) -> Result<Option<QueryResult>, ErrorMessage> {
+    let mut last = None;
+    for reply in replies {
+        match reply {
+            Reply::Notice(notice) => notice_processor(&notice, pset, stderr),
+            Reply::Result(result) => last = Some(result),
+            Reply::Broken(err) => return Err(err),
+        }
+    }
+    Ok(last)
+}
+
+/// `PQerrorMessage(pset.db)` after a call whose last result is `result`:
+/// libpq appends the server's error to the connection's buffer as
+/// `pqBuildErrorMessage3` renders it at the connection's verbosity
+/// (`fe-protocol3.c:973`-`:995`), which is `PQresultErrorMessage` of that
+/// result.
+fn error_message(
+    result: &Result<Option<QueryResult>, ErrorMessage>,
+    pset: &PsqlSettings,
+) -> Vec<u8> {
+    match result {
+        Ok(Some(result)) => match result.error() {
+            Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
+            None => result.error_message(),
+        },
+        Ok(None) => Vec::new(),
+        Err(err) => err.as_bytes().to_vec(),
+    }
+}
+
+/// `AcceptResult(result, true)` (`common.c:418`): whether `result` is one
+/// psql carries on with, logging libpq's error when it is not.
+fn accept_and_report(
+    result: &Result<Option<QueryResult>, ErrorMessage>,
+    pset: &PsqlSettings,
+    stderr: &mut dyn Write,
+) -> bool {
+    if let Ok(Some(result)) = result
+        && accept_result(result)
+    {
+        return true;
+    }
+    let message = error_message(result, pset);
+    if !message.is_empty() {
+        log(stderr, pset, Level::Info, &message);
+    }
+    false
+}
+
+/// The query `\gdesc` runs to name each column's type (`common.c:1407`-
+/// `:1439`): one `VALUES` row per column, its name escaped as a literal,
+/// its type OID and modifier, through `pg_catalog.format_type`.
+///
+/// # Errors
+/// A column name `escape` refuses, with libpq's error buffer.
+fn describe_columns_query(
+    described: &QueryResult,
+    escape: impl Fn(&[u8]) -> Result<Vec<u8>, ErrorMessage>,
+) -> Result<Vec<u8>, ErrorMessage> {
+    let mut buf = b"SELECT name AS \"Column\", pg_catalog.format_type(tp, tpm) AS \"Type\"\n\
+                    FROM (VALUES "
+        .to_vec();
+    for i in 0..described.nfields() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        let escname = escape(described.fname(i).unwrap_or_default())?;
+        buf.push(b'(');
+        buf.extend_from_slice(&escname);
+        buf.extend_from_slice(
+            format!(
+                ", '{}'::pg_catalog.oid, {})",
+                described.ftype(i).unwrap_or_default(),
+                described.fmod(i).unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+    }
+    buf.extend_from_slice(b") s(name, tp, tpm)");
+    Ok(buf)
+}
+
+/// `DescribeQuery()` (`common.c:1362`): `\gdesc`, the columns `query`
+/// would return, found by preparing it as the unnamed statement and
+/// describing that, without running it.
+///
+/// `\timing` is not ported, so no elapsed time is measured.
+fn describe_query(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let prepared = last_result(executor.prepare(query), pset, stderr);
+    if !matches!(&prepared, Ok(Some(r)) if r.status() == ExecStatus::CommandOk) {
+        log(stderr, pset, Level::Info, error_message(&prepared, pset));
+        set_result_variables(vars, prepared.ok().flatten().as_ref(), false);
+        return false;
+    }
+
+    let mut result = last_result(executor.describe_prepared(), pset, stderr);
+    let mut ok = accept_and_report(&result, pset, stderr)
+        && matches!(&result, Ok(Some(r)) if r.status() == ExecStatus::CommandOk);
+    if ok && let Ok(Some(described)) = &result {
+        if described.nfields() > 0 {
+            let sql = match describe_columns_query(described, |name| executor.escape_literal(name))
+            {
+                Ok(sql) => sql,
+                Err(err) => {
+                    // Upstream returns here, leaving the result variables
+                    // as they were (`common.c:1424`-`:1430`).
+                    log(stderr, pset, Level::Info, err.as_bytes());
+                    return false;
+                }
+            };
+            result = last_result(executor.exec(&sql), pset, stderr);
+            ok = accept_and_report(&result, pset, stderr);
+            if ok && let Ok(Some(columns)) = &result {
+                ok = print_query_result(columns, true, executor, pset, vars, stdout, stderr);
+            }
+        } else {
+            let _ = stdout.write_all(b"The command has no result, or the result has no columns.\n");
+        }
+    }
+
+    set_result_variables(vars, result.ok().flatten().as_ref(), ok);
+    ok
+}
+
+/// `ExecQueryAndProcessResults()` (`common.c:1581`).
 fn exec_query_and_process_results(
     executor: &mut dyn Executor,
     query: &[u8],
@@ -367,14 +539,6 @@ fn exec_query_and_process_results(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
-    if query.iter().all(u8::is_ascii_whitespace) {
-        return true;
-    }
-    if let Some(line) = echo_line(query, pset) {
-        let _ = stdout.write_all(&line);
-        let _ = stdout.write_all(b"\n");
-    }
-
     // A result is handled only once the next one has been fetched
     // (`common.c:2164`), so every notice parsed up to then is already on
     // stderr: hold each result back until the next result, or the end, is
@@ -464,9 +628,25 @@ impl Handling<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rlibpq::{Backend, ContextVisibility, FieldDescription, QueryRunner, TransactionStatus};
+
+    /// The extended-protocol half of [`Executor`], for a double whose test
+    /// never takes `\gdesc`'s path.
+    macro_rules! no_gdesc {
+        () => {
+            fn prepare(&mut self, _query: &[u8]) -> Vec<Reply> {
+                unreachable!("only \\gdesc prepares")
+            }
+            fn describe_prepared(&mut self) -> Vec<Reply> {
+                unreachable!("only \\gdesc describes")
+            }
+            fn escape_literal(&self, _value: &[u8]) -> Result<Vec<u8>, ErrorMessage> {
+                unreachable!("only \\gdesc escapes")
+            }
+        };
+    }
 
     struct Replay(Vec<Vec<Reply>>);
 
@@ -474,6 +654,7 @@ mod tests {
         fn exec(&mut self, _query: &[u8]) -> Vec<Reply> {
             self.0.remove(0)
         }
+        no_gdesc!();
         fn connected(&self) -> bool {
             true
         }
@@ -786,7 +967,7 @@ mod tests {
     }
 
     /// A `text`-only result with `rows`, a `None` cell being NULL.
-    fn rows(names: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
+    pub(crate) fn rows(names: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
         let mut runner = QueryRunner::new();
         runner
             .push(Backend::RowDescription(
@@ -836,6 +1017,22 @@ mod tests {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
             vec![Reply::Result(self.answers.remove(0))]
         }
+        fn prepare(&mut self, query: &[u8]) -> Vec<Reply> {
+            self.seen
+                .push(format!("Parse: {}", String::from_utf8_lossy(query)));
+            vec![Reply::Result(self.answers.remove(0))]
+        }
+        fn describe_prepared(&mut self) -> Vec<Reply> {
+            self.seen.push("Describe".to_string());
+            vec![Reply::Result(self.answers.remove(0))]
+        }
+        fn escape_literal(&self, value: &[u8]) -> Result<Vec<u8>, ErrorMessage> {
+            rlibpq::escape_literal(value, rlibpq::ClientEncoding::Utf8).map_err(|err| {
+                let mut message = err.message();
+                message.push(b'\n');
+                ErrorMessage::new(message)
+            })
+        }
         fn connected(&self) -> bool {
             true
         }
@@ -849,6 +1046,15 @@ mod tests {
         pset: &mut PsqlSettings,
         vars: &mut VariableSpace,
     ) -> (bool, String, Vec<String>) {
+        session_of(b"select", answers, pset, vars)
+    }
+
+    fn session_of(
+        query: &[u8],
+        answers: Vec<QueryResult>,
+        pset: &mut PsqlSettings,
+        vars: &mut VariableSpace,
+    ) -> (bool, String, Vec<String>) {
         let mut executor = Script {
             answers,
             seen: Vec::new(),
@@ -857,7 +1063,7 @@ mod tests {
         let mut out = Tee(Vec::new(), both.clone());
         let mut err = Tee(Vec::new(), both.clone());
         pset.log_terse = true;
-        let ok = send_query(&mut executor, b"select", pset, vars, &mut out, &mut err);
+        let ok = send_query(&mut executor, query, pset, vars, &mut out, &mut err);
         assert!(executor.answers.is_empty(), "every answer is asked for");
         let both = String::from_utf8(both.0.borrow().clone()).unwrap();
         (ok, both, executor.seen)
@@ -1052,6 +1258,225 @@ mod tests {
         assert_eq!(both, "ERROR:  no\n");
     }
 
+    /// A column of type `typid` with modifier `typmod`.
+    pub(crate) fn column(name: &[u8], typid: u32, typmod: i32) -> FieldDescription {
+        FieldDescription {
+            name: name.to_vec(),
+            tableid: 0,
+            columnid: 0,
+            typid,
+            typlen: -1,
+            atttypmod: typmod,
+            format: 0,
+        }
+    }
+
+    /// `PQdescribePrepared`'s one `COMMAND_OK` result for a statement with
+    /// `columns`, NoData for none, as the protocol state machine makes it.
+    pub(crate) fn described(columns: Vec<FieldDescription>) -> QueryResult {
+        use rlibpq::pipeline::{Admit, Next, message_id};
+        use rlibpq::{PipelineState, QueryClass};
+        let mut state = PipelineState::new();
+        state.begin_send(QueryClass::Describe).unwrap();
+        state.append(QueryClass::Describe);
+        let columns = if columns.is_empty() {
+            Backend::NoData
+        } else {
+            Backend::RowDescription(columns)
+        };
+        // The result is ready at the RowDescription or NoData, before the
+        // ReadyForQuery (`fe-protocol3.c:351`).
+        for message in [Backend::ParameterDescription(Vec::new()), columns] {
+            assert_ne!(state.admit(message_id(&message)), Admit::Wait);
+            state.apply(message).unwrap();
+        }
+        let Next::Result(result) = state.next_result() else {
+            panic!("the Describe's result");
+        };
+        assert_eq!(result.status(), ExecStatus::CommandOk);
+        result
+    }
+
+    /// `PQprepare`'s ParseComplete.
+    pub(crate) fn parsed() -> QueryResult {
+        QueryResult::new(ExecStatus::CommandOk)
+    }
+
+    /// psql.sql:168-172, `-- query buffer should remain unchanged`: the
+    /// statement is prepared and described, never run, and each column's
+    /// name, type OID and modifier go to the server in one `VALUES` query
+    /// whose answer is printed; `ROW_COUNT` is that query's, and the trigger
+    /// is gone afterwards.
+    #[test]
+    fn gdesc_describes_each_column_through_format_type() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let answers = vec![
+            parsed(),
+            described(vec![
+                column(b"x", 23, -1),
+                column(b"?column?", 25, -1),
+                column(b"six", 1043, 8),
+                column(b"dirty\\name", 16, -1),
+            ]),
+            rows(
+                &["Column", "Type"],
+                &[
+                    &[Some("x"), Some("integer")],
+                    &[Some("?column?"), Some("text")],
+                    &[Some("six"), Some("character varying(4)")],
+                    &[Some("dirty\\name"), Some("boolean")],
+                ],
+            ),
+        ];
+        let (ok, both, seen) = session(answers, &mut pset, &mut vars);
+        assert!(ok);
+        assert_eq!(
+            seen,
+            [
+                "Parse: select",
+                "Describe",
+                "SELECT name AS \"Column\", pg_catalog.format_type(tp, tpm) AS \"Type\"\n\
+                 FROM (VALUES ('x', '23'::pg_catalog.oid, -1),\
+                 ('?column?', '25'::pg_catalog.oid, -1),\
+                 ('six', '1043'::pg_catalog.oid, 8),\
+                 ( E'dirty\\\\name', '16'::pg_catalog.oid, -1)) s(name, tp, tpm)",
+            ]
+        );
+        assert_eq!(
+            both,
+            "   Column   |         Type         \n\
+             ------------+----------------------\n \
+             x          | integer\n \
+             ?column?   | text\n \
+             six        | character varying(4)\n \
+             dirty\\name | boolean\n\
+             (4 rows)\n\n"
+        );
+        assert_eq!(
+            ["ERROR", "SQLSTATE", "ROW_COUNT"].map(|name| vars.get(name)),
+            [Some("false"), Some("00000"), Some("4")]
+        );
+        assert!(!pset.gdesc_flag, "sendquery_cleanup (common.c:1336)");
+    }
+
+    /// psql.sql:162-164, `-- check behavior with empty results`: a
+    /// statement with no columns is reported as such and nothing else is
+    /// sent.
+    #[test]
+    fn gdesc_of_a_statement_without_columns_says_so() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (ok, both, seen) = session(vec![parsed(), described(Vec::new())], &mut pset, &mut vars);
+        assert!(ok);
+        assert_eq!(seen, ["Parse: select", "Describe"]);
+        assert_eq!(
+            both,
+            "The command has no result, or the result has no columns.\n"
+        );
+        assert_eq!(
+            ["ERROR", "SQLSTATE", "ROW_COUNT"].map(|name| vars.get(name)),
+            [Some("false"), Some("00000"), Some("0")]
+        );
+    }
+
+    /// `\gdesc` on an empty buffer, e.g. a session's first command, when
+    /// there is no previous query to copy: `SendQuery` has no emptiness
+    /// check (`common.c:1126`-`:1224`), so `DescribeQuery` prepares "",
+    /// which has no columns (`common.c:1458`-`:1460`).
+    #[test]
+    fn gdesc_of_an_empty_buffer_prepares_it_and_says_it_has_no_columns() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (ok, both, seen) = session_of(
+            b"",
+            vec![parsed(), described(Vec::new())],
+            &mut pset,
+            &mut vars,
+        );
+        assert!(ok);
+        assert_eq!(seen, ["Parse: ", "Describe"]);
+        assert_eq!(
+            both,
+            "The command has no result, or the result has no columns.\n"
+        );
+        assert_eq!(
+            ["ERROR", "ROW_COUNT"].map(|name| vars.get(name)),
+            [Some("false"), Some("0")]
+        );
+        assert!(!pset.gdesc_flag);
+    }
+
+    /// psql.sql:159-160 and :1231-1237, `-- should fail cleanly - syntax
+    /// error` and `-- \gdesc with an error`: the Parse fails, its error is
+    /// logged, nothing more is sent, and the error variables are set.
+    #[test]
+    fn gdesc_of_a_syntax_error_logs_it_and_sends_nothing_more() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            verbosity: rlibpq::Verbosity::Terse,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let error = error_result(&[
+            (b'S', b"ERROR"),
+            (b'V', b"ERROR"),
+            (b'C', b"42601"),
+            (b'M', b"syntax error at end of input"),
+            (b'P', b"13"),
+        ]);
+        let (ok, both, seen) = session(vec![error], &mut pset, &mut vars);
+        assert!(!ok);
+        assert_eq!(seen, ["Parse: select"]);
+        assert_eq!(
+            both,
+            "ERROR:  syntax error at end of input at character 13\n"
+        );
+        assert_eq!(
+            variables(&vars),
+            [
+                ("ERROR", Some("true".into())),
+                ("SQLSTATE", Some("42601".into())),
+                ("ROW_COUNT", Some("0".into())),
+                (
+                    "LAST_ERROR_MESSAGE",
+                    Some("syntax error at end of input".into())
+                ),
+                ("LAST_ERROR_SQLSTATE", Some("42601".into())),
+            ]
+        );
+        assert!(!pset.gdesc_flag);
+    }
+
+    /// `common.c:1424`-`:1430`: a column name `PQescapeLiteral` refuses
+    /// ends `\gdesc` with libpq's error, before the `VALUES` query is sent
+    /// and without touching the result variables.
+    #[test]
+    fn gdesc_of_a_name_the_client_encoding_refuses_stops_before_the_query() {
+        let mut pset = PsqlSettings {
+            gdesc_flag: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        vars.set("ERROR", Some("before")).unwrap();
+        let answers = vec![parsed(), described(vec![column(b"bad \xe9'''", 25, -1)])];
+        let (ok, both, seen) = session(answers, &mut pset, &mut vars);
+        assert!(!ok);
+        assert_eq!(seen, ["Parse: select", "Describe"]);
+        assert_eq!(both, "invalid multibyte character\n");
+        assert_eq!(vars.get("ERROR"), Some("before"));
+        assert!(!pset.gdesc_flag);
+    }
+
     #[test]
     fn a_select_prints_the_table_and_nothing_else() {
         let (ok, out, err) = run(one_row(), &PsqlSettings::default());
@@ -1182,6 +1607,7 @@ mod tests {
                     b"no such database \"\xc3\x28\"".to_vec(),
                 ))]
             }
+            no_gdesc!();
             fn connected(&self) -> bool {
                 false
             }
@@ -1235,6 +1661,7 @@ mod tests {
             fn exec(&mut self, _query: &[u8]) -> Vec<Reply> {
                 panic!("an empty query must not reach the server");
             }
+            no_gdesc!();
             fn connected(&self) -> bool {
                 true
             }

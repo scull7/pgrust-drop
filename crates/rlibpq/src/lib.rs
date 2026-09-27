@@ -18,7 +18,8 @@
 //! over the pure state machine in `pipeline`; the COPY data transfer in both
 //! directions (`PQputCopyData`, `PQputCopyEnd`, `PQgetCopyData`); the
 //! blocking query cancel calls (`PQgetCancel`, `PQcancel`, `PQrequestCancel`,
-//! `PQcancelCreate`, `PQcancelBlocking`); and the
+//! `PQcancelCreate`, `PQcancelBlocking`); string escaping (`PQescapeLiteral`,
+//! `PQescapeIdentifier`); and the
 //! `fe-trace.c` protocol trace behind `PQtrace` and `PQsetTraceFlags`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
@@ -40,6 +41,7 @@ pub mod connection;
 pub mod conninfo;
 mod cstr;
 pub mod error;
+pub mod escape;
 pub mod extended;
 pub mod hmac;
 pub mod md5;
@@ -65,6 +67,7 @@ pub use conninfo::{
     uri_prefix_length,
 };
 pub use error::ConnError;
+pub use escape::{ClientEncoding, EscapeError, escape_identifier, escape_literal};
 pub use extended::{ArgumentError, Format, PQ_QUERY_PARAM_MAX_LIMIT, Params};
 pub use message::{
     Backend, CopyFormat, Frame, Frontend, ProtocolError, Target, TransactionStatus,

@@ -172,6 +172,9 @@ pub enum PipelineError {
     /// `fe-exec.c:3345`: a pipeline Sync while a COPY runs, which upstream
     /// calls unreachable.
     SyncDuringCopy,
+    /// `fe-exec.c:3041`: `PQfn` while a command is running or its result
+    /// is still to be collected.
+    WrongState,
 }
 
 impl PipelineError {
@@ -203,6 +206,7 @@ impl PipelineError {
             PipelineError::SyncDuringCopy => {
                 b"internal error: cannot send pipeline while in COPY".to_vec()
             }
+            PipelineError::WrongState => b"connection in wrong state".to_vec(),
         }
     }
 }
@@ -361,6 +365,21 @@ impl PipelineState {
             Ok(())
         } else {
             Err(PipelineError::SynchronousInPipelineMode)
+        }
+    }
+
+    /// `PQnfn`'s refusals, `fe-exec.c:3032`-`:3043`: not in pipeline mode,
+    /// and only on an idle connection with no result left uncollected.
+    ///
+    /// # Errors
+    /// In pipeline mode, or a command is running or its result waits.
+    pub fn begin_fn(&self) -> Result<(), PipelineError> {
+        if self.pipeline != PipelineStatus::Off {
+            Err(PipelineError::NotAllowedInPipelineMode("PQfn"))
+        } else if self.status != AsyncStatus::Idle || self.result.is_some() {
+            Err(PipelineError::WrongState)
+        } else {
+            Ok(())
         }
     }
 
@@ -554,8 +573,9 @@ impl PipelineState {
     /// # Errors
     /// The message cannot appear here at all — a DataRow with no preceding
     /// RowDescription, a field count that disagrees with it, a startup
-    /// message, or a type this port does not handle yet (FunctionCallResponse)
-    /// or that libpq never provokes (PortalSuspended, `fe-protocol3.c:446`).
+    /// message, a FunctionCallResponse (read only by `PQfn`'s own loop,
+    /// `fe-protocol3.c:2288`), or a type libpq never provokes
+    /// (PortalSuspended, `fe-protocol3.c:446`).
     /// Upstream turns these into an error result and carries on; here they
     /// end the exchange.
     pub fn apply(&mut self, message: Backend) -> Result<Option<Event>, ProtocolError> {
@@ -698,6 +718,7 @@ impl PipelineState {
             // the startup loop (`fe-connect.c:4148`), never mid-query.
             other @ (Backend::PortalSuspended
             | Backend::NegotiateProtocolVersion { .. }
+            | Backend::FunctionCallResponse(_)
             | Backend::Other { .. }) => {
                 return Err(ProtocolError::UnexpectedResponse(message_id(&other)));
             }
@@ -1131,6 +1152,7 @@ pub fn message_id(message: &Backend) -> u8 {
         Backend::CopyBothResponse(_) => b'W',
         Backend::CopyData(_) => b'd',
         Backend::CopyDone => b'c',
+        Backend::FunctionCallResponse(_) => b'V',
         Backend::Other { id, .. } => *id,
     }
 }

@@ -34,6 +34,7 @@ int
 main(void)
 {
 	char		buf[16];
+	PGconn	   *conn;
 	const char *const *names = PQsslAttributeNames(NULL);
 
 	printf("PQlibVersion %d\n", PQlibVersion());
@@ -60,5 +61,31 @@ main(void)
 	PQfreemem(malloc(16));
 	PQfreeNotify(malloc(sizeof(PGnotify)));
 	printf("freed\n");
+
+	/* a NULL PGconn and a NULL PGresult */
+	printf("PQstatus %d\n", PQstatus(NULL));
+	printf("PQerrorMessage %s", PQerrorMessage(NULL));
+	printf("PQexec %s\n", null_or_set(PQexec(NULL, "select 1")));
+	printf("PQresultStatus %s\n", PQresStatus(PQresultStatus(NULL)));
+	printf("PQresStatus %s|%s|%s\n", PQresStatus(PGRES_EMPTY_QUERY),
+		   PQresStatus(PGRES_TUPLES_CHUNK), PQresStatus(PGRES_TUPLES_CHUNK + 1));
+	printf("PQresultErrorMessage \"%s\"\n", PQresultErrorMessage(NULL));
+	printf("PQntuples %d PQnfields %d\n", PQntuples(NULL), PQnfields(NULL));
+	printf("PQfname %s\n", null_or_set(PQfname(NULL, 0)));
+	printf("PQcmdStatus %s\n", null_or_set(PQcmdStatus(NULL)));
+	printf("PQgetvalue %s PQgetlength %d PQgetisnull %d\n",
+		   null_or_set(PQgetvalue(NULL, 0, 0)), PQgetlength(NULL, 0, 0),
+		   PQgetisnull(NULL, 0, 0));
+	PQclear(NULL);
+	PQfinish(NULL);
+
+	/* a PGconn whose conninfo does not parse: no socket is ever opened */
+	conn = PQconnectdb("bogus");
+	printf("PQconnectdb %s\n", null_or_set(conn));
+	printf("PQstatus %d\n", PQstatus(conn));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	printf("PQexec %s\n", null_or_set(PQexec(conn, "select 1")));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	PQfinish(conn);
 	return 0;
 }

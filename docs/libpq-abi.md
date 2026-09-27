@@ -23,14 +23,14 @@ a `cdylib` crate type, and musl is the lane CI gates first (ADR-0007).
 is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 `rlibpq` has none of the three yet.
 
-19 of 210 symbols implemented, 0 stubbed with an error, 191 not yet.
+35 of 210 symbols implemented, 0 stubbed with an error, 175 not yet.
 
 | ordinal | symbol | coverage | follows |
 |--:|---|---|---|
-| 1 | `PQconnectdb` | not yet |  |
+| 1 | `PQconnectdb` | implemented | fe-connect.c:820 |
 | 2 | `PQsetdbLogin` | not yet |  |
 | 3 | `PQconndefaults` | implemented | fe-connect.c:2193 |
-| 4 | `PQfinish` | not yet |  |
+| 4 | `PQfinish` | implemented | fe-connect.c:5301 |
 | 5 | `PQreset` | not yet |  |
 | 6 | `PQrequestCancel` | not yet |  |
 | 7 | `PQdb` | not yet |  |
@@ -40,14 +40,14 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 11 | `PQport` | not yet |  |
 | 12 | `PQtty` | not yet |  |
 | 13 | `PQoptions` | not yet |  |
-| 14 | `PQstatus` | not yet |  |
-| 15 | `PQerrorMessage` | not yet |  |
+| 14 | `PQstatus` | implemented | fe-connect.c:7575 |
+| 15 | `PQerrorMessage` | implemented | fe-connect.c:7638 |
 | 16 | `PQsocket` | not yet |  |
 | 17 | `PQbackendPID` | not yet |  |
 | 18 | `PQtrace` | not yet |  |
 | 19 | `PQuntrace` | not yet |  |
 | 20 | `PQsetNoticeProcessor` | not yet |  |
-| 21 | `PQexec` | not yet |  |
+| 21 | `PQexec` | implemented | fe-exec.c:2279 |
 | 22 | `PQnotifies` | not yet |  |
 | 23 | `PQsendQuery` | not yet |  |
 | 24 | `PQgetResult` | not yet |  |
@@ -59,22 +59,22 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 30 | `PQputnbytes` | not yet |  |
 | 31 | `PQendcopy` | not yet |  |
 | 32 | `PQfn` | not yet |  |
-| 33 | `PQresultStatus` | not yet |  |
-| 34 | `PQntuples` | not yet |  |
-| 35 | `PQnfields` | not yet |  |
+| 33 | `PQresultStatus` | implemented | fe-exec.c:3442 |
+| 34 | `PQntuples` | implemented | fe-exec.c:3512 |
+| 35 | `PQnfields` | implemented | fe-exec.c:3520 |
 | 36 | `PQbinaryTuples` | not yet |  |
-| 37 | `PQfname` | not yet |  |
+| 37 | `PQfname` | implemented | fe-exec.c:3598 |
 | 38 | `PQfnumber` | not yet |  |
 | 39 | `PQftype` | not yet |  |
 | 40 | `PQfsize` | not yet |  |
 | 41 | `PQfmod` | not yet |  |
-| 42 | `PQcmdStatus` | not yet |  |
+| 42 | `PQcmdStatus` | implemented | fe-exec.c:3783 |
 | 43 | `PQoidStatus` | not yet |  |
 | 44 | `PQcmdTuples` | not yet |  |
-| 45 | `PQgetvalue` | not yet |  |
-| 46 | `PQgetlength` | not yet |  |
-| 47 | `PQgetisnull` | not yet |  |
-| 48 | `PQclear` | not yet |  |
+| 45 | `PQgetvalue` | implemented | fe-exec.c:3907 |
+| 46 | `PQgetlength` | implemented | fe-exec.c:3918 |
+| 47 | `PQgetisnull` | implemented | fe-exec.c:3932 |
+| 48 | `PQclear` | implemented | fe-exec.c:727 |
 | 49 | `PQmakeEmptyPGresult` | not yet |  |
 | 50 | `PQprint` | not yet |  |
 | 51 | `PQdisplayTuples` | not yet |  |
@@ -91,8 +91,8 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 62 | `lo_export` | not yet |  |
 | 63 | `pgresStatus` | not yet |  |
 | 64 | `PQmblen` | not yet |  |
-| 65 | `PQresultErrorMessage` | not yet |  |
-| 66 | `PQresStatus` | not yet |  |
+| 65 | `PQresultErrorMessage` | implemented | fe-exec.c:3458 |
+| 66 | `PQresStatus` | implemented | fe-exec.c:3450 |
 | 67 | `termPQExpBuffer` | not yet |  |
 | 68 | `appendPQExpBufferChar` | not yet |  |
 | 69 | `initPQExpBuffer` | not yet |  |

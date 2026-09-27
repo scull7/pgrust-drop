@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rinitdb::control::ControlFile;
+use rinitdb::single_user::SERVER_ENV;
 use testkit::env::Environment;
 use testkit::reference;
 
@@ -227,11 +228,6 @@ fn the_template_fixes_encoding_utf8_and_locale_c() {
             "initdb: error: locale \"en_US.UTF-8\" (--lc-collate) is not supported yet: the \
              embedded template cluster has encoding \"UTF8\" and locale \"C\"",
         ),
-        (
-            &["-U", "alice"],
-            "initdb: error: superuser name \"alice\" is not supported yet: the embedded template \
-             cluster's superuser is \"postgres\" and renaming it is not implemented",
-        ),
     ] {
         let pgdata = tempdir.join("refused");
         let mut argv = args(&["-U", "postgres"]);
@@ -320,13 +316,15 @@ fn a_text_search_config_that_does_not_match_locale_c_warns() {
     );
 }
 
-/// A `--waldir` that fails keeps precedence over this port's refusal
-/// (`docs/divergences.md`), and a refusal that leaves `lc_ctype` at C does
-/// not take the warning with it: the reference initdb writes these four
-/// stderr lines, in this order, for this command line with `-U alice`.
+/// A superuser other than the template's is a single-user session to run,
+/// and a `--waldir` that fails still fails where C's does, after the
+/// warning: the reference initdb writes these four stderr lines, in this
+/// order, for this command line. The `postgres` found ([`fake_postgres`])
+/// is never started.
 #[test]
-fn a_failing_waldir_behind_a_superuser_refusal_still_warns_first() {
+fn a_failing_waldir_behind_a_superuser_rename_still_warns_first() {
     let tempdir = TempDir::new("expanded-tsearch-waldir");
+    let postgres = fake_postgres(&tempdir);
     let pgdata = tempdir.join("data");
     let waldir = tempdir.join("wal");
     std::fs::create_dir(&waldir).expect("create the WAL directory");
@@ -344,7 +342,9 @@ fn a_failing_waldir_behind_a_superuser_refusal_still_warns_first() {
         &waldir.to_string_lossy(),
         &pgdata.to_string_lossy(),
     ]);
-    let outcome = testkit::run(Path::new(RINITDB), &argv).expect("run rinitdb");
+    let env = Environment::inherited().with(SERVER_ENV, &postgres);
+    let outcome = testkit::run_in(Path::new(RINITDB), &argv, &[], &env).expect("run rinitdb");
+    assert!(!tempdir.join("session.log").exists(), "the server was run");
     assert_eq!(outcome.status, Some(1), "{}", outcome.stderr_text());
     let (pgdata, waldir) = (pgdata.display(), waldir.display());
     assert_eq!(
@@ -626,4 +626,210 @@ fn an_empty_locale_is_the_environments_like_no_switch() {
             }
         }
     }
+}
+
+/// A stand-in `postgres` in `tempdir`, for the single-user session
+/// (`rinitdb::single_user`): it answers `-V` with 18.6's
+/// `PG_BACKEND_VERSIONSTR`, and otherwise writes `PGDATA`, its arguments and
+/// its stdin to `session.log` beside itself and exits with `FAKE_EXIT`
+/// (0 by default). Named by [`SERVER_ENV`], as nothing is beside `rinitdb`.
+fn fake_postgres(tempdir: &TempDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = tempdir.join("postgres");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = -V ]; then echo 'postgres (PostgreSQL) 18.6'; exit 0; fi\n\
+         log=\"$(dirname \"$0\")/session.log\"\n\
+         { echo \"PGDATA=$PGDATA\"; for arg in \"$@\"; do echo \"arg=$arg\"; done; cat; } > \"$log\"\n\
+         exit \"${FAKE_EXIT:-0}\"\n",
+    )
+    .expect("write the stand-in postgres");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in postgres executable");
+    path
+}
+
+/// The environment `rinitdb` runs in for these tests: no `PGDROP_POSTGRES`
+/// but the one given.
+fn with_server(postgres: Option<&Path>) -> Environment {
+    let env = Environment::inherited().without(SERVER_ENV);
+    match postgres {
+        Some(path) => env.with(SERVER_ENV, path),
+        None => env,
+    }
+}
+
+/// `setup_bin_paths` (`initdb.c:2661`): a superuser other than the
+/// template's needs a `postgres`, and with none beside `rinitdb` and none
+/// named, C's error — before anything is made, as in C.
+#[test]
+fn another_superuser_needs_a_postgres_beside_initdb() {
+    let tempdir = TempDir::new("single-user-none");
+    let pgdata = tempdir.join("data");
+    let argv = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        pgdata.clone().into(),
+    ];
+    let outcome =
+        testkit::run_in(Path::new(RINITDB), &argv, &[], &with_server(None)).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(1), "{}", outcome.stderr_text());
+    assert_eq!(outcome.stdout_text(), "");
+    let my_exec = std::fs::canonicalize(RINITDB).expect("canonicalize rinitdb");
+    assert_eq!(
+        outcome.stderr_text(),
+        format!(
+            "initdb: error: program \"postgres\" is needed by initdb but was not found in the \
+             same directory as \"{}\"\n",
+            my_exec.display()
+        )
+    );
+    assert!(!pgdata.exists());
+
+    // The template's own superuser needs no session and no server.
+    rinitdb_ok(
+        &["-U", "postgres", "--no-sync"],
+        &pgdata,
+        &with_server(None),
+    );
+}
+
+/// A `PGDROP_POSTGRES` that is not a `postgres` of this version is refused
+/// rather than skipped.
+#[test]
+fn an_unusable_server_override_is_an_error() {
+    let tempdir = TempDir::new("single-user-override");
+    let pgdata = tempdir.join("data");
+    let bogus = tempdir.join("no-such-postgres");
+    let argv = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        pgdata.clone().into(),
+    ];
+    let outcome = testkit::run_in(Path::new(RINITDB), &argv, &[], &with_server(Some(&bogus)))
+        .expect("run rinitdb");
+    assert_eq!(outcome.status, Some(1));
+    assert_eq!(
+        outcome.stderr_text(),
+        format!(
+            "initdb: error: PGDROP_POSTGRES names \"{}\", which is not a postgres executable of \
+             the same version as initdb\n",
+            bogus.display()
+        )
+    );
+    assert!(!pgdata.exists());
+}
+
+/// The session is started as `initialize_data_directory` starts it
+/// (`initdb.c:226`, `:3112`; PGDATA exported, `:2642`), after the cluster is
+/// written, and is fed the rename.
+#[test]
+fn another_superuser_is_renamed_in_a_single_user_session() {
+    let tempdir = TempDir::new("single-user-args");
+    let postgres = fake_postgres(&tempdir);
+    let pgdata = tempdir.join("data");
+    rinitdb_ok(
+        &["-U", "alice", "--no-sync"],
+        &pgdata,
+        &with_server(Some(&postgres)),
+    );
+    let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
+    assert_eq!(
+        log,
+        format!(
+            "PGDATA={}\n\
+             arg=--single\narg=-F\narg=-O\narg=-j\n\
+             arg=-c\narg=search_path=pg_catalog\narg=-c\narg=exit_on_error=true\n\
+             arg=-c\narg=log_checkpoints=false\narg=template1\n\
+             UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n",
+            pgdata.display()
+        )
+    );
+    assert!(pgdata.join("global/pg_control").is_file());
+}
+
+/// `pclose_check` (`src/common/exec.c:410`), then the exit handler removes
+/// what was made (`cleanup_directories_atexit`, `initdb.c:762`).
+#[test]
+fn a_failed_single_user_session_removes_the_data_directory() {
+    let tempdir = TempDir::new("single-user-fails");
+    let postgres = fake_postgres(&tempdir);
+    let pgdata = tempdir.join("data");
+    let argv = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        OsString::from("--no-sync"),
+        pgdata.clone().into(),
+    ];
+    let env = with_server(Some(&postgres)).with("FAKE_EXIT", "3");
+    let outcome = testkit::run_in(Path::new(RINITDB), &argv, &[], &env).expect("run rinitdb");
+    assert_eq!(outcome.status, Some(1));
+    assert_eq!(
+        outcome.stderr_text(),
+        format!(
+            "initdb: error: child process exited with exit code 3\n\
+             initdb: removing data directory \"{}\"\n",
+            pgdata.display()
+        )
+    );
+    assert!(!pgdata.exists());
+}
+
+/// The superuser, the databases it owns and an ACL naming it, as a
+/// single-user session prints them.
+const SUPERUSER_QUERIES: &str = "\
+select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, \
+rolreplication, rolbypassrls, rolconnlimit, rolpassword, rolvaliduntil from pg_authid order by oid;
+select datname, datdba::regrole as owner from pg_database order by oid;
+select relacl from pg_class where oid = 'pg_class'::regclass;
+select current_user as session_superuser;
+";
+
+/// Gate: `-U alice` makes the roles, owners and ACLs the reference initdb
+/// makes (the image's own recipe, `--no-locale -E UTF8`), as the reference
+/// `postgres --single` reads them from each cluster. The reference server
+/// also runs our session (`PGDROP_POSTGRES`). NAT-383's `\du` gate is this
+/// check without a psql and a running server.
+#[test]
+fn the_renamed_superuser_matches_reference_initdb() {
+    let tempdir = TempDir::new("single-user-gate");
+    let Some(initdb) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let Some(postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
+    let ours = tempdir.join("ours");
+    rinitdb_ok(
+        &["-U", "alice", "--no-sync"],
+        &ours,
+        &with_server(Some(&postgres)),
+    );
+    let theirs = tempdir.join("theirs");
+    let argv = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        OsString::from("--no-sync"),
+        OsString::from("--no-locale"),
+        OsString::from("-E"),
+        OsString::from("UTF8"),
+        theirs.clone().into(),
+    ];
+    let outcome = testkit::run(&initdb, &argv).expect("run the reference initdb");
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+
+    let read = |pgdata: &Path| {
+        let outcome = reference_single_user(pgdata, SUPERUSER_QUERIES).expect("found above");
+        assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+        outcome.stdout_text()
+    };
+    let (ours, theirs) = (read(&ours), read(&theirs));
+    assert_eq!(
+        single_user_values(&ours, "session_superuser"),
+        ["alice"],
+        "{ours}"
+    );
+    assert_eq!(single_user_values(&ours, "rolname")[0], "alice", "{ours}");
+    assert_eq!(ours, theirs);
 }

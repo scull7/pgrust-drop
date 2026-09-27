@@ -190,3 +190,38 @@ All three CI lanes' references are built with ICU, so step 2 runs live on every
 lane and step 3 runs only for `:116`. The case of a reference built without ICU
 is exercised without one by
 `the_icu_probe_and_the_byte_diff_rule_read_both_builds`.
+
+## The `--set` name check (NAT-386)
+
+`fails for invalid --set option` (`001_initdb.pl:290`) fails in C only once a
+server reads the file: `setup_config` appends `foo = bar` to `postgresql.conf`
+(`initdb.c:624`: "We rely on the bootstrap server to complain if it's not a
+valid GUC name"), and `bootstrap_template1`'s backend reports the name
+(`guc.c:428`) and refuses the file (`guc.c:611`). The template (ADR-0002) has no
+bootstrap backend, so `rinitdb::guc` ports that one step at the same point:
+after the configuration files are written, with the data directory then
+removed.
+
+- **The table.** `guc::PARAMETER_NAMES` is the 405 names of a standard
+  REL_18_6 build, in `guc_tables.c` order. The 13 entries behind a developer
+  `#ifdef` are left out, and `map_old_guc_names` (`guc.c:190`) is kept beside
+  it.
+- **The case.** Upstream's line runs as written (`command_fails`). On a host
+  whose user is not `postgres`, rinitdb refuses that line over the superuser
+  first (NAT-383), so the exact stderr is pinned on the same line with
+  `-U postgres` in front. The gate runs C initdb on that line too. It diffs
+  stderr after two normalizations, each named in `server_refusal_as_initdb`:
+  - the backend's `log_line_prefix` and severity become rinitdb's `error:` and
+    `detail:` lines;
+  - `child process exited with exit code 1` is dropped.
+
+  The line number is compared too. It is each sample's appended line, and it
+  is carried over, flagged, only when a distribution's sample has a different
+  length.
+- **The table's gate.** `the_parameter_names_are_the_reference_servers` writes
+  one `postgresql.conf` that assigns every name in the table, the old names, a
+  custom name, the 13 compiled-out names and `foo`. The reference
+  `postgres -C` reads it and reports every name it does not know, with its
+  line, before any value is judged. That list must equal rinitdb's for the
+  same file. For the reverse direction, every name in the reference's
+  `--describe-config` must be in the table.

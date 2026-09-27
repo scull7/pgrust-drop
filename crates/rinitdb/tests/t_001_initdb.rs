@@ -1731,6 +1731,228 @@ fn fails_for_invalid_option_combination() {
     gate_strictly(&argv);
 }
 
+/// The line `replace_guc_value` appends a parameter the sample does not
+/// mention on (`initdb.c:624`, "We rely on the bootstrap server to complain
+/// if it's not a valid GUC name"): one past the sample's last, since every
+/// other line `setup_config` writes replaces one in place.
+fn appended_line(sample: &str) -> usize {
+    sample.lines().count() + 1
+}
+
+/// C's stderr for a bootstrap backend that refused `postgresql.conf`, in
+/// rinitdb's form, so the two can be diffed.
+///
+/// Each normalization is one fact about the run, not about the message:
+/// - the backend's `log_line_prefix` (`%m [%p] `, a timestamp and a pid) and
+///   its severity become rinitdb's frontend prefixes: the `FATAL` line
+///   (`guc.c:611`) becomes the `error:` line, and each `LOG` line (`guc.c:428`)
+///   one `detail:` line under it, in order — rinitdb reports what one process
+///   found as one `pg_log_error` with its details;
+/// - `child process exited with exit code 1` (`src/common/wait_error.c:64`,
+///   which `pclose_check` prints from `PG_CMD_CLOSE`, `initdb.c:1628`) is
+///   dropped: rinitdb starts no child.
+///
+/// Every other line is kept verbatim, so anything else C writes fails the diff.
+fn server_refusal_as_initdb(stderr: &str) -> String {
+    let (mut fatal, mut logs, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    for line in stderr.lines() {
+        if let Some((_, message)) = line.split_once("] FATAL:  ") {
+            fatal.push(format!("initdb: error: {message}"));
+        } else if let Some((_, message)) = line.split_once("] LOG:  ") {
+            logs.push(format!("initdb: detail: {message}"));
+        } else if line != "child process exited with exit code 1" {
+            rest.push(line.to_owned());
+        }
+    }
+    let mut out = String::new();
+    for line in fatal.iter().chain(&logs).chain(&rest) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// `command_fails([ 'initdb', '--no-sync', '--set' => 'foo=bar',
+/// "$tempdir/dataX" ], 'fails for invalid --set option');` — 001_initdb.pl:290.
+///
+/// C fails in `bootstrap_template1` (`initdb.c:3097`): its backend reads the
+/// `postgresql.conf` that `setup_config` has just written, with `foo = bar`
+/// appended, reports the name (`guc.c:428`) and refuses the file
+/// (`guc.c:611`), and initdb removes the data directory. rinitdb runs the
+/// same check (`rinitdb::guc`) at the same point.
+///
+/// Upstream's line runs as written. On a host whose user is not `postgres`,
+/// rinitdb refuses that line earlier, over the superuser (NAT-383). So the
+/// exact stderr is pinned on the same line with `-U postgres` in front, which
+/// reaches the parameter check on every host, and the gate runs C on that
+/// line as well.
+#[cfg(unix)]
+#[test]
+fn fails_for_invalid_set_option() {
+    let tempdir = TempDir::new("invalid-set");
+    let stolen = ["--no-sync", "--set", "foo=bar"];
+    testkit::command_fails(
+        Path::new(RINITDB),
+        sync_argv(&stolen, &tempdir.join("dataX"), &[]),
+    );
+
+    let pinned = |dir: &Path| {
+        let mut before = vec!["-U", "postgres"];
+        before.extend(stolen);
+        sync_argv(&before, &dir.join("dataX"), &[])
+    };
+    let ours_dir = tempdir.join("ours");
+    let ours = testkit::run(Path::new(RINITDB), pinned(&ours_dir)).expect("run rinitdb");
+    let datadir = ours_dir.join("dataX");
+    let conf = datadir.join("postgresql.conf");
+    let (datadir, conf) = (datadir.display(), conf.display());
+    let line = appended_line(rinitdb::conf::POSTGRESQL_CONF_SAMPLE);
+    assert_eq!(ours.status, Some(1));
+    assert_eq!(ours.stdout_text(), "");
+    assert_eq!(
+        ours.stderr_text(),
+        format!(
+            "initdb: error: configuration file \"{conf}\" contains errors\n\
+             initdb: detail: unrecognized configuration parameter \"foo\" in file \"{conf}\" \
+             line {line}\n\
+             initdb: removing data directory \"{datadir}\"\n"
+        )
+    );
+    assert!(
+        !ours_dir.join("dataX").exists(),
+        "the data directory is removed"
+    );
+
+    let Some(initdb) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let theirs_dir = tempdir.join("theirs");
+    let theirs = testkit::run(&initdb, pinned(&theirs_dir)).expect("run the reference initdb");
+    assert_eq!(theirs.status, Some(1), "{}", theirs.stderr_text());
+    assert!(!theirs_dir.join("dataX").exists(), "C removes it too");
+
+    let mut theirs_text = server_refusal_as_initdb(&theirs.stderr_text())
+        .replace(&theirs_dir.display().to_string(), "<dir>");
+    // The line C names is its own sample's; a distribution may patch the
+    // sample (Alpine does). The rule is checked on C's side, then the number
+    // is carried over, flagged.
+    if let Some([sample, _, _]) = reference_samples(&initdb) {
+        let theirs_line = appended_line(&sample);
+        let (from, to) = (format!(" line {theirs_line}\n"), format!(" line {line}\n"));
+        assert!(
+            theirs_text.contains(&from),
+            "C names line {theirs_line}: {theirs_text}"
+        );
+        if theirs_line != line {
+            reference::announce_skip(&format!(
+                "{}: the reference's postgresql.conf.sample has {} lines, this port's {}; \
+                 the line number is compared as each sample's appended line",
+                reference::SKIP_FLAG,
+                theirs_line - 1,
+                line - 1
+            ));
+            theirs_text = theirs_text.replace(&from, &to);
+        }
+    }
+    let ours_text = ours
+        .stderr_text()
+        .replace(&ours_dir.display().to_string(), "<dir>");
+    assert_eq!(ours_text, theirs_text);
+}
+
+/// Not an upstream case: `rinitdb::guc`'s name table against the reference
+/// server's own, which `fails_for_invalid_set_option` rests on.
+///
+/// One `postgresql.conf` assigns every name in the table, the obsolete names
+/// `map_old_guc_names` still accepts (`guc.c:190`), a name in another case, a
+/// custom name, the 13 names a standard build compiles out, and `foo`. The
+/// reference `postgres -C` reads it (`-C` is allowed as root, `main.c:174`)
+/// and reports each name it does not know, with its line, before judging any
+/// value (`guc.c:395`-`:434`). That list must be exactly rinitdb's for the
+/// same file. So every name in the table is known to the reference, and the 13
+/// are not. The reverse direction is `--describe-config` (`help_config.c`):
+/// every name the reference lists there must be in the table.
+#[cfg(unix)]
+#[test]
+fn the_parameter_names_are_the_reference_servers() {
+    let Some(postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
+    let compiled_out = [
+        "debug_copy_parse_plan_trees",
+        "debug_write_read_parse_plan_trees",
+        "debug_raw_expression_coverage_test",
+        "log_btree_build_stats",
+        "trace_locks",
+        "trace_userlocks",
+        "trace_lwlocks",
+        "debug_deadlocks",
+        "trace_syncscan",
+        "optimize_bounded_sort",
+        "wal_debug",
+        "trace_lock_oidmin",
+        "trace_lock_table",
+    ];
+    let names = rinitdb::guc::PARAMETER_NAMES
+        .iter()
+        .chain(rinitdb::guc::OLD_PARAMETER_NAMES.iter().map(|(old, _)| old))
+        .chain(&["Work_Mem", "plpgsql.variable_conflict"])
+        .chain(&compiled_out)
+        .chain(&["foo"]);
+    let conf = names.fold(String::new(), |mut conf, name| {
+        conf.push_str(name);
+        conf.push_str(" = 0\n");
+        conf
+    });
+
+    let tempdir = TempDir::new("guc-names");
+    std::fs::write(tempdir.join("postgresql.conf"), &conf).expect("write postgresql.conf");
+    // `-C` first: only there does it skip the root check (main.c:186).
+    let argv = [
+        OsString::from("-C"),
+        OsString::from("work_mem"),
+        OsString::from("-D"),
+        OsString::from(&tempdir.0),
+    ];
+    let outcome = testkit::run(&postgres, argv).expect("run the reference postgres");
+    assert_ne!(outcome.status, Some(0), "the file has unknown names");
+
+    let theirs: Vec<(String, usize)> = outcome
+        .stderr_text()
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("] LOG:  unrecognized configuration parameter \"")?;
+            let (name, rest) = rest.split_once('"')?;
+            let (_, number) = rest.rsplit_once(" line ")?;
+            Some((name.to_owned(), number.parse().ok()?))
+        })
+        .collect();
+    let ours: Vec<(String, usize)> = rinitdb::guc::unrecognized_parameters(&conf)
+        .into_iter()
+        .map(|found| (found.name, found.line))
+        .collect();
+    assert_eq!(ours, theirs, "{}", outcome.stderr_text());
+    let unknown: Vec<&str> = ours.iter().map(|(name, _)| name.as_str()).collect();
+    let mut expected = compiled_out.to_vec();
+    expected.push("foo");
+    assert_eq!(unknown, expected);
+
+    let described = testkit::run(&postgres, ["--describe-config"]).expect("describe the config");
+    assert_eq!(described.status, Some(0), "{}", described.stderr_text());
+    let listed: Vec<String> = described
+        .stdout_text()
+        .lines()
+        .filter_map(|line| line.split('\t').next().map(str::to_owned))
+        .collect();
+    assert!(listed.len() > 300, "{} names listed", listed.len());
+    for name in &listed {
+        assert!(
+            rinitdb::guc::is_parameter(name),
+            "{name} is missing from the table"
+        );
+    }
+}
+
 /// `command_ok([ 'initdb', '--no-sync', '--set' => 'work_mem=128',
 /// '--set' => 'Work_Mem=256', '--set' => 'WORK_MEM=512', "$tempdir/dataY" ],
 /// 'multiple --set options with different case');` plus the three assertions

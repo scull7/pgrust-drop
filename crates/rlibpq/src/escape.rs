@@ -340,7 +340,7 @@ mod tests {
         ("UTF-8", b"\xC3\xb6"),
     ];
 
-    /// `test_one_vector_escape` (`test_escape.c:633`) for `PQescapeLiteral`
+    /// `test_one_vector_escape` (`test_escape.c:634`) for `PQescapeLiteral`
     /// and `PQescapeIdentifier`, both `reports_errors` and
     /// `supports_input_length` (`:396`-`:407`): nothing past the input is
     /// escaped, an input valid up to its first NUL escapes and an invalid

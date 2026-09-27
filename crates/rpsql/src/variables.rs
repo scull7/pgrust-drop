@@ -594,25 +594,9 @@ fn check_assign(hook: Assign, name: &str, value: Option<&str>) -> Result<(), Ass
                 })
             }
         }
-        Assign::WatchInterval => {
-            let mut slot = 0.0;
-            if parse_variable_double(
-                value,
-                Some(name),
-                &mut slot,
-                0.0,
-                DEFAULT_WATCH_INTERVAL_MAX,
-            ) {
-                Ok(())
-            } else {
-                Err(AssignError {
-                    message: format!(
-                        "invalid value \"{}\" for \"{name}\": number expected",
-                        value.unwrap_or("")
-                    ),
-                })
-            }
-        }
+        Assign::WatchInterval => variable_double(value, name, 0.0, DEFAULT_WATCH_INTERVAL_MAX)
+            .map(|_| ())
+            .map_err(|message| AssignError { message }),
         Assign::Enum(field) => {
             let value = value.unwrap_or("");
             let ok = match field {
@@ -712,22 +696,63 @@ pub fn parse_variable_num(value: Option<&str>, _name: Option<&str>, result: &mut
 }
 
 /// `ParseVariableDouble()` (`variables.c:195`), range-checked into
-/// `[min, max]`.
+/// `[min, max]`; the message is [`variable_double`]'s.
 pub fn parse_variable_double(
     value: Option<&str>,
-    _name: Option<&str>,
+    name: Option<&str>,
     result: &mut f64,
     min: f64,
     max: f64,
 ) -> bool {
-    let Ok(parsed) = value.unwrap_or("").trim().parse::<f64>() else {
-        return false;
-    };
-    if !parsed.is_finite() || parsed < min || parsed > max {
-        return false;
+    match variable_double(value, name.unwrap_or(""), min, max) {
+        Ok(parsed) => {
+            *result = parsed;
+            true
+        }
+        Err(_) => false,
     }
-    *result = parsed;
-    true
+}
+
+/// Calculation: `ParseVariableDouble()`'s verdict (`variables.c:195`-`:250`)
+/// on `value`, with the message it logs for the variable `name` when it
+/// refuses it.
+///
+/// # Errors
+/// The message: an empty value, one `strtod` does not read whole, one out of
+/// `[min, max]`, or one out of the range of a double.
+pub fn variable_double(value: Option<&str>, name: &str, min: f64, max: f64) -> Result<f64, String> {
+    // Empty-string input has historically been treated differently by
+    // strtod on various platforms, so handle that by specifically checking
+    // for it.
+    let value = match value {
+        None | Some("") => {
+            return Err(format!("invalid input syntax for variable \"{name}\""));
+        }
+        Some(value) => value,
+    };
+    let c = crate::strtonum::strtod(value);
+    if !c.erange && c.end == value.len() && c.end != 0 {
+        if c.value < min {
+            Err(format!(
+                "invalid value \"{value}\" for variable \"{name}\": must be greater than {min:.2}"
+            ))
+        } else if c.value > max {
+            Err(format!(
+                "invalid value \"{value}\" for variable \"{name}\": must be less than {max:.2}"
+            ))
+        } else {
+            Ok(c.value)
+        }
+    } else if c.erange && (c.value == 0.0 || c.value.is_infinite()) {
+        // Cater for platforms which treat values which aren't zero, but
+        // that are too close to zero to have full precision, by checking
+        // for zero or real out-of-range values.
+        Err(format!(
+            "value \"{value}\" is out of range for variable \"{name}\""
+        ))
+    } else {
+        Err(format!("invalid value \"{value}\" for variable \"{name}\""))
+    }
 }
 
 fn parse_echo(value: &str) -> Option<Echo> {
@@ -1029,5 +1054,55 @@ mod tests {
         let view = VarView(&vars);
 
         let _ = view.get_variable("f", QuoteType::ShellArg);
+    }
+
+    #[test]
+    fn watch_interval_is_read_the_way_parse_variable_double_reads_it() {
+        // `variables.c:195`-`:250`, through `watch_interval_hook`
+        // (`startup.c:956`); `001_basic.pl:425`-`:443`.
+        let mut vars = VariableSpace::new();
+        let mut refused = |value: &str| {
+            vars.set("WATCH_INTERVAL", Some(value))
+                .expect_err(value)
+                .message
+        };
+        for (value, message) in [
+            (
+                "1e500",
+                "value \"1e500\" is out of range for variable \"WATCH_INTERVAL\"",
+            ),
+            (
+                "1e-400",
+                "value \"1e-400\" is out of range for variable \"WATCH_INTERVAL\"",
+            ),
+            (
+                "-1",
+                "invalid value \"-1\" for variable \"WATCH_INTERVAL\": must be greater than 0.00",
+            ),
+            (
+                "1000001",
+                "invalid value \"1000001\" for variable \"WATCH_INTERVAL\": must be less than 1000000.00",
+            ),
+            ("", "invalid input syntax for variable \"WATCH_INTERVAL\""),
+            (
+                "abc",
+                "invalid value \"abc\" for variable \"WATCH_INTERVAL\"",
+            ),
+            ("1x", "invalid value \"1x\" for variable \"WATCH_INTERVAL\""),
+            // Subnormal: `ERANGE`, but neither zero nor huge.
+            (
+                "1e-310",
+                "invalid value \"1e-310\" for variable \"WATCH_INTERVAL\"",
+            ),
+        ] {
+            assert_eq!(refused(value), message);
+        }
+        // A refused value leaves the variable and the setting alone.
+        assert_eq!(vars.get("WATCH_INTERVAL"), Some("2"));
+        vars.set("WATCH_INTERVAL", Some(" 0x10")).unwrap();
+        let pset = vars.settings(&PsqlSettings::default());
+        assert!((pset.watch_interval - 16.0).abs() < f64::EPSILON);
+        vars.delete("WATCH_INTERVAL").unwrap();
+        assert_eq!(vars.get("WATCH_INTERVAL"), Some("2"));
     }
 }

@@ -63,7 +63,9 @@ pub mod scan;
 pub mod settings;
 pub mod slash;
 pub mod startup;
+pub mod strtonum;
 pub mod variables;
+pub mod watch;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal as _, Write};
@@ -716,7 +718,7 @@ fn run_action(
                     is_stdin: true,
                     is_tty,
                 };
-                dispatch_slash(
+                let status = dispatch_slash(
                     &mut scanner,
                     &mut session.pset,
                     &mut session.vars,
@@ -724,7 +726,33 @@ fn run_action(
                     &mut source,
                     out,
                     stderr,
-                )
+                );
+                // `-c '\watch'` has no query buffer (`startup.c:409`), so
+                // `do_watch` refuses it.
+                if let CommandResult::Watch(args) = status {
+                    let mut loop_session = LoopSession {
+                        pset: &mut session.pset,
+                        vars: &mut session.vars,
+                        cancel_pressed: &cancel::CANCEL_PRESSED,
+                    };
+                    if let Some(args) = args
+                        && watch::do_watch(
+                            b"",
+                            args,
+                            executor,
+                            &mut loop_session,
+                            &mut source,
+                            out,
+                            stderr,
+                        )
+                    {
+                        CommandResult::SkipLine
+                    } else {
+                        CommandResult::Error
+                    }
+                } else {
+                    status
+                }
             } else {
                 CommandResult::Error
             };

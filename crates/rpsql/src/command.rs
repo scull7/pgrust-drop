@@ -5,7 +5,7 @@
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
 //! NAT-400 adds `\pset`, NAT-403 `\timing`, `\errverbose`, `\copy`, `\o`,
-//! `\getenv` and `\g`'s file or pipe,
+//! `\getenv`, `\g`'s file or pipe and `\watch`,
 //! NAT-404 `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
 //! `\bind`, `\bind_named` and `\close_prepared`, and the pipeline commands
 //! `\startpipeline`, `\sendpipeline`, `\syncpipeline`, `\flush`,
@@ -45,6 +45,11 @@ pub enum CommandResult {
     /// `\copy`'s whole line, for `do_copy`, which needs the connection and
     /// so is performed by [`dispatch_slash`] (`command.c:963`).
     Copy(Option<Vec<u8>>),
+    /// `\watch`'s parsed arguments, for `do_watch`, or `None` when they were
+    /// refused (and the refusal logged). Either way the query buffer is
+    /// reset afterwards, so the caller that holds it performs the rest
+    /// (`command.c:3504`-`:3514`).
+    Watch(Option<crate::watch::WatchArgs>),
 }
 
 /// The four arguments `\connect` takes (`command.c:645`-`:648`).
@@ -237,8 +242,9 @@ fn g_options(scanner: &mut Scanner, vars: &dyn VariableSource) -> Vec<SlashOptio
 fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
     let takes = match cmd {
         // `\echo` and friends take everything, and so do `\bind` and
-        // `\bind_named`, whose parameters run to the end of the command.
-        "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" => return Vec::new(),
+        // `\bind_named`, whose parameters run to the end of the command, and
+        // `\watch`'s loop.
+        "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" | "watch" => return Vec::new(),
         "c" | "connect" | "crosstabview" => 4,
         "pset" | "getenv" => 2,
         "unset" | "timing" | "parse" | "close_prepared" | "getresults" | "o" | "out" => 1,
@@ -384,6 +390,25 @@ fn exec_command(
         "errverbose" => {
             exec_command_errverbose(ctx.pset, &mut *out.stdout, stderr);
             CommandResult::SkipLine
+        }
+        // `exec_command_watch()` (`command.c:3370`): the arguments here, the
+        // runs where the query buffer is.
+        "watch" => {
+            if ctx.pipeline != PipelineStatus::Off {
+                // `command.c:3384`: refused before any argument is read.
+                logging::error(ctx.pset, "\\watch not allowed in pipeline mode", stderr);
+                // `clean_extended_state()`.
+                ctx.pset.send_mode = SendMode::Query;
+                return CommandResult::Watch(None);
+            }
+            let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+            match crate::watch::parse_watch_args(&values, ctx.pset.watch_interval) {
+                Ok(args) => CommandResult::Watch(Some(args)),
+                Err(message) => {
+                    logging::error(ctx.pset, message, stderr);
+                    CommandResult::Watch(None)
+                }
+            }
         }
         // `exec_command_lo()` (`command.c:2368`), for every `lo_` command
         // (`command.c:417`).

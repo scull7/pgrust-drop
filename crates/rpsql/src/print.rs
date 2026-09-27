@@ -18,6 +18,7 @@ use rlibpq::QueryResult;
 use crate::settings::{Expanded, LineStyle, PrintFormat, PrintQueryOpt, TableOpt, XheaderWidth};
 
 mod markup;
+mod wchar;
 
 /// What this port cannot render yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,10 +569,10 @@ struct Line {
 ///
 /// A carriage return becomes `\r`, a tab spaces to the next multiple of 8, an
 /// other ASCII control character `\xNN` and a C1 control character `\uNNNN`,
-/// as for a UTF-8 client encoding. Every other character is one column wide:
-/// the East-Asian-width and non-spacing tables `ucs_wcwidth` searches
-/// (`wchar.c:646`) are not ported, which is a recorded divergence. A cell
-/// that is not UTF-8 is walked byte by byte, one column per byte.
+/// as for a UTF-8 client encoding. Every other character takes the columns
+/// [`wchar::ucs_wcwidth`] gives it: 0 for a non-spacing one, 2 for a wide
+/// one, 1 otherwise. A cell that is not UTF-8 is walked byte by byte, one
+/// column per byte.
 ///
 /// Upstream steps and measures by the client encoding (`PQmblen`, `PQdsplen`,
 /// `mbprint.c:304`, `:307`); this walk is UTF-8's whatever it is, because the
@@ -603,11 +604,14 @@ fn format_cell(cell: &[u8]) -> Vec<Line> {
                 }
             },
             [b] if *b < 0x20 || *b == 0x7f => push_escaped(line, &format!("\\x{b:02X}")),
-            _ => match c {
-                Some(c) if ('\u{80}'..'\u{a0}').contains(&c) => {
-                    push_escaped(line, &format!("\\u{:04X}", u32::from(c)));
+            _ => match c.map(|c| (c, wchar::ucs_wcwidth(u32::from(c)))) {
+                // Only C1 is a multibyte control character (`mbprint.c:353`).
+                Some((c, None)) => push_escaped(line, &format!("\\u{:04X}", u32::from(c))),
+                Some((_, Some(w))) => {
+                    line.bytes.extend_from_slice(raw);
+                    line.width += w;
                 }
-                _ => {
+                None => {
                     line.bytes.extend_from_slice(raw);
                     line.width += 1;
                 }
@@ -637,24 +641,30 @@ fn widest(lines: &[Line]) -> usize {
 /// columns actually filled. The first character is taken even when it alone
 /// is wider than the target.
 ///
-/// `bytes` is a [`Line`]'s, already escaped, so every character in it is one
-/// column wide, as [`format_cell`] measured it.
+/// `bytes` is a [`Line`]'s, already escaped, so every character in it is
+/// printable and is measured as [`format_cell`] measured it: by
+/// [`wchar::ucs_wcwidth`] when `utf8`, one column per byte otherwise. A
+/// zero-width character is therefore always taken with the text before it.
 fn strlen_max_width(bytes: &[u8], utf8: bool, target_width: &mut usize) -> usize {
+    let text = if utf8 {
+        std::str::from_utf8(bytes).ok()
+    } else {
+        None
+    };
     let mut pos = 0;
     let mut curr_width = 0;
     while pos < bytes.len() {
-        let char_width = 1;
+        // `PQdsplen` and `PQmblen`.
+        let (char_width, len) = match text.and_then(|t| t[pos..].chars().next()) {
+            // A control character was escaped, so `None` cannot occur here.
+            Some(c) => (wchar::ucs_wcwidth(u32::from(c)).unwrap_or(0), c.len_utf8()),
+            None => (1, 1),
+        };
         if *target_width < curr_width + char_width && curr_width != 0 {
             break;
         }
         curr_width += char_width;
-        // `PQmblen`: a UTF-8 lead byte says how long its character is.
-        let len = if utf8 {
-            bytes[pos].leading_ones().max(1) as usize
-        } else {
-            1
-        };
-        pos = (pos + len).min(bytes.len());
+        pos += len;
     }
     *target_width = curr_width;
     pos
@@ -1355,8 +1365,10 @@ fn print_aligned_vertical(cont: &TableContent<'_>) -> Result<Vec<u8>, PrintError
                 let mut target_width = dwidth;
                 let bytes_to_output = strlen_max_width(rest, this_line.utf8, &mut target_width);
                 out.extend_from_slice(&rest[..bytes_to_output]);
-                // Every character is one column wide here, so this reaches 0
-                // exactly at the end of the line.
+                // What each call takes adds up to the line's width, so this
+                // never goes below 0; it reaches 0 at the end of the line, or
+                // early where a zero-width character follows one wider than
+                // `dwidth`, which C then drops as this does.
                 chars_to_output = chars_to_output.saturating_sub(target_width);
                 offset += bytes_to_output;
                 let spacer = dwidth.saturating_sub(target_width);
@@ -1617,6 +1629,21 @@ mod tests {
             vec![vec![Some("alpha")], vec![Some("b")]],
         );
         assert_eq!(rendered(&res), "   t   \n-------\n alpha\n b\n(2 rows)\n\n");
+    }
+
+    #[test]
+    fn a_wide_character_takes_two_columns_and_a_combining_one_none() {
+        // `ucs_wcwidth` (`wchar.c:646`) through `pg_wcssize`: `中文` is four
+        // columns wide and `é` spelt with a combining acute is one, so the
+        // column is four wide and `h` centres in it as over `abcd`.
+        let res = result(
+            vec![text_field("h"), text_field("e")],
+            vec![vec![Some("中文"), Some("e\u{301}")]],
+        );
+        assert_eq!(
+            rendered(&res),
+            "  h   | e \n------+---\n 中文 | e\u{301}\n(1 row)\n\n"
+        );
     }
 
     #[test]
@@ -1937,6 +1964,32 @@ mod tests {
     }
 
     #[test]
+    fn strlen_max_width_counts_display_columns() {
+        // Two wide characters: one fits in three columns, and the first is
+        // taken even when it alone is wider than the target.
+        let mut target = 3;
+        assert_eq!(strlen_max_width("中文".as_bytes(), true, &mut target), 3);
+        assert_eq!(target, 2);
+        let mut target = 1;
+        assert_eq!(strlen_max_width("中文".as_bytes(), true, &mut target), 3);
+        assert_eq!(target, 2);
+        // A zero-width character goes with the one before it...
+        let mut target = 1;
+        assert_eq!(
+            strlen_max_width("e\u{301}x".as_bytes(), true, &mut target),
+            3
+        );
+        assert_eq!(target, 1);
+        // ...unless that one was already past the target, as in C.
+        let mut target = 1;
+        assert_eq!(
+            strlen_max_width("中\u{301}".as_bytes(), true, &mut target),
+            3
+        );
+        assert_eq!(target, 2);
+    }
+
+    #[test]
     fn strlen_max_width_takes_whole_characters_and_at_least_one() {
         // `print.c:3747`.
         let mut target = 2;
@@ -2102,6 +2155,17 @@ mod tests {
         let lines = format_cell(b"\xE9t\xE9");
         assert_eq!(lines[0].bytes, b"\xE9t\xE9");
         assert_eq!(lines[0].width, 3);
+    }
+
+    #[test]
+    fn a_cell_is_measured_in_display_columns() {
+        assert_eq!(widest(&format_cell("中文".as_bytes())), 4);
+        assert_eq!(widest(&format_cell("e\u{301}".as_bytes())), 1);
+        assert_eq!(widest(&format_cell("\u{200d}".as_bytes())), 0);
+        // A tab stop counts the wide character's two columns.
+        let lines = format_cell("中\tx".as_bytes());
+        assert_eq!(lines[0].bytes, "中      x".as_bytes());
+        assert_eq!(lines[0].width, 9);
     }
 
     fn with(edit: impl Fn(&mut PrintQueryOpt)) -> PrintQueryOpt {

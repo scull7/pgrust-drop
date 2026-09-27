@@ -14,7 +14,7 @@ pgrust-drop copies that *method* for every crate (the method, not pgrust's corpu
 | ours      | upstream tests                                                                                         |
 | --------- | ------------------------------------------------------------------------------------------------------ |
 | `rinitdb` | `src/bin/initdb/t/001_initdb.pl` (334 lines); datadir tree diff vs C initdb                            |
-| `rlibpq`  | `src/interfaces/libpq/t/001_uri.pl` … `006_service.pl`, `test/libpq_uri_regress.c`, `libpq_testclient.c`, `src/test/modules/libpq_pipeline` (9 traces) |
+| `rlibpq`  | `src/interfaces/libpq/t/001_uri.pl` … `006_service.pl`, `test/libpq_uri_regress.c`, `libpq_testclient.c`, `src/test/modules/libpq_pipeline` (9 traces), `src/test/examples/testlibpq.c` (over `rlibpq-ffi`'s `libpq.a`) |
 | `rpsql`   | `src/bin/psql/t/001_basic.pl`, `020_cancel.pl`, regress `psql.sql` (+`psql.out` 6982 lines), `psql_crosstab.sql`, `psql_pipeline.sql`; gate corpus written here or cut from regress (never copied from pgrust, ADR-0003) |
 | helpers   | `src/test/perl/PostgreSQL/Test/Utils.pm` (`program_help_ok`, `command_ok`, `check_mode_recursive`, …) |
 

@@ -2046,9 +2046,14 @@ mod tests {
     /// attempt there (`goto error_return`), whatever hosts are left.
     #[test]
     fn a_port_out_of_range_moves_on_and_one_that_is_not_an_integer_stops() {
+        // The first host's reason would be its port; what comes back is the
+        // second host's: its socket, /nonexistent-b/.s.PGSQL.5432, is absent.
         let info = conninfo("host=/nonexistent-a,/nonexistent-b port=99999,5432");
         let error = Connection::connect(&info).unwrap_err();
-        assert!(matches!(error, ConnectionError::Io(_)), "{error:?}");
+        assert!(
+            matches!(&error, ConnectionError::Io(err) if err.kind() == io::ErrorKind::NotFound),
+            "{error:?}"
+        );
 
         let info = conninfo("host=/nonexistent-a,/nonexistent-b port=5432,abc");
         let error = Connection::connect(&info).unwrap_err();

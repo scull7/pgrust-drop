@@ -355,7 +355,7 @@ fn run_action(
             if send_query(
                 executor,
                 sql.as_bytes(),
-                &session.pset,
+                &mut session.pset,
                 &mut session.vars,
                 stdout,
                 stderr,

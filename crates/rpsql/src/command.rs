@@ -8,7 +8,7 @@
 //!
 //! Commands ported so far: `\q`, `\c` (refused by [`dispatch_slash`] until
 //! NAT-405), `\echo`/`\qecho`/`\warn`, `\p`, `\r`, `\set`, `\unset`, `\pset` (NAT-400),
-//! `\if`/`\elif`/`\else`/`\endif` and a bare `\g`. Every other command upstream knows is in
+//! `\if`/`\elif`/`\else`/`\endif`, a bare `\g`, `\gexec` and `\gset`. Every other command upstream knows is in
 //! [`unported_shape`]: skipped correctly in an inactive branch, refused with
 //! `\X is not implemented yet` in an active one. Anything else renders
 //! upstream's `invalid command \X`.
@@ -299,9 +299,7 @@ pub enum ArgShape {
 #[must_use]
 pub fn unported_shape(cmd: &str) -> Option<ArgShape> {
     let shape = match cmd {
-        "a" | "conninfo" | "copyright" | "errverbose" | "gdesc" | "gexec" | "H" | "html" => {
-            ArgShape::None
-        }
+        "a" | "conninfo" | "copyright" | "errverbose" | "gdesc" | "H" | "html" => ArgShape::None,
         "o" | "out" | "w" | "write" => ArgShape::FilePipe,
         "ef" | "ev" | "h" | "help" | "sf" | "sf+" | "sv" | "sv+" | "unrestrict" | "!" => {
             ArgShape::WholeLine
@@ -309,7 +307,7 @@ pub fn unported_shape(cmd: &str) -> Option<ArgShape> {
         // `pg_strcasecmp(cmd, "copy")` (`command.c:354`).
         _ if cmd.eq_ignore_ascii_case("copy") => ArgShape::WholeLine,
         "bind" | "bind_named" | "C" | "cd" | "close_prepared" | "crosstabview" | "e" | "edit"
-        | "encoding" | "f" | "flush" | "flushrequest" | "getenv" | "getresults" | "gset" | "i"
+        | "encoding" | "f" | "flush" | "flushrequest" | "getenv" | "getresults" | "i"
         | "include" | "ir" | "include_relative" | "l" | "list" | "lx" | "listx" | "l+"
         | "list+" | "lx+" | "listx+" | "l+x" | "list+x" | "parse" | "password" | "prompt"
         | "restrict" | "s" | "sendpipeline" | "setenv" | "startpipeline" | "syncpipeline"
@@ -348,6 +346,8 @@ fn exec_command(cmd: &str, c: &mut Cmd<'_, '_>) -> CommandResult {
         "else" => exec_command_else(c),
         "endif" => exec_command_endif(c),
         "g" | "gx" => exec_command_g(c, active_branch, cmd),
+        "gexec" => exec_command_gexec(c, active_branch),
+        "gset" => exec_command_gset(c, active_branch),
         "if" => exec_command_if(c),
         "p" | "print" => exec_command_print(c, active_branch),
         "pset" => exec_command_pset(c, active_branch),
@@ -542,6 +542,31 @@ fn exec_command_g(c: &mut Cmd<'_, '_>, active_branch: bool, cmd: &str) -> Comman
         );
         return CommandResult::Error;
     }
+    CommandResult::Send
+}
+
+/// `exec_command_gexec()` (`command.c:1965`): send the query and run each
+/// field of its result. There is no pipeline mode to refuse yet (NAT-404).
+fn exec_command_gexec(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if !active_branch {
+        return CommandResult::SkipLine;
+    }
+    c.ctx.pset.gexec_flag = true;
+    CommandResult::Send
+}
+
+/// `exec_command_gset()` (`command.c:1988`): send the query and store its
+/// one row in variables named by the prefix and each column. There is no
+/// pipeline mode to refuse yet (NAT-404).
+fn exec_command_gset(c: &mut Cmd<'_, '_>, active_branch: bool) -> CommandResult {
+    if !active_branch {
+        c.ignore_options();
+        return CommandResult::SkipLine;
+    }
+    // A bare `\gset` still needs a prefix, the empty one, to trigger
+    // storing.
+    let prefix = c.option(OptionType::Normal).map(|o| o.value);
+    c.ctx.pset.gset_prefix = Some(prefix.unwrap_or_default());
     CommandResult::Send
 }
 
@@ -1042,6 +1067,8 @@ mod tests {
             "\\pset arg1 arg2",
             "\\g arg1",
             "\\g (format=csv) x",
+            "\\gset pre_",
+            "\\gexec",
             "\\dt arg1",
             "\\lo_list",
         ] {

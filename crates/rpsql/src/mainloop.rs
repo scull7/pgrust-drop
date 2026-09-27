@@ -305,6 +305,9 @@ mod tests {
     struct Recorder {
         seen: Vec<String>,
         fail: Vec<bool>,
+        /// Results to answer with, in order, before falling back to a
+        /// CommandComplete.
+        answers: Vec<rlibpq::QueryResult>,
         connected: bool,
     }
 
@@ -313,6 +316,7 @@ mod tests {
             Self {
                 seen: Vec::new(),
                 fail: Vec::new(),
+                answers: Vec::new(),
                 connected: true,
             }
         }
@@ -321,6 +325,9 @@ mod tests {
     impl Executor for Recorder {
         fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
             self.seen.push(String::from_utf8_lossy(query).into_owned());
+            if !self.answers.is_empty() {
+                return vec![Reply::Result(self.answers.remove(0))];
+            }
             let fails = self.fail.first().copied().unwrap_or(false);
             if !self.fail.is_empty() {
                 self.fail.remove(0);
@@ -561,6 +568,14 @@ mod tests {
     /// `psql -X -a -q` reading a pipe, as pg_regress runs it
     /// (`pg_regress_main.c:74`): echo all, quiet, terse logging, no file.
     fn run_like_pg_regress(input: &str) -> (String, Vec<String>) {
+        run_like_pg_regress_answering(input, Vec::new())
+    }
+
+    /// [`run_like_pg_regress`], the server answering with `answers` in turn.
+    fn run_like_pg_regress_answering(
+        input: &str,
+        answers: Vec<rlibpq::QueryResult>,
+    ) -> (String, Vec<String>) {
         let mut pset = PsqlSettings {
             echo: crate::settings::Echo::All,
             quiet: true,
@@ -576,6 +591,7 @@ mod tests {
             vars: &mut vars,
         };
         let mut executor = Recorder::new();
+        executor.answers = answers;
         let out = Shared(std::rc::Rc::default());
         let code = main_loop(
             &mut Lines::new(input.as_bytes()),
@@ -659,6 +675,70 @@ mod tests {
             assert_eq!(out, block(PSQL_OUT, from, to), "block {from:?}");
             assert!(seen.is_empty(), "block {from:?} sent {seen:?}");
         }
+    }
+
+    /// `select <x> as x, <y> as y`'s one row of two integers.
+    fn x_y(x: &str, y: &str) -> rlibpq::QueryResult {
+        let int = |name: &str| rlibpq::FieldDescription {
+            name: name.as_bytes().to_vec(),
+            tableid: 0,
+            columnid: 0,
+            typid: 23,
+            typlen: 4,
+            atttypmod: -1,
+            format: 0,
+        };
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(vec![int("x"), int("y")]))
+            .unwrap();
+        runner
+            .push(Backend::DataRow(vec![
+                Some(x.as_bytes().to_vec()),
+                Some(y.as_bytes().to_vec()),
+            ]))
+            .unwrap();
+        runner
+            .push(Backend::CommandComplete(b"SELECT 1".to_vec()))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results().remove(0)
+    }
+
+    /// psql.sql:112-116, `-- multiple backslash commands in one line`,
+    /// against `expected/psql.out` byte for byte, the server's four answers
+    /// played back: `\gset` sends at once and the commands after it on the
+    /// line read what it stored, while a `\g` after it resends the query to
+    /// print it. The live gate in `tests/t_regress_psql.rs` runs the whole
+    /// `\gset` section against a server and C psql.
+    #[test]
+    fn several_backslash_commands_around_gset_match_psql_out() {
+        let (from, to) = ("-- multiple backslash commands", "-- NULL should unset");
+        let (out, seen) = run_like_pg_regress_answering(
+            block(PSQL_SQL, from, to),
+            vec![
+                x_y("1", "2"),
+                x_y("3", "4"),
+                x_y("5", "6"),
+                x_y("5", "6"),
+                x_y("7", "8"),
+                x_y("7", "8"),
+            ],
+        );
+        assert_eq!(out, block(PSQL_OUT, from, to));
+        assert_eq!(
+            seen,
+            [
+                "select 1 as x, 2 as y ",
+                "select 3 as x, 4 as y ",
+                "select 5 as x, 6 as y ",
+                "select 5 as x, 6 as y ",
+                "select 7 as x, 8 as y ",
+                "select 7 as x, 8 as y ",
+            ]
+        );
     }
 
     #[test]

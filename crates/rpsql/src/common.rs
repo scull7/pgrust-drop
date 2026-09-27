@@ -201,30 +201,127 @@ fn set_result_variables(vars: &mut VariableSpace, result: Option<&QueryResult>, 
     }
 }
 
+/// `StoreQueryTuple()` (`common.c:803`): `\gset`'s one row, each column
+/// stored in the variable named by `prefix` and the column name, a NULL
+/// unsetting it. A variable psql treats specially is skipped with a warning.
+///
+/// Column names and values become strings lossily, as every variable does
+/// (`docs/divergences.md`).
+fn store_query_tuple(
+    result: &QueryResult,
+    prefix: &str,
+    pset: &PsqlSettings,
+    vars: &mut VariableSpace,
+    stderr: &mut dyn Write,
+) -> bool {
+    match result.ntuples() {
+        0 => {
+            log(stderr, pset, Level::Error, "no rows returned for \\gset");
+            return false;
+        }
+        1 => {}
+        _ => {
+            log(
+                stderr,
+                pset,
+                Level::Error,
+                "more than one row returned for \\gset",
+            );
+            return false;
+        }
+    }
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    for column in 0..result.nfields() {
+        let varname = format!("{prefix}{}", text(result.fname(column).unwrap_or_default()));
+        if vars.has_hook(&varname) {
+            log(
+                stderr,
+                pset,
+                Level::Warning,
+                format!("attempt to \\gset into specially treated variable \"{varname}\" ignored"),
+            );
+            continue;
+        }
+        let value = result.value(0, column).map(text);
+        if let Err(err) = vars.set(&varname, value.as_deref()) {
+            // `SetVariable` logs its own refusal (`variables.c:295`).
+            log(stderr, pset, Level::Error, err.message);
+            return false;
+        }
+    }
+    true
+}
+
+/// `ExecQueryTuples()` (`common.c:867`): `\gexec`, every non-NULL field sent
+/// as a query in row-major order, as the user would have typed it.
+///
+/// `gexec_flag` is off while they run, so a field cannot recurse, and back on
+/// afterwards for `SendQuery`'s cleanup to clear.
+fn exec_query_tuples(
+    result: &QueryResult,
+    executor: &mut dyn Executor,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let mut success = true;
+    pset.gexec_flag = false;
+    'rows: for row in 0..result.ntuples() {
+        for column in 0..result.nfields() {
+            let Some(query) = result.value(row, column) else {
+                continue;
+            };
+            // `SendQuery` assumes `MainLoop` did `ECHO=all`'s echo, so it is
+            // done here (`common.c:896`).
+            if pset.echo == Echo::All && !pset.singlestep {
+                let _ = stdout.write_all(query);
+                let _ = stdout.write_all(b"\n");
+            }
+            if !send_query(executor, query, pset, vars, stdout, stderr) {
+                success = false;
+                if pset.on_error_stop {
+                    break 'rows;
+                }
+            }
+        }
+    }
+    pset.gexec_flag = true;
+    success
+}
+
 /// `PrintQueryResult()` (`common.c:1043`), for the statuses a simple query
-/// produces: the rows and the status line of the last result, or of every
-/// result under `SHOW_ALL_RESULTS`.
+/// produces: the last result stored by `\gset`, run by `\gexec` or printed,
+/// with its status line; every result's under `SHOW_ALL_RESULTS`.
 fn print_query_result(
     result: &QueryResult,
     last: bool,
-    pset: &PsqlSettings,
+    executor: &mut dyn Executor,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> bool {
     let shown = last || pset.show_all_results;
     let mut success = true;
     match result.status() {
-        ExecStatus::TuplesOk if shown => {
-            match print_query(result, &pset.popt) {
-                Ok(text) => {
-                    let _ = stdout.write_all(&text);
-                }
-                Err(err) => {
-                    log(stderr, pset, Level::Error, err.to_string());
-                    success = false;
+        ExecStatus::TuplesOk => {
+            if let (true, Some(prefix)) = (last, pset.gset_prefix.clone()) {
+                success = store_query_tuple(result, &prefix, pset, vars, stderr);
+            } else if last && pset.gexec_flag {
+                success = exec_query_tuples(result, executor, pset, vars, stdout, stderr);
+            } else if shown {
+                match print_query(result, &pset.popt) {
+                    Ok(text) => {
+                        let _ = stdout.write_all(&text);
+                    }
+                    Err(err) => {
+                        log(stderr, pset, Level::Error, err.to_string());
+                        success = false;
+                    }
                 }
             }
-            if let Some(status) = query_status_line(result, pset) {
+            if shown && let Some(status) = query_status_line(result, pset) {
                 let _ = stdout.write_all(&status);
             }
         }
@@ -243,11 +340,29 @@ fn print_query_result(
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `ERROR`, `SQLSTATE`, `ROW_COUNT` and the `LAST_ERROR_*`
 /// pair are set in `vars` from the outcome, as upstream sets them for every
-/// query the user typed.
+/// query the user typed. Whatever happened, the one-shot `\gset` and
+/// `\gexec` triggers are cleared afterwards (`sendquery_cleanup`,
+/// `common.c:1328`-`:1339`).
 pub fn send_query(
     executor: &mut dyn Executor,
     query: &[u8],
-    pset: &PsqlSettings,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> bool {
+    let success = exec_query_and_process_results(executor, query, pset, vars, stdout, stderr);
+    pset.gset_prefix = None;
+    pset.gexec_flag = false;
+    success
+}
+
+/// `ExecQueryAndProcessResults()` (`common.c:1581`), with the part of
+/// `SendQuery` that comes before it.
+fn exec_query_and_process_results(
+    executor: &mut dyn Executor,
+    query: &[u8],
+    pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -260,69 +375,92 @@ pub fn send_query(
         let _ = stdout.write_all(b"\n");
     }
 
-    // `ExecQueryAndProcessResults()` (`common.c:1581`). A result is handled
-    // only once the next one has been fetched (`:2164`), so every notice
-    // parsed up to then is already on stderr: hold each result back until
-    // the next result, or the end, is reached.
+    // A result is handled only once the next one has been fetched
+    // (`common.c:2164`), so every notice parsed up to then is already on
+    // stderr: hold each result back until the next result, or the end, is
+    // reached.
     let mut success = true;
     let mut pending: Option<QueryResult> = None;
-    for reply in executor.exec(query) {
+    let mut session = Handling {
+        executor,
+        pset,
+        vars,
+        stdout,
+        stderr,
+    };
+    for reply in session.executor.exec(query) {
         match reply {
-            Reply::Notice(notice) => notice_processor(&notice, pset, stderr),
+            Reply::Notice(notice) => notice_processor(&notice, session.pset, session.stderr),
             Reply::Result(result) => {
                 if let Some(previous) = pending.take() {
-                    success = handle_result(&previous, false, success, pset, vars, stdout, stderr);
+                    success = session.handle_result(&previous, false, success);
                 }
                 pending = Some(result);
             }
             Reply::Broken(err) => {
                 if let Some(previous) = pending.take() {
-                    let _ = handle_result(&previous, false, success, pset, vars, stdout, stderr);
+                    let _ = session.handle_result(&previous, false, success);
                 }
-                let _ = stderr.write_all(&err.rendered());
-                set_result_variables(vars, None, false);
+                let _ = session.stderr.write_all(&err.rendered());
+                set_result_variables(session.vars, None, false);
                 return false;
             }
         }
     }
     if let Some(last) = pending {
-        success = handle_result(&last, true, success, pset, vars, stdout, stderr);
+        success = session.handle_result(&last, true, success);
     }
     success
 }
 
-/// One pass of `ExecQueryAndProcessResults`'s result loop
-/// (`common.c:1818`-`:2231`): report a failed result, or print a good one
-/// while nothing has failed yet, and set the result variables from the last.
-/// Returns the loop's `success` after this result.
-fn handle_result(
-    result: &QueryResult,
-    last: bool,
-    success: bool,
-    pset: &PsqlSettings,
-    vars: &mut VariableSpace,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> bool {
-    if !accept_result(result) {
-        // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at the
-        // configured verbosity (`common.c:1831`).
-        let message = match result.error() {
-            Some(error) => error.message(result.status(), pset.verbosity, pset.show_context),
-            None => result.error_message(),
-        };
-        // `pg_log_info("%s", error)`, when there is one (`common.c:1833`-`:1834`).
-        if !message.is_empty() {
-            log(stderr, pset, Level::Info, &message);
+/// What one query's results are handled with: `\gexec` may send more
+/// queries while the last result is handled.
+struct Handling<'a> {
+    executor: &'a mut dyn Executor,
+    pset: &'a mut PsqlSettings,
+    vars: &'a mut VariableSpace,
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+impl Handling<'_> {
+    /// One pass of `ExecQueryAndProcessResults`'s result loop
+    /// (`common.c:1818`-`:2231`): report a failed result, or print a good
+    /// one while nothing has failed yet, and set the result variables from
+    /// the last. Returns the loop's `success` after this result.
+    fn handle_result(&mut self, result: &QueryResult, last: bool, success: bool) -> bool {
+        if !accept_result(result) {
+            // `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering, at
+            // the configured verbosity (`common.c:1831`).
+            let message = match result.error() {
+                Some(error) => {
+                    error.message(result.status(), self.pset.verbosity, self.pset.show_context)
+                }
+                None => result.error_message(),
+            };
+            // `pg_log_info("%s", error)`, when there is one
+            // (`common.c:1833`-`:1834`).
+            if !message.is_empty() {
+                log(self.stderr, self.pset, Level::Info, &message);
+            }
+            set_result_variables(self.vars, Some(result), false);
+            return false;
         }
-        set_result_variables(vars, Some(result), false);
-        return false;
+        let success = success
+            && print_query_result(
+                result,
+                last,
+                self.executor,
+                self.pset,
+                self.vars,
+                self.stdout,
+                self.stderr,
+            );
+        if last {
+            set_result_variables(self.vars, Some(result), success);
+        }
+        success
     }
-    let success = success && print_query_result(result, last, pset, stdout, stderr);
-    if last {
-        set_result_variables(vars, Some(result), success);
-    }
-    success
 }
 
 #[cfg(test)]
@@ -397,7 +535,14 @@ mod tests {
         let both = Shared::default();
         let mut out = Tee(Vec::new(), both.clone());
         let mut err = Tee(Vec::new(), both.clone());
-        let ok = send_query(&mut executor, b"select 1", pset, vars, &mut out, &mut err);
+        let ok = send_query(
+            &mut executor,
+            b"select 1",
+            &mut pset.clone(),
+            vars,
+            &mut out,
+            &mut err,
+        );
         (
             ok,
             String::from_utf8(out.0).unwrap(),
@@ -640,6 +785,273 @@ mod tests {
         assert_eq!(both, "NOTICE:  between\nCREATE TABLE\nDROP TABLE\n");
     }
 
+    /// A `text`-only result with `rows`, a `None` cell being NULL.
+    fn rows(names: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(
+                names
+                    .iter()
+                    .map(|name| FieldDescription {
+                        name: name.as_bytes().to_vec(),
+                        tableid: 0,
+                        columnid: 0,
+                        typid: 25,
+                        typlen: -1,
+                        atttypmod: -1,
+                        format: 0,
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+        for row in rows {
+            runner
+                .push(Backend::DataRow(
+                    row.iter()
+                        .map(|c| c.map(|c| c.as_bytes().to_vec()))
+                        .collect(),
+                ))
+                .unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(
+                format!("SELECT {}", rows.len()).into_bytes(),
+            ))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results().remove(0)
+    }
+
+    /// An executor that answers each query with the next scripted result,
+    /// and records the queries.
+    struct Script {
+        answers: Vec<QueryResult>,
+        seen: Vec<String>,
+    }
+
+    impl Executor for Script {
+        fn exec(&mut self, query: &[u8]) -> Vec<Reply> {
+            self.seen.push(String::from_utf8_lossy(query).into_owned());
+            vec![Reply::Result(self.answers.remove(0))]
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+    }
+
+    /// `send_query` of each result in turn under `pset`, as one terse
+    /// session: what came out, stdout and stderr as pg_regress interleaves
+    /// them, and the queries the executor saw.
+    fn session(
+        answers: Vec<QueryResult>,
+        pset: &mut PsqlSettings,
+        vars: &mut VariableSpace,
+    ) -> (bool, String, Vec<String>) {
+        let mut executor = Script {
+            answers,
+            seen: Vec::new(),
+        };
+        let both = Shared::default();
+        let mut out = Tee(Vec::new(), both.clone());
+        let mut err = Tee(Vec::new(), both.clone());
+        pset.log_terse = true;
+        let ok = send_query(&mut executor, b"select", pset, vars, &mut out, &mut err);
+        assert!(executor.answers.is_empty(), "every answer is asked for");
+        let both = String::from_utf8(both.0.borrow().clone()).unwrap();
+        (ok, both, executor.seen)
+    }
+
+    /// psql.sql:101-103: `\gset pref01_` stores the one row's columns under
+    /// the prefix and prints nothing, and the trigger is gone afterwards.
+    #[test]
+    fn gset_stores_the_row_under_the_prefix_and_prints_nothing() {
+        let mut pset = PsqlSettings {
+            gset_prefix: Some("pref01_".into()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let result = rows(
+            &["test01", "test02", "test03"],
+            &[&[Some("10"), Some("20"), Some("Hello")]],
+        );
+        let (ok, both, _) = session(vec![result], &mut pset, &mut vars);
+        assert!(ok);
+        assert_eq!(both, "");
+        let got: Vec<_> = ["pref01_test01", "pref01_test02", "pref01_test03"]
+            .map(|name| vars.get(name))
+            .into();
+        assert_eq!(got, [Some("10"), Some("20"), Some("Hello")]);
+        assert_eq!(vars.get("ROW_COUNT"), Some("1"));
+        assert_eq!(pset.gset_prefix, None, "sendquery_cleanup (common.c:1329)");
+    }
+
+    /// docs/divergences.md: the variable space holds strings, so a column
+    /// name or value that is not UTF-8 is stored lossily.
+    #[test]
+    fn gset_stores_a_value_that_is_not_utf8_lossily() {
+        let mut pset = PsqlSettings {
+            gset_prefix: Some(String::new()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let fields = rows(&["v"], &[]).fields().to_vec();
+        let mut runner = QueryRunner::new();
+        runner.push(Backend::RowDescription(fields)).unwrap();
+        runner
+            .push(Backend::DataRow(vec![Some(b"bad \xff".to_vec())]))
+            .unwrap();
+        runner
+            .push(Backend::CommandComplete(b"SELECT 1".to_vec()))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        let result = runner.into_results().remove(0);
+        assert!(session(vec![result], &mut pset, &mut vars).0);
+        assert_eq!(vars.get("v"), Some("bad \u{fffd}"));
+    }
+
+    /// psql.sql:118-121: a NULL unsets the variable.
+    #[test]
+    fn gset_of_a_null_unsets_the_variable() {
+        let mut pset = PsqlSettings {
+            gset_prefix: Some(String::new()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        vars.set("var2", Some("xyz")).unwrap();
+        let result = rows(&["var1", "var2", "var3"], &[&[Some("1"), None, Some("3")]]);
+        assert!(session(vec![result], &mut pset, &mut vars).0);
+        assert_eq!(
+            ["var1", "var2", "var3"].map(|name| vars.get(name)),
+            [Some("1"), None, Some("3")]
+        );
+    }
+
+    /// psql.sql:105-110 and psql.out: a bad name stops the assignments with
+    /// `SetVariable`'s error; a specially treated variable is skipped with a
+    /// warning and the rest are still stored.
+    #[test]
+    fn gset_refuses_a_bad_name_and_skips_a_hooked_one() {
+        let mut vars = VariableSpace::new();
+        let mut pset = PsqlSettings {
+            gset_prefix: Some(String::new()),
+            ..PsqlSettings::default()
+        };
+        let (ok, both, _) = session(
+            vec![rows(&["bad name"], &[&[Some("10")]])],
+            &mut pset,
+            &mut vars,
+        );
+        assert!(!ok);
+        assert_eq!(both, "invalid variable name: \"bad name\"\n");
+
+        pset.gset_prefix = Some("IGNORE".into());
+        let (ok, both, _) = session(
+            vec![rows(&["EOF", "_foo"], &[&[Some("97"), Some("ok")]])],
+            &mut pset,
+            &mut vars,
+        );
+        assert!(ok);
+        assert_eq!(
+            both,
+            "attempt to \\gset into specially treated variable \"IGNOREEOF\" ignored\n"
+        );
+        assert_eq!(vars.get("IGNORE_foo"), Some("ok"));
+        assert_eq!(vars.get("IGNOREEOF"), Some("0"), "left as it was");
+    }
+
+    /// psql.sql:123-129: exactly one row, or an error; a failed `\gset` sets
+    /// `ERROR` with an empty SQLSTATE, the result having none.
+    #[test]
+    fn gset_requires_exactly_one_row() {
+        for (n, message) in [
+            (3, "more than one row returned for \\gset\n"),
+            (0, "no rows returned for \\gset\n"),
+        ] {
+            let mut pset = PsqlSettings {
+                gset_prefix: Some(String::new()),
+                ..PsqlSettings::default()
+            };
+            let mut vars = VariableSpace::new();
+            let row: &[Option<&str>] = &[Some("10"), Some("20")];
+            let result = rows(&["test01", "test02"], &vec![row; n]);
+            let (ok, both, _) = session(vec![result], &mut pset, &mut vars);
+            assert!(!ok);
+            assert_eq!(both, message);
+            assert_eq!(vars.get("test01"), None);
+            assert_eq!(
+                ["ERROR", "SQLSTATE", "ROW_COUNT"].map(|name| vars.get(name)),
+                [Some("true"), Some(""), Some("0")]
+            );
+        }
+    }
+
+    /// psql.sql:187-192: each non-NULL field is sent in row-major order and
+    /// echoed first under `ECHO=all`; one that fails does not stop the rest,
+    /// and the trigger is gone afterwards.
+    #[test]
+    fn gexec_sends_every_field_in_order_and_echoes_each() {
+        let mut pset = PsqlSettings {
+            gexec_flag: true,
+            echo: Echo::All,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let meta = rows(
+            &["a", "b"],
+            &[
+                &[Some("select 1 as ones"), Some("drop table t")],
+                &[None, Some("create table t()")],
+            ],
+        );
+        let answers = vec![
+            meta,
+            rows(&["ones"], &[&[Some("1")]]),
+            error_result(&[(b'S', b"ERROR"), (b'M', b"table \"t\" does not exist")]),
+            command_ok("CREATE TABLE").remove(0),
+        ];
+        let (ok, both, seen) = session(answers, &mut pset, &mut vars);
+        assert!(!ok, "one of them failed");
+        assert_eq!(
+            seen,
+            [
+                "select",
+                "select 1 as ones",
+                "drop table t",
+                "create table t()"
+            ]
+        );
+        assert_eq!(
+            both,
+            "select 1 as ones\n ones \n------\n 1\n(1 row)\n\n\
+             drop table t\nERROR:  table \"t\" does not exist\n\
+             create table t()\nCREATE TABLE\n"
+        );
+        assert!(!pset.gexec_flag, "sendquery_cleanup (common.c:1339)");
+        // The meta query's own outcome is set last.
+        assert_eq!(vars.get("ERROR"), Some("true"));
+    }
+
+    /// `common.c:906`: under `ON_ERROR_STOP` the first failure abandons the
+    /// rest.
+    #[test]
+    fn gexec_stops_at_the_first_failure_under_on_error_stop() {
+        let mut pset = PsqlSettings {
+            gexec_flag: true,
+            on_error_stop: true,
+            ..PsqlSettings::default()
+        };
+        let meta = rows(&["q"], &[&[Some("bad")], &[Some("select 1")]]);
+        let answers = vec![meta, error_result(&[(b'S', b"ERROR"), (b'M', b"no")])];
+        let (ok, both, seen) = session(answers, &mut pset, &mut VariableSpace::new());
+        assert!(!ok);
+        assert_eq!(seen, ["select", "bad"]);
+        assert_eq!(both, "ERROR:  no\n");
+    }
+
     #[test]
     fn a_select_prints_the_table_and_nothing_else() {
         let (ok, out, err) = run(one_row(), &PsqlSettings::default());
@@ -780,7 +1192,7 @@ mod tests {
         let ok = send_query(
             &mut Broken,
             b"select 1",
-            &PsqlSettings::default(),
+            &mut PsqlSettings::default(),
             &mut VariableSpace::new(),
             &mut out,
             &mut err,
@@ -832,7 +1244,7 @@ mod tests {
         assert!(send_query(
             &mut Never,
             b"  \n ",
-            &PsqlSettings::default(),
+            &mut PsqlSettings::default(),
             &mut VariableSpace::new(),
             &mut out,
             &mut err

@@ -17,7 +17,8 @@
 //! `sync_pgdata`, [`control`] parses and rewrites `pg_control` over
 //! [`crc32c`], [`image`] packs and expands the template cluster ADR-0002
 //! builds on, [`wal`] writes a new cluster's first WAL segment, [`cluster`]
-//! says what the template can make and what is written on top of it, [`tz`]
+//! says what the template can make and what is written on top of it, [`guc`]
+//! is the server's check on the names `postgresql.conf` assigns, [`tz`]
 //! reads the timezone database and [`findtimezone`] picks
 //! the default zone over it, [`help`] is the upstream text, and [`run`] is the
 //! only function that writes to a stream.
@@ -40,6 +41,7 @@ pub mod encoding;
 pub mod error;
 pub mod file_perm;
 pub mod findtimezone;
+pub mod guc;
 pub mod help;
 pub mod image;
 pub mod layout;
@@ -208,9 +210,37 @@ fn initialize_data_directory(
     // catalogs exist; then the catalogs; then pg_control and the WAL.
     let (config, rest) = generated.split_at(conf::CONF_FILES.len());
     image::expand(&entries(config)?, &plan.pgdata, plan.perm)?;
+    // bootstrap_template1 (initdb.c:3097): the first thing its backend does
+    // is read the file just written, and refuse it over an unknown name.
+    check_postgresql_conf(config, &plan.pgdata)?;
     image::expand(&template, &plan.pgdata, plan.perm)?;
     image::expand(&entries(rest)?, &plan.pgdata, plan.perm)?;
     Ok(())
+}
+
+/// Action at the edge of [`guc::unrecognized_parameters`]: the names in the
+/// `postgresql.conf` among `config`, judged as the server would, and reported
+/// with the path `SelectConfigFiles` gives the file (`guc.c:1794`, `:1823`),
+/// which `make_absolute_path` has made absolute against the working directory.
+fn check_postgresql_conf(
+    config: &[cluster::GeneratedFile],
+    pgdata: &std::path::Path,
+) -> Result<(), InitdbError> {
+    let Some((name, contents)) = config
+        .iter()
+        .find(|(name, _)| name.as_str() == conf::CONF_FILES[0])
+    else {
+        return Ok(());
+    };
+    let unrecognized = guc::unrecognized_parameters(&String::from_utf8_lossy(contents));
+    if unrecognized.is_empty() {
+        return Ok(());
+    }
+    let configdir = std::path::absolute(pgdata).unwrap_or_else(|_| pgdata.to_path_buf());
+    Err(InitdbError::ConfigurationFileContainsErrors {
+        path: configdir.join(name).to_string_lossy().into_owned(),
+        unrecognized,
+    })
 }
 
 /// The generated files as image entries, so [`image::expand`] writes them

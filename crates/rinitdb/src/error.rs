@@ -290,6 +290,16 @@ pub enum InitdbError {
     /// `xlog.c:4213` (`InitControlFile`): `pg_strong_random` failed.
     #[error("could not generate secret authorization token")]
     CouldNotGenerateSecretToken,
+
+    /// `guc.c:611`, which the bootstrap backend C initdb starts reports after
+    /// one `guc.c:428` line per unrecognized name (`crate::guc`). Here the
+    /// names are the detail lines, since no backend runs (`docs/divergences.md`).
+    /// `path` is the file as the server names it, absolute.
+    #[error("configuration file \"{path}\" contains errors")]
+    ConfigurationFileContainsErrors {
+        path: String,
+        unrecognized: Vec<crate::guc::Unrecognized>,
+    },
 }
 
 impl InitdbError {
@@ -309,6 +319,16 @@ impl InitdbError {
                 ],
                 NotEmpty::Entries => Vec::new(),
             },
+            // guc.c:428, once per name, in file order.
+            InitdbError::ConfigurationFileContainsErrors { path, unrecognized } => unrecognized
+                .iter()
+                .map(|found| {
+                    format!(
+                        "unrecognized configuration parameter \"{}\" in file \"{path}\" line {}",
+                        found.name, found.line
+                    )
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -622,6 +642,26 @@ mod tests {
             (
                 InitdbError::WalDirectoryNotAbsolute,
                 "initdb: error: WAL directory location must be an absolute path",
+            ),
+            (
+                InitdbError::ConfigurationFileContainsErrors {
+                    path: "/tmp/dataX/postgresql.conf".to_owned(),
+                    unrecognized: vec![
+                        crate::guc::Unrecognized {
+                            name: "foo".to_owned(),
+                            line: 890,
+                        },
+                        crate::guc::Unrecognized {
+                            name: "bar".to_owned(),
+                            line: 891,
+                        },
+                    ],
+                },
+                "initdb: error: configuration file \"/tmp/dataX/postgresql.conf\" contains errors\n\
+                 initdb: detail: unrecognized configuration parameter \"foo\" in file \
+                 \"/tmp/dataX/postgresql.conf\" line 890\n\
+                 initdb: detail: unrecognized configuration parameter \"bar\" in file \
+                 \"/tmp/dataX/postgresql.conf\" line 891",
             ),
         ];
         for (err, expected) in cases {

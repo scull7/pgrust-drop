@@ -833,3 +833,212 @@ fn the_renamed_superuser_matches_reference_initdb() {
     assert_eq!(single_user_values(&ours, "rolname")[0], "alice", "{ours}");
     assert_eq!(ours, theirs);
 }
+
+/// `rinitdb <before> <pgdata>` with `--pwfile` holding `contents`, in
+/// `tempdir`: the password file's path and the outcome.
+fn rinitdb_with_pwfile(
+    tempdir: &TempDir,
+    contents: Option<&[u8]>,
+    before: &[&str],
+    env: &Environment,
+) -> (PathBuf, testkit::CommandOutcome) {
+    let pwfile = tempdir.join("pwfile");
+    if let Some(contents) = contents {
+        std::fs::write(&pwfile, contents).expect("write the password file");
+    }
+    let mut argv = args(before);
+    argv.extend([
+        OsString::from("--pwfile"),
+        pwfile.clone().into(),
+        tempdir.join("data").into(),
+    ]);
+    let outcome = testkit::run_in(Path::new(RINITDB), &argv, &[], env).expect("run rinitdb");
+    (pwfile, outcome)
+}
+
+/// `--pwfile`: `setup_auth`'s `ALTER USER` (`initdb.c:1649`) is fed to the
+/// session after the rename, with the file's first line, its line end
+/// stripped and its quotes doubled. A password alone, for the template's
+/// own superuser, is a session too.
+#[test]
+fn a_password_file_is_set_in_the_single_user_session() {
+    let tempdir = TempDir::new("single-user-password");
+    let postgres = fake_postgres(&tempdir);
+    let env = with_server(Some(&postgres));
+    let (_, outcome) = rinitdb_with_pwfile(
+        &tempdir,
+        Some(b"it's\\secret\r\nsecond line\n"),
+        &["-U", "alice", "--no-sync"],
+        &env,
+    );
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    // No -A: C's trust warning (initdb.c:3521) is all of stderr.
+    assert_eq!(
+        outcome.stderr_text(),
+        format!("{}\n", rinitdb::report::trust_warning())
+    );
+    let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
+    assert!(
+        log.ends_with(
+            "arg=template1\n\
+             UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n\
+             ALTER USER \"alice\" WITH PASSWORD E'it''s\\\\secret';\n\n"
+        ),
+        "{log}"
+    );
+
+    let tempdir = TempDir::new("single-user-password-only");
+    let postgres = fake_postgres(&tempdir);
+    let (_, outcome) = rinitdb_with_pwfile(
+        &tempdir,
+        Some(b"pw\n"),
+        &["-U", "postgres", "--no-sync"],
+        &with_server(Some(&postgres)),
+    );
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
+    assert!(
+        log.ends_with("arg=template1\nALTER USER \"postgres\" WITH PASSWORD E'pw';\n\n"),
+        "{log}"
+    );
+}
+
+/// `get_su_pwd`'s three `pg_fatal`s (`initdb.c:1692`, `:1701`; `:1698`
+/// in the unit tests) come before the first `mkdir`, so nothing is made or
+/// removed, and no session runs. Gate: the reference initdb writes the same
+/// stderr and exits 1 too.
+#[test]
+fn an_unreadable_or_empty_password_file_is_cs_error() {
+    for (tag, contents, message) in [
+        (
+            "pwfile-missing",
+            None,
+            "could not open file \"{}\" for reading: No such file or directory",
+        ),
+        (
+            "pwfile-empty",
+            Some(&b""[..]),
+            "password file \"{}\" is empty",
+        ),
+    ] {
+        let tempdir = TempDir::new(tag);
+        let postgres = fake_postgres(&tempdir);
+        let before = ["-U", "alice", "--no-sync", "--no-locale", "-E", "UTF8"];
+        let (pwfile, outcome) =
+            rinitdb_with_pwfile(&tempdir, contents, &before, &with_server(Some(&postgres)));
+        let expected = format!(
+            "initdb: error: {}\n",
+            message.replace("{}", &pwfile.display().to_string())
+        );
+        assert_eq!(outcome.status, Some(1), "{tag}");
+        assert_eq!(outcome.stderr_text(), expected, "{tag}");
+        assert!(!tempdir.join("data").exists(), "{tag}");
+        assert!(!tempdir.join("session.log").exists(), "{tag}");
+
+        let Some(initdb) = reference::find_or_skip("initdb") else {
+            continue;
+        };
+        let mut argv = args(&before);
+        argv.extend([
+            OsString::from("--pwfile"),
+            pwfile.clone().into(),
+            tempdir.join("data").into(),
+        ]);
+        let theirs = testkit::run(&initdb, &argv).expect("run the reference initdb");
+        assert_eq!(theirs.status, Some(1), "{tag}");
+        assert_eq!(theirs.stderr_text(), expected, "{tag}");
+        assert!(!tempdir.join("data").exists(), "{tag}");
+    }
+}
+
+/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` with the
+/// three random-per-cluster parts replaced, after checking their lengths:
+/// a 16-byte salt and two 32-byte keys, base64 (`scram_build_secret`,
+/// `src/common/scram-common.c:209`). Anything else is left alone.
+fn normalize_scram(stdout: &str) -> String {
+    let mut out = String::with_capacity(stdout.len());
+    let mut rest = stdout;
+    while let Some(at) = rest.find("SCRAM-SHA-256$") {
+        out.push_str(&rest[..at]);
+        let secret = &rest[at..];
+        let end = secret.find('"').unwrap_or(secret.len());
+        let (secret, after) = secret.split_at(end);
+        let parsed = secret
+            .strip_prefix("SCRAM-SHA-256$")
+            .and_then(|s| s.split_once(':'))
+            .and_then(|(iterations, s)| {
+                let (salt, keys) = s.split_once('$')?;
+                let (stored, server) = keys.split_once(':')?;
+                Some((iterations, salt.len(), stored.len(), server.len()))
+            });
+        match parsed {
+            Some((iterations, 24, 44, 44)) => {
+                out.push_str("SCRAM-SHA-256$");
+                out.push_str(iterations);
+                out.push_str(":<salt>$<StoredKey>:<ServerKey>");
+            }
+            _ => panic!("not a SCRAM secret: {secret}"),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Gate: `-U alice --pwfile` makes the `pg_authid` row the reference
+/// initdb makes for the same command line — a SCRAM secret by
+/// `password_encryption`'s default, with 4096 iterations — up to the salt
+/// and the keys, which are random per cluster. The reference `postgres`
+/// runs our session. That the secret opens a login is
+/// `crates/pgdrop/tests/template_boot.rs`'s, against pgrust.
+#[test]
+fn the_superuser_password_matches_reference_initdb() {
+    let tempdir = TempDir::new("single-user-password-gate");
+    let Some(initdb) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let Some(postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
+    let pwfile = tempdir.join("pwfile");
+    std::fs::write(&pwfile, "gate'pw\n").expect("write the password file");
+    let common = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        OsString::from("--pwfile"),
+        pwfile.into(),
+        OsString::from("--no-sync"),
+    ];
+    let ours = tempdir.join("ours");
+    let mut argv = common.to_vec();
+    argv.push(ours.clone().into());
+    let outcome = testkit::run_in(
+        Path::new(RINITDB),
+        &argv,
+        &[],
+        &with_server(Some(&postgres)),
+    )
+    .expect("run rinitdb");
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    assert_eq!(outcome.stderr_text(), "");
+
+    let theirs = tempdir.join("theirs");
+    let mut argv = common.to_vec();
+    argv.extend(args(&["--no-locale", "-E", "UTF8"]));
+    argv.push(theirs.clone().into());
+    let outcome = testkit::run(&initdb, &argv).expect("run the reference initdb");
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+
+    let read = |pgdata: &Path| {
+        let outcome = reference_single_user(pgdata, SUPERUSER_QUERIES).expect("found above");
+        assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+        outcome.stdout_text()
+    };
+    let (ours, theirs) = (read(&ours), read(&theirs));
+    assert_eq!(
+        normalize_scram(single_user_values(&ours, "rolpassword")[0]),
+        "SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>",
+        "{ours}"
+    );
+    assert_eq!(normalize_scram(&ours), normalize_scram(&theirs));
+}

@@ -100,11 +100,22 @@ fn server_env(scratch: &Path) -> Environment {
 
 /// `<postgres> --single -D <pgdata> postgres` with `input`: exit 0; stdout.
 fn single(postgres: &Path, pgdata: &Path, env: &Environment, input: &str) -> String {
+    single_in(postgres, pgdata, env, "postgres", input)
+}
+
+/// [`single`] on `database`.
+fn single_in(
+    postgres: &Path,
+    pgdata: &Path,
+    env: &Environment,
+    database: &str,
+    input: &str,
+) -> String {
     let argv = [
         OsString::from("--single"),
         OsString::from("-D"),
         pgdata.into(),
-        OsString::from("postgres"),
+        OsString::from(database),
     ];
     let outcome =
         testkit::run_in(postgres, argv, input.as_bytes(), env).expect("run postgres --single");
@@ -298,6 +309,39 @@ fn superuser(postgres: &Path, pgdata: &Path, env: &Environment) -> (Vec<String>,
     ([owned("su"), owned("me")].concat(), owned("leftover"))
 }
 
+/// pgrust `--single` on `pgdata`, in `template1`, `template0` and
+/// `postgres`: that database's statistics on `pg_authid.rolname` (the
+/// histogram, slot 1), and whether `VACUUM FREEZE` has advanced
+/// `pg_authid`'s `relfrozenxid` past the superuser's row.
+fn analyzed_and_frozen(postgres: &Path, pgdata: &Path, env: &Environment) -> Vec<String> {
+    ["template1", "template0", "postgres"]
+        .into_iter()
+        .flat_map(|database| {
+            let stdout = single_in(
+                postgres,
+                pgdata,
+                env,
+                database,
+                "select stavalues1 as rolnames from pg_statistic \
+                 where starelid = 1260 and staattnum = 2;\n\
+                 select (select relfrozenxid::text::int8 from pg_class where oid = 1260) \
+                 > xmin::text::int8 as frozen from pg_authid where oid = 10;\n",
+            );
+            let rolnames = values(&stdout, "rolnames");
+            let frozen = values(&stdout, "frozen");
+            vec![
+                format!(
+                    "{database}: {}",
+                    rolnames
+                        .first()
+                        .map_or("", |names| names.split(',').next().unwrap_or(""))
+                ),
+                format!("{database}: frozen {frozen:?}"),
+            ]
+        })
+        .collect()
+}
+
 /// NAT-383: `-U alice` renames the template's superuser in a pgrust
 /// single-user session, found the two ways pgdrop finds one — `postgres`
 /// beside `initdb` (`setup_bin_paths`, `initdb.c:2648`), and pgdrop itself
@@ -317,6 +361,19 @@ fn another_superuser_is_the_templates_renamed_under_pgrust() {
     assert_eq!(
         superuser(&pgrust, &beside, &server_env(&scratch.0)),
         (vec!["alice".to_owned(), "alice".to_owned()], Vec::new())
+    );
+    // vacuum_db's ANALYZE and VACUUM FREEZE (initdb.c:2004) ran after the
+    // rename in every database, under pgrust too.
+    assert_eq!(
+        analyzed_and_frozen(&pgrust, &beside, &server_env(&scratch.0)),
+        [
+            "template1: {alice",
+            "template1: frozen [\"t\"]",
+            "template0: {alice",
+            "template0: frozen [\"t\"]",
+            "postgres: {alice",
+            "postgres: frozen [\"t\"]",
+        ]
     );
 
     // A bin/ with pgdrop alone: the embedded server, `pgdrop postgres`.

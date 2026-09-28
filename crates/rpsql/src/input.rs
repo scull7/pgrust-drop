@@ -13,6 +13,10 @@ use std::ffi::OsStr;
 use std::io::{BufRead, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use liner::KeyMap as _;
+use termion::input::TermRead as _;
+use termion::raw::IntoRawMode as _;
+
 use crate::mainloop::gets_from_file;
 use crate::settings::HistControl;
 
@@ -225,8 +229,18 @@ impl liner::Completer for NoCompletion {
 }
 
 /// The readline arm, through `redox_liner` (ADR-0005).
+///
+/// It drives `liner::Editor` with the Emacs keymap itself rather than calling
+/// `Context::read_line`, because that builds a fresh `stdin().keys()` for
+/// every line, and termion's key iterator reads two bytes at a time and keeps
+/// the second: when a line's Enter is the first of the two, the next line's
+/// first byte died with the iterator (a pasted `\echo ab\n\warn cd\n` gave
+/// `warn cd`). One iterator for the whole session keeps that byte, as
+/// readline's one input stream does (ADR-0005, 2026-09-27 amendment).
 pub struct LinerEditor {
     context: liner::Context,
+    /// The session's only key source: see above.
+    keys: termion::input::Keys<std::io::Stdin>,
     /// `psql_history`
     file: Option<PathBuf>,
     /// This session's entries, `history_lines_added` of them.
@@ -251,6 +265,7 @@ impl LinerEditor {
         }
         Self {
             context,
+            keys: std::io::stdin().keys(),
             file,
             added: Vec::new(),
         }
@@ -281,13 +296,34 @@ impl LinerEditor {
 impl LineEditor for LinerEditor {
     fn read_line(&mut self, prompt: &str) -> Fetched {
         let _ = std::io::stdout().flush();
-        match self
-            .context
-            .read_line(liner::Prompt::from(prompt), None, &mut NoCompletion)
-        {
-            Ok(line) => Fetched::Line(line.into_bytes()),
-            Err(err) if err.kind() == ErrorKind::Interrupted => Fetched::Interrupted,
-            Err(_) => Fetched::Eof,
+        // Raw mode only while the line is edited: dropping `editor` at the
+        // end restores the terminal, so a query runs with ISIG back on and a
+        // Control-C is the SIGINT handler's.
+        let Ok(out) = std::io::stdout().into_raw_mode() else {
+            return Fetched::Eof;
+        };
+        let Ok(mut editor) =
+            liner::Editor::new(out, liner::Prompt::from(prompt), None, &mut self.context)
+        else {
+            return Fetched::Eof;
+        };
+        let mut keymap = liner::Emacs::new();
+        keymap.init(&mut editor);
+        // `Context::handle_keys`, over the session's iterator.
+        while let Some(Ok(key)) = self.keys.next() {
+            match keymap.handle_key(key, &mut editor, &mut NoCompletion) {
+                Ok(true) => return Fetched::Line(String::from(editor).into_bytes()),
+                Ok(false) => {}
+                Err(err) if err.kind() == ErrorKind::Interrupted => return Fetched::Interrupted,
+                Err(_) => return Fetched::Eof,
+            }
+        }
+        // End of input: readline hands back a partial line before `NULL`.
+        let line = String::from(editor);
+        if line.is_empty() {
+            Fetched::Eof
+        } else {
+            Fetched::Line(line.into_bytes())
         }
     }
 

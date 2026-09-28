@@ -28,3 +28,33 @@ unaffected by the editor.
   implementation (later issue).
 - The crate saw its last release in 2024; if it stalls we vendor or swap
   behind the same small `LineEditor` trait, which is why rpsql wraps it.
+
+## Amendment, 2026-09-27: termion as rpsql's key source (Nathan, NAT-405)
+
+`redox_liner` 0.5.3's `Context::read_line` builds a fresh `stdin().keys()`
+for every line (`src/context.rs:129`), and termion 4's key iterator reads two
+bytes at a time and parks the second in the iterator. When a line's Enter is
+the first of the two, the next line's first byte is dropped with the
+iterator: a pasted `\echo ab\n\warn cd\n` ran `warn cd` as query text.
+Statement-complete buffering cannot bring back a byte that was never
+delivered, and liner does not re-export `termion::event::Key`, so nothing
+short of termion itself can drive liner's `Editor` with a longer-lived
+iterator.
+
+Decision (owner, 2026-09-27): `termion = "4"` is an approved direct
+dependency of `rpsql`, used **only** for raw mode (`IntoRawMode`) and one
+session-lived `stdin().keys()` iterator. `input::LinerEditor` owns that
+iterator and drives `liner::Editor` with `liner::Emacs` itself, as
+`Context::handle_keys` does, instead of calling `Context::read_line`. It adds
+no crate to the build: redox_liner already depends on termion 4. `rpsql`
+stays `#![deny(unsafe_code)]` with no exception.
+
+Rejected: a `[patch]` of liner (kept as the fallback, and as an optional
+follow-up to send upstream), replacing the editor, termios through libc or
+`stty`, and shipping the bug. rustyline and reedline are not options.
+Bracketed paste is a later, optional slice.
+
+The pty the interactive gates type into (`crates/rpsql/tests/pty/mod.rs`)
+still declares `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` itself:
+test code only, never linked into `rpsql`, because the standard library
+cannot open a pseudo-terminal and no crate for it is approved.

@@ -121,8 +121,10 @@ container does not change that.
   its whole transitive dependency tree, **in `pgdrop` only** — owner,
   2026-09-23; `rustix` (rlibpq's readiness wait, `event` + `std` features
   only, ADR-0010) — owner, 2026-09-27; `libc` (rlibpq-ffi's C-library calls;
-  `free` for `PQfreemem`) — owner, 2026-09-27; musl (Alpine) is a priority
-  target. `anyhow` is not approved. `ring` needs a musl C toolchain:
+  `free` for `PQfreemem`) — owner, 2026-09-27; `signal-hook` (rpsql's SIGINT
+  handler, ADR-0009) and `termion` (rpsql's raw mode and session-lived key
+  iterator only, ADR-0005 amendment) — owner, 2026-09-27; musl (Alpine) is a
+  priority target. `anyhow` is not approved. `ring` needs a musl C toolchain:
   `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`. pgrust's tree
   needs a C compiler, `perl` and `make` (vendored OpenSSL), and for a release
   build libre2 plus a C++ compiler; see ADR-0001's 2026-09-23 amendment.

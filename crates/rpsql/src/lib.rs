@@ -55,7 +55,8 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, QueryResult, Stream,
+    Connection, ConnectionError, Env, ExecStatus, Filesystem, QueryResult, Stream,
+    conninfo_array_parse,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
@@ -144,17 +145,22 @@ pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
 
 /// Action: open the connection this session asks for.
 ///
-/// `conninfo_array_parse` (`fe-connect.c:6466`, `:6602`), which
-/// `PQconnectdbParams` runs: the keywords first, then the
-/// defaults — a service file, then the environment — for whatever they left
-/// unset, so a failed service lookup is the connection's error.
+/// `PQconnectdbParams(keywords, values, true)` (`startup.c:277`):
+/// `conninfo_array_parse` (`fe-connect.c:6466`, `:6602`) takes the keywords
+/// first, expanding a connection string or URI given as the database name,
+/// then the defaults (a service file, then the environment) fill whatever
+/// they left unset. A malformed string or a failed service lookup is the
+/// connection's error.
 fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
-    let mut conninfo = ConnInfo::new();
-    for (key, value) in connection_keywords(session) {
-        // Every keyword here is a row of `PQconninfoOptions[]`, so an unknown
-        // one is a bug in this function rather than in the command line.
-        let _ = conninfo.set(key.as_bytes(), value.as_bytes());
-    }
+    let keywords = connection_keywords(session);
+    let params: Vec<(&[u8], &[u8])> = keywords
+        .iter()
+        .map(|(key, value)| (key.as_bytes(), value.as_bytes()))
+        .collect();
+    let mut conninfo = match conninfo_array_parse(&params, true) {
+        Ok(conninfo) => conninfo,
+        Err(err) => return Err(ConnectionError::from(err).into()),
+    };
     if let Err(err) = conninfo.add_defaults(&Env::from_process(), &Filesystem) {
         return Err(ConnectionError::from(err).into());
     }

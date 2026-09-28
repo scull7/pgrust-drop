@@ -326,12 +326,25 @@ impl Cluster {
         output
     }
 
+    /// `$node->connstr($dbname)` (`Cluster.pm:273`-`:289`): the database
+    /// name `'`-quoted, with `\` and `'` escaped.
+    fn connstr(&self, dbname: &str) -> String {
+        let dbname = dbname.replace('\\', "\\\\").replace('\'', "\\'");
+        format!(
+            "port={} host={} dbname='{dbname}'",
+            self.port,
+            self.dir.display()
+        )
+    }
+
     /// Action: `$node->psql('postgres', $sql, on_error_stop => …)`
     /// (`src/test/perl/PostgreSQL/Test/Cluster.pm:2116`) through `psql`:
-    /// `--no-psqlrc --no-align --tuples-only --quiet --file -` with `sql` on
-    /// stdin, and `--variable ON_ERROR_STOP=1` unless `on_error_stop` is
-    /// false (`:2163`). Like upstream, one trailing newline is chomped from
-    /// each stream (`:2228`-`:2236`).
+    /// `--no-psqlrc --no-align --tuples-only --quiet --dbname $connstr
+    /// --file -` with `sql` on stdin (`:2136`-`:2143`), and `--variable
+    /// ON_ERROR_STOP=1` unless `on_error_stop` is false (`:2163`). The
+    /// database name is a connection string, as upstream's is, so every
+    /// case through here also proves psql expands one. Like upstream, one
+    /// trailing newline is chomped from each stream (`:2228`-`:2236`).
     ///
     /// # Panics
     /// When `psql` cannot be started, or is killed by a signal, which
@@ -340,7 +353,9 @@ impl Cluster {
         let mut command = Command::new(psql);
         command
             .args(["--no-psqlrc", "--no-align", "--tuples-only", "--quiet"])
-            .args(["--dbname", "postgres", "--file", "-"]);
+            .arg("--dbname")
+            .arg(self.connstr("postgres"))
+            .args(["--file", "-"]);
         if on_error_stop {
             command.args(["--variable", "ON_ERROR_STOP=1"]);
         }

@@ -787,6 +787,58 @@ pub fn parse_conninfo(conninfo: &[u8]) -> Result<ConnInfo, ConnError> {
     }
 }
 
+/// `conninfo_array_parse` (`fe-connect.c:6466`) with `use_defaults` false:
+/// the keyword/value arrays `PQconnectdbParams` takes, in order, each value
+/// replacing any earlier one. C's NULL value is a pair left out; an empty
+/// value is skipped as C skips it (`:6518`).
+///
+/// With `expand_dbname`, the first `dbname` is checked for a connection
+/// string (`:6479`-`:6498`). If it is one, it is parsed before anything
+/// else, and where that `dbname` sits every option the string set replaces
+/// what came before it, while later pairs still replace those
+/// (`:6541`-`:6576`). This is how `psql "postgresql://…"` and
+/// `psql --dbname "host=… port=…"` connect.
+///
+/// # Errors
+/// The [`ConnError`] of parsing the connection string, or
+/// [`ConnError::InvalidConnectionOption`] for a keyword the table lacks
+/// (`:6528`).
+pub fn conninfo_array_parse(
+    params: &[(&[u8], &[u8])],
+    expand_dbname: bool,
+) -> Result<ConnInfo, ConnError> {
+    let mut dbname_options = match params.iter().find(|(keyword, _)| *keyword == b"dbname") {
+        Some((_, value)) if expand_dbname && recognized_connection_string(value) => {
+            Some(parse_conninfo(value)?)
+        }
+        _ => None,
+    };
+
+    let mut options = ConnInfo::new();
+    for &(keyword, value) in params {
+        if value.is_empty() {
+            continue;
+        }
+        let index = ConnInfo::index_of(keyword)
+            .ok_or_else(|| ConnError::InvalidConnectionOption(keyword.into()))?;
+        // Taken, so that a later `dbname` is not expanded (`:6571`).
+        match dbname_options.take() {
+            Some(parsed) if keyword == b"dbname" => {
+                for (slot, parsed) in options.values.iter_mut().zip(parsed.values) {
+                    if parsed.is_some() {
+                        *slot = parsed;
+                    }
+                }
+            }
+            untouched => {
+                dbname_options = untouched;
+                options.values[index] = Some(value.into());
+            }
+        }
+    }
+    Ok(options)
+}
+
 /// `conninfo_parse` (`fe-connect.c:6290`) with `use_defaults` false: a string
 /// of `key = value` pairs, where a value may be `'`-quoted and `\` escapes the
 /// next byte in either form.
@@ -1091,6 +1143,114 @@ mod tests {
     fn an_unknown_keyword_is_an_error_naming_it() {
         assert_eq!(
             parse_conninfo(b"uzer=me"),
+            Err(ConnError::InvalidConnectionOption("uzer".into()))
+        );
+    }
+
+    /// The pairs `psql` hands `PQconnectdbParams` (`startup.c:258`-`:272`),
+    /// with `dbname` given as `dbname`.
+    fn psql_params<'a>(host: &'a [u8], dbname: &'a [u8]) -> Vec<(&'a [u8], &'a [u8])> {
+        vec![
+            (b"host", host),
+            (b"port", b"5432"),
+            (b"dbname", dbname),
+            (b"fallback_application_name", b"psql"),
+        ]
+    }
+
+    fn array_value(params: &[(&[u8], &[u8])], expand: bool, keyword: &str) -> Option<String> {
+        conninfo_array_parse(params, expand)
+            .expect("parses")
+            .get(keyword)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+    }
+
+    /// `fe-connect.c:6541`-`:6567`: a URI in `dbname` replaces what came
+    /// before it, and sets `dbname` only if it names one.
+    #[test]
+    fn an_expanded_uri_overrides_the_pairs_before_it() {
+        let params = psql_params(b"/tmp", b"postgresql://u@%2Frun%2Fpg:6000/db");
+        assert_eq!(
+            array_value(&params, true, "host").as_deref(),
+            Some("/run/pg")
+        );
+        assert_eq!(array_value(&params, true, "port").as_deref(), Some("6000"));
+        assert_eq!(array_value(&params, true, "user").as_deref(), Some("u"));
+        assert_eq!(array_value(&params, true, "dbname").as_deref(), Some("db"));
+
+        let params = psql_params(b"/tmp", b"postgresql://u@%2Frun%2Fpg");
+        assert_eq!(array_value(&params, true, "dbname"), None);
+        assert_eq!(array_value(&params, true, "port").as_deref(), Some("5432"));
+    }
+
+    /// `Cluster.pm`'s `connstr` (`:273`-`:289`), the `--dbname` every
+    /// `$node->psql` passes (`:2136`-`:2143`), is a `key=value` string.
+    #[test]
+    fn an_expanded_keyword_value_string_overrides_the_pairs_before_it() {
+        let params = psql_params(b"/tmp", b"port=6000 host=/run/pg dbname='post gres'");
+        assert_eq!(
+            array_value(&params, true, "host").as_deref(),
+            Some("/run/pg")
+        );
+        assert_eq!(array_value(&params, true, "port").as_deref(), Some("6000"));
+        assert_eq!(
+            array_value(&params, true, "dbname").as_deref(),
+            Some("post gres")
+        );
+    }
+
+    /// Later pairs still win over the expanded string, and only the first
+    /// `dbname` is expanded (`:6571`).
+    #[test]
+    fn later_pairs_win_and_only_the_first_dbname_expands() {
+        let params: [(&[u8], &[u8]); 4] = [
+            (b"dbname", b"host=/run/pg application_name=a"),
+            (b"application_name", b"b"),
+            (b"dbname", b"host=elsewhere"),
+            (b"fallback_application_name", b"psql"),
+        ];
+        assert_eq!(
+            array_value(&params, true, "application_name").as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            array_value(&params, true, "host").as_deref(),
+            Some("/run/pg")
+        );
+        assert_eq!(
+            array_value(&params, true, "dbname").as_deref(),
+            Some("host=elsewhere")
+        );
+    }
+
+    /// A plain name, or any string without `expand_dbname`, is a database
+    /// name; an empty value is skipped (`:6518`).
+    #[test]
+    fn a_plain_name_is_a_name_and_an_empty_value_is_skipped() {
+        let params = psql_params(b"", b"postgres");
+        assert_eq!(
+            array_value(&params, true, "dbname").as_deref(),
+            Some("postgres")
+        );
+        assert_eq!(array_value(&params, true, "host"), None);
+        let params = psql_params(b"/tmp", b"host=/run/pg");
+        assert_eq!(
+            array_value(&params, false, "dbname").as_deref(),
+            Some("host=/run/pg")
+        );
+        assert_eq!(array_value(&params, false, "host").as_deref(), Some("/tmp"));
+    }
+
+    /// A malformed string's error is the connection's (`:6495`), and so is a
+    /// keyword the table lacks (`:6528`).
+    #[test]
+    fn a_bad_string_or_keyword_is_an_error() {
+        assert_eq!(
+            conninfo_array_parse(&psql_params(b"/tmp", b"host=/run/pg db"), true),
+            Err(ConnError::MissingEquals("db".into()))
+        );
+        assert_eq!(
+            conninfo_array_parse(&[(b"uzer", b"me")], true),
             Err(ConnError::InvalidConnectionOption("uzer".into()))
         );
     }

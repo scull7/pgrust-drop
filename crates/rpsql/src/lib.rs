@@ -26,8 +26,6 @@
 //! calculation over its inputs, and the only actions are [`connect`], the
 //! SIGINT handler in [`cancel`] and the stream writing in [`run`].
 
-// Denied everywhere but `cancel`'s declarations of `signal()`, `write()` and
-// `errno`, which a signal handler cannot do without (ADR-0009).
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
 // allowed here because crate attributes are the only level that outranks that

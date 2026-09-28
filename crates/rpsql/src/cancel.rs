@@ -12,26 +12,28 @@
 //! `:686`, `:690`) so that the handler knows which backend to cancel.
 //!
 //! `PQcancel` is written to be async-signal-safe; [`rlibpq::Cancel::cancel`]
-//! is not — `std`'s socket calls allocate. So the handler here does only what
-//! is safe in a handler — it stores `cancel_pressed` and writes one byte to a
-//! non-blocking socket — and a thread of its own, woken by that byte, sends
-//! the request and writes the report, as the Windows arm of `cancel.c` does
-//! from its console-handler thread (`cancel.c:195`-`:224`, holding
-//! `cancelConnLock` as [`CANCEL_CONN`]'s mutex is held here). ADR-0009
-//! records why the handler needs the crate's only `unsafe` code, and
-//! `docs/divergences.md` the window the thread opens.
+//! is not — `std`'s socket calls allocate. So the handler here, installed
+//! with `signal-hook` (ADR-0009), does only what is safe in a handler: it
+//! stores `cancel_pressed` ([`signal_hook::flag::register`]) and wakes a
+//! thread of its own ([`signal_hook::iterator::Signals`]), which sends the
+//! request and writes the report, as the Windows arm of `cancel.c` does from
+//! its console-handler thread (`cancel.c:195`-`:224`, holding
+//! `cancelConnLock` as [`CANCEL_CONN`]'s mutex is held here).
+//! `docs/divergences.md` records the window the thread opens.
 //!
 //! Data and calculations: [`CANCEL_PRESSED`], [`cancel_report`]. Actions:
 //! [`setup_cancel_handler`], [`set_cancel_conn`], [`reset_cancel_conn`].
 
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use rlibpq::{Cancel, CancelError};
 
 /// `cancel_pressed` (`common.c:323`): set by every SIGINT, read and cleared
 /// by `MainLoop` (`mainloop.c:88`-`:100`).
-pub static CANCEL_PRESSED: AtomicBool = AtomicBool::new(false);
+/// An `Arc` because the handler keeps a reference of its own.
+pub static CANCEL_PRESSED: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 /// `cancelConn` (`cancel.c:43`): what the handler's thread cancels, `None`
 /// while no query is running.
@@ -70,20 +72,24 @@ pub fn cancel_report(outcome: &Result<(), CancelError>) -> Vec<u8> {
 }
 
 /// Action: the body of `handle_sigint` after the callback — cancel the
-/// running query, if there is one, and say how that went.
+/// running query, if there is one, and say how that went on `stderr`.
 #[cfg(unix)]
-fn send_cancel() {
+fn send_cancel(stderr: &mut impl std::io::Write) {
     // Held across the request, as `cancelConnLock` is (`cancel.c:208`-`:222`):
     // the query cannot be replaced by the next one while it is cancelled.
     let conn = cancel_conn();
     if let Some(cancel) = conn.as_ref() {
-        sys::write_stderr(&cancel_report(&cancel.cancel()));
+        // One write, its result ignored, as `write_stderr` does
+        // (`cancel.c:31`-`:36`).
+        let _ = stderr.write_all(&cancel_report(&cancel.cancel()));
     }
 }
 
 /// `psql_setup_cancel_handler()` (`common.c:327`): install the SIGINT
-/// handler. Only the first call does anything. A failure to install leaves
-/// SIGINT's default action in place, as a failed `pqsignal` does upstream.
+/// handler. Only the first call does anything. A failure to duplicate
+/// stderr or to open `signal-hook`'s wake-up pipe leaves SIGINT's default
+/// action in place, as a failed `pqsignal` does upstream; a failure to start
+/// the thread after that leaves SIGINT caught and ignored.
 pub fn setup_cancel_handler() {
     #[cfg(unix)]
     {
@@ -94,125 +100,45 @@ pub fn setup_cancel_handler() {
 
 #[cfg(unix)]
 mod unix {
-    use std::ffi::c_int;
-    use std::os::fd::IntoRawFd as _;
-    use std::os::unix::net::UnixDatagram;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::os::fd::AsFd as _;
+    use std::sync::Arc;
 
-    use super::{CANCEL_PRESSED, send_cancel, sys};
+    use signal_hook::consts::SIGINT;
+    use signal_hook::iterator::Signals;
 
-    /// The write end of the wake-up socket, for the handler; `-1` until set.
-    static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+    use super::{CANCEL_PRESSED, send_cancel};
 
-    /// `handle_sigint` (`cancel.c:153`) up to the point where it would call
-    /// `PQcancel`: `psql_cancel_callback`'s `cancel_pressed = true`, then one
-    /// byte to wake the thread that sends the request. Atomics and `write()`
-    /// are all it touches; `errno` is saved and restored around it, as
-    /// `pqsignal`'s `wrapper_handler` does (`src/port/pqsignal.c:88`, `:112`).
-    extern "C" fn handle_sigint(_signo: c_int) {
-        sys::preserving_errno(|| {
-            CANCEL_PRESSED.store(true, Ordering::SeqCst);
-            // The socket is non-blocking, so a full buffer — a pile of
-            // unanswered SIGINTs — drops this byte rather than hanging here.
-            sys::write(WAKE_FD.load(Ordering::SeqCst), &[0]);
-        });
-    }
-
+    /// `handle_sigint` (`cancel.c:153`), split in two. In the handler,
+    /// `psql_cancel_callback`'s `cancel_pressed = true` (`common.c:323`) and a
+    /// wake-up for the `psql-cancel` thread; on that thread, the `PQcancel`
+    /// and the report. `signal-hook` installs its handler with `SA_RESTART`,
+    /// as `pqsignal` does (`src/port/pqsignal.c:141`), and saves and restores
+    /// `errno` around it, as `pqsignal`'s `wrapper_handler` does
+    /// (`pqsignal.c:88`, `:112`).
     pub(super) fn setup() {
-        let Ok((wake, woken)) = UnixDatagram::pair() else {
+        // `write_stderr` writes to descriptor 2 directly (`cancel.c:31`),
+        // past `std`'s `Stderr` lock, which the main thread holds for the
+        // whole session: so does a duplicate of it.
+        let Ok(stderr) = std::io::stderr().as_fd().try_clone_to_owned() else {
             return;
         };
-        if wake.set_nonblocking(true).is_err() {
+        let mut stderr = std::fs::File::from(stderr);
+        // The handler does nothing but wake the thread until the flag is
+        // registered below, and `send_cancel` does nothing outside a query,
+        // so the order of the two registrations is not observable.
+        let Ok(mut signals) = Signals::new([SIGINT]) else {
             return;
-        }
+        };
         let spawned = std::thread::Builder::new()
             .name("psql-cancel".to_string())
             .spawn(move || {
-                let mut byte = [0u8; 1];
-                loop {
-                    match woken.recv(&mut byte) {
-                        Ok(_) => send_cancel(),
-                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(_) => return,
-                    }
+                for _ in signals.forever() {
+                    send_cancel(&mut stderr);
                 }
             });
-        if spawned.is_err() {
-            return;
+        if spawned.is_ok() {
+            let _ = signal_hook::flag::register(SIGINT, Arc::clone(&CANCEL_PRESSED));
         }
-        // The descriptor stays open for the life of the process: the handler
-        // may run at any moment until it exits.
-        WAKE_FD.store(wake.into_raw_fd(), Ordering::SeqCst);
-        sys::install_sigint(handle_sigint);
-    }
-}
-
-/// The C library calls the handler needs and `std` does not offer: installing
-/// a signal handler, a `write()` safe to make inside one, and `errno`.
-///
-/// Declared here rather than taken from the `libc` crate, which is not an
-/// approved dependency (AGENTS.md); each signature is the same on glibc, musl
-/// and Darwin, the three targets rpsql ships to (ADR-0007), and so is
-/// `SIGINT`'s number. ADR-0009.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-mod sys {
-    use std::ffi::{c_int, c_void};
-
-    /// `SIGINT` on Linux and Darwin alike.
-    const SIGINT: c_int = 2;
-    /// `SIG_ERR`, `(void (*)(int)) -1`.
-    const SIG_ERR: usize = usize::MAX;
-
-    unsafe extern "C" {
-        // `sighandler_t signal(int, sighandler_t)`: a function pointer in, a
-        // function pointer (or `SIG_ERR`) out; `usize` has its size.
-        fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
-        #[link_name = "write"]
-        fn c_write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-        #[cfg_attr(
-            any(target_os = "linux", target_os = "android"),
-            link_name = "__errno_location"
-        )]
-        #[cfg_attr(
-            any(target_os = "macos", target_os = "ios", target_os = "freebsd"),
-            link_name = "__error"
-        )]
-        fn errno_location() -> *mut c_int;
-    }
-
-    /// `pqsignal(SIGINT, handler)` (`cancel.c:189`). `signal()` has BSD
-    /// semantics on all three C libraries — the handler stays installed and
-    /// interrupted system calls restart — which is what `pqsignal` asks
-    /// `sigaction` for with `SA_RESTART` (`pqsignal.c:141`).
-    pub(super) fn install_sigint(handler: extern "C" fn(c_int)) -> bool {
-        // SAFETY: `handler` is an `extern "C"` function that touches only
-        // atomics, `write()` and `errno`, all async-signal-safe.
-        unsafe { signal(SIGINT, handler) != SIG_ERR }
-    }
-
-    /// One `write()`, its result ignored, as `write_stderr` does
-    /// (`cancel.c:31`-`:36`).
-    pub(super) fn write(fd: c_int, bytes: &[u8]) {
-        // SAFETY: the pointer and length describe `bytes`, which outlives the
-        // call; a bad descriptor is an `EBADF`, not undefined behaviour.
-        let _ = unsafe { c_write(fd, bytes.as_ptr().cast(), bytes.len()) };
-    }
-
-    /// `write_stderr` (`cancel.c:31`): straight to descriptor 2, past `std`'s
-    /// `Stderr` lock, which the main thread may be holding.
-    pub(super) fn write_stderr(bytes: &[u8]) {
-        write(2, bytes);
-    }
-
-    /// Run `f` and put `errno` back as it was.
-    pub(super) fn preserving_errno(f: impl FnOnce()) {
-        // SAFETY: `errno_location` returns the calling thread's `errno`,
-        // valid for the life of the thread.
-        let saved = unsafe { *errno_location() };
-        f();
-        // SAFETY: as above.
-        unsafe { *errno_location() = saved };
     }
 }
 

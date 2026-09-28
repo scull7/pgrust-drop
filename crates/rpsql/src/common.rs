@@ -17,6 +17,10 @@
 //! `handleCopyOut` / `handleCopyIn` from the middle of the result loop
 //! (`common.c:1912`-`:2011`), with the data going to or coming from the
 //! stream [`CopyIo`] names.
+//!
+//! Results go to `pset.queryFout` ([`Output`]), or to the file or pipe a
+//! `\g` named (`pset.gfname`), which is opened at the first result that
+//! needs it and closed when the query is done (`common.c:92`-`:124`).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -27,6 +31,7 @@ use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultErr
 use crate::copy::{handle_copy_in, handle_copy_out};
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::logging;
+use crate::output::{Opened, Output, OutputFile, set_shell_result_variables};
 use crate::print::print_query;
 use crate::scan::{NoVariables, Scanner};
 use crate::settings::{EXIT_BADCONN, Echo, PipelineCounters, PsqlSettings, SendMode};
@@ -227,12 +232,19 @@ impl<'a> CommandSource<'a> {
 /// `pset.copyStream` (`settings.h:108`): where `\copy` sends a COPY's data
 /// or takes it from, instead of the default places.
 pub enum CopyStream<'a> {
-    /// `NULL`, or a stream that *is* the default place: COPY OUT writes to
-    /// `pset.queryFout` and COPY IN reads [`CommandSource`]. `\copy … to
-    /// stdout` and `\copy … from stdin` set `copyStream` to those very
-    /// streams (`copy.c:299`, `:318`), which behaves the same in every test
-    /// upstream makes of it.
+    /// `NULL`, or `\copy … from stdin`'s `pset.cur_cmd_source`
+    /// (`copy.c:299`), which COPY IN reads either way: COPY OUT writes to
+    /// `\g`'s file if there is one, else to `pset.queryFout`, and COPY IN
+    /// reads [`CommandSource`].
     Default,
+    /// `\copy … to stdout`: `pset.queryFout` (`copy.c:318`). Not
+    /// [`Self::Default`], because a `copyStream` is picked before
+    /// `pset.gfname` (`common.c:1955`-`:1966`): a `\g` file left over from
+    /// an earlier `-c` does not catch the data.
+    QueryFout,
+    /// `\copy … to pstdout`: psql's own stdout (`copy.c:320`), which is
+    /// `pset.queryFout` too unless `-o` or `\o` moved that.
+    Stdout,
     /// A file or `pstdin` that COPY IN reads.
     Read {
         /// The stream.
@@ -407,13 +419,14 @@ fn print_notices(executor: &mut dyn Executor, pset: &PsqlSettings, stderr: &mut 
 /// Returns whether the query succeeded, which is what `MainLoop` tests against
 /// `ON_ERROR_STOP`. `pset` is written because a failed result is kept for
 /// `\errverbose`, and because a `COPY … FROM STDIN` that reads its data from
-/// the command source moves `pset.lineno` on (`copy.c:652`).
+/// the command source moves `pset.lineno` on (`copy.c:652`); `vars` because
+/// a `\g` pipe's status becomes `SHELL_ERROR` and `SHELL_EXIT_CODE`.
 /// `copy_from_stdin` is `SendQuery`'s `num_copy_from_stdin`.
 ///
 /// The one-shot requests a backslash command leaves for this query —
-/// `\crosstabview`'s, `\bind`'s and its siblings' send mode, and the print
-/// options `\g (…)` or `\gx` saved — are cleared on the way out whatever
-/// happened (`common.c:1311`-`:1341`). Here the first two are taken on the
+/// `\crosstabview`'s, `\bind`'s and its siblings' send mode, `\g`'s file,
+/// and the print options `\g (…)` or `\gx` saved — are cleared on the way
+/// out whatever happened (`common.c:1311`-`:1341`). Here the first two are taken on the
 /// way in, which nothing between the two can tell apart, and the saved print
 /// options are put back on the way out.
 // `SendQuery`'s one argument plus the `pset` members it reads, each borrow
@@ -426,7 +439,7 @@ pub fn send_query(
     vars: &mut VariableSpace,
     source: &mut CommandSource<'_>,
     copy_from_stdin: Option<usize>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     let mut io = CopyIo {
@@ -434,7 +447,7 @@ pub fn send_query(
         stream: CopyStream::Default,
         copy_from_stdin,
     };
-    send_query_with(executor, query, pset, vars, &mut io, stdout, stderr)
+    send_query_with(executor, query, pset, vars, &mut io, out, stderr)
 }
 
 /// `SendQuery()` (`common.c:1126`) with `pset.copyStream` set, which is how
@@ -445,15 +458,15 @@ pub fn send_query_with(
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
     io: &mut CopyIo<'_, '_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     let crosstab = pset.crosstab.take();
     let mode = std::mem::take(&mut pset.send_mode);
     let ok = if mode.is_pipeline_control() || executor.pipeline_status() != PipelineStatus::Off {
         if let Some(line) = echo_line(query, pset) {
-            let _ = stdout.write_all(&line);
-            let _ = stdout.write_all(b"\n");
+            let _ = out.stdout.write_all(&line);
+            let _ = out.stdout.write_all(b"\n");
         }
         exec_pipelined(
             executor,
@@ -462,7 +475,7 @@ pub fn send_query_with(
             crosstab.as_ref(),
             pset,
             vars,
-            stdout,
+            out,
             stderr,
         )
     } else {
@@ -472,11 +485,15 @@ pub fn send_query_with(
             &mode,
             crosstab.as_ref(),
             pset,
+            vars,
             io,
-            stdout,
+            out,
             stderr,
         )
     };
+    // `sendquery_cleanup` (`common.c:1312`): reset `\g`'s output-to-filename
+    // trigger, whatever became of the query.
+    pset.gfname = None;
     // `restorePsetInfo` (`common.c:1319`).
     if let Some(saved) = pset.gsavepopt.take() {
         pset.popt = saved;
@@ -493,8 +510,9 @@ fn send_query_simple(
     mode: &SendMode,
     crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
     io: &mut CopyIo<'_, '_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     // An empty simple query comes back as PGRES_EMPTY_QUERY, which prints
@@ -504,8 +522,8 @@ fn send_query_simple(
         return true;
     }
     if let Some(line) = echo_line(query, pset) {
-        let _ = stdout.write_all(&line);
-        let _ = stdout.write_all(b"\n");
+        let _ = out.stdout.write_all(&line);
+        let _ = out.stdout.write_all(b"\n");
     }
 
     // `common.c:1128`: whether to time is decided before the query runs.
@@ -516,16 +534,17 @@ fn send_query_simple(
         mode,
         crosstab,
         pset,
+        vars,
         io,
-        stdout,
+        out,
         stderr,
         Instant::now(),
     );
 
     // `common.c:1286`: the timing line follows success and failure alike,
-    // which is what `001_basic.pl:95` tests.
+    // which is what `001_basic.pl:95` tests. `PrintTiming` writes to stdout.
     if timing {
-        let _ = stdout.write_all(timing_line(elapsed_msec).as_bytes());
+        let _ = out.stdout.write_all(timing_line(elapsed_msec).as_bytes());
     }
     ok
 }
@@ -593,24 +612,73 @@ fn count_copy_from_stdin(query: &[u8], std_strings: bool) -> usize {
     usize::try_from(scanner.count_copy_from_stdin()).unwrap_or(0)
 }
 
+/// `gfile_fout` in `ExecQueryAndProcessResults`: the stream `\g` named,
+/// opened by `SetupGOutput` (`common.c:92`) at the first result that needs
+/// it and closed by `CloseGOutput` (`common.c:112`) after the last.
+enum GFile {
+    /// Not opened: no `\g` file, or none needed yet, or it failed to open.
+    Unopened,
+    /// `\g ''`: `openQueryOutputFile` hands back psql's stdout.
+    Stdout,
+    /// A file, or a pipe to a shell command.
+    Open(OutputFile),
+}
+
+impl GFile {
+    /// `SetupGOutput()` (`common.c:92`): open `pset.gfname` if there is one
+    /// and it is not open already. `false` when it cannot be opened, which
+    /// has been logged; it is tried again at the next result.
+    fn setup(&mut self, pset: &PsqlSettings, out: &mut Output<'_>, stderr: &mut dyn Write) -> bool {
+        if pset.gfname.is_some() && matches!(self, Self::Unopened) {
+            match out.open_query_output_file(pset.gfname.as_deref(), pset, stderr) {
+                Some(Opened::File(file)) => *self = Self::Open(file),
+                Some(Opened::Stdout) => *self = Self::Stdout,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Where a result's tuples go: the `\g` stream if one is open, else
+    /// `pset.queryFout` (`common.c:2218`-`:2223`).
+    fn tuples<'w>(&'w mut self, out: &'w mut Output<'_>) -> &'w mut dyn Write {
+        match self {
+            Self::Open(file) => file,
+            Self::Stdout => &mut *out.stdout,
+            Self::Unopened => out.query_fout(),
+        }
+    }
+
+    /// `CloseGOutput()` (`common.c:112`): a pipe's status goes to
+    /// `SHELL_ERROR` and `SHELL_EXIT_CODE`.
+    fn close(self, vars: &mut VariableSpace) {
+        if let Self::Open(file) = self
+            && let Some(status) = file.close()
+        {
+            set_shell_result_variables(vars, status);
+        }
+    }
+}
+
 /// `ExecQueryAndProcessResults()` (`common.c:1581`), outside a pipeline and
-/// without `FETCH_COUNT`, `\g`, `\gset`, `\gexec` and `\watch`, which are
-/// later slices. `mode` and `crosstab` are the one-shot requests
+/// without `FETCH_COUNT`, `\gset`, `\gexec` and `\watch`, which are later
+/// slices. `mode` and `crosstab` are the one-shot requests
 /// [`send_query_with`] took.
 ///
 /// Returns the success and the milliseconds from `before` to the last
 /// result, taken before that result is printed (`common.c:2197`).
 // Upstream reads the one-shot requests and the COPY streams from `pset`;
 // passing them separately keeps each borrow visible at the call site.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn exec_query_and_process_results(
     executor: &mut dyn Executor,
     query: &[u8],
     mode: &SendMode,
     crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
     io: &mut CopyIo<'_, '_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
     before: Instant,
 ) -> (bool, f64) {
@@ -636,6 +704,7 @@ fn exec_query_and_process_results(
     let mut results = Results::new(first);
     let mut success = true;
     let mut elapsed_msec = 0.0;
+    let mut gfile = GFile::Unopened;
 
     let mut result = results.next(executor, pset, stderr, &mut success);
     while let Some(current) = result {
@@ -672,14 +741,17 @@ fn exec_query_and_process_results(
                     abort_connection(
                         pset,
                         "unexpected COPY_IN result, aborting connection",
-                        stdout,
+                        out,
                         stderr,
                     );
                 }
                 copy_from_stdin -= 1;
             }
-            let (ok, final_result) =
-                handle_copy_result(executor, &copy_result, pset, io, stdout, stderr);
+            let (ok, final_result) = if status == ExecStatus::CopyOut {
+                copy_out(executor, pset, io, &mut gfile, out, stderr)
+            } else {
+                copy_in(executor, &copy_result, pset, io, stderr)
+            };
             success &= ok;
             current = final_result;
         }
@@ -689,13 +761,21 @@ fn exec_query_and_process_results(
         elapsed_msec = now();
 
         if let Some(current) = &current {
+            // `common.c:2218`-`:2226`: a `\g` file is opened for tuples.
+            if current.status() == ExecStatus::TuplesOk {
+                success &= gfile.setup(pset, out, stderr);
+            }
             if success {
-                success &= print_query_result(current, last, crosstab, pset, stdout, stderr);
+                success &=
+                    print_query_result(current, last, crosstab, pset, &mut gfile, out, stderr);
             }
             clear_or_save_result(current, pset);
         }
         result = next;
     }
+
+    // `common.c:2252`: close the `\g` file if we opened it.
+    gfile.close(vars);
 
     // `common.c:2290`: may need this to recover from conn loss during COPY.
     if !executor.connected() {
@@ -729,47 +809,85 @@ fn exec_query_and_process_results(
 fn abort_connection(
     pset: &PsqlSettings,
     message: &str,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> ! {
     logging::info(pset, message, stderr);
-    let _ = stdout.flush();
+    out.flush_all();
     let _ = stderr.flush();
     std::process::exit(i32::from(EXIT_BADCONN))
 }
 
-/// `HandleCopyResult()` (`common.c:942`): move a COPY's data between the
-/// connection and the stream `ExecQueryAndProcessResults` picked
-/// (`common.c:1946`-`:2010`), and hand back the COPY command's own result in
-/// place of the COPY result — or `None` when its status would go to the
-/// place the data just went.
-fn handle_copy_result(
+/// `HandleCopyResult()` (`common.c:942`) for a COPY OUT: send the data to
+/// the sink `ExecQueryAndProcessResults` picks (`common.c:1947`-`:1976`) —
+/// `\copy`'s stream, else `\g`'s file, else `pset.queryFout` — and hand
+/// back the COPY command's own result, or `None` when its status line would
+/// go where the data just went (`common.c:965`).
+fn copy_out(
+    executor: &mut dyn Executor,
+    pset: &PsqlSettings,
+    io: &mut CopyIo<'_, '_>,
+    gfile: &mut GFile,
+    out: &mut Output<'_>,
+    stderr: &mut dyn Write,
+) -> (bool, Option<QueryResult>) {
+    let mut opened = true;
+    let (ok, copy_result, to_query_fout) = match &mut io.stream {
+        CopyStream::Write(sink) => {
+            let (ok, r) = handle_copy_out(executor, Some(&mut **sink), pset, stderr);
+            (ok, r, false)
+        }
+        // A `\copy … from` whose query the server ran as a COPY TO: C
+        // writes to a stream opened for reading, which fails.
+        CopyStream::Read { .. } => {
+            let (ok, r) = handle_copy_out(executor, Some(&mut ReadOnly), pset, stderr);
+            (ok, r, false)
+        }
+        CopyStream::Stdout => {
+            let same = out.query_fout_is_stdout();
+            let (ok, r) = handle_copy_out(executor, Some(&mut *out.stdout), pset, stderr);
+            (ok, r, same)
+        }
+        // `COPY … TO STDOUT \g file` (`common.c:1965`).
+        CopyStream::Default if pset.gfname.is_some() => {
+            opened = gfile.setup(pset, out, stderr);
+            match gfile {
+                GFile::Open(file) => {
+                    let (ok, r) = handle_copy_out(executor, Some(file), pset, stderr);
+                    (ok, r, false)
+                }
+                GFile::Stdout => {
+                    let same = out.query_fout_is_stdout();
+                    let (ok, r) = handle_copy_out(executor, Some(&mut *out.stdout), pset, stderr);
+                    (ok, r, same)
+                }
+                // The file did not open: the data is read and dropped, and
+                // that is a failure (`common.c:956`-`:958`).
+                GFile::Unopened => {
+                    let (_, r) = handle_copy_out(executor, None, pset, stderr);
+                    (false, r, false)
+                }
+            }
+        }
+        CopyStream::Default | CopyStream::QueryFout => {
+            let (ok, r) = handle_copy_out(executor, Some(out.query_fout()), pset, stderr);
+            (ok, r, true)
+        }
+    };
+    let copy_result = if to_query_fout { None } else { copy_result };
+    (ok && opened, copy_result)
+}
+
+/// `HandleCopyResult()` (`common.c:942`) for a COPY IN: read `\copy`'s
+/// stream, else the command source (`common.c:1999`-`:2003`), and hand back
+/// the COPY command's own result.
+fn copy_in(
     executor: &mut dyn Executor,
     result: &QueryResult,
     pset: &mut PsqlSettings,
     io: &mut CopyIo<'_, '_>,
-    stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> (bool, Option<QueryResult>) {
-    if result.status() == ExecStatus::CopyOut {
-        // `common.c:1947`-`:1970`: `\copy`'s stream, else `pset.queryFout`.
-        let (ok, copy_result) = match &mut io.stream {
-            CopyStream::Write(sink) => handle_copy_out(executor, Some(&mut **sink), pset, stderr),
-            CopyStream::Default => handle_copy_out(executor, Some(stdout), pset, stderr),
-            // A `\copy … from` whose query the server ran as a COPY TO: C
-            // writes to a stream opened for reading, which fails.
-            CopyStream::Read { .. } => handle_copy_out(executor, Some(&mut ReadOnly), pset, stderr),
-        };
-        // `common.c:961`: no status line where the data went.
-        let copy_result = if matches!(io.stream, CopyStream::Default) {
-            None
-        } else {
-            copy_result
-        };
-        return (ok, copy_result);
-    }
-
-    // COPY IN: `\copy`'s stream, else the command source (`common.c:1999`).
     let binary = result.binary_tuples();
     match &mut io.stream {
         CopyStream::Read { reader, is_tty } => handle_copy_in(
@@ -781,7 +899,7 @@ fn handle_copy_result(
             pset,
             stderr,
         ),
-        CopyStream::Default => handle_copy_in(
+        CopyStream::Default | CopyStream::Stdout => handle_copy_in(
             Some(executor),
             io.source.reader,
             true,
@@ -792,7 +910,7 @@ fn handle_copy_result(
         ),
         // A `\copy … to` whose query the server ran as a COPY FROM: C reads
         // a stream opened for writing, which fails.
-        CopyStream::Write(_) => handle_copy_in(
+        CopyStream::Write(_) | CopyStream::QueryFout => handle_copy_in(
             Some(executor),
             &mut std::io::BufReader::new(ReadOnly),
             false,
@@ -824,14 +942,17 @@ impl Write for ReadOnly {
 }
 
 /// `PrintQueryResult()` (`common.c:1043`), for a result `AcceptResult`
-/// passed: print the rows and the status line, or pivot the last result for
-/// `\crosstabview`.
+/// passed: print the rows — to `\g`'s stream or `pset.queryFout` — and the
+/// status line to `pset.queryFout` (`printStatusFout`, `common.c:1038`), or
+/// pivot the last result for `\crosstabview`, which prints to
+/// `pset.queryFout` (`crosstabview.c:422`).
 fn print_query_result(
     result: &QueryResult,
     last: bool,
     crosstab: Option<&CtvArgs>,
     pset: &PsqlSettings,
-    stdout: &mut dyn Write,
+    gfile: &mut GFile,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     if !(last || pset.show_all_results) {
@@ -839,30 +960,51 @@ fn print_query_result(
     }
     match result.status() {
         ExecStatus::TuplesOk => {
-            let printed = match crosstab {
-                Some(args) if last => {
-                    print_result_in_crosstab(result, args, &pset.popt).map_err(|err| err.message())
-                }
-                _ => print_query(result, &pset.popt).map_err(|err| err.to_string().into_bytes()),
-            };
-            let ok = match printed {
-                Ok(text) => {
-                    let _ = stdout.write_all(&text);
-                    true
-                }
-                Err(message) => {
-                    logging::error(pset, &message, stderr);
-                    false
-                }
+            let ok = match crosstab {
+                Some(args) if last => match print_result_in_crosstab(result, args, &pset.popt) {
+                    Ok(text) => {
+                        let _ = out.query_fout().write_all(&text);
+                        true
+                    }
+                    Err(err) => {
+                        logging::error(pset, err.message(), stderr);
+                        false
+                    }
+                },
+                _ => match print_query(result, &pset.popt) {
+                    // `PrintQueryTuples()` (`common.c:785`-`:791`): print,
+                    // flush, and report a stream that failed — a `\g` or
+                    // `\o` pipe whose command has exited, say.
+                    Ok(text) => {
+                        let fout = gfile.tuples(out);
+                        if let Err(err) = fout.write_all(&text).and_then(|()| fout.flush()) {
+                            logging::error(
+                                pset,
+                                format!(
+                                    "could not print result table: {}",
+                                    crate::copy::strerror(&err)
+                                ),
+                                stderr,
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(err) => {
+                        logging::error(pset, err.to_string(), stderr);
+                        false
+                    }
+                },
             };
             if let Some(status) = query_status_line(result, pset) {
-                let _ = stdout.write_all(&status);
+                let _ = out.query_fout().write_all(&status);
             }
             ok
         }
         ExecStatus::CommandOk => {
             if let Some(status) = query_status_line(result, pset) {
-                let _ = stdout.write_all(&status);
+                let _ = out.query_fout().write_all(&status);
             }
             true
         }
@@ -948,7 +1090,7 @@ fn exec_pipelined(
     crosstab: Option<&CtvArgs>,
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     let in_pipeline = |executor: &dyn Executor| executor.pipeline_status() != PipelineStatus::Off;
@@ -1119,7 +1261,17 @@ fn exec_pipelined(
 
         // A sync has nothing to print.
         if status != ExecStatus::PipelineSync && success {
-            success &= print_query_result(&current, last, crosstab, pset, stdout, stderr);
+            // `\g` is refused in a pipeline (`command.c:1764`), so there is
+            // never a `\g` file to open here.
+            success &= print_query_result(
+                &current,
+                last,
+                crosstab,
+                pset,
+                &mut GFile::Unopened,
+                out,
+                stderr,
+            );
         }
         result = next;
     }
@@ -1182,7 +1334,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut source,
             None,
-            stdout,
+            &mut Output::new(stdout),
             stderr,
         )
     }
@@ -1618,7 +1770,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut source,
             copy_from_stdin,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err,
         );
         (
@@ -1716,7 +1868,7 @@ mod tests {
             &mut PsqlSettings::default(),
             &mut VariableSpace::new(),
             &mut io,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err,
         ));
         assert_eq!(file, b"x\n");
@@ -1795,7 +1947,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert!(send_query(
@@ -1805,7 +1957,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert_eq!(
@@ -1839,7 +1991,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert!(send_query(
@@ -1849,7 +2001,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert_eq!(executor.0, [(Vec::new(), close)]);
@@ -1872,7 +2024,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert_eq!(
@@ -2010,7 +2162,7 @@ mod tests {
             vars,
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err,
         );
         (
@@ -2275,7 +2427,7 @@ mod tests {
             &mut VariableSpace::new(),
             &mut CommandSource::file(&mut &b""[..]),
             None,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err
         ));
         assert_eq!(
@@ -2287,5 +2439,236 @@ mod tests {
             String::from_utf8(out).unwrap(),
             " ?column? \n----------\n        1\n(1 row)\n\n"
         );
+    }
+
+    #[test]
+    fn copy_to_stdout_ignores_a_leftover_g_file() {
+        // `psql -c '\g gf' -c '\copy (select 1) to stdout'`: the first
+        // `-c` sends nothing and leaves `gfname` set, but `\copy`'s
+        // `copyStream` is `pset.queryFout` (`copy.c:318`) and is picked
+        // before `gfname` (`common.c:1955`-`:1966`). The data goes to
+        // queryFout, so its status line is suppressed (`common.c:961`).
+        let path = scratch("leftover");
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyOut)],
+            vec![tag("COPY 1")],
+        );
+        server.rows = VecDeque::from([b"1\n".to_vec()]);
+        let mut pset = PsqlSettings {
+            gfname: Some(path.as_os_str().as_encoded_bytes().to_vec()),
+            ..PsqlSettings::default()
+        };
+        let mut input: &[u8] = b"";
+        let mut source = CommandSource::file(&mut input);
+        let mut io = CopyIo {
+            source: &mut source,
+            stream: CopyStream::QueryFout,
+            copy_from_stdin: Some(0),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query_with(
+            &mut server,
+            b"COPY  ( select 1 ) TO STDOUT ",
+            &mut pset,
+            &mut VariableSpace::new(),
+            &mut io,
+            &mut Output::new(&mut out),
+            &mut err,
+        ));
+        assert_eq!(out, b"1\n");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `SendQuery` after `\g gfname`: success, stdout, stderr, and the
+    /// settings and variables it leaves.
+    fn send_g(
+        executor: &mut dyn Executor,
+        gfname: &[u8],
+    ) -> (bool, String, String, PsqlSettings, VariableSpace) {
+        let mut pset = PsqlSettings {
+            gfname: Some(gfname.to_vec()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut empty: &[u8] = b"";
+        let ok = send_query(
+            executor,
+            b"select 1",
+            &mut pset,
+            &mut vars,
+            &mut CommandSource::file(&mut empty),
+            None,
+            &mut Output::new(&mut out),
+            &mut err,
+        );
+        (
+            ok,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            pset,
+            vars,
+        )
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rpsql-g-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("g.out")
+    }
+
+    #[test]
+    fn g_sends_the_tuples_to_its_file_and_the_status_to_query_fout() {
+        // `common.c:2218`-`:2226`: tuples to `gfile_fout`, the status line
+        // to `printQueryFout`; `gfname` is forgotten afterwards
+        // (`common.c:1312`).
+        let path = scratch("tuples");
+        let mut results = one_row();
+        results.extend(command_ok("UPDATE 0"));
+        let mut executor = Replay(vec![results]);
+        let (ok, out, err, pset, _) = send_g(&mut executor, path.as_os_str().as_encoded_bytes());
+        assert!(ok, "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            " ?column? \n----------\n        1\n(1 row)\n\n"
+        );
+        assert_eq!(out, "UPDATE 0\n");
+        assert_eq!(pset.gfname, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn copy_out_under_g_writes_its_file_and_keeps_its_status() {
+        // `common.c:1965`: `COPY … TO STDOUT \g file`; the data went to the
+        // file, not `pset.queryFout`, so the status is printed there.
+        let path = scratch("copy");
+        let mut server = CopyReplay::new(
+            vec![QueryResult::new(ExecStatus::CopyOut)],
+            vec![tag("COPY 2")],
+        );
+        server.rows = VecDeque::from([b"foo\n".to_vec(), b"bar\n".to_vec()]);
+        let (ok, out, err, _, _) = send_g(&mut server, path.as_os_str().as_encoded_bytes());
+        assert!(ok, "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"foo\nbar\n");
+        assert_eq!(out, "COPY 2\n");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_g_pipe_is_closed_after_the_query_and_its_status_kept() {
+        // `CloseGOutput` (`common.c:118`): `SetShellResultVariables(pclose)`.
+        let mut executor = Replay(vec![one_row()]);
+        let (ok, out, err, _, vars) = send_g(&mut executor, b"|cat >/dev/null; exit 5");
+        assert!(ok, "{err}");
+        assert_eq!(out, "");
+        assert_eq!(vars.get("SHELL_ERROR"), Some("true"));
+        assert_eq!(vars.get("SHELL_EXIT_CODE"), Some("5"));
+    }
+
+    #[test]
+    fn a_g_file_that_cannot_be_opened_fails_the_query_and_prints_nothing() {
+        // `common.c:2221`: `success &= SetupGOutput(…)`, then
+        // `if (success) PrintQueryResult(…)`.
+        let mut executor = Replay(vec![one_row()]);
+        let (ok, out, err, pset, _) = send_g(&mut executor, b"/nonexistent/dir/g");
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "psql: error: /nonexistent/dir/g: No such file or directory\n"
+        );
+        assert_eq!(pset.gfname, None);
+    }
+
+    #[test]
+    fn a_command_tag_alone_never_opens_the_g_file() {
+        // `SetupGOutput` is called for `PGRES_TUPLES_OK` only
+        // (`common.c:2220`).
+        let path = scratch("tag");
+        let mut executor = Replay(vec![command_ok("CREATE TABLE")]);
+        let (ok, out, _, _, _) = send_g(&mut executor, path.as_os_str().as_encoded_bytes());
+        assert!(ok);
+        assert_eq!(out, "CREATE TABLE\n");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn g_with_an_empty_name_leaves_stdout_open() {
+        // Divergence (docs/divergences.md): `\g ''` gets stdout from
+        // `openQueryOutputFile` (`common.c:60`-`:64`), and C's
+        // `CloseGOutput` then `fclose`s it (`common.c:122`), so the next
+        // query fails with `could not print result table` (`common.c:789`).
+        // rpsql never closes stdout: both results print.
+        let mut executor = Replay(vec![one_row(), one_row()]);
+        let mut pset = PsqlSettings {
+            gfname: Some(Vec::new()),
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut output = Output::new(&mut out);
+        for _ in 0..2 {
+            let mut empty: &[u8] = b"";
+            assert!(send_query(
+                &mut executor,
+                b"select 1",
+                &mut pset,
+                &mut vars,
+                &mut CommandSource::file(&mut empty),
+                None,
+                &mut output,
+                &mut err,
+            ));
+        }
+        drop(output);
+        let table = " ?column? \n----------\n        1\n(1 row)\n\n";
+        assert_eq!(String::from_utf8(out).unwrap(), table.repeat(2));
+        assert_eq!(err, b"");
+    }
+
+    /// A one-column result of `n` rows, each `width` bytes wide.
+    fn many_rows(n: usize, width: usize) -> Vec<QueryResult> {
+        let mut runner = QueryRunner::new();
+        runner
+            .push(Backend::RowDescription(vec![FieldDescription {
+                name: b"x".to_vec(),
+                tableid: 0,
+                columnid: 0,
+                typid: 25,
+                typlen: -1,
+                atttypmod: -1,
+                format: 0,
+            }]))
+            .unwrap();
+        for _ in 0..n {
+            runner
+                .push(Backend::DataRow(vec![Some(vec![b'x'; width])]))
+                .unwrap();
+        }
+        runner
+            .push(Backend::CommandComplete(format!("SELECT {n}").into_bytes()))
+            .unwrap();
+        runner
+            .push(Backend::ReadyForQuery(TransactionStatus::Idle))
+            .unwrap();
+        runner.into_results()
+    }
+
+    #[test]
+    fn a_table_the_g_pipe_will_not_take_is_reported_and_fails() {
+        // `PrintQueryTuples()` (`common.c:785`-`:791`). The table is larger
+        // than any pipe buffer, so the write blocks until the command has
+        // exited unread, and then fails with EPIPE whatever the timing.
+        let mut executor = Replay(vec![many_rows(2000, 100)]);
+        let (ok, out, err, _, vars) = send_g(&mut executor, b"|exit 0");
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "psql: error: could not print result table: Broken pipe\n"
+        );
+        assert_eq!(vars.get("SHELL_ERROR"), Some("false"));
     }
 }

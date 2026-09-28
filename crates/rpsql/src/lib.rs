@@ -17,9 +17,10 @@
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
-//! `\errverbose`, and `copy.c` ([`copy`]): `\copy` and the COPY data transfer.
-//! It also adds `\copyright` and `\help` ([`help`]) over the `QL_HELP` table
-//! PostgreSQL's `create_help.pl` generates ([`sql_help`]).
+//! `\errverbose`, `copy.c` ([`copy`]): `\copy` and the COPY data transfer,
+//! `-o`, `\o` and `\g`'s files and pipes ([`output`]), and `\copyright` and
+//! `\help` ([`help`]) over the `QL_HELP` table PostgreSQL's `create_help.pl`
+//! generates ([`sql_help`]).
 //! NAT-404 adds `\crosstabview` ([`crosstab`],
 //! `crosstabview.c`), `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
@@ -53,6 +54,7 @@ pub mod help;
 pub mod large_obj;
 pub mod logging;
 pub mod mainloop;
+pub mod output;
 pub mod print;
 pub mod prompt;
 pub mod pset;
@@ -75,6 +77,7 @@ use rlibpq::{
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{CommandSource, ErrorMessage, Executor, send_query};
 use crate::mainloop::{Session as LoopSession, main_loop};
+use crate::output::Output;
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
@@ -408,6 +411,20 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         }
     }
 
+    // `-o` (`startup.c:594`): `setQFout` while the options are parsed, before
+    // anything else is judged, or `exit(EXIT_FAILURE)`.
+    let mut out = Output::new(stdout);
+    if let Some(output) = &session.output
+        && !out.set_query_fout(
+            Some(output.as_bytes()),
+            &session.pset,
+            &mut session.vars,
+            stderr,
+        )
+    {
+        return ExitCode::from(EXIT_FAILURE);
+    }
+
     // `startup.c:186`: judged on the process's own descriptors, not on the
     // streams this function writes to, which a test may have swapped.
     session.pset.notty = !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal();
@@ -431,15 +448,24 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         );
         return ExitCode::from(EXIT_FAILURE);
     }
-    if session.list_dbs || session.output.is_some() || session.logfilename.is_some() {
+    if session.list_dbs || session.logfilename.is_some() {
         let _ = writeln!(
             stderr,
-            "psql: error: -l, -o and -L are not implemented yet (Linear NAT-401, NAT-403)"
+            "psql: error: -l and -L are not implemented yet (Linear NAT-401, NAT-403)"
         );
         return ExitCode::from(EXIT_FAILURE);
     }
 
-    let mut executor = match connect(&session) {
+    let code = run_connected(&mut session, &mut out, stderr);
+    // `startup.c:477`: `setQFout(NULL)`, which waits for an `\o` pipe.
+    out.close();
+    code
+}
+
+/// The part of `main` that needs the connection: connect, run the actions,
+/// finish a `-1` transaction and disconnect (`startup.c:277`-`:475`).
+fn run_connected(session: &mut Session, out: &mut Output<'_>, stderr: &mut impl Write) -> ExitCode {
+    let mut executor = match connect(session) {
         Ok(executor) => executor,
         Err(err) => {
             let _ = stderr.write_all(&err.rendered());
@@ -461,7 +487,7 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
     let begun = !single_txn || psql_exec(&mut executor, b"BEGIN", &mut session.pset, stderr);
     if begun || !session.pset.on_error_stop {
         for action in &actions {
-            code = run_action(action, &mut session, &mut executor, stdout, stderr);
+            code = run_action(action, session, &mut executor, out, stderr);
             if code != EXIT_SUCCESS && session.pset.on_error_stop {
                 break;
             }
@@ -545,7 +571,7 @@ fn run_action(
     action: &Action,
     session: &mut Session,
     executor: &mut LiveExecutor,
-    stdout: &mut impl Write,
+    out: &mut Output<'_>,
     stderr: &mut impl Write,
 ) -> u8 {
     // `startup.c:162`: outside `-f`, the command source is stdin, which a
@@ -557,7 +583,7 @@ fn run_action(
         Action::SingleQuery(sql) => {
             session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
-                let _ = writeln!(stdout, "{sql}");
+                let _ = writeln!(out.stdout, "{sql}");
             }
             let mut lock = stdin.lock();
             let mut source = CommandSource {
@@ -572,7 +598,7 @@ fn run_action(
                 &mut session.vars,
                 &mut source,
                 None,
-                stdout,
+                out,
                 stderr,
             ) {
                 EXIT_SUCCESS
@@ -584,7 +610,7 @@ fn run_action(
         Action::SingleSlash(text) => {
             session.pset.log_terse = true;
             if session.pset.echo == settings::Echo::All {
-                let _ = writeln!(stdout, "{text}");
+                let _ = writeln!(out.stdout, "{text}");
             }
             let mut scanner = Scanner::new();
             scanner.setup(format!("\\{text}").as_bytes(), true);
@@ -604,7 +630,7 @@ fn run_action(
                     &mut session.vars,
                     executor,
                     &mut source,
-                    stdout,
+                    out,
                     stderr,
                 )
             } else {
@@ -617,7 +643,7 @@ fn run_action(
             }
         }
         // `ACT_FILE` (`startup.c:418`).
-        Action::File(name) => process_file(name.as_deref(), session, executor, stdout, stderr),
+        Action::File(name) => process_file(name.as_deref(), session, executor, out, stderr),
     }
 }
 
@@ -662,7 +688,7 @@ fn process_file(
     name: Option<&str>,
     session: &mut Session,
     executor: &mut LiveExecutor,
-    stdout: &mut impl Write,
+    out: &mut Output<'_>,
     stderr: &mut impl Write,
 ) -> u8 {
     let input = InputFile::from_arg(name);
@@ -690,7 +716,7 @@ fn process_file(
         // Read whole beforehand, so never a terminal to prompt on.
         let mut reader = std::io::Cursor::new(bytes);
         let mut source = CommandSource::file(&mut reader);
-        run_main_loop(&mut source, session, executor, stdout, stderr)
+        run_main_loop(&mut source, session, executor, out, stderr)
     } else {
         // Stdin, which `\copy … from pstdin` then reads too (`copy.c:301`).
         let stdin = std::io::stdin();
@@ -701,7 +727,7 @@ fn process_file(
             is_stdin: true,
             is_tty,
         };
-        run_main_loop(&mut source, session, executor, stdout, stderr)
+        run_main_loop(&mut source, session, executor, out, stderr)
     };
     session.pset.inputfile = old;
     // `command.c:4979`.
@@ -715,7 +741,7 @@ fn run_main_loop(
     source: &mut CommandSource<'_>,
     session: &mut Session,
     executor: &mut LiveExecutor,
-    stdout: &mut impl Write,
+    out: &mut Output<'_>,
     stderr: &mut impl Write,
 ) -> u8 {
     let mut loop_session = LoopSession {
@@ -723,7 +749,7 @@ fn run_main_loop(
         vars: &mut session.vars,
         cancel_pressed: &cancel::CANCEL_PRESSED,
     };
-    main_loop(source, &mut loop_session, executor, stdout, stderr)
+    main_loop(source, &mut loop_session, executor, out, stderr)
 }
 
 #[cfg(test)]

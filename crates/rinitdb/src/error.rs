@@ -99,8 +99,6 @@ pub enum Unsupported {
     EncodingOrLocale,
     /// Any WAL segment size but 16 MB.
     WalSegmentSize,
-    /// A superuser other than the template's `postgres` (NAT-383).
-    Superuser,
     /// `-W` / `--pwfile` (NAT-383).
     Password,
 }
@@ -114,10 +112,6 @@ impl Unsupported {
                 "the embedded template cluster has encoding \"UTF8\" and locale \"C\""
             }
             Unsupported::WalSegmentSize => "the embedded template cluster has 16 MB WAL segments",
-            Unsupported::Superuser => {
-                "the embedded template cluster's superuser is \"postgres\" and renaming it is \
-                 not implemented"
-            }
             Unsupported::Password => "setting the superuser's password is not implemented",
         }
     }
@@ -130,7 +124,6 @@ impl Unsupported {
                 "Clusters with another encoding, locale or WAL segment size need bootstrap \
                  mode, which this initdb does not have yet."
             }
-            Unsupported::Superuser => "Run initdb with -U postgres.",
             Unsupported::Password => {
                 "Create the cluster without a password and set one with ALTER ROLE."
             }
@@ -332,6 +325,48 @@ pub enum InitdbError {
         path: String,
         unrecognized: Vec<crate::guc::Unrecognized>,
     },
+
+    /// `initdb.c:2661` (`setup_bin_paths`): no `postgres` beside this
+    /// program. `full_path` is `find_my_exec`'s, or `progname`.
+    #[error(
+        "program \"postgres\" is needed by {} but was not found in the same directory as \
+         \"{full_path}\"",
+        crate::help::PROGNAME
+    )]
+    ServerNotFound { full_path: String },
+
+    /// `initdb.c:2664` (`setup_bin_paths`): the `postgres` beside this
+    /// program printed another version.
+    #[error(
+        "program \"postgres\" was found by \"{full_path}\" but was not the same version as {}",
+        crate::help::PROGNAME
+    )]
+    ServerWrongVersion { full_path: String },
+
+    /// Not an upstream site: `PGDROP_POSTGRES` names something that is not
+    /// an executable `postgres` of this version
+    /// (`crate::single_user::resolve_server`).
+    #[error(
+        "PGDROP_POSTGRES names \"{path}\", which is not a postgres executable of the same \
+         version as {}",
+        crate::help::PROGNAME
+    )]
+    ServerOverrideUnusable { path: String },
+
+    /// `initdb.c:753` (`popen_check`).
+    #[error("could not execute command \"{command}\": {reason}")]
+    CouldNotExecuteCommand { command: String, reason: String },
+
+    /// `src/common/exec.c:404` and `:410` (`pclose_check`): the single-user
+    /// backend failed. `reason` is `wait_result_to_str`'s.
+    #[error("{reason}")]
+    ChildProcessFailed { reason: String },
+
+    /// `initdb.c:2119` (`check_ok`), which C prints on stdout without a
+    /// prefix, where its progress line is; this port prints it on stderr
+    /// like the others.
+    #[error("could not write to child process: {reason}")]
+    CouldNotWriteToChildProcess { reason: String },
 }
 
 impl InitdbError {

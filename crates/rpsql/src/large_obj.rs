@@ -20,6 +20,7 @@ use rlibpq::{ExecStatus, LoError, QueryResult, TransactionStatus};
 use crate::command::{CommandContext, CommandResult};
 use crate::common::Executor;
 use crate::logging;
+use crate::output::Output;
 use crate::print::print_query;
 use crate::settings::{EchoHidden, Expanded, PrintFormat, PsqlSettings, SendMode};
 use crate::slash::SlashOption;
@@ -253,7 +254,7 @@ pub fn exec_command_lo(
     cmd: &str,
     options: &[SlashOption],
     ctx: &mut CommandContext<'_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> CommandResult {
     let home = std::env::var_os("HOME");
@@ -274,7 +275,7 @@ pub fn exec_command_lo(
         pset: ctx.pset,
         vars: ctx.vars,
         executor: &mut *ctx.executor,
-        stdout,
+        out,
         stderr,
     };
     let success = match command {
@@ -301,15 +302,17 @@ pub fn exec_command_lo(
 }
 
 /// What `large_obj.c` reads through the `pset` global.
-struct LoContext<'a> {
+struct LoContext<'a, 'o> {
     pset: &'a mut PsqlSettings,
     vars: &'a mut crate::variables::VariableSpace,
     executor: &'a mut dyn Executor,
-    stdout: &'a mut dyn Write,
+    /// psql's stdout, and `pset.queryFout`, where `large_obj.c` prints
+    /// (`large_obj.c:29`, `describe.c:7284`).
+    out: &'a mut Output<'o>,
     stderr: &'a mut dyn Write,
 }
 
-impl LoContext<'_> {
+impl LoContext<'_, '_> {
     /// `do_lo_export()` (`large_obj.c:142`).
     fn do_lo_export(&mut self, loid: u32, filename: &[u8]) -> bool {
         const OP: &str = "\\lo_export";
@@ -395,7 +398,7 @@ impl LoContext<'_> {
         opt.title = Some("Large objects".to_owned());
         match print_query(&result, &opt) {
             Ok(text) => {
-                let _ = self.stdout.write_all(&text);
+                let _ = self.out.query_fout().write_all(&text);
                 true
             }
             Err(err) => {
@@ -486,7 +489,7 @@ impl LoContext<'_> {
     /// `print_lo_result()` (`large_obj.c:19`). No `-L` log file exists yet.
     fn print_lo_result(&mut self, text: &str) {
         if let Some(text) = lo_result_text(self.pset, text) {
-            let _ = self.stdout.write_all(text.as_bytes());
+            let _ = self.out.query_fout().write_all(text.as_bytes());
         }
     }
 
@@ -502,9 +505,12 @@ impl LoContext<'_> {
             return None;
         }
         if self.pset.echo_hidden != EchoHidden::Off {
-            let _ = self.stdout.write_all(b"/******** QUERY *********/\n");
-            let _ = self.stdout.write_all(query);
-            let _ = self.stdout.write_all(b"\n/************************/\n\n");
+            let _ = self.out.stdout.write_all(b"/******** QUERY *********/\n");
+            let _ = self.out.stdout.write_all(query);
+            let _ = self
+                .out
+                .stdout
+                .write_all(b"\n/************************/\n\n");
             if self.pset.echo_hidden == EchoHidden::NoExec {
                 return None;
             }
@@ -784,7 +790,13 @@ mod tests {
                 pipeline: rlibpq::PipelineStatus::Off,
                 executor: &mut fake,
             };
-            exec_command_lo(cmd, &opts(args), &mut ctx, &mut stdout, &mut stderr)
+            exec_command_lo(
+                cmd,
+                &opts(args),
+                &mut ctx,
+                &mut Output::new(&mut stdout),
+                &mut stderr,
+            )
         };
         Ran {
             result,

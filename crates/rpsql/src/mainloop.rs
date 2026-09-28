@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{CommandSource, Executor, send_query};
+use crate::output::Output;
 use crate::scan::{PromptStatus, ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
 use crate::variables::{VarView, VariableSpace};
@@ -55,7 +56,7 @@ pub fn main_loop(
     source: &mut CommandSource<'_>,
     session: &mut Session<'_>,
     executor: &mut dyn Executor,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> u8 {
     let mut scanner = Scanner::new();
@@ -105,7 +106,7 @@ pub fn main_loop(
             && !session.pset.cur_cmd_interactive
             && line.starts_with(b"PGDMP")
         {
-            let _ = stdout.write_all(
+            let _ = out.stdout.write_all(
                 b"The input is a PostgreSQL custom-format dump.\n\
                   Use the pg_restore command-line client to restore this dump to a database.\n\n",
             );
@@ -120,8 +121,8 @@ pub fn main_loop(
 
         // ECHO=all echoes the input line, unless interactive (`mainloop.c:360`).
         if session.pset.echo == crate::settings::Echo::All && !session.pset.cur_cmd_interactive {
-            let _ = stdout.write_all(&line);
-            let _ = stdout.write_all(b"\n");
+            let _ = out.stdout.write_all(&line);
+            let _ = out.stdout.write_all(b"\n");
         }
 
         // Insert newlines into the query buffer between source lines.
@@ -157,7 +158,7 @@ pub fn main_loop(
                     session.vars,
                     source,
                     Some(copies),
-                    stdout,
+                    out,
                     stderr,
                 );
                 slash_status = if success {
@@ -185,7 +186,7 @@ pub fn main_loop(
                     session.vars,
                     executor,
                     source,
-                    stdout,
+                    out,
                     stderr,
                 );
                 success = slash_status != CommandResult::Error;
@@ -207,7 +208,7 @@ pub fn main_loop(
                             session.vars,
                             source,
                             None,
-                            stdout,
+                            out,
                             stderr,
                         );
                         std::mem::swap(&mut previous_buf, &mut query_buf);
@@ -252,7 +253,7 @@ pub fn main_loop(
             session.vars,
             source,
             Some(copies),
-            stdout,
+            out,
             stderr,
         );
         if !ok && die_on_error {
@@ -365,7 +366,7 @@ mod tests {
             &mut CommandSource::file(&mut input.as_bytes()),
             &mut session,
             &mut executor,
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         Outcome {
@@ -444,7 +445,7 @@ mod tests {
             &mut CommandSource::file(&mut &b"select 1;\nselect 2;\nselect 3;\n"[..]),
             &mut session,
             &mut executor,
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         assert_eq!(code, EXIT_USER);
@@ -472,7 +473,7 @@ mod tests {
             &mut CommandSource::file(&mut &b"select 1;\nselect 2;\n"[..]),
             &mut session,
             &mut executor,
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         assert_eq!(code, EXIT_SUCCESS);
@@ -540,7 +541,7 @@ mod tests {
             &mut CommandSource::file(&mut &b"select 1;\nselect 2"[..]),
             &mut session,
             &mut executor,
-            &mut Vec::new(),
+            &mut Output::new(&mut Vec::new()),
             &mut Vec::new(),
         );
         assert_eq!(code, EXIT_USER);
@@ -574,7 +575,7 @@ mod tests {
             &mut CommandSource::file(&mut &b"select 1;\n"[..]),
             &mut session,
             &mut executor,
-            &mut Vec::new(),
+            &mut Output::new(&mut Vec::new()),
             &mut Vec::new(),
         );
         assert_eq!(code, EXIT_SUCCESS);
@@ -658,7 +659,7 @@ mod tests {
             &mut CommandSource::file(&mut reader),
             &mut session,
             &mut executor,
-            &mut Vec::new(),
+            &mut Output::new(&mut Vec::new()),
             &mut stderr,
         );
         assert_eq!(code, crate::settings::EXIT_FAILURE);
@@ -673,5 +674,13 @@ mod tests {
     fn blank_lines_are_skipped_but_not_inside_a_literal() {
         let out = run("select 'a\n\nb';\n", PsqlSettings::default());
         assert_eq!(out.seen, ["select 'a\n\nb';"]);
+    }
+
+    #[test]
+    fn g_on_an_empty_buffer_sends_the_previous_query_again() {
+        // `copy_previous_query()` (`command.c:489`, `:3850`).
+        let out = run("select 1;\n\\g\nselect 2 \\g\n", PsqlSettings::default());
+        assert_eq!(out.seen, ["select 1;", "select 1;", "select 2 "]);
+        assert_eq!(out.stderr, "");
     }
 }

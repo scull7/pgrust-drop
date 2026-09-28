@@ -1174,7 +1174,13 @@ fn the_superuser_is_analyzed_and_frozen_in_every_database_as_in_reference_initdb
         )
         .expect("run rinitdb");
         assert_eq!(outcome.status, Some(0), "{tag}: {}", outcome.stderr_text());
-        assert_eq!(outcome.stderr_text(), "", "{tag}");
+        // Without -A, C's trust warning (initdb.c:3521) is all of stderr.
+        let expected_stderr = if extra.is_empty() {
+            format!("{}\n", rinitdb::report::trust_warning())
+        } else {
+            String::new()
+        };
+        assert_eq!(outcome.stderr_text(), expected_stderr, "{tag}");
 
         let theirs = tempdir.join(&format!("theirs-{tag}"));
         let mut argv = common;

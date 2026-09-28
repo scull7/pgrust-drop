@@ -8,7 +8,10 @@
 //! a data directory with no `postmaster.pid`, or no data directory at all,
 //! is a cluster that is already stopped and exits 0, where `do_stop` says
 //! "PID file … does not exist" (`:1035`) and `get_pgpid` "directory … does
-//! not exist" (`:255`), both exit 1. See `docs/divergences.md`.
+//! not exist" (`:255`), both exit 1. So is a `postmaster.pid` a crashed
+//! server left behind, naming a process that no longer exists, where
+//! `do_stop`'s `kill` fails "could not send stop signal" (`:1050`), exit 1.
+//! See `docs/divergences.md`.
 //!
 //! Data / Calculations / Actions: [`Stop`] is the command line, [`plan`]
 //! decides from what is on disk, and [`run`] reads the disk, signals, waits
@@ -47,7 +50,7 @@ pub const POLL: Duration = Duration::from_millis(1);
 
 /// How often, in polls, `stop` asks whether the server is still alive
 /// (`kill -0`), as `wait_for_postmaster_stop` does every time it looks
-/// (`pg_ctl.c:727`). Once per pg_ctl interval: each ask spawns a process.
+/// (`pg_ctl.c:728`). Once per pg_ctl interval: each ask spawns a process.
 pub const LIVENESS_EVERY: u32 = 100;
 
 /// What `postmaster.pid`'s first line names (`pidfile.h:37`). A standalone
@@ -186,7 +189,7 @@ impl fmt::Display for StopError {
         match self {
             StopError::NoDatadir => write!(
                 f,
-                "no data directory specified and environment variable PGDATA unset"
+                "no database directory specified and environment variable PGDATA unset"
             ),
             StopError::EmptyPidfile => write!(f, "the PID file \"{PIDFILE}\" is empty"),
             StopError::BadPidfile => write!(f, "invalid data in PID file \"{PIDFILE}\""),
@@ -235,10 +238,24 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
     let record = read_if_exists(&datadir.join(crate::start::RECORD_FILE))?;
     let plan = plan(&datadir, pidfile.as_deref(), record.as_deref())?;
     if let Some(pid) = plan.signal {
-        signal(pid, "-INT").map_err(|detail| StopError::Signal { pid, detail })?;
-        wait_for_postmaster_stop(&pidfile_path, pid)?;
+        match signal(pid, "-INT") {
+            Ok(()) => wait_for_postmaster_stop(&pidfile_path, pid)?,
+            // A crashed server's `postmaster.pid`: already stopped.
+            Err(detail) if no_such_process(&detail) => {}
+            Err(detail) => return Err(StopError::Signal { pid, detail }),
+        }
     }
     remove_all(&plan)
+}
+
+/// Pure: whether the `kill` utility's complaint is `ESRCH`, the process is
+/// gone. Every `kill` this runs on (util-linux, procps, busybox, BSD) prints
+/// `strerror(ESRCH)`, which is this in the C locale [`signal`] sets on the
+/// three C libraries of ADR-0007. Anything else, `EPERM` above all (a
+/// process that is there), is not.
+#[must_use]
+pub fn no_such_process(detail: &str) -> bool {
+    detail.contains("No such process")
 }
 
 /// Action: the plan's removals, in order.
@@ -282,6 +299,7 @@ fn remove(result: io::Result<()>, path: &Path) -> Result<(), StopError> {
 /// `Err` carries the utility's complaint.
 pub(crate) fn signal(pid: u32, sig: &str) -> Result<(), String> {
     let output = Command::new("kill")
+        .env("LC_ALL", "C")
         .arg(sig)
         .arg(pid.to_string())
         .stdin(Stdio::null())
@@ -431,6 +449,25 @@ mod tests {
             plan(Path::new("/d"), None, Some("remove everything\n")),
             Err(StopError::BadRecord)
         ));
+    }
+
+    #[test]
+    fn only_a_process_that_is_gone_is_already_stopped() {
+        for gone in [
+            "kill: (4242): No such process",
+            "kill: sending signal to 4242 failed: No such process",
+            "kill: can't kill pid 4242: No such process",
+            "kill: 4242: No such process",
+        ] {
+            assert!(no_such_process(gone), "{gone}");
+        }
+        for there in [
+            "kill: (1): Operation not permitted",
+            "could not run kill: No such file or directory (os error 2)",
+            "",
+        ] {
+            assert!(!no_such_process(there), "{there}");
+        }
     }
 
     #[test]

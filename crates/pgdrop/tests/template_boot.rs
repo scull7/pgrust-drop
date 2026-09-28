@@ -441,7 +441,8 @@ impl Server {
             quote(password)
         );
         let mut info = rlibpq::parse_conninfo(conninfo.as_bytes()).expect("conninfo parses");
-        info.add_defaults(&rlibpq::Env::empty());
+        info.add_defaults(&rlibpq::Env::empty(), &rlibpq::Filesystem)
+            .expect("no service to look up");
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
             match rlibpq::Connection::connect(&info) {

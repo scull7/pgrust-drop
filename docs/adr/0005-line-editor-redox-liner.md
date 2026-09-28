@@ -32,7 +32,7 @@ unaffected by the editor.
 ## Amendment, 2026-09-27: termion as rpsql's key source (Nathan, NAT-405)
 
 `redox_liner` 0.5.3's `Context::read_line` builds a fresh `stdin().keys()`
-for every line (`src/context.rs:129`), and termion 4's key iterator reads two
+for every line (`src/context.rs:129`), and termion 4's key iterator reads two <!-- citation-lint: allow: redox_liner 0.5.3's source, not upstream -->
 bytes at a time and parks the second in the iterator. When a line's Enter is
 the first of the two, the next line's first byte is dropped with the
 iterator: a pasted `\echo ab\n\warn cd\n` ran `warn cd` as query text.

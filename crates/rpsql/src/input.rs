@@ -48,7 +48,7 @@ pub trait LineEditor {
     /// `gets_interactive(prompt, query_buf)` (`input.c:66`).
     fn read_line(&mut self, prompt: &str) -> Fetched;
 
-    /// readline's `add_history(s)` (`input.c:171`): one finished entry.
+    /// readline's `add_history(s)` (`input.c:163`): one finished entry.
     fn add_history(&mut self, entry: &[u8]);
 }
 
@@ -138,7 +138,7 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// `read_history(psql_history)` then `decode_history()` (`input.c:398`-`:400`):
+/// `read_history(psql_history)` then `decode_history()` (`input.c:393`-`:394`):
 /// one entry per line, `NL_IN_HISTORY` turned back into `\n`.
 #[must_use]
 pub fn decode_history(file: &[u8]) -> Vec<Vec<u8>> {
@@ -271,8 +271,11 @@ impl LinerEditor {
         }
     }
 
-    /// `finishInput` (`input.c:535`) → `saveHistory(psql_history, histsize)`
+    /// `finishInput` (`input.c:540`) → `saveHistory(psql_history, histsize)`
     /// (`input.c:412`). Writing `/dev/null` is skipped, as upstream skips it.
+    /// A new file is created `0600`, as `saveHistory` creates it
+    /// (`input.c:452`), since entries can carry passwords; an existing
+    /// file keeps its mode.
     ///
     /// # Errors
     /// The message `pg_log_error` prints when the file cannot be written.
@@ -284,12 +287,37 @@ impl LinerEditor {
             return Ok(());
         }
         let existing = std::fs::read(&file).unwrap_or_default();
-        std::fs::write(&file, saved_history(&existing, &self.added, histsize)).map_err(|err| {
+        write_history_file(&file, &saved_history(&existing, &self.added, histsize)).map_err(|err| {
             format!(
-                "could not save history to file \"{}\": {err}",
-                file.display()
+                "could not save history to file \"{}\": {}",
+                file.display(),
+                strerror(&err)
             )
         })
+    }
+}
+
+/// Replace the history file's contents, creating it `0600` if it is missing
+/// (`input.c:452`'s `open(fname, O_CREAT | O_WRONLY | PG_BINARY, 0600)`).
+fn write_history_file(file: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)?
+        .write_all(contents)
+}
+
+/// `%m`: `strerror(errno)`, without the ` (os error N)` Rust adds.
+fn strerror(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .map_or_else(|| text.clone(), str::to_owned),
+        None => text,
     }
 }
 
@@ -424,6 +452,53 @@ mod tests {
         assert_eq!(saved_history(file, &added, 1), b"e\n");
         assert_eq!(saved_history(file, &added, 0), b"");
         assert_eq!(saved_history(file, &added, -1), b"a\nb\nc\nd\ne\n");
+    }
+
+    #[test]
+    fn a_new_history_file_is_0600_and_an_old_one_keeps_its_mode() {
+        // `input.c:452`: `open(fname, O_CREAT | O_WRONLY | PG_BINARY, 0600)`.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("rpsql-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+
+        let new = dir.join("new");
+        let _ = std::fs::remove_file(&new);
+        write_history_file(&new, b"a\n").unwrap();
+        assert_eq!(mode(&new), 0o600);
+
+        let old = dir.join("old");
+        std::fs::write(&old, b"x\ny\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_history_file(&old, b"a\n").unwrap();
+        assert_eq!(mode(&old), 0o640);
+        assert_eq!(std::fs::read(&old).unwrap(), b"a\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_error_is_rendered_as_percent_m() {
+        let err = std::io::Error::from_raw_os_error(13);
+        assert!(err.to_string().ends_with(" (os error 13)"));
+        assert!(!strerror(&err).contains("os error"));
+        assert_eq!(strerror(&std::io::Error::other("x")), "x");
+    }
+
+    #[test]
+    fn an_invalid_utf8_byte_is_dropped_with_up_to_three_bytes_after_it() {
+        // A divergence (docs/divergences.md): readline inserts the byte.
+        // termion's key iterator gathers up to four bytes looking for a
+        // character, then reports them as one unsupported event, which its
+        // `Keys` skips; the Enter among them is lost too.
+        let keys: Vec<_> = (&b"\xffab\ncd"[..]).keys().map(Result::unwrap).collect();
+        assert_eq!(
+            keys,
+            [
+                termion::event::Key::Char('c'),
+                termion::event::Key::Char('d')
+            ]
+        );
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub mod message;
 pub mod negotiate;
 pub mod pg_config;
 pub mod pipeline;
+pub mod print;
 pub mod regress;
 pub mod result;
 pub mod scram;
@@ -104,6 +105,7 @@ pub use pipeline::{
     AsyncStatus, CopyStep, Flow, PipelineError, PipelineState, PipelineStatus, QueryClass,
     QueryRunner, RowMode,
 };
+pub use print::{PrintOpt, display_tuples, print, print_tuples};
 pub use regress::regress_report;
 pub use result::{
     ContextVisibility, ExecStatus, FieldDescription, QueryResult, ResultError, Verbosity,

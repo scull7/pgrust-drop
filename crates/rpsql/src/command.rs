@@ -761,6 +761,66 @@ fn exec_command_errverbose(pset: &PsqlSettings, stdout: &mut dyn Write, stderr: 
     }
 }
 
+/// `connection_warnings(in_startup)` (`command.c:4445`): the banner, and a
+/// warning when the server is newer than psql or older than 9.2.
+/// `server_version` is `PQparameterStatus(pset.db, "server_version")`. There
+/// is no SSL or GSS to report in this build, and no Windows code page.
+#[must_use]
+pub fn connection_warnings(
+    pset: &PsqlSettings,
+    server_version: Option<&str>,
+    in_startup: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if pset.quiet || pset.notty {
+        return out;
+    }
+    let client_ver = crate::PG_VERSION_NUM;
+    if pset.sversion != client_ver {
+        let server_version = server_version.map_or_else(
+            || format_pg_version_number(pset.sversion, true),
+            str::to_string,
+        );
+        let _ = writeln!(
+            out,
+            "{} ({}, server {server_version})",
+            pset.progname,
+            crate::PG_VERSION
+        );
+    } else if in_startup {
+        // For version match, only print psql banner on startup.
+        let _ = writeln!(out, "{} ({})", pset.progname, crate::PG_VERSION);
+    }
+    if pset.sversion / 100 > client_ver / 100 || pset.sversion < 90200 {
+        let _ = writeln!(
+            out,
+            "WARNING: {} major version {}, server major version {}.\n         Some psql features might not work.",
+            pset.progname,
+            format_pg_version_number(client_ver, false),
+            format_pg_version_number(pset.sversion, false)
+        );
+    }
+    out
+}
+
+/// `formatPGVersionNumber` (`fe_utils/string_utils.c:313`).
+#[must_use]
+pub fn format_pg_version_number(version: i32, include_minor: bool) -> String {
+    match (version >= 100_000, include_minor) {
+        (true, true) => format!("{}.{}", version / 10000, version % 10000),
+        (true, false) => format!("{}", version / 10000),
+        (false, true) => format!(
+            "{}.{}.{}",
+            version / 10000,
+            (version / 100) % 100,
+            version % 100
+        ),
+        (false, false) => format!("{}.{}", version / 10000, (version / 100) % 100),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1695,5 +1755,47 @@ mod tests {
             err,
             "psql: error: /nonexistent/dir/f: No such file or directory\n"
         );
+    }
+
+    #[test]
+    fn the_banner_names_the_server_only_when_it_differs() {
+        // `command.c:4447`-`:4486`.
+        let pset = PsqlSettings {
+            sversion: 180_006,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(
+            connection_warnings(&pset, Some("18.6"), true),
+            "psql (18.6)\n"
+        );
+        assert_eq!(connection_warnings(&pset, Some("18.6"), false), "");
+        let older = PsqlSettings {
+            sversion: 170_002,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(
+            connection_warnings(&older, Some("17.2 (Debian)"), true),
+            "psql (18.6, server 17.2 (Debian))\n"
+        );
+        let newer = PsqlSettings {
+            sversion: 190_000,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(
+            connection_warnings(&newer, None, false),
+            "psql (18.6, server 19.0)\n\
+             WARNING: psql major version 18, server major version 19.\n         \
+             Some psql features might not work.\n"
+        );
+        let ancient = PsqlSettings {
+            sversion: 90_105,
+            ..PsqlSettings::default()
+        };
+        assert!(connection_warnings(&ancient, None, true).contains("server major version 9.1."));
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..older
+        };
+        assert_eq!(connection_warnings(&quiet, None, true), "");
     }
 }

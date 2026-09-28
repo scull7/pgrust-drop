@@ -29,6 +29,12 @@ rustix = { version = "1", default-features = false, features = ["event", "std"] 
 # for `PQfreemem`; owner, 2026-09-27) and pgdrop's stack rlimit and signal
 # mask (NAT-407; inside the pgrust tree approved for pgdrop, 2026-09-23).
 libc = "0.2"
+# rpsql's line editor (ADR-0005; owner, 2026-09-16). Aliased to `liner`, its
+# library name.
+liner = { package = "redox_liner", version = "0.5" }
+# rpsql's raw mode and its one session-lived key iterator, nothing else
+# (ADR-0005 amendment; owner, 2026-09-27). redox_liner already depends on it.
+termion = "4"
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

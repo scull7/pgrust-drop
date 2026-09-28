@@ -26,14 +26,16 @@
 //! `\sendpipeline`, `\syncpipeline`, `\flush`, `\flushrequest`,
 //! `\getresults` and `\endpipeline` on rlibpq's pipeline mode
 //! ([`settings::PipelineCounters`]). NAT-405 adds Ctrl-C ([`cancel`],
-//! `fe_utils/cancel.c`): a SIGINT cancels the running query. NAT-396 adds
-//! `\lo_import`, `\lo_export`, `\lo_list` and `\lo_unlink` ([`large_obj`],
-//! `large_obj.c`) over rlibpq's `fe-lobj.c`. `\d` is NAT-401's and
-//! interactive input is NAT-405's.
+//! `fe_utils/cancel.c`): a SIGINT cancels the running query — and
+//! interactive input ([`input`], `input.c`) through a line editor
+//! (ADR-0005). NAT-396 adds `\lo_import`, `\lo_export`, `\lo_list` and
+//! `\lo_unlink` ([`large_obj`], `large_obj.c`) over rlibpq's `fe-lobj.c`.
+//! `\d` is NAT-401's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`], the
-//! SIGINT handler in [`cancel`] and the stream writing in [`run`].
+//! SIGINT handler in [`cancel`], the terminal and history file behind
+//! [`input::LinerEditor`] and the stream writing in [`run`].
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -49,6 +51,7 @@ pub mod common;
 pub mod copy;
 pub mod crosstab;
 pub mod help;
+pub mod input;
 pub mod large_obj;
 pub mod logging;
 pub mod mainloop;
@@ -68,13 +71,15 @@ use std::process::ExitCode;
 
 use rlibpq::{
     ConnInfo, Connection, ConnectionError, CopyRead, Env, ExecStatus, Filesystem, LoError, Params,
-    PipelineStatus, QueryResult, ResultError, Stream,
+    PipelineStatus, QueryResult, ResultError, Stream, TransactionStatus,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{CommandSource, ErrorMessage, Executor, send_query};
+use crate::input::{LineEditor, LinerEditor, PlainEditor, history_file};
 use crate::mainloop::{Session as LoopSession, main_loop};
 use crate::output::Output;
+use crate::prompt::{PromptFacts, TransactionMark};
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
@@ -82,6 +87,9 @@ use crate::variables::VarView;
 
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
 pub const PG_VERSION: &str = "18.6";
+
+/// `PG_VERSION_NUM` in `pg_config.h`.
+pub const PG_VERSION_NUM: i32 = 180_006;
 
 /// `showVersion()` (`startup.c:844`).
 #[must_use]
@@ -113,6 +121,9 @@ struct LiveExecutor {
     alive: bool,
     /// How many of the connection's notices have been handed out.
     notices_seen: usize,
+    /// `PQdb`, `PQuser`, `PQhost` and `PQport`: what the connection was
+    /// opened with, which `rlibpq` does not keep.
+    opened_as: PromptFacts,
 }
 
 impl LiveExecutor {
@@ -280,6 +291,31 @@ impl Executor for LiveExecutor {
     fn large_objects(&mut self) -> Option<&mut dyn large_obj::LargeObjects> {
         Some(self)
     }
+
+    fn prompt_facts(&self) -> PromptFacts {
+        if !self.alive {
+            return PromptFacts::default();
+        }
+        let status = |name: &[u8]| {
+            self.connection
+                .parameter_status(name)
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+        };
+        PromptFacts {
+            // `session_username()` (`common.c:2641`).
+            username: status(b"session_authorization").or_else(|| self.opened_as.username.clone()),
+            backend_pid: Some(self.connection.backend_pid()),
+            // `is_superuser()` (`common.c:2601`).
+            superuser: status(b"is_superuser").as_deref() == Some("on"),
+            transaction: match self.connection.transaction_status() {
+                TransactionStatus::Idle => TransactionMark::Idle,
+                TransactionStatus::InTransaction => TransactionMark::InTransaction,
+                TransactionStatus::InError => TransactionMark::Failed,
+                TransactionStatus::Unknown => TransactionMark::Unknown,
+            },
+            ..self.opened_as.clone()
+        }
+    }
 }
 
 impl LiveExecutor {
@@ -327,6 +363,26 @@ impl large_obj::LargeObjects for LiveExecutor {
     }
 }
 
+/// Calculation: `PQdb`, `PQuser`, `PQhost` and `PQport` of a connection
+/// opened with `conninfo`, defaults already applied. An empty `dbname` is
+/// the user name, as `pqConnectOptions2` makes it (`fe-connect.c:1414`-`:1417`).
+fn opened_as(conninfo: &rlibpq::ConnInfo) -> PromptFacts {
+    let get = |key: &str| {
+        conninfo
+            .get(key)
+            .filter(|v| !v.is_empty())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    };
+    let username = get("user");
+    PromptFacts {
+        dbname: get("dbname").or_else(|| username.clone()),
+        username,
+        host: get("host"),
+        port: get("port"),
+        ..PromptFacts::default()
+    }
+}
+
 /// The connection keyword/value array `main()` builds (`startup.c:254`).
 #[must_use]
 pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
@@ -371,6 +427,7 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
             notices_seen: connection.notices().len(),
             connection,
             alive: true,
+            opened_as: opened_as(&conninfo),
         }),
         Err(err) => Err(err.into()),
     }
@@ -434,13 +491,6 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
         );
         return ExitCode::from(EXIT_FAILURE);
     }
-    if session.actions.is_empty() {
-        let _ = writeln!(
-            stderr,
-            "psql: error: interactive mode is not implemented yet (Linear NAT-405)"
-        );
-        return ExitCode::from(EXIT_FAILURE);
-    }
     if session.list_dbs || session.logfilename.is_some() {
         let _ = writeln!(
             stderr,
@@ -465,8 +515,17 @@ fn run_connected(session: &mut Session, out: &mut Output<'_>, stderr: &mut impl 
             return ExitCode::from(EXIT_BADCONN);
         }
     };
+    // `SyncVariables` (`command.c:4582`).
+    session.pset.sversion = executor.connection.server_version();
     // `startup.c:314`, once the connection is up.
     cancel::setup_cancel_handler();
+
+    // No action: the interactive main loop (`startup.c:458`-`:468`).
+    if session.actions.is_empty() {
+        let code = run_interactive(session, &mut executor, out, stderr);
+        let _ = executor.connection.terminate();
+        return ExitCode::from(code);
+    }
 
     // The list is consumed here and never read again, so it moves out rather
     // than being cloned past the `&mut session` the loop needs.
@@ -502,6 +561,46 @@ fn run_connected(session: &mut Session, out: &mut Output<'_>, stderr: &mut impl 
 
     let _ = executor.connection.terminate();
     ExitCode::from(code)
+}
+
+/// `startup.c:461`-`:467`: the banner, then `MainLoop(stdin)` through the
+/// line editor `initializeInput` sets up, then `finishInput`.
+fn run_interactive(
+    session: &mut Session,
+    executor: &mut LiveExecutor,
+    out: &mut Output<'_>,
+    stderr: &mut impl Write,
+) -> u8 {
+    let server_version = executor
+        .connection
+        .parameter_status(b"server_version")
+        .map(|v| String::from_utf8_lossy(v).into_owned());
+    let _ = out.stdout.write_all(
+        command::connection_warnings(&session.pset, server_version.as_deref(), true).as_bytes(),
+    );
+    if !session.pset.quiet {
+        let _ = out.stdout.write_all(b"Type \"help\" for help.\n\n");
+    }
+
+    // `initializeInput(options.no_readline ? 0 : 1)` (`startup.c:466`).
+    if session.no_readline {
+        let mut editor = PlainEditor::new(StdinLines::default(), std::io::stdout());
+        return run_on_stdin(&mut editor, session, executor, out, stderr);
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from);
+    let file = history_file(
+        session.vars.get("HISTFILE"),
+        std::env::var_os("PSQL_HISTORY").as_deref(),
+        home.as_deref(),
+    );
+    let mut editor = LinerEditor::initialize(file);
+    let code = run_on_stdin(&mut editor, session, executor, out, stderr);
+    if let Err(message) = editor.finish(session.pset.histsize) {
+        let _ = writeln!(stderr, "psql: error: {message}");
+    }
+    code
 }
 
 /// Which statement closes a `-1` transaction (`startup.c:439`).
@@ -709,7 +808,12 @@ fn process_file(
         // Read whole beforehand, so never a terminal to prompt on.
         let mut reader = std::io::Cursor::new(bytes);
         let mut source = CommandSource::file(&mut reader);
-        run_main_loop(&mut source, session, executor, out, stderr)
+        run_main_loop(&mut source, None, session, executor, out, stderr)
+    } else if !session.pset.notty {
+        // `-f -` at a terminal is interactive (`mainloop.c:65`), without
+        // readline, which only `initializeInput` turns on.
+        let mut editor = PlainEditor::new(StdinLines::default(), std::io::stdout());
+        run_on_stdin(&mut editor, session, executor, out, stderr)
     } else {
         // Stdin, which `\copy … from pstdin` then reads too (`copy.c:301`).
         let stdin = std::io::stdin();
@@ -720,7 +824,7 @@ fn process_file(
             is_stdin: true,
             is_tty,
         };
-        run_main_loop(&mut source, session, executor, out, stderr)
+        run_main_loop(&mut source, None, session, executor, out, stderr)
     };
     session.pset.inputfile = old;
     // `command.c:4979`.
@@ -732,6 +836,7 @@ fn process_file(
 /// `cancel_pressed`.
 fn run_main_loop(
     source: &mut CommandSource<'_>,
+    editor: Option<&mut dyn LineEditor>,
     session: &mut Session,
     executor: &mut LiveExecutor,
     out: &mut Output<'_>,
@@ -742,7 +847,65 @@ fn run_main_loop(
         vars: &mut session.vars,
         cancel_pressed: &cancel::CANCEL_PRESSED,
     };
-    main_loop(source, &mut loop_session, executor, out, stderr)
+    main_loop(source, editor, &mut loop_session, executor, out, stderr)
+}
+
+/// `MainLoop(stdin)` at a terminal: lines from `editor`, and the data of a
+/// `COPY … FROM STDIN` from stdin itself, which is `pset.cur_cmd_source`
+/// (`copy.c:301`, `common.c:2001`).
+fn run_on_stdin(
+    editor: &mut dyn LineEditor,
+    session: &mut Session,
+    executor: &mut LiveExecutor,
+    out: &mut Output<'_>,
+    stderr: &mut impl Write,
+) -> u8 {
+    let mut reader = StdinLines::default();
+    let mut source = CommandSource {
+        reader: &mut reader,
+        is_stdin: true,
+        is_tty: std::io::stdin().is_terminal(),
+    };
+    run_main_loop(&mut source, Some(editor), session, executor, out, stderr)
+}
+
+/// The process's stdin, read a line at a time and locked only for each read.
+/// At a terminal the line editor and a `COPY … FROM STDIN` take turns at the
+/// same stream, as they do at upstream's one `FILE *`: neither may hold the
+/// lock across the other's reads, nor read ahead into a line the other is
+/// owed.
+#[derive(Default)]
+struct StdinLines {
+    line: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for StdinLines {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let avail = std::io::BufRead::fill_buf(self)?;
+            let n = avail.len().min(out.len());
+            out[..n].copy_from_slice(&avail[..n]);
+            n
+        };
+        std::io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for StdinLines {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.pos >= self.line.len() {
+            self.line.clear();
+            self.pos = 0;
+            std::io::stdin().lock().read_until(b'\n', &mut self.line)?;
+        }
+        Ok(&self.line[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.line.len());
+    }
 }
 
 #[cfg(test)]

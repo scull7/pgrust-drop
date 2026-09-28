@@ -202,6 +202,12 @@ pub trait Executor {
     fn large_objects(&mut self) -> Option<&mut dyn crate::large_obj::LargeObjects> {
         None
     }
+
+    /// What `get_prompt` reads from `pset.db` (`prompt.c:68`). The default
+    /// is no connection at all.
+    fn prompt_facts(&self) -> crate::prompt::PromptFacts {
+        crate::prompt::PromptFacts::default()
+    }
 }
 
 /// `pset.cur_cmd_source`: the stream commands are read from, which is also

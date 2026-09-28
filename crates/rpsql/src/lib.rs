@@ -24,8 +24,10 @@
 //! `\sendpipeline`, `\syncpipeline`, `\flush`, `\flushrequest`,
 //! `\getresults` and `\endpipeline` on rlibpq's pipeline mode
 //! ([`settings::PipelineCounters`]). NAT-405 adds Ctrl-C ([`cancel`],
-//! `fe_utils/cancel.c`): a SIGINT cancels the running query. `\d` is
-//! NAT-401's and interactive input is NAT-405's.
+//! `fe_utils/cancel.c`): a SIGINT cancels the running query. NAT-396 adds
+//! `\lo_import`, `\lo_export`, `\lo_list` and `\lo_unlink` ([`large_obj`],
+//! `large_obj.c`) over rlibpq's `fe-lobj.c`. `\d` is NAT-401's and
+//! interactive input is NAT-405's.
 //!
 //! Layout follows Data / Calculations / Actions: every module above is a pure
 //! calculation over its inputs, and the only actions are [`connect`], the
@@ -44,6 +46,7 @@ pub mod command;
 pub mod common;
 pub mod crosstab;
 pub mod help;
+pub mod large_obj;
 pub mod logging;
 pub mod mainloop;
 pub mod print;
@@ -60,8 +63,8 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, Params, PipelineStatus,
-    QueryResult, ResultError, Stream,
+    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, LoError, Params,
+    PipelineStatus, QueryResult, ResultError, Stream,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
@@ -233,6 +236,55 @@ impl Executor for LiveExecutor {
         let notices = self.connection.notices()[self.notices_seen..].to_vec();
         self.notices_seen += notices.len();
         notices
+    }
+
+    fn large_objects(&mut self) -> Option<&mut dyn large_obj::LargeObjects> {
+        Some(self)
+    }
+}
+
+impl LiveExecutor {
+    /// A large-object call's outcome, with the connection marked broken
+    /// when the call broke it, as [`Executor::exec`] marks it.
+    fn lo_outcome<T>(&mut self, outcome: Result<T, LoError>) -> Result<T, LoError> {
+        if let Err(LoError::Connection(err)) = &outcome
+            && !matches!(
+                err,
+                ConnectionError::Argument(_) | ConnectionError::Pipeline(_)
+            )
+        {
+            self.alive = false;
+        }
+        outcome
+    }
+}
+
+/// `large_obj.c`'s calls go straight to libpq, with no cancel connection
+/// set: `SetCancelConn(NULL)` (`large_obj.c:150`, `:186`, `:248`).
+impl large_obj::LargeObjects for LiveExecutor {
+    fn transaction_status(&self) -> rlibpq::TransactionStatus {
+        self.connection.transaction_status()
+    }
+
+    fn lo_import(&mut self, filename: &std::path::Path) -> Result<u32, LoError> {
+        let outcome = self.connection.lo_import(filename);
+        self.lo_outcome(outcome)
+    }
+
+    fn lo_export(&mut self, loid: u32, filename: &std::path::Path) -> Result<(), LoError> {
+        let outcome = self.connection.lo_export(loid, filename);
+        self.lo_outcome(outcome)
+    }
+
+    fn lo_unlink(&mut self, loid: u32) -> Result<(), LoError> {
+        // `status == -1` is the failure (`large_obj.c:252`), and C's -1
+        // comes back here as the `Err`.
+        let outcome = self.connection.lo_unlink(loid).map(|_| ());
+        self.lo_outcome(outcome)
+    }
+
+    fn escape_string(&self, from: &[u8]) -> Vec<u8> {
+        self.connection.escape_string_conn(from).bytes
     }
 }
 
@@ -490,6 +542,7 @@ fn run_action(
                     &mut session.pset,
                     &mut session.vars,
                     executor.pipeline_status(),
+                    executor,
                     stdout,
                     stderr,
                 )

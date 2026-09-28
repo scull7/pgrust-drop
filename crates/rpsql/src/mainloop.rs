@@ -221,6 +221,7 @@ pub fn main_loop(
                     session.pset,
                     session.vars,
                     executor.pipeline_status(),
+                    executor,
                     stdout,
                     stderr,
                 );

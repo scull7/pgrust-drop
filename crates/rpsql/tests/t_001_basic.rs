@@ -146,8 +146,10 @@ fn copyright_and_help() {
 /// The listing's columns (stdout is a pipe, so C's `TIOCGWINSZ` fails and it
 /// assumes 80), an exact name that stops at itself, a prefix, the two-word
 /// and one-word fallbacks, `*`, a topic nothing matches, and the trailing
-/// semicolons and spaces the scanner strips. Not an upstream test: upstream
-/// has no psql to compare against.
+/// semicolons and spaces the scanner strips. Then, under `\\o`, `\\copyright`
+/// and `\\h` still write to stdout (`puts`, `help.c:757`; `PageOutput`,
+/// `:704`), while a query's result goes to the file. Not an upstream test:
+/// upstream has no psql to compare against.
 const HELP_SQL_GATE_SCRIPT: &str = "\\copyright
 \\help
 \\h SELECT
@@ -159,7 +161,16 @@ const HELP_SQL_GATE_SCRIPT: &str = "\\copyright
 \\h nosuch thing
 \\h *
 \\copyright extra
+\\o help_o.out
+\\copyright
+\\h ABORT
+SELECT 'to the file' AS o;
+\\o
 ";
+
+/// What [`HELP_SQL_GATE_SCRIPT`]'s `\\o` leaves in its file: the query's
+/// result, and none of `\\copyright` and `\\h`.
+const HELP_SQL_GATE_O_FILE: &str = "help_o.out";
 
 /// Runs [`HELP_SQL_GATE_SCRIPT`] through rpsql and C psql.
 #[test]
@@ -171,13 +182,27 @@ fn help_sql_matches_c_psql() {
         reference::skip("psql");
         return;
     };
-    let run = |psql: &Path| {
+    let run = |psql: &Path, name: &str| {
+        let dir = cluster.tempdir(name);
         let mut command = cluster.command(psql);
-        command.args(["-X", "-f", "-"]);
-        regress::run(command, HELP_SQL_GATE_SCRIPT.as_bytes())
+        command.args(["-X", "-f", "-"]).current_dir(&dir);
+        let outcome = regress::run(command, HELP_SQL_GATE_SCRIPT.as_bytes());
+        let file = std::fs::read(dir.join(HELP_SQL_GATE_O_FILE))
+            .unwrap_or_else(|e| panic!("{name}: {HELP_SQL_GATE_O_FILE}: {e}"));
+        (outcome, file)
     };
-    let ours = run(Path::new(RPSQL));
-    let theirs = run(&reference);
+    let (ours, our_file) = run(Path::new(RPSQL), "help_rpsql");
+    let (theirs, their_file) = run(&reference, "help_c");
+    assert_eq!(
+        String::from_utf8_lossy(&our_file),
+        String::from_utf8_lossy(&their_file),
+        "{HELP_SQL_GATE_O_FILE}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&our_file),
+        "      o      \n-------------\n to the file\n(1 row)\n\n",
+        "only the query's result goes to \\o's file"
+    );
     assert_eq!(ours.ret, theirs.ret, "exit status");
     assert_eq!(ours.stderr, theirs.stderr, "stderr");
     if let Some(at) = regress::first_difference(theirs.stdout.as_bytes(), ours.stdout.as_bytes()) {

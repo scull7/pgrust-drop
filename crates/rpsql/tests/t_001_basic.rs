@@ -5,11 +5,12 @@
 //! from the reference `initdb` and `pg_ctl` (`regress::Cluster`) and run each
 //! stolen assertion through rpsql and, when the lane has one, through C psql
 //! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
-//! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
+//! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far:
+//! `\copyright` and `\help` (lines 75-77), `\timing`
 //! (lines 86-108), `\errverbose with no previous error` (159-164),
 //! `\errverbose after normal query with error` (170-181), the multiple
 //! `-c`/`-f` switches (212-343) and `\copy from with DEFAULT` (345-367). The
-//! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
+//! `ENCODING`, notification, crash and remaining
 //! `\errverbose` cases, and the rest of the file, land with Linear
 //! NAT-400 … NAT-405.
 //!
@@ -84,6 +85,8 @@ const ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT: u16 = 55_404;
 const MULTIPLE_C_AND_F_SWITCHES_PORT: u16 = 55_405;
 const COPY_FROM_WITH_DEFAULT_PORT: u16 = 55_406;
 const COPY_ROUND_TRIP_PORT: u16 = 55_407;
+const COPYRIGHT_AND_HELP_PORT: u16 = 55_416;
+const HELP_SQL_GATE_PORT: u16 = 55_417;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -122,6 +125,67 @@ fn psql_like(cluster: &Cluster, sql: &str, expected_stdout: &str, test_name: &st
         assert_eq!(stderr, "", "{name}: no stderr");
         assert_like(&stdout, expected_stdout, &format!("{name}: matches"));
     }
+}
+
+/// `\copyright`, `\help without arguments` and `\help with argument` —
+/// 001_basic.pl:75-77, through every psql in turn.
+#[test]
+fn copyright_and_help() {
+    let Some(cluster) = Cluster::start(COPYRIGHT_AND_HELP_PORT) else {
+        return;
+    };
+    psql_like(&cluster, "\\copyright", "Copyright", "\\copyright");
+    psql_like(&cluster, "\\help", "ALTER", "\\help without arguments");
+    psql_like(&cluster, "\\help SELECT", "SELECT", "\\help with argument");
+}
+
+/// Every path through `helpSQL` (`help.c:593`) and `\copyright`, byte for
+/// byte against C psql: stdout, stderr and the exit status, no normalizer.
+/// The listing's columns (stdout is a pipe, so C's `TIOCGWINSZ` fails and it
+/// assumes 80), an exact name that stops at itself, a prefix, the two-word
+/// and one-word fallbacks, `*`, a topic nothing matches, and the trailing
+/// semicolons and spaces the scanner strips. Not an upstream test: upstream
+/// has no psql to compare against.
+const HELP_SQL_GATE_SCRIPT: &str = "\\copyright
+\\help
+\\h SELECT
+\\h select ;; \t
+\\h DROP TABL
+\\h drop table foo
+\\h abort now please
+\\h CREATE
+\\h nosuch thing
+\\h *
+\\copyright extra
+";
+
+/// Runs [`HELP_SQL_GATE_SCRIPT`] through rpsql and C psql.
+#[test]
+fn help_sql_matches_c_psql() {
+    let Some(cluster) = Cluster::start(HELP_SQL_GATE_PORT) else {
+        return;
+    };
+    let Some(reference) = cluster.reference_psql() else {
+        reference::skip("psql");
+        return;
+    };
+    let run = |psql: &Path| {
+        let mut command = cluster.command(psql);
+        command.args(["-X", "-f", "-"]);
+        regress::run(command, HELP_SQL_GATE_SCRIPT.as_bytes())
+    };
+    let ours = run(Path::new(RPSQL));
+    let theirs = run(&reference);
+    assert_eq!(ours.ret, theirs.ret, "exit status");
+    assert_eq!(ours.stderr, theirs.stderr, "stderr");
+    if let Some(at) = regress::first_difference(theirs.stdout.as_bytes(), ours.stdout.as_bytes()) {
+        panic!("stdout differs from C psql's: {at}");
+    }
+    assert_eq!(ours.ret, 0, "stderr {:?}", ours.stderr);
+    assert_eq!(
+        ours.stderr, "psql:<stdin>:11: warning: \\copyright: extra argument \"extra\" ignored",
+        "the one warning"
+    );
 }
 
 /// `# test \timing` — 001_basic.pl:86-93.

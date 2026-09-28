@@ -200,6 +200,109 @@ pub fn plan(args: &[OsString]) -> Invocation {
     }
 }
 
+/// A line C initdb prints from inside its getopt loop, as it meets the
+/// option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// `-d`/`--debug` (`initdb.c:3298`).
+    Debug,
+    /// `-n`/`--no-clean`/`--noclean` (`initdb.c:3302`).
+    NoClean,
+}
+
+impl Notice {
+    /// The line, as C's `printf` writes it to stdout.
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Notice::Debug => "Running in debug mode.\n",
+            Notice::NoClean => "Running in no-clean mode.  Mistakes will not be cleaned up.\n",
+        }
+    }
+}
+
+/// The short options that take an argument: `"A:c:dD:E:gkL:nNsST:U:WX:"`.
+const SHORT_WITH_ARGUMENT: &[u8] = b"AcDELTUX";
+
+/// The `long_options[]` entries with `required_argument` (`initdb.c:3160`).
+const LONG_WITH_ARGUMENT: [&str; 23] = [
+    "pgdata",
+    "encoding",
+    "locale",
+    "lc-collate",
+    "lc-ctype",
+    "lc-monetary",
+    "lc-numeric",
+    "lc-time",
+    "lc-messages",
+    "text-search-config",
+    "auth",
+    "auth-local",
+    "auth-host",
+    "pwfile",
+    "username",
+    "set",
+    "waldir",
+    "wal-segsize",
+    "locale-provider",
+    "builtin-locale",
+    "icu-locale",
+    "icu-rules",
+    "sync-method",
+];
+
+/// Pure: the [`Notice`]s `getopt_long` walks past in `args`, in command-line
+/// order and once per occurrence, up to the first help or version option
+/// (whose `'?'` ends the loop with the hint, `initdb.c:3398`).
+///
+/// Run over a line that parsed, so every long option is spelled out in full
+/// (usage-rs takes no abbreviations, ADR-0004); a value is skipped whether
+/// attached (`-Dd`, `--pgdata=d`) or the next word, and `--` ends the options.
+#[must_use]
+pub fn notices(args: &[OsString]) -> Vec<Notice> {
+    let mut found = Vec::new();
+    let mut words = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            match name {
+                "debug" => found.push(Notice::Debug),
+                "no-clean" | "noclean" => found.push(Notice::NoClean),
+                "help" | "version" => break,
+                _ if !attached && LONG_WITH_ARGUMENT.contains(&name) => {
+                    words.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
+            continue;
+        };
+        for (at, option) in cluster.bytes().enumerate() {
+            match option {
+                b'd' => found.push(Notice::Debug),
+                b'n' => found.push(Notice::NoClean),
+                b'?' | b'V' => return found,
+                _ if SHORT_WITH_ARGUMENT.contains(&option) => {
+                    if at + 1 == cluster.len() {
+                        words.next();
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
 /// `initdb.c`: only `argv[1]` is checked for help and version.
 fn fast_path(first: Option<&OsStr>) -> Option<Invocation> {
     match first?.to_str()? {
@@ -236,6 +339,49 @@ mod tests {
             Invocation::Init(options) => *options,
             other => panic!("{list:?} did not parse as Init: {other:?}"),
         }
+    }
+
+    #[test]
+    fn notices_come_in_command_line_order_once_per_occurrence() {
+        // initdb.c:3296-:3303 print from inside the getopt loop.
+        use Notice::{Debug, NoClean};
+        assert_eq!(notices(&args(&["-d", "-n"])), [Debug, NoClean]);
+        assert_eq!(notices(&args(&["--no-clean", "--debug"])), [NoClean, Debug]);
+        assert_eq!(
+            notices(&args(&["-nd", "--noclean", "-d"])),
+            [NoClean, Debug, NoClean, Debug]
+        );
+        assert_eq!(notices(&args(&["data", "-N", "-kn"])), [NoClean]);
+        assert!(notices(&args(&["-D", "data", "-S"])).is_empty());
+    }
+
+    #[test]
+    fn a_value_that_looks_like_an_option_is_not_one() {
+        use Notice::{Debug, NoClean};
+        assert!(notices(&args(&["-D", "-d"])).is_empty());
+        assert!(notices(&args(&["-Dd", "-U", "-n"])).is_empty());
+        assert!(notices(&args(&["--pgdata", "-d", "--set", "-n"])).is_empty());
+        assert_eq!(notices(&args(&["--pgdata=x", "-d"])), [Debug]);
+        assert_eq!(notices(&args(&["-L", "-d", "-n"])), [NoClean]);
+        assert_eq!(notices(&args(&["-kdc", "x=y", "-n"])), [Debug, NoClean]);
+        assert_eq!(notices(&args(&["-d", "--", "-n"])), [Debug]);
+    }
+
+    #[test]
+    fn notices_stop_at_the_help_and_version_options() {
+        // '?' reaches the `default:` arm, which exits with the hint.
+        assert_eq!(notices(&args(&["-d", "--help", "-n"])), [Notice::Debug]);
+        assert_eq!(notices(&args(&["-n", "-V", "-d"])), [Notice::NoClean]);
+        assert!(notices(&args(&["--version", "-d"])).is_empty());
+    }
+
+    #[test]
+    fn notices_are_upstreams_bytes() {
+        assert_eq!(Notice::Debug.text(), "Running in debug mode.\n");
+        assert_eq!(
+            Notice::NoClean.text(),
+            "Running in no-clean mode.  Mistakes will not be cleaned up.\n"
+        );
     }
 
     #[test]

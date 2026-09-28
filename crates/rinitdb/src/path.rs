@@ -1,6 +1,6 @@
-//! The parts of `src/port/path.c` initdb's closing instructions need:
-//! [`canonicalize_path`], [`get_parent_directory`] and
-//! [`join_path_components`], over Unix paths.
+//! The parts of `src/port/path.c` initdb's closing instructions and its `-s`
+//! block need: [`canonicalize_path`], [`get_parent_directory`],
+//! [`join_path_components`] and [`get_share_path`], over Unix paths.
 //!
 //! Pure string functions. The Windows arms (drive letters, backslashes, the
 //! trailing-quote repair) are not ported: this crate ships to Linux and macOS
@@ -89,6 +89,59 @@ pub fn join_path_components(head: &str, tail: &str) -> String {
     }
 }
 
+/// `get_share_path` (`src/port/path.c:919`): where a build whose compiled-in
+/// directories are `PGSHAREDIR` and `PGBINDIR` finds its share directory
+/// when its executable is `my_exec_path`.
+#[must_use]
+pub fn get_share_path(my_exec_path: &str) -> String {
+    make_relative_path(
+        crate::pg_config::PGSHAREDIR,
+        crate::pg_config::PGBINDIR,
+        my_exec_path,
+    )
+}
+
+/// `make_relative_path` (`src/port/path.c:755`): take the common prefix of
+/// `target_path` and `bin_path` (ending on a separator); if the rest of
+/// `bin_path` is the tail of `my_exec_path`'s directory, swap it for the rest
+/// of `target_path`, and otherwise return `target_path` itself, canonicalized
+/// either way.
+fn make_relative_path(target_path: &str, bin_path: &str, my_exec_path: &str) -> String {
+    let prefix_len = target_path
+        .bytes()
+        .zip(bin_path.bytes())
+        .enumerate()
+        .take_while(|(_, (t, b))| t == b || (*t == b'/' && *b == b'/'))
+        .filter(|(_, (t, _))| *t == b'/')
+        .last()
+        .map_or(0, |(i, _)| i + 1);
+    if prefix_len == 0 {
+        return canonicalize_path(target_path);
+    }
+    let bin_tail = &bin_path[prefix_len..];
+    let exec_dir = canonicalize_path(get_parent_directory(my_exec_path));
+    // `tail_start > 0` with a separator before it, and dir_strcmp (`:707`),
+    // which on Unix is strcmp.
+    if let Some(head) = exec_dir.strip_suffix(bin_tail)
+        && head.ends_with('/')
+    {
+        let head = trim_trailing_separator(head);
+        return canonicalize_path(&join_path_components(head, &target_path[prefix_len..]));
+    }
+    canonicalize_path(target_path)
+}
+
+/// `trim_trailing_separator` (`src/port/path.c:1134`), which never removes a
+/// leading `/`.
+fn trim_trailing_separator(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && !path.is_empty() {
+        &path[..1]
+    } else {
+        trimmed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +210,42 @@ mod tests {
         assert_eq!(join_path_components("/", "pg_ctl"), "//pg_ctl");
         assert_eq!(join_path_components("", "pg_ctl"), "pg_ctl");
         assert_eq!(join_path_components("/usr/bin", ""), "/usr/bin");
+    }
+
+    #[test]
+    fn the_share_path_follows_a_relocated_bin_directory() {
+        // path.c:740's own example, with this port's PGSHAREDIR/PGBINDIR.
+        assert_eq!(
+            get_share_path("/opt/pgsql/bin/postgres"),
+            "/opt/pgsql/share"
+        );
+        assert_eq!(get_share_path("/usr/local/bin/pgdrop"), "/usr/local/share");
+        assert_eq!(get_share_path("/bin/initdb"), "/share");
+        // No `bin` tail: the compiled-in directory, as is.
+        assert_eq!(
+            get_share_path("/work/target/debug/rinitdb"),
+            "/usr/local/pgsql/share"
+        );
+        // The tail must be a whole component: `sbin` does not end in `/bin`.
+        assert_eq!(get_share_path("/usr/sbin/initdb"), "/usr/local/pgsql/share");
+        assert_eq!(get_share_path("initdb"), "/usr/local/pgsql/share");
+    }
+
+    #[test]
+    fn make_relative_path_needs_a_common_prefix_ending_on_a_separator() {
+        // path.c:765: '/usr/lib' and '/usr/libexec' share only '/usr/'.
+        assert_eq!(
+            make_relative_path("/usr/libexec/pg", "/usr/lib/bin", "/opt/lib/bin/x"),
+            "/opt/libexec/pg"
+        );
+        assert_eq!(make_relative_path("share", "bin", "/opt/bin/x"), "share");
+    }
+
+    #[test]
+    fn trailing_separators_go_but_a_leading_one_stays() {
+        assert_eq!(trim_trailing_separator("/opt//"), "/opt");
+        assert_eq!(trim_trailing_separator("/"), "/");
+        assert_eq!(trim_trailing_separator("//"), "/");
+        assert_eq!(trim_trailing_separator(""), "");
     }
 }

@@ -38,6 +38,15 @@ pub const DEFAULT_PGSOCKET_DIR: &str = "/tmp";
 #[cfg(windows)]
 pub const DEFAULT_PGSOCKET_DIR: &str = "";
 
+/// `PGBINDIR` (`src/port/Makefile:140`): `bindir` of a stock build, whose
+/// prefix is `configure.ac:29`'s `AC_PREFIX_DEFAULT(/usr/local/pgsql)`.
+pub const PGBINDIR: &str = "/usr/local/pgsql/bin";
+
+/// `PGSHAREDIR` (`src/port/Makefile:141`): `datadir` of the same build.
+/// `src/Makefile.global.in:114`-`:118` appends `/postgresql` only to a
+/// `datadir` without `pgsql` or `postgres` in it, and this one has `pgsql`.
+pub const PGSHAREDIR: &str = "/usr/local/pgsql/share";
+
 /// `src/include/access/xlog_internal.h:91`.
 pub const DEFAULT_MIN_WAL_SEGS: u32 = 5;
 

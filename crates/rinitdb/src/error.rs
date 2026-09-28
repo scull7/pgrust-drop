@@ -177,6 +177,10 @@ pub enum InitdbError {
     #[error("password prompt and password file cannot be specified together")]
     PasswordPromptAndFile,
 
+    /// `initdb.c:2679` (`setup_bin_paths`): `-L` must be absolute.
+    #[error("input file location must be an absolute path")]
+    InputFileLocationNotAbsolute,
+
     /// `initdb.c:3479`.
     #[error("superuser name \"{name}\" is disallowed; role names cannot begin with \"pg_\"")]
     SuperuserNameDisallowed { name: String },
@@ -609,6 +613,10 @@ mod tests {
             (
                 InitdbError::PasswordPromptAndFile,
                 "initdb: error: password prompt and password file cannot be specified together",
+            ),
+            (
+                InitdbError::InputFileLocationNotAbsolute,
+                "initdb: error: input file location must be an absolute path",
             ),
             (
                 InitdbError::LocaleRequiredForProvider {

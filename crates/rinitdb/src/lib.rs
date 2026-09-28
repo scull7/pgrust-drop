@@ -76,7 +76,8 @@ pub use findtimezone::{RealTzSource, TzSource, select_default_timezone};
 pub use layout::{FsOp, layout};
 pub use sync::{SyncMethod, SyncOp};
 pub use validate::{
-    CreatePlan, DirAction, Environment, FsProbe, Plan, RealFs, SyncPlan, classify_waldir, validate,
+    CreatePlan, DirAction, Environment, FsProbe, Plan, RealFs, ShowPlan, SyncPlan, classify_waldir,
+    validate,
 };
 
 /// Exit status C initdb uses for its own errors (`pg_fatal`, `exit(1)`).
@@ -105,6 +106,7 @@ pub fn run(
             ExitCode::SUCCESS
         }
         Invocation::Hint => {
+            print_notices(args, stdout);
             let _ = writeln!(stderr, "{}", help::try_help_hint(help::PROGNAME));
             ExitCode::from(EXIT_FAILURE)
         }
@@ -115,6 +117,7 @@ pub fn run(
         // Everything C decides between the getopt loop and the first `mkdir`
         // is one pure calculation; only its inputs are read from the process.
         Invocation::Init(options) => {
+            print_notices(args, stdout);
             let env = Environment::from_process();
             match validate(&options, &env, &RealFs) {
                 Err(err) => {
@@ -124,6 +127,14 @@ pub fn run(
                 // initdb.c:3439 — `--sync-only` does its one job and returns 0
                 // before any of the cluster-creation steps.
                 Ok(Plan::Sync(plan)) => sync_only(&plan, stdout, stderr),
+                Ok(Plan::Show(plan)) => {
+                    let run = Run {
+                        options: &options,
+                        env: &env,
+                        argv0,
+                    };
+                    show(&plan, &run, stdout, stderr)
+                }
                 Ok(Plan::Create(plan)) => {
                     let run = Run {
                         options: &options,
@@ -135,6 +146,65 @@ pub fn run(
             }
         }
     }
+}
+
+/// Action: the `-d`/`-n` lines C's getopt loop prints as it meets them
+/// (`initdb.c:3298`, `:3302`), ahead of everything decided after the loop.
+fn print_notices(args: &[OsString], stdout: &mut impl Write) {
+    let notices = cli::notices(args);
+    for notice in &notices {
+        let _ = stdout.write_all(notice.text().as_bytes());
+    }
+    if !notices.is_empty() {
+        let _ = stdout.flush();
+    }
+}
+
+/// `-s`: `main` from the ownership lines (`initdb.c:3481`) to the `exit(0)` in
+/// `setup_data_file_paths` (`:2819`).
+fn show(
+    plan: &ShowPlan,
+    run: &Run<'_>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    if let Some(user) = run.env.effective_user.as_deref() {
+        let _ = stdout.write_all(report::owned_by(user).as_bytes());
+        let _ = stdout.flush();
+    }
+    let _ =
+        stderr.write_all(settings_block(&plan.pgdata, plan.username.as_deref(), run).as_bytes());
+    ExitCode::SUCCESS
+}
+
+/// Action at the edge of [`report::shown_settings`]: the block `-s` and `-d`
+/// print (`initdb.c:2805`), with `setup_bin_paths`' directories (`:2648`)
+/// taken from this executable.
+///
+/// C's `bin_path` is the directory of the `postgres` it found beside itself
+/// and its `share_path` is `-L` or `get_share_path` of it. This port runs no
+/// backend and reads no share directory — the template and the samples are
+/// compiled in (ADR-0002) — so both are derived from its own executable,
+/// `find_my_exec`'s answer (`current_exe`, symlinks resolved), exactly as C
+/// derives them from its backend's (`docs/divergences.md`).
+fn settings_block(pgdata: &std::path::Path, username: Option<&str>, run: &Run<'_>) -> String {
+    let my_exec_path = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_or_else(
+            |_| run.argv0.to_string_lossy().into_owned(),
+            |exe| exe.to_string_lossy().into_owned(),
+        );
+    let bin_path = path::canonicalize_path(path::get_parent_directory(&my_exec_path));
+    let share_path = run.options.input_dir.as_deref().map_or_else(
+        || path::get_share_path(&my_exec_path),
+        path::canonicalize_path,
+    );
+    report::shown_settings(&report::ShownSettings {
+        pgdata: &path::canonicalize_path(&pgdata.to_string_lossy()),
+        share_path: &share_path,
+        bin_path: &bin_path,
+        username: username.unwrap_or_default(),
+    })
 }
 
 /// What [`create_cluster`] needs besides the plan: the command line, the
@@ -185,7 +255,7 @@ fn create_cluster(
     // exist (initdb.c:3091), and announces the answer there too.
     let default_timezone = RealTzSource::from_env().and_then(|src| select_default_timezone(&src));
     let settings = cluster::settings(options, plan, default_timezone);
-    preamble(run, &settings, stdout, stderr);
+    preamble(plan, run, &settings, stdout, stderr);
 
     let mut progress = Progress::default();
     let created = initialize_data_directory(plan, options, &settings, &mut progress, stdout)
@@ -240,12 +310,25 @@ fn clean_up_and_fail(progress: &Progress, options: &Options, stderr: &mut impl W
 /// The ownership lines need the effective user, which this port reads from
 /// `USER`/`LOGNAME`; when neither is set they are left out rather than name
 /// someone (`docs/divergences.md`). The encoding line is printed when `-E`
-/// was not given, as in C, and names the encoding the cluster gets.
-fn preamble(run: &Run<'_>, settings: &Settings, stdout: &mut impl Write, stderr: &mut impl Write) {
-    let mut text = String::new();
+/// was not given, as in C, and names the encoding the cluster gets. Under
+/// `-d` the settings block goes to stderr between the ownership lines and the
+/// locale report, from `setup_data_file_paths` (`initdb.c:2805`).
+fn preamble(
+    plan: &CreatePlan,
+    run: &Run<'_>,
+    settings: &Settings,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) {
     if let Some(user) = run.env.effective_user.as_deref() {
-        text.push_str(&report::owned_by(user));
+        let _ = stdout.write_all(report::owned_by(user).as_bytes());
+        let _ = stdout.flush();
     }
+    if run.options.debug {
+        let block = settings_block(&plan.pgdata, plan.username.as_deref(), run);
+        let _ = stderr.write_all(block.as_bytes());
+    }
+    let mut text = String::new();
     text.push_str(&report::locale_configuration(
         &report::Locales::of_template(settings, cluster::catalog_locales(run.options)),
     ));

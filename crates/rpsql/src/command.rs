@@ -4,7 +4,8 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
-//! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, and NAT-404
+//! NAT-400 adds `\pset`, NAT-403 `\timing`, `\errverbose`, `\cd`, `\i` and
+//! `\ir` (whose file the caller runs, [`CommandResult::Include`]), and NAT-404
 //! `\crosstabview`, `\g`, `\gx` and the extended-query commands `\parse`,
 //! `\bind`, `\bind_named` and `\close_prepared`. Everything else is
 //! [`CommandResult::Unknown`], which renders upstream's `invalid command \%s`;
@@ -36,6 +37,21 @@ pub enum CommandResult {
     Error,
     /// `\c`'s reconnection, `do_connect`, which the caller performs (`command.c:3919`).
     Connect(Box<ConnectRequest>),
+    /// `\i` and `\ir`'s `process_file` (`command.c:2084`), which needs the
+    /// connection and so is the caller's to perform: it answers
+    /// [`CommandResult::SkipLine`] when the file's `MainLoop` exits
+    /// successfully and [`CommandResult::Error`] otherwise.
+    Include(IncludeRequest),
+}
+
+/// The file `\i` or `\ir` names, and which of the two it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeRequest {
+    /// The argument, after `expand_tilde` (`command.c:2083`).
+    pub filename: String,
+    /// `\ir` or `\include_relative`: resolve a relative name against the
+    /// file being read (`command.c:4942`).
+    pub use_relative_path: bool,
 }
 
 /// The four arguments `\connect` takes (`command.c:645`-`:648`).
@@ -170,7 +186,8 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" => return Vec::new(),
         "c" | "connect" | "crosstabview" => 4,
         "pset" => 2,
-        "unset" | "timing" | "parse" | "close_prepared" => 1,
+        "unset" | "timing" | "parse" | "close_prepared" | "cd" | "i" | "include" | "ir"
+        | "include_relative" => 1,
         "g" | "gx" => GArgs::split(options).consumed,
         _ => 0,
     };
@@ -276,7 +293,62 @@ fn exec_command(
             exec_command_errverbose(ctx.pset, stdout, stderr);
             CommandResult::SkipLine
         }
+        // `exec_command_cd()` (`command.c:691`).
+        "cd" => exec_command_cd(cmd, options, ctx.pset, stderr),
+        // `exec_command_include()` (`command.c:2063`).
+        "i" | "include" | "ir" | "include_relative" => {
+            let Some(fname) = options.first() else {
+                return missing_required_argument(cmd, ctx.pset, stderr);
+            };
+            CommandResult::Include(IncludeRequest {
+                filename: crate::path::expand_tilde(&fname.value, home().as_deref()),
+                use_relative_path: matches!(cmd, "ir" | "include_relative"),
+            })
+        }
         _ => CommandResult::Unknown,
+    }
+}
+
+/// `$HOME`, which is what `get_home_path` (`src/port/path.c:1022`) and
+/// `exec_command_cd` (`command.c:707`) consult first. Their fallback, the
+/// password database, is out of reach (see `docs/divergences.md`), and an
+/// empty `HOME` is no answer, as in C.
+fn home() -> Option<String> {
+    std::env::var_os("HOME")
+        .map(|home| home.to_string_lossy().into_owned())
+        .filter(|home| !home.is_empty())
+}
+
+/// `exec_command_cd()` (`command.c:691`): change to the argument, or with
+/// none to the home directory.
+fn exec_command_cd(
+    cmd: &str,
+    options: &[SlashOption],
+    pset: &PsqlSettings,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let Some(dir) = options.first().map(|opt| opt.value.clone()).or_else(home) else {
+        logging::error(
+            pset,
+            "could not get home directory: HOME is not set",
+            stderr,
+        );
+        return CommandResult::Error;
+    };
+    // Action: `chdir(dir)` (`command.c:736`).
+    match std::env::set_current_dir(&dir) {
+        Ok(()) => CommandResult::SkipLine,
+        Err(err) => {
+            logging::error(
+                pset,
+                format!(
+                    "\\{cmd}: could not change directory to \"{dir}\": {}",
+                    logging::strerror(&err)
+                ),
+                stderr,
+            );
+            CommandResult::Error
+        }
     }
 }
 
@@ -1172,6 +1244,68 @@ mod tests {
         assert_eq!(
             run_from("\\lo", located).3,
             "psql:a.sql:3: error: invalid command \\lo\n"
+        );
+    }
+
+    #[test]
+    fn i_and_ir_name_a_file_for_the_caller_to_run() {
+        for (line, filename, use_relative_path) in [
+            ("\\i a.sql", "a.sql", false),
+            ("\\include a.sql", "a.sql", false),
+            ("\\ir sub/a.sql", "sub/a.sql", true),
+            ("\\include_relative 'b c.sql'", "b c.sql", true),
+        ] {
+            assert_eq!(
+                run(line).result,
+                CommandResult::Include(IncludeRequest {
+                    filename: filename.into(),
+                    use_relative_path,
+                }),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn i_without_a_file_is_refused_and_a_second_argument_ignored() {
+        // `command.c:2074`.
+        for cmd in ["i", "include", "ir", "include_relative"] {
+            let out = run(&format!("\\{cmd}"));
+            assert_eq!(out.result, CommandResult::Error);
+            assert_eq!(
+                out.stderr,
+                format!("psql: error: \\{cmd}: missing required argument\n")
+            );
+        }
+        let out = run("\\i a.sql b.sql");
+        assert!(matches!(out.result, CommandResult::Include(_)));
+        assert_eq!(
+            out.stderr,
+            "psql: warning: \\i: extra argument \"b.sql\" ignored\n"
+        );
+    }
+
+    #[test]
+    fn cd_to_a_directory_that_is_not_there_is_an_error() {
+        // `command.c:738`.
+        let out = run("\\cd /nonexistent-rpsql-dir");
+        assert_eq!(out.result, CommandResult::Error);
+        assert_eq!(
+            out.stderr,
+            "psql: error: \\cd: could not change directory to \"/nonexistent-rpsql-dir\": \
+             No such file or directory\n"
+        );
+    }
+
+    #[test]
+    fn a_trailing_semicolon_stays_on_an_include_until_the_lexer_strips_it() {
+        // docs/divergences.md: C strips it (`psqlscanslash.l:604`).
+        assert_eq!(
+            run("\\i a.sql;").result,
+            CommandResult::Include(IncludeRequest {
+                filename: "a.sql;".into(),
+                use_relative_path: false,
+            })
         );
     }
 }

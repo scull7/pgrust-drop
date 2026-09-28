@@ -107,6 +107,21 @@ pub fn info(pset: &PsqlSettings, message: impl AsRef<[u8]>, stderr: &mut dyn Wri
     log(pset, Level::Info, message.as_ref(), stderr);
 }
 
+/// What `%m` expands to for `err`: `strerror(errno)` without the
+/// ` (os error N)` that `std::io::Error`'s `Display` appends
+/// (`src/port/snprintf.c:724`).
+#[must_use]
+pub fn strerror(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .unwrap_or(&text)
+            .to_owned(),
+        None => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +232,13 @@ mod tests {
         let mut err = Vec::new();
         error(&pset, "x", &mut err);
         assert_eq!(err, b"psql:<stdin>:7: error: x\n");
+    }
+
+    #[test]
+    fn strerror_drops_the_os_error_suffix_rust_adds() {
+        let enoent = std::io::Error::from_raw_os_error(2);
+        assert_eq!(strerror(&enoent), "No such file or directory");
+        // An error with no errno is its own text.
+        assert_eq!(strerror(&std::io::Error::other("boom")), "boom");
     }
 }

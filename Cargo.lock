@@ -12606,6 +12606,7 @@ dependencies = [
  "rpsql",
  "runtime",
  "seams_init",
+ "signal-hook",
  "testkit",
  "usage-rs",
 ]

@@ -16,8 +16,10 @@
 #![cfg(unix)]
 #![allow(clippy::doc_markdown)]
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const PGDROP: &str = env!("CARGO_BIN_EXE_pgdrop");
 
@@ -113,15 +115,101 @@ fn start<'a>(scratch: &'a Scratch, extra: &[&str]) -> Running<'a> {
 fn running<'a>(scratch: &'a Scratch, output: &Output) -> Running<'a> {
     assert_success(output, "pgdrop start");
     let json = std::str::from_utf8(&output.stdout).expect("UTF-8");
-    assert!(json.ends_with("}\n"), "{json:?}");
     Running {
         scratch,
-        started: Started {
-            uri: json_field(json, "uri").to_owned(),
-            pid: json_field(json, "pid").parse().expect("a PID"),
-            datadir: json_field(json, "datadir").to_owned(),
-        },
+        started: parse_started(json),
     }
+}
+
+fn parse_started(json: &str) -> Started {
+    assert!(json.ends_with("}\n"), "{json:?}");
+    Started {
+        uri: json_field(json, "uri").to_owned(),
+        pid: json_field(json, "pid").parse().expect("a PID"),
+        datadir: json_field(json, "datadir").to_owned(),
+    }
+}
+
+/// A `start --foreground --json` still running: its process, and what it
+/// printed once the server was ready. Dropping it stops the cluster and
+/// then `start` itself.
+struct Attached<'a> {
+    scratch: &'a Scratch,
+    child: Child,
+    started: Started,
+    stderr: PathBuf,
+}
+
+impl Attached<'_> {
+    /// `start` exits on its own; its status, within a minute.
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for pgdrop start") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pgdrop start --foreground did not exit; stderr:\n{}",
+                self.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+}
+
+impl Drop for Attached<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .scratch
+            .pgdrop(&["stop", "--datadir", &self.started.datadir]);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `start --foreground --json`, returned once it has printed its line. Its
+/// stderr, which the server's log goes to, is a file in the scratch
+/// directory.
+fn start_attached<'a>(scratch: &'a Scratch, tag: &str, extra: &[&str]) -> Attached<'a> {
+    let mut argv = vec!["start", "--foreground", "--json"];
+    argv.extend_from_slice(extra);
+    let stderr = scratch.0.join(format!("{tag}.stderr"));
+    let mut child = scratch
+        .command(&argv)
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr).expect("create the stderr file"))
+        .spawn()
+        .expect("run pgdrop start --foreground");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read what start printed");
+    assert!(
+        !line.is_empty(),
+        "start --foreground printed nothing; stderr:\n{}",
+        std::fs::read_to_string(&stderr).unwrap_or_default()
+    );
+    Attached {
+        scratch,
+        child,
+        started: parse_started(&line),
+        stderr,
+    }
+}
+
+/// Action: the POSIX `kill` utility, as `pgdrop stop` signals.
+fn send(signal: &str, pid: u32) {
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid}");
 }
 
 fn assert_success(output: &Output, what: &str) {
@@ -313,7 +401,6 @@ fn the_server_keeps_no_descriptor_start_inherited() {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    use std::time::Duration;
 
     let scratch = Scratch::new("inherited-fd");
     let (mut reader, writer) = std::io::pipe().expect("create a pipe");
@@ -348,13 +435,70 @@ fn the_server_keeps_no_descriptor_start_inherited() {
     drop(running);
 }
 
+/// `--foreground`: `start` stays attached to the server it prints, forwards
+/// SIGINT (Ctrl-C) and SIGTERM to it as a fast shutdown, as pg_ctl forwards
+/// SIGINT while it waits for a server (`pg_ctl.c:851`-`:872`), and once the
+/// server has exited removes what `stop` would and exits 0. The server's log
+/// is on `start`'s stderr, and none of it on stdout.
+#[test]
+fn foreground_forwards_sigint_and_sigterm_and_cleans_up() {
+    let scratch = Scratch::new("foreground");
+    for signal in ["-INT", "-TERM"] {
+        let mut attached = start_attached(&scratch, signal, &[]);
+        let started = attached.started.clone();
+        assert_ne!(started.pid, attached.child.id(), "the server is a child");
+        assert_eq!(postmaster_pid(&started.datadir), Some(started.pid));
+        assert!(
+            Path::new(&started.datadir).join("pgdrop.start").is_file(),
+            "stop's record"
+        );
+        select_1(&scratch, &started);
+
+        send(signal, attached.child.id());
+        let status = attached.wait();
+        assert!(
+            status.success(),
+            "{signal}: {status}\n{}",
+            attached.stderr()
+        );
+        let run_dir = started.run_dir();
+        assert!(!Path::new(&run_dir).exists(), "{signal}: {run_dir}");
+        let stderr = attached.stderr();
+        assert!(
+            stderr.contains("fast shutdown request"),
+            "{signal}: {stderr}"
+        );
+    }
+}
+
+/// `pgdrop stop` works on a foreground cluster as on a detached one, and
+/// `start` then exits 0; with `--keep` the data directory stays, without
+/// `start`'s record, as it does after a detached `--keep`.
+#[test]
+fn foreground_ends_when_pgdrop_stop_stops_it() {
+    let scratch = Scratch::new("foreground-stop");
+    let datadir = scratch.0.join("data");
+    let datadir = datadir.to_str().expect("UTF-8");
+    let mut attached = start_attached(&scratch, "keep", &["--datadir", datadir, "--keep"]);
+    let started = attached.started.clone();
+    select_1(&scratch, &started);
+
+    let stop = scratch.pgdrop(&["stop", "--datadir", datadir]);
+    assert_success(&stop, "pgdrop stop");
+    let status = attached.wait();
+    assert!(status.success(), "{status}\n{}", attached.stderr());
+    assert!(Path::new(datadir).join("PG_VERSION").is_file(), "--keep");
+    assert!(!Path::new(datadir).join("postmaster.pid").exists());
+    assert!(!Path::new(datadir).join("pgdrop.start").exists());
+    std::fs::remove_dir_all(started.run_dir()).expect("remove the kept run directory");
+}
+
 #[test]
 fn start_refuses_a_bad_command_line() {
     let scratch = Scratch::new("refuse");
     for (args, message) in [
         (&["--set", "fsync"][..], "--set fsync requires a value"),
         (&["--set", "port=1"][..], "--set cannot change port"),
-        (&["--foreground"][..], "--foreground is not implemented yet"),
     ] {
         let mut argv = vec!["start"];
         argv.extend_from_slice(args);

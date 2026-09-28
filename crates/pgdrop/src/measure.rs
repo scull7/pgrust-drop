@@ -9,9 +9,15 @@
 //! reports p50 and p95 of each over N runs, and splits the binary's size
 //! between what pgdrop embeds and everything else.
 //!
+//! It also times the same life through pgdrop's own commands (`start`,
+//! `psql`, `stop`), and it gates: each CI lane's dev-profile build has a
+//! budget 20% above what that lane measured in CI run 36291661005 (PR #38),
+//! on the p50 of the four phases' total and on the binary's size. p95 and
+//! the size breakdown are printed beside it, not gated.
+//!
 //! Everything here is a calculation: parsing the pid file, percentiles,
-//! the size breakdown and the report text. Spawning, signalling and timing
-//! stay in the bench.
+//! the size breakdown, the budgets and the report text. Spawning,
+//! signalling, timing and failing stay in the bench.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -162,6 +168,16 @@ fn mib(bytes: u64) -> String {
     format!("{mib:.2} MiB")
 }
 
+/// One report row: `name`, then p50 / p95 of `times`.
+fn row(out: &mut String, name: &str, times: &[Duration]) {
+    let _ = writeln!(
+        out,
+        "  {name:<20} {:>10} / {:>10}",
+        ms(percentile(times, 50)),
+        ms(percentile(times, 95))
+    );
+}
+
 /// Pure: the startup report, one line per phase plus the total, p50 and
 /// p95 over `runs`.
 #[must_use]
@@ -170,14 +186,6 @@ pub fn render_startup(profile: &str, runs: &[Run]) -> String {
         "pgdrop startup ({profile} build), {} runs: p50 / p95\n",
         runs.len()
     );
-    let row = |out: &mut String, name: &str, times: &[Duration]| {
-        let _ = writeln!(
-            out,
-            "  {name:<20} {:>10} / {:>10}",
-            ms(percentile(times, 50)),
-            ms(percentile(times, 95))
-        );
-    };
     for phase in Phase::ALL {
         let times: Vec<Duration> = runs.iter().map(|run| run.get(phase)).collect();
         row(&mut out, phase.name(), &times);
@@ -185,6 +193,182 @@ pub fn render_startup(profile: &str, runs: &[Run]) -> String {
     let totals: Vec<Duration> = runs.iter().map(Run::total).collect();
     row(&mut out, "total", &totals);
     out
+}
+
+/// One cluster's life through pgdrop's own commands, the way a test suite
+/// drives it: `pgdrop start --json`, `pgdrop psql -c 'select 1'`, `pgdrop
+/// stop --datadir DIR`, each from spawn to exit. Reported, not budgeted:
+/// the baselines the budgets come from (#38) predate `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Session {
+    /// `pgdrop start --json`: mint, spawn, wait for ReadyForQuery.
+    pub start: Duration,
+    /// `pgdrop psql -c 'select 1'`.
+    pub select: Duration,
+    /// `pgdrop stop --datadir DIR`: signal, wait, remove.
+    pub stop: Duration,
+}
+
+impl Session {
+    /// All three commands end to end.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.start + self.select + self.stop
+    }
+}
+
+/// Pure: the session report, one line per command plus the total, p50 and
+/// p95 over `sessions`.
+#[must_use]
+pub fn render_sessions(profile: &str, sessions: &[Session]) -> String {
+    let mut out = format!(
+        "pgdrop start / psql / stop ({profile} build), {} runs: p50 / p95\n",
+        sessions.len()
+    );
+    let column =
+        |pick: fn(&Session) -> Duration| -> Vec<Duration> { sessions.iter().map(pick).collect() };
+    row(&mut out, "start --json", &column(|s| s.start));
+    row(&mut out, "psql select 1", &column(|s| s.select));
+    row(&mut out, "stop --datadir", &column(|s| s.stop));
+    row(&mut out, "total", &column(Session::total));
+    out
+}
+
+/// Pure: the `"datadir"` of `pgdrop start --json`'s one-line object
+/// ([`crate::start::StartPlan::json`]). `None` if it is missing, or holds an
+/// escape: a scratch path never needs one, so this does not decode them.
+#[must_use]
+pub fn started_datadir(json: &str) -> Option<&str> {
+    let (_, rest) = json.split_once("\"datadir\": \"")?;
+    let (value, _) = rest.split_once('"')?;
+    (!value.contains('\\')).then_some(value)
+}
+
+/// A CI lane (ADR-0007): the target a budget was measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// x86_64 Linux, musl (Alpine): the `musl` job.
+    Musl,
+    /// x86_64 Linux, glibc: the `gnu` job.
+    Gnu,
+    /// aarch64 macOS: the `apple` job.
+    Apple,
+}
+
+impl Lane {
+    /// The lane this build's target is, if it is one of CI's.
+    #[must_use]
+    pub fn of_this_build() -> Option<Self> {
+        if cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "musl"
+        )) {
+            Some(Lane::Musl)
+        } else if cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu"
+        )) {
+            Some(Lane::Gnu)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(Lane::Apple)
+        } else {
+            None
+        }
+    }
+
+    /// The CI job's name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Musl => "musl",
+            Lane::Gnu => "gnu",
+            Lane::Apple => "apple",
+        }
+    }
+
+    /// What this lane's dev-profile build measured in CI run 36291661005
+    /// (PR #38, head baf1813, 20 runs): the p50 of the four phases' total,
+    /// and the binary's size.
+    #[must_use]
+    pub fn baseline(self) -> Limits {
+        let (p50_micros, binary) = match self {
+            Lane::Musl => (583_700, 382_376_208),
+            Lane::Gnu => (368_800, 386_856_432),
+            Lane::Apple => (413_000, 236_828_680),
+        };
+        Limits {
+            startup_p50: Duration::from_micros(p50_micros),
+            binary,
+        }
+    }
+}
+
+/// The CI run the baselines come from, named in the budget report.
+pub const BASELINE_RUN: &str = "36291661005";
+
+/// A startup time and a binary size: a lane's baseline, its budget, or what
+/// this build measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// p50 of [`Run::total`]: an empty directory to a stopped cluster.
+    pub startup_p50: Duration,
+    /// The executable's size on disk.
+    pub binary: u64,
+}
+
+impl Limits {
+    /// Pure: the budget 20% above this baseline (NAT-410), rounded down.
+    #[must_use]
+    pub fn budget(self) -> Self {
+        Self {
+            startup_p50: self.startup_p50 * 6 / 5,
+            binary: self.binary * 6 / 5,
+        }
+    }
+}
+
+/// Pure: the budget for a `debug` build on `lane`. Only the dev profile has
+/// one, because only it has CI baselines; release numbers are NAT-411's.
+#[must_use]
+pub fn budget_for(lane: Option<Lane>, debug: bool) -> Option<Limits> {
+    lane.filter(|_| debug).map(|lane| lane.baseline().budget())
+}
+
+/// Pure: the budget report, and whether `measured` is within `budget`: one
+/// line per limit, each `ok` or `OVER`.
+#[must_use]
+pub fn render_budget(
+    profile: &str,
+    lane: Lane,
+    budget: &Limits,
+    measured: &Limits,
+) -> (String, bool) {
+    let mut out = format!(
+        "pgdrop budget ({profile} build, {} lane; 20% above CI run {BASELINE_RUN})\n",
+        lane.name()
+    );
+    let verdict = |within: bool| if within { "ok" } else { "OVER" };
+    let time_ok = measured.startup_p50 <= budget.startup_p50;
+    let size_ok = measured.binary <= budget.binary;
+    let _ = writeln!(
+        out,
+        "  {:<20} {:>12} <= {:>12}  {}",
+        "startup p50 (total)",
+        ms(measured.startup_p50),
+        ms(budget.startup_p50),
+        verdict(time_ok)
+    );
+    let _ = writeln!(
+        out,
+        "  {:<20} {:>12} <= {:>12}  {}",
+        "binary size",
+        format!("{} B", measured.binary),
+        format!("{} B", budget.binary),
+        verdict(size_ok)
+    );
+    (out, time_ok && size_ok)
 }
 
 /// Pure: the size report, one line per part, bytes and MiB.
@@ -267,6 +451,94 @@ mod tests {
         // A binary cannot be smaller than what it embeds; if a caller says
         // so, the rest is zero rather than an underflow.
         assert_eq!(SizeBreakdown::of_this_build(0).server_and_tools(), 0);
+    }
+
+    #[test]
+    fn budgets_are_20_percent_above_the_ci_baselines() {
+        let gnu = Lane::Gnu.baseline().budget();
+        assert_eq!(gnu.startup_p50, Duration::from_micros(442_560));
+        assert_eq!(gnu.binary, 464_227_718);
+        let musl = Lane::Musl.baseline().budget();
+        assert_eq!(musl.startup_p50, Duration::from_micros(700_440));
+        assert_eq!(musl.binary, 458_851_449);
+        let apple = Lane::Apple.baseline().budget();
+        assert_eq!(apple.startup_p50, Duration::from_micros(495_600));
+        assert_eq!(apple.binary, 284_194_416);
+    }
+
+    #[test]
+    fn only_a_ci_lanes_dev_build_has_a_budget() {
+        assert_eq!(
+            budget_for(Some(Lane::Apple), true),
+            Some(Lane::Apple.baseline().budget())
+        );
+        assert_eq!(budget_for(Some(Lane::Apple), false), None);
+        assert_eq!(budget_for(None, true), None);
+    }
+
+    #[test]
+    fn the_budget_report_says_ok_or_over_for_each_limit() {
+        let budget = Limits {
+            startup_p50: Duration::from_millis(400),
+            binary: 1000,
+        };
+        let within = Limits {
+            startup_p50: Duration::from_micros(399_950),
+            binary: 1000,
+        };
+        let (text, ok) = render_budget("debug", Lane::Gnu, &budget, &within);
+        assert!(ok);
+        assert_eq!(
+            text,
+            "pgdrop budget (debug build, gnu lane; 20% above CI run 36291661005)\n\
+             \x20 startup p50 (total)      400.0 ms <=     400.0 ms  ok\n\
+             \x20 binary size                1000 B <=       1000 B  ok\n"
+        );
+
+        let slow = Limits {
+            startup_p50: Duration::from_millis(401),
+            ..within
+        };
+        let (text, ok) = render_budget("debug", Lane::Gnu, &budget, &slow);
+        assert!(!ok);
+        assert!(text.contains("401.0 ms <=     400.0 ms  OVER\n"), "{text}");
+        assert!(text.contains("1000 B  ok\n"), "{text}");
+
+        let big = Limits {
+            binary: 1001,
+            ..within
+        };
+        let (text, ok) = render_budget("debug", Lane::Gnu, &budget, &big);
+        assert!(!ok);
+        assert!(text.contains("1001 B <=       1000 B  OVER\n"), "{text}");
+    }
+
+    #[test]
+    fn the_datadir_is_read_from_starts_json() {
+        let json = "{\"uri\": \"postgresql://postgres@%2Ftmp%2Fpgdrop-1-2:5432/postgres\", \
+                    \"pid\": 7, \"datadir\": \"/tmp/pgdrop-1-2/data\"}\n";
+        assert_eq!(started_datadir(json), Some("/tmp/pgdrop-1-2/data"));
+        assert_eq!(started_datadir("{\"datadir\": \"/a\\\"b\"}"), None);
+        assert_eq!(started_datadir("{\"pid\": 7}"), None);
+    }
+
+    #[test]
+    fn the_session_report_names_every_command() {
+        let session = Session {
+            start: Duration::from_millis(3),
+            select: Duration::from_millis(2),
+            stop: Duration::from_millis(1),
+        };
+        assert_eq!(session.total(), Duration::from_millis(6));
+        let text = render_sessions("debug", &[session]);
+        assert!(text.starts_with("pgdrop start / psql / stop (debug build), 1 runs: p50 / p95\n"));
+        for name in ["start --json", "psql select 1", "stop --datadir"] {
+            assert!(text.contains(name), "{text}");
+        }
+        assert!(
+            text.contains("  total                    6.0 ms /     6.0 ms\n"),
+            "{text}"
+        );
     }
 
     #[test]

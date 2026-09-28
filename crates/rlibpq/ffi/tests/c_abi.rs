@@ -54,7 +54,19 @@ fn every_shim_in_the_matrix_links_from_c() {
 /// parse: `PQconnectdb` still returns a `PGconn`, `CONNECTION_BAD` with
 /// `conninfo_parse`'s message (`fe-connect.c:6347`), and `PQexec`,
 /// `PQexecParams` and `PQdescribePortal` on it send nothing
-/// (`fe-exec.c:1706`), before any argument is checked.
+/// (`fe-exec.c:1706`), before any argument is checked. The accessors of
+/// that `PGconn` read fields never filled (`fe-connect.c:7472`-`:7680`):
+/// NULL, but `""` for `PQpass`, `PQhost` and `PQtty` and `DEF_PGPORT_STR`
+/// for `PQport`; `PQconninfo` is every row with no value; and `PQreset`
+/// fails with an empty message, the options never having been valid
+/// (`pqClosePGconn`, `:5254`; `pqConnectDBStart`, `:2709`). Then each other
+/// way in refuses options that do not parse: `PQconnectStart`,
+/// `PQconnectdbParams` (`conninfo_array_parse`, `:6528`),
+/// `PQconnectStartParams` with an expanded `dbname`, and `PQsetdbLogin`
+/// with a `dbName` that is a connection string (`:2250`).
+///
+/// Every line past the SSL and GSSAPI probes is what C libpq 18.6 prints
+/// for the same program (checked against PGDG's `libpq.so.5`).
 #[test]
 fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
     let program = build(
@@ -97,6 +109,12 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQresultErrorField NULL\n\
          PQexecParams NULL PQprepare NULL PQexecPrepared NULL\n\
          PQdescribePrepared NULL PQdescribePortal NULL\n\
+         PQdb NULL PQuser NULL PQoptions NULL\n\
+         PQpass NULL PQhost NULL PQport NULL PQtty NULL\n\
+         PQtransactionStatus 4 PQparameterStatus NULL PQserverVersion 0\n\
+         PQsocket -1 PQbackendPID 0 PQconnectPoll 0\n\
+         PQconninfo NULL\n\
+         PQparameterStatus NULL PQresetStart 0 PQresetPoll 0\n\
          PQconnectdb set\n\
          PQstatus 1\n\
          PQerrorMessage missing \"=\" after \"bogus\" in connection info string\n\
@@ -105,7 +123,20 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQexecParams NULL\n\
          PQerrorMessage no connection to the server\n\
          PQdescribePortal NULL\n\
-         PQerrorMessage no connection to the server\n"
+         PQerrorMessage no connection to the server\n\
+         PQdb NULL PQuser NULL PQoptions NULL\n\
+         PQpass  PQhost  PQport 5432 PQtty \n\
+         PQtransactionStatus 4 PQparameterStatus NULL PQserverVersion 0\n\
+         PQsocket -1 PQbackendPID 0 PQconnectPoll 0\n\
+         PQconninfo 50 rows, 0 set\n\
+         PQparameterStatus NULL\n\
+         PQreset PQstatus 1 PQerrorMessage \"\"\n\
+         PQresetStart 0 PQresetPoll 0\n\
+         PQconnectStart PQstatus 1 PQconnectPoll 0 \
+         PQerrorMessage missing \"=\" after \"bogus\" in connection info string\n\
+         PQconnectdbParams PQstatus 1 PQerrorMessage invalid connection option \"bogus\"\n\
+         PQconnectStartParams PQstatus 1 PQerrorMessage invalid connection option \"bogus\"\n\
+         PQsetdbLogin PQstatus 1 PQerrorMessage invalid connection option \"bogus\"\n"
     );
     assert_eq!(outcome.status, Some(0));
 }

@@ -41,8 +41,8 @@ use crate::message::{
 };
 use crate::negotiate::{Build, EncMethod, EncryptionOptions, Negotiation};
 use crate::pipeline::{
-    Admit, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus, QueryClass,
-    message_id,
+    Admit, AsyncStatus, CopyStep, Event, Next, PipelineError, PipelineState, PipelineStatus,
+    QueryClass, message_id,
 };
 use crate::poll;
 use crate::result::{ExecStatus, FieldDescription, QueryResult, ResultError};
@@ -593,6 +593,10 @@ pub struct Connection<S = Stream> {
     /// was opened (`fe-connect.c:3249`), so nothing the peer does later
     /// changes it. `None` for a stream [`Connection::start_up`] was handed.
     raddr: Option<Peer>,
+    /// `conn->connhost[conn->whichhost]`: the host entry the connection was
+    /// made to, set with `raddr`. `None` for a stream
+    /// [`Connection::start_up`] was handed.
+    connhost: Option<ConnHost>,
     /// `conn->nonblocking` (`libpq-int.h:465`): whether a flush may leave
     /// output unsent rather than wait ([`Connection::set_nonblocking`]).
     nonblocking: bool,
@@ -707,6 +711,7 @@ impl Connection<Stream> {
                         Ok(mut conn) => {
                             // fe-connect.c:3249 — the address it was dialled at.
                             conn.raddr = Some(peer);
+                            conn.connhost = Some(host.clone());
                             match conn.check_target(target, second_pass)? {
                                 None => return Ok(conn),
                                 // :4436 — the next host, not the next address.
@@ -783,6 +788,7 @@ impl<S: Socket> Connection<S> {
             notifications: Vec::new(),
             trace: None,
             raddr: None,
+            connhost: None,
             nonblocking: false,
             lobjfuncs: None,
         };
@@ -1661,6 +1667,40 @@ impl<S: Socket> Connection<S> {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// `conn->pstatus` (`pqSaveParameterStatus`, `fe-exec.c:1091`): every
+    /// parameter the server has reported, each with the last value it
+    /// reported, in the order the names were first reported.
+    #[must_use]
+    pub fn parameter_statuses(&self) -> Vec<(&[u8], &[u8])> {
+        let mut statuses: Vec<(&[u8], &[u8])> = Vec::new();
+        for (name, value) in &self.parameters {
+            match statuses
+                .iter_mut()
+                .find(|(seen, _)| *seen == name.as_slice())
+            {
+                Some(status) => status.1 = value,
+                None => statuses.push((name, value)),
+            }
+        }
+        statuses
+    }
+
+    /// `conn->connhost[conn->whichhost]`, which `PQhost` and `PQport` read
+    /// (`fe-connect.c:7505`, `:7541`): the host entry
+    /// [`Connection::connect`] reached, as `conn_hosts` listed it. `None`
+    /// for a stream [`Connection::start_up`] was handed.
+    #[must_use]
+    pub fn host(&self) -> Option<&ConnHost> {
+        self.connhost.as_ref()
+    }
+
+    /// `conn->asyncStatus`, which `PQtransactionStatus` reports as
+    /// `PQTRANS_ACTIVE` whenever it is not idle (`fe-connect.c:7583`).
+    #[must_use]
+    pub fn async_status(&self) -> AsyncStatus {
+        self.state.async_status()
+    }
+
     /// `PQbackendPID`, `fe-connect.c:7674`.
     #[must_use]
     pub fn backend_pid(&self) -> i32 {
@@ -2320,6 +2360,30 @@ mod tests {
             error.message(),
             b"invalid load_balance_hosts value: \"x\"".to_vec()
         );
+    }
+
+    /// `conn->pstatus` keeps one entry per name, the last value reported; a
+    /// stream handed to `start_up` has no host entry, and a connection that
+    /// has just started up is idle.
+    #[test]
+    fn parameter_statuses_keep_the_last_value_of_each_name() {
+        let mut script = auth_ok();
+        script.extend(message(b'S', b"server_version 18.6 "));
+        script.extend(message(b'S', b"application_name a "));
+        script.extend(message(b'S', b"application_name b "));
+        script.extend(ready(b'I'));
+
+        let info = conninfo("user=alice dbname=postgres");
+        let conn = Connection::start_up(Scripted::new(script), &info, &[0; 18]).unwrap();
+        assert_eq!(
+            conn.parameter_statuses(),
+            [
+                (&b"server_version"[..], &b"18.6"[..]),
+                (&b"application_name"[..], &b"b"[..]),
+            ]
+        );
+        assert_eq!(conn.host(), None);
+        assert_eq!(conn.async_status(), AsyncStatus::Idle);
     }
 
     /// A trust connection and one `select version()`, replayed end to end:

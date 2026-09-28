@@ -83,7 +83,7 @@ fn static_ptr_or_null(text: Option<&CString>) -> *mut c_char {
 
 /// Action: `info` as a `malloc`'d array terminated by an all-zero row, or null
 /// when an allocation fails (C's "out of memory" returns, `fe-connect.c:6208`).
-fn to_c(info: &ConnInfo) -> *mut PQconninfoOption {
+pub(crate) fn to_c(info: &ConnInfo) -> *mut PQconninfoOption {
     let rows = static_rows();
     // SAFETY: `calloc` has no preconditions. The extra row is the terminator,
     // and zeroed memory is a valid all-NULL `PQconninfoOption`.

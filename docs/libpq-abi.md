@@ -21,29 +21,31 @@ a `cdylib` crate type, and musl is the lane CI gates first (ADR-0007).
 "Follows" is the C definition at `REL_18_6`, relative to
 `src/interfaces/libpq/`. Where C picks an arm by build configuration, the arm
 is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
-`rlibpq` has none of the three yet.
+`rlibpq` has none of the three yet. "blocking" marks a call C makes step
+by step without waiting and `rlibpq-ffi` makes in one blocking step
+(`docs/divergences.md`).
 
-54 of 210 symbols implemented, 0 stubbed with an error, 156 not yet.
+75 of 210 symbols implemented, 0 stubbed with an error, 135 not yet.
 
 | ordinal | symbol | coverage | follows |
 |--:|---|---|---|
 | 1 | `PQconnectdb` | implemented | fe-connect.c:820 |
-| 2 | `PQsetdbLogin` | not yet |  |
+| 2 | `PQsetdbLogin` | implemented | fe-connect.c:2231 |
 | 3 | `PQconndefaults` | implemented | fe-connect.c:2193 |
 | 4 | `PQfinish` | implemented | fe-connect.c:5301 |
-| 5 | `PQreset` | not yet |  |
+| 5 | `PQreset` | implemented | fe-connect.c:5315 |
 | 6 | `PQrequestCancel` | not yet |  |
-| 7 | `PQdb` | not yet |  |
-| 8 | `PQuser` | not yet |  |
-| 9 | `PQpass` | not yet |  |
-| 10 | `PQhost` | not yet |  |
-| 11 | `PQport` | not yet |  |
-| 12 | `PQtty` | not yet |  |
-| 13 | `PQoptions` | not yet |  |
+| 7 | `PQdb` | implemented | fe-connect.c:7472 |
+| 8 | `PQuser` | implemented | fe-connect.c:7480 |
+| 9 | `PQpass` | implemented | fe-connect.c:7488 |
+| 10 | `PQhost` | implemented | fe-connect.c:7505 |
+| 11 | `PQport` | implemented | fe-connect.c:7541 |
+| 12 | `PQtty` | implemented | fe-connect.c:7559 |
+| 13 | `PQoptions` | implemented | fe-connect.c:7567 |
 | 14 | `PQstatus` | implemented | fe-connect.c:7575 |
 | 15 | `PQerrorMessage` | implemented | fe-connect.c:7638 |
-| 16 | `PQsocket` | not yet |  |
-| 17 | `PQbackendPID` | not yet |  |
+| 16 | `PQsocket` | implemented | fe-connect.c:7664 |
+| 17 | `PQbackendPID` | implemented | fe-connect.c:7674 |
 | 18 | `PQtrace` | not yet |  |
 | 19 | `PQuntrace` | not yet |  |
 | 20 | `PQsetNoticeProcessor` | not yet |  |
@@ -105,12 +107,12 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 76 | `destroyPQExpBuffer` | not yet |  |
 | 77 | `createPQExpBuffer` | not yet |  |
 | 78 | `PQconninfoFree` | implemented | fe-connect.c:7459 |
-| 79 | `PQconnectPoll` | not yet |  |
-| 80 | `PQconnectStart` | not yet |  |
+| 79 | `PQconnectPoll` | implemented | fe-connect.c:2908, blocking |
+| 80 | `PQconnectStart` | implemented | fe-connect.c:948, blocking |
 | 81 | `PQflush` | not yet |  |
 | 82 | `PQisnonblocking` | not yet |  |
-| 83 | `PQresetPoll` | not yet |  |
-| 84 | `PQresetStart` | not yet |  |
+| 83 | `PQresetPoll` | implemented | fe-connect.c:5367, blocking |
+| 84 | `PQresetStart` | implemented | fe-connect.c:5348, blocking |
 | 85 | `PQsetClientEncoding` | not yet |  |
 | 86 | `PQsetnonblocking` | not yet |  |
 | 87 | `PQfreeNotify` | implemented | fe-exec.c:4080 |
@@ -122,8 +124,8 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 93 | `pg_utf_mblen` | not yet |  |
 | 94 | `PQunescapeBytea` | not yet |  |
 | 95 | `PQfreemem` | implemented | fe-exec.c:4063 |
-| 96 | `PQtransactionStatus` | not yet |  |
-| 97 | `PQparameterStatus` | not yet |  |
+| 96 | `PQtransactionStatus` | implemented | fe-connect.c:7583 |
+| 97 | `PQparameterStatus` | implemented | fe-connect.c:7593 |
 | 98 | `PQprotocolVersion` | not yet |  |
 | 99 | `PQsetErrorVerbosity` | not yet |  |
 | 100 | `PQsetNoticeReceiver` | not yet |  |
@@ -139,7 +141,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 110 | `PQexecPrepared` | implemented | fe-exec.c:2340 |
 | 111 | `PQsendQueryPrepared` | not yet |  |
 | 112 | `PQdsplen` | not yet |  |
-| 113 | `PQserverVersion` | not yet |  |
+| 113 | `PQserverVersion` | implemented | fe-connect.c:7628 |
 | 114 | `PQgetssl` | implemented | fe-secure.c:452, without SSL |
 | 115 | `pg_char_to_encoding` | not yet |  |
 | 116 | `pg_valid_server_encoding` | not yet |  |
@@ -182,8 +184,8 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 153 | `PQinitOpenSSL` | implemented | fe-secure.c:129 |
 | 154 | `PQescapeLiteral` | not yet |  |
 | 155 | `PQescapeIdentifier` | not yet |  |
-| 156 | `PQconnectdbParams` | not yet |  |
-| 157 | `PQconnectStartParams` | not yet |  |
+| 156 | `PQconnectdbParams` | implemented | fe-connect.c:765 |
+| 157 | `PQconnectStartParams` | implemented | fe-connect.c:867, blocking |
 | 158 | `PQping` | not yet |  |
 | 159 | `PQpingParams` | not yet |  |
 | 160 | `PQlibVersion` | implemented | fe-misc.c:65 |
@@ -191,7 +193,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 | 162 | `lo_lseek64` | not yet |  |
 | 163 | `lo_tell64` | not yet |  |
 | 164 | `lo_truncate64` | not yet |  |
-| 165 | `PQconninfo` | not yet |  |
+| 165 | `PQconninfo` | implemented | fe-connect.c:7415 |
 | 166 | `PQsslInUse` | implemented | fe-secure.c:103, without SSL |
 | 167 | `PQsslStruct` | implemented | fe-secure.c:458, without SSL |
 | 168 | `PQsslAttributeNames` | implemented | fe-secure.c:470, without SSL |

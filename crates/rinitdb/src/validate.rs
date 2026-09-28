@@ -32,9 +32,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::Options;
+use crate::conf::AuthMethods;
 use crate::encoding::{self, Encoding};
 use crate::error::{DirRole, InitdbError, LocaleProvider, NotEmpty};
 use crate::file_perm::DataDirPerm;
+use crate::pg_config;
 use crate::strerror::strerror;
 use crate::sync::{self, SyncMethod};
 
@@ -204,6 +206,9 @@ pub struct CreatePlan {
     pub sync_method: SyncMethod,
     /// `--no-sync-data-files` (`initdb.c:3396`).
     pub sync_data_files: bool,
+    /// `wal_segment_size_mb` (`initdb.c:169`), as `--wal-segsize` left it:
+    /// already a power of two in 1..1024 (`:3465`).
+    pub wal_segment_size_mb: u32,
 }
 
 /// `-s`/`--show`: print the settings block and exit 0 (`initdb.c:2805`-`:2819`),
@@ -239,6 +244,11 @@ pub fn validate(
     let locale_provider = parse_locale_provider(options.locale_provider.as_deref())?;
     // initdb.c:3388, the `case 19:` arm.
     let sync_method = sync::parse_sync_method(options.sync_method.as_deref())?;
+    // initdb.c:3353, the `case 12:` arm; :169 is the default.
+    let wal_segment_size_mb = match options.wal_segsize.as_deref() {
+        Some(arg) => option_parse_int(arg, "--wal-segsize", 1, 1024)?,
+        None => pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB.cast_signed(),
+    };
 
     // --- immediately after the loop (initdb.c:3416) ---
     let datadir = options.resolve_datadir()?;
@@ -268,6 +278,15 @@ pub fn validate(
     // initdb.c:3454, before setup_pgdata.
     if options.pwprompt && options.pwfile.is_some() {
         return Err(InitdbError::PasswordPromptAndFile);
+    }
+
+    // initdb.c:3457-:3463: check_authmethod_unspecified (the `trust`
+    // default), check_authmethod_valid and check_need_password.
+    AuthMethods::resolve(options).check(options.pwprompt || options.pwfile.is_some())?;
+
+    // initdb.c:3465.
+    if !is_valid_wal_seg_size_mb(wal_segment_size_mb) {
+        return Err(InitdbError::WalSegSizeNotPowerOfTwo);
     }
 
     let pgdata = require_datadir(datadir, env)?;
@@ -320,6 +339,7 @@ pub fn validate(
         do_sync: !options.no_sync,
         sync_method,
         sync_data_files: !options.no_sync_data_files,
+        wal_segment_size_mb: wal_segment_size_mb.cast_unsigned(),
     }))
 }
 
@@ -358,6 +378,71 @@ fn split_gucs(set: &[String]) -> Result<Vec<(String, String)>, InitdbError> {
             None => Err(InitdbError::SetRequiresValue { name: item.clone() }),
         })
         .collect()
+}
+
+/// `option_parse_int` (`src/fe_utils/option_utils.c:50`) over `strtoint`
+/// (`src/common/string.c:50`), which is `strtol` base 10 narrowed to `int`.
+///
+/// `strtol` skips leading whitespace and takes an optional sign; with no
+/// digits after them it consumes nothing and returns 0, so an empty or blank
+/// argument is out of range rather than invalid. Only trailing whitespace may
+/// follow the digits (`option_utils.c:64`).
+fn option_parse_int(
+    arg: &str,
+    option: &'static str,
+    min: i32,
+    max: i32,
+) -> Result<i32, InitdbError> {
+    let bytes = arg.as_bytes();
+    let mut pos = bytes.iter().take_while(|&&b| is_c_space(b)).count();
+    let negative = match bytes.get(pos) {
+        Some(b'-') => {
+            pos += 1;
+            true
+        }
+        Some(b'+') => {
+            pos += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = bytes[pos..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    // `long` is 64 bits on every target this ships to; strtol saturates there
+    // and sets ERANGE, and strtoint sets it again for anything outside `int`.
+    let (value, end) = if digits == 0 {
+        (0_i64, 0)
+    } else {
+        let magnitude = bytes[pos..pos + digits].iter().fold(0_i64, |acc, &b| {
+            acc.saturating_mul(10).saturating_add(i64::from(b - b'0'))
+        });
+        (if negative { -magnitude } else { magnitude }, pos + digits)
+    };
+    if !bytes[end..].iter().all(|&b| is_c_space(b)) {
+        return Err(InitdbError::InvalidOptionValue {
+            value: arg.to_owned(),
+            option,
+        });
+    }
+    match i32::try_from(value) {
+        Ok(value) if (min..=max).contains(&value) => Ok(value),
+        _ => Err(InitdbError::OptionOutOfRange { option, min, max }),
+    }
+}
+
+/// C's `isspace()` in the "C" locale.
+fn is_c_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// `IsValidWalSegSize(wal_segment_size_mb * 1024 * 1024)`
+/// (`src/include/access/xlog_internal.h:96`): a power of two between
+/// `WalSegMinSize` and `WalSegMaxSize`, 1 MB and 1 GB (`:88`-`:89`).
+fn is_valid_wal_seg_size_mb(mb: i32) -> bool {
+    let size = i64::from(mb) * 1024 * 1024;
+    size > 0 && size & (size - 1) == 0 && (1 << 20..=1 << 30).contains(&size)
 }
 
 /// `initdb.c:3367`: the `--locale-provider` switch arm.
@@ -960,6 +1045,186 @@ mod tests {
             check(&["-s", "-S", "/tmp/data"], &fs),
             Ok(Plan::Sync(_))
         ));
+        // initdb.c:3460-:3466: the auth methods and the WAL segment size are
+        // judged before setup_pgdata, so -s does not get past them either.
+        assert_eq!(
+            failure(&["-s", "-A", "bogus", "/tmp/data"], &FakeFs::empty()),
+            InitdbError::InvalidAuthMethod {
+                method: "bogus".to_owned(),
+                conntype: "local"
+            }
+        );
+        assert_eq!(
+            failure(&["-s", "--wal-segsize", "3", "/tmp/data"], &FakeFs::empty()),
+            InitdbError::WalSegSizeNotPowerOfTwo
+        );
+    }
+
+    // --- initdb.c:3457-:3466, between --sync-only and setup_pgdata ---------
+
+    #[test]
+    fn an_auth_method_must_be_on_its_sides_list() {
+        // check_authmethod_valid (initdb.c:2582), local before host (:3460).
+        assert_eq!(
+            failure(&["-A", "bogus", "dd"], &FakeFs::empty()),
+            InitdbError::InvalidAuthMethod {
+                method: "bogus".to_owned(),
+                conntype: "local"
+            }
+        );
+        // `peer` is local-only and `ident` host-only; -A maps each to the
+        // other on the side it cannot serve (initdb.c:3255), so -A peer is
+        // fine but --auth-host peer is not.
+        assert!(matches!(
+            check(&["-A", "peer", "dd"], &FakeFs::empty()),
+            Ok(Plan::Create(_))
+        ));
+        assert_eq!(
+            failure(&["--auth-host", "peer", "dd"], &FakeFs::empty()),
+            InitdbError::InvalidAuthMethod {
+                method: "peer".to_owned(),
+                conntype: "host"
+            }
+        );
+        assert_eq!(
+            failure(&["--auth-local", "ident", "dd"], &FakeFs::empty()),
+            InitdbError::InvalidAuthMethod {
+                method: "ident".to_owned(),
+                conntype: "local"
+            }
+        );
+        // A stock build has no GSS, PAM, LDAP, BSD auth or SSL
+        // (docs/divergences.md).
+        for method in ["gss", "sspi", "pam", "bsd", "ldap", "cert"] {
+            assert_eq!(
+                failure(&["--auth-host", method, "dd"], &FakeFs::empty()),
+                InitdbError::InvalidAuthMethod {
+                    method: method.to_owned(),
+                    conntype: "host"
+                },
+                "{method}"
+            );
+        }
+        for method in ["reject", "radius", "password"] {
+            assert!(
+                matches!(
+                    check(&["--auth-local", method, "dd"], &FakeFs::empty()),
+                    Ok(Plan::Create(_))
+                ),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_authentication_on_both_sides_needs_a_password() {
+        // check_need_password (initdb.c:2597).
+        for auth in ["md5", "password", "scram-sha-256"] {
+            assert_eq!(
+                failure(&["-A", auth, "dd"], &FakeFs::empty()),
+                InitdbError::PasswordRequired,
+                "{auth}"
+            );
+        }
+        assert_eq!(
+            failure(
+                &["--auth-local", "md5", "--auth-host", "scram-sha-256", "dd"],
+                &FakeFs::empty()
+            ),
+            InitdbError::PasswordRequired
+        );
+        // One side enough to connect without one, or a password given.
+        for list in [
+            &["--auth-host", "md5", "dd"][..],
+            &["-A", "md5", "--pwfile", "/tmp/pw", "dd"],
+            &["-A", "md5", "-W", "dd"],
+        ] {
+            assert!(
+                matches!(check(list, &FakeFs::empty()), Ok(Plan::Create(_))),
+                "{list:?}"
+            );
+        }
+        // After the prompt-and-file check (initdb.c:3454), before setup_pgdata.
+        assert_eq!(
+            failure(
+                &["-A", "md5", "-W", "--pwfile", "/tmp/pw"],
+                &FakeFs::empty()
+            ),
+            InitdbError::PasswordPromptAndFile
+        );
+        assert_eq!(
+            failure(&["-A", "md5"], &FakeFs::empty()),
+            InitdbError::PasswordRequired
+        );
+    }
+
+    #[test]
+    fn wal_segsize_is_parsed_as_option_parse_int_does() {
+        // initdb.c:3353 over option_utils.c:50.
+        let invalid = |value: &str| InitdbError::InvalidOptionValue {
+            value: value.to_owned(),
+            option: "--wal-segsize",
+        };
+        let range = InitdbError::OptionOutOfRange {
+            option: "--wal-segsize",
+            min: 1,
+            max: 1024,
+        };
+        for value in ["abc", "16MB", "0x10", "1 6", " -", "1.5"] {
+            assert_eq!(
+                failure(&[&format!("--wal-segsize={value}"), "dd"], &FakeFs::empty()),
+                invalid(value),
+                "{value:?}"
+            );
+        }
+        // No digits consumes nothing and returns 0; strtol saturates.
+        for value in ["", "   ", "0", "-16", "2048", "99999999999999999999999"] {
+            assert_eq!(
+                failure(&[&format!("--wal-segsize={value}"), "dd"], &FakeFs::empty()),
+                range,
+                "{value:?}"
+            );
+        }
+        // Leading and trailing whitespace and a sign are strtol's.
+        for value in [" 16", "16 ", "+16", "\t16\n"] {
+            assert!(
+                matches!(
+                    check(&[&format!("--wal-segsize={value}"), "dd"], &FakeFs::empty()),
+                    Ok(Plan::Create(_))
+                ),
+                "{value:?}"
+            );
+        }
+        // A getopt-stage error: it beats the missing data directory.
+        assert_eq!(
+            failure(&["--wal-segsize", "abc"], &FakeFs::empty()),
+            invalid("abc")
+        );
+    }
+
+    #[test]
+    fn wal_segsize_must_be_a_power_of_two() {
+        // initdb.c:3465, IsValidWalSegSize (xlog_internal.h:96).
+        for mb in [1, 2, 16, 64, 1024] {
+            assert!(is_valid_wal_seg_size_mb(mb), "{mb}");
+        }
+        for mb in [0, 3, 24, 1000, 2048, -1] {
+            assert!(!is_valid_wal_seg_size_mb(mb), "{mb}");
+        }
+        assert_eq!(
+            failure(&["--wal-segsize", "3", "dd"], &FakeFs::empty()),
+            InitdbError::WalSegSizeNotPowerOfTwo
+        );
+        // After check_need_password (:3463).
+        assert_eq!(
+            failure(&["-A", "md5", "--wal-segsize", "3", "dd"], &FakeFs::empty()),
+            InitdbError::PasswordRequired
+        );
+        // And before setup_pgdata (:3470).
+        assert_eq!(
+            failure(&["--wal-segsize", "3"], &FakeFs::empty()),
+            InitdbError::WalSegSizeNotPowerOfTwo
+        );
     }
 
     // --- locales and encodings --------------------------------------------
@@ -1278,6 +1543,19 @@ mod tests {
                 InitdbError::SetRequiresValue {
                     name: "work_mem".to_owned()
                 },
+                "{order:?}"
+            );
+        }
+        // --wal-segsize (initdb.c:3353) comes after the other three.
+        for order in [
+            vec!["--wal-segsize", "abc", "--sync-method", "xyz", "/tmp/d"],
+            vec!["--sync-method", "xyz", "--wal-segsize", "abc", "/tmp/d"],
+        ] {
+            assert!(
+                matches!(
+                    failure(&order, &FakeFs::empty()),
+                    InitdbError::UnrecognizedSyncMethod { .. }
+                ),
                 "{order:?}"
             );
         }

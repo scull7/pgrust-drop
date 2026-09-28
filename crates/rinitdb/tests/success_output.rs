@@ -299,6 +299,48 @@ fn show_with_the_notices_matches_reference_initdb() {
     );
 }
 
+/// What `-s` does not get past: the auth methods, the superuser password
+/// they need and the WAL segment size are judged at `initdb.c:3454`-`:3466`,
+/// after the getopt loop and before `setup_pgdata`, so C refuses these with
+/// exit 1 and prints no settings block. All three streams are compared as
+/// they are.
+#[test]
+fn show_refuses_what_reference_initdb_refuses() {
+    let Some(initdb) = reference::find("initdb") else {
+        reference::skip("initdb");
+        return;
+    };
+    let tempdir = TempDir::new("show-refusals");
+    let env = gate_env();
+    for (tag, argv) in [
+        ("auth", &["-s", "-A", "bogus", "data"][..]),
+        ("auth-host", &["-s", "--auth-host", "peer", "data"]),
+        ("password", &["-s", "-A", "md5", "data"]),
+        ("segsize", &["-s", "--wal-segsize", "3", "data"]),
+        ("segsize-value", &["-s", "--wal-segsize", "16MB", "data"]),
+        ("segsize-range", &["-s", "--wal-segsize", "2048", "data"]),
+    ] {
+        let argv = args(argv);
+        let [theirs, ours] =
+            [(initdb.as_path(), "c"), (Path::new(RINITDB), "rinitdb")].map(|(bin, side)| {
+                let cwd = tempdir.side(&format!("{tag}-{side}"));
+                run_in_dir(bin, &argv, &cwd, &env)
+            });
+        assert_eq!(
+            theirs.status,
+            Some(1),
+            "C initdb {argv:?} ({tag}): {}",
+            theirs.stderr_text()
+        );
+        let report = testkit::gate::compare(&theirs, &ours, &[], Scope::Everything);
+        assert!(
+            report.is_clean(),
+            "gate {} vs {RINITDB} {argv:?} ({tag})\n{report}",
+            initdb.display()
+        );
+    }
+}
+
 /// `-d -n`: the notices, the settings block on stderr under the ownership
 /// lines, then an ordinary run. C's stderr also carries the bootstrap
 /// backend's `-d 5` log (`initdb.c:1616`), which `backend-log` drops.

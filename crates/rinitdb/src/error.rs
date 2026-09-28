@@ -177,6 +177,34 @@ pub enum InitdbError {
     #[error("password prompt and password file cannot be specified together")]
     PasswordPromptAndFile,
 
+    /// `option_parse_int` (`src/fe_utils/option_utils.c:69`), from the
+    /// `--wal-segsize` arm (`initdb.c:3353`): not an integer.
+    #[error("invalid value \"{value}\" for option {option}")]
+    InvalidOptionValue { value: String, option: &'static str },
+
+    /// `option_parse_int` (`src/fe_utils/option_utils.c:76`): out of range.
+    #[error("{option} must be in range {min}..{max}")]
+    OptionOutOfRange {
+        option: &'static str,
+        min: i32,
+        max: i32,
+    },
+
+    /// `check_authmethod_valid` (`initdb.c:2592`).
+    #[error("invalid authentication method \"{method}\" for \"{conntype}\" connections")]
+    InvalidAuthMethod {
+        method: String,
+        conntype: &'static str,
+    },
+
+    /// `check_need_password` (`initdb.c:2606`).
+    #[error("must specify a password for the superuser to enable password authentication")]
+    PasswordRequired,
+
+    /// `initdb.c:3466`: `IsValidWalSegSize` refused `--wal-segsize`.
+    #[error("argument of --wal-segsize must be a power of two between 1 and 1024")]
+    WalSegSizeNotPowerOfTwo,
+
     /// `initdb.c:2679` (`setup_bin_paths`): `-L` must be absolute.
     #[error("input file location must be an absolute path")]
     InputFileLocationNotAbsolute,
@@ -584,6 +612,49 @@ mod tests {
             "initdb: error: --icu-locale cannot be specified unless locale provider \
              \"icu\" is chosen"
         );
+    }
+
+    #[test]
+    fn the_checks_between_the_getopt_loop_and_setup_pgdata_render_upstreams_sentences() {
+        // option_parse_int (option_utils.c:69, :76), initdb.c:2592, :2606, :3466.
+        let cases = [
+            (
+                InitdbError::InvalidOptionValue {
+                    value: "abc".to_owned(),
+                    option: "--wal-segsize",
+                },
+                "initdb: error: invalid value \"abc\" for option --wal-segsize",
+            ),
+            (
+                InitdbError::OptionOutOfRange {
+                    option: "--wal-segsize",
+                    min: 1,
+                    max: 1024,
+                },
+                "initdb: error: --wal-segsize must be in range 1..1024",
+            ),
+            (
+                InitdbError::InvalidAuthMethod {
+                    method: "bogus".to_owned(),
+                    conntype: "local",
+                },
+                "initdb: error: invalid authentication method \"bogus\" for \"local\" connections",
+            ),
+            (
+                InitdbError::PasswordRequired,
+                "initdb: error: must specify a password for the superuser to enable password \
+                 authentication",
+            ),
+            (
+                InitdbError::WalSegSizeNotPowerOfTwo,
+                "initdb: error: argument of --wal-segsize must be a power of two between 1 and 1024",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.render(), expected);
+            // pg_fatal and a bare pg_log_error: no hint.
+            assert!(err.hints().is_empty(), "{err:?}");
+        }
     }
 
     #[test]

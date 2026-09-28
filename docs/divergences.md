@@ -95,3 +95,23 @@ Each entry: what differs, why, and the test that pins the divergent behaviour.
 | rlibpq | `libpq_prng_init`'s fallback seed, used only when `/dev/urandom` cannot be read, mixes the pid and the time but not the `PGconn` pointer (`fe-connect.c:1179`). | There is no stable object address to mix in under `#![deny(unsafe_code)]`, and the fallback is not what runs on any supported platform; the strong seed is upstream's (`pg_prng_strong_seed`, `pg_prng.h:46`). | `crates/rlibpq/src/hosts.rs` unit tests `the_generator_draws_what_pg_prng_draws` and `the_shuffle_is_upstreams_inside_out_fisher_yates` (the generator and shuffle themselves, against values printed by REL_18_6's own `pg_prng.c`) |
 | rlibpq | `print` (`PQprint`) never pages: `PrintOpt::pager` is carried and ignored. C pipes the output through `$PAGER` when `fout` is `stdout`, both `stdin` and `stdout` are terminals, and the result looks longer than the screen (`fe-print.c:150`-`:204`). | A `Write` is not known to be `stdout`; the screen size (`TIOCGWINSZ`) and the `SIGPIPE` mask around `popen` need libc, and the crate is `#![deny(unsafe_code)]` without it: the `libc` approval in AGENTS.md covers rlibpq-ffi only (the C-ABI shim's `free` for `PQfreemem`), not rlibpq. Upstream's only caller, `isolationtester`, never sets `pager`, and written anywhere but an interactive terminal the two render identically, which the live gate checks with `pager` set. | `crates/rlibpq/src/print.rs` unit test `the_pager_never_pages`; `crates/rlibpq/tests/t_fe_print.rs::fe_print_matches_c_libpq` (pager on and off, stdout a pipe) |
 | rlibpq-ffi | The C ABI answers every TLS and GSSAPI probe as a libpq configured without SSL, OpenSSL and GSSAPI does — upstream's own `#ifndef USE_SSL`, `#ifndef USE_OPENSSL` and `#ifndef ENABLE_GSS` arms (`fe-secure.c:449`-`:518`): `PQsslAttribute(NULL, "library")` is `NULL`, so `libpq_testclient --ssl` prints `SSL is not enabled`, where a distribution libpq, built with OpenSSL, answers `OpenSSL`. | Same cause as the `DefaultSSLMode` entry above: `rlibpq` has no TLS backend until NAT-392 adds ADR-0006's `tls` feature, and `crates/rlibpq/ffi/src/secure.rs` refuses to compile once `rlibpq::pg_config::USE_SSL` or `ENABLE_GSS` turns true, so the answers cannot outlive the fact. | `crates/rlibpq/ffi/tests/t_002_api.rs::pq_ssl_attribute_null_library_returns_null` (`002_api.pl:17`-`:19`, the arm a build without OpenSSL takes) and `crates/rlibpq/ffi/tests/c_abi.rs::every_shim_answers_as_c_libpq_without_ssl_or_gssapi` |
+
+## pgrust-side divergences (file upstream)
+
+The table above is this repository's own choices. This list is the other
+kind: places where pgrust, the server `pgdrop` links, prints something
+PostgreSQL 18.6 does not, found by running a stolen regression script
+through the reference C psql 18.6 against a server `pgdrop start` brought
+up. Each is to be filed upstream at `malisper/pgrust`; none is to be fixed
+here. The runner is `crates/pgdrop/tests/pgrust_regress/mod.rs`: a section
+named in a gate's `pgrust` list must still differ from the expected output
+through C psql, so a pgrust that has caught up fails the gate until its
+entry goes.
+
+| script | section (header) | what pgrust prints | filed | pinned by |
+| ------ | ---------------- | ------------------ | ----- | --------- |
+
+Scripts gated against pgrust with no entry above, at the pinned pgrust
+revision: `psql_crosstab.sql` (whole) and `psql_pipeline.sql` (all 58
+sections through C psql; rpsql skips the 9 its `NOT_YET` names) —
+`crates/pgdrop/tests/regress_vs_pgrust.rs::psql_crosstab`, `::psql_pipeline`.

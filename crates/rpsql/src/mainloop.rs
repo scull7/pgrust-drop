@@ -177,7 +177,9 @@ pub fn main_loop(
 
         let Some(line) = source.next_line() else {
             if let Some(err) = source.take_error() {
-                // `input.c:215`, before this line is counted.
+                // `input.c:215`, before this line is counted; a read error
+                // fails this loop (`mainloop.c:172`).
+                success_result = EXIT_FAILURE;
                 logging::error(
                     session.pset,
                     format!(
@@ -990,5 +992,20 @@ mod tests {
             format!("psql:{sub}: error: could not read from input file: Is a directory\n")
         );
         assert_eq!(out.seen, ["select 2;"]);
+        // The inner loop fails (`mainloop.c:172`), so `\i` is an error;
+        // without ON_ERROR_STOP the outer file reads on and ends well.
+        assert_eq!(out.code, EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn a_read_error_fails_the_loop_that_hit_it() {
+        // `-f <dir>`: `gets_fromFile` fails and `MainLoop` returns
+        // `EXIT_FAILURE` (`mainloop.c:172`-`:173`).
+        let dir = Scripts::new("unreadable-top");
+        let sub = dir.0.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let out = run_file(sub.to_str().unwrap());
+        assert_eq!(out.code, EXIT_FAILURE);
+        assert!(out.seen.is_empty());
     }
 }

@@ -18,7 +18,8 @@
 //! there, a directory that cannot be read, `\q` inside an included file, a
 //! server error inside one, `~` (`expand_tilde`), `\i -` reading on from
 //! stdin, `\cd` with and without an argument, `-c '\i …'`, stdin with no
-//! `-f`, and `ON_ERROR_STOP` stopping the including file.
+//! `-f`, `ON_ERROR_STOP` stopping the including file, and a read error
+//! failing its loop (`mainloop.c:172`) under `-f`, `-c` and `ON_ERROR_STOP`.
 
 // Integration tests are their own crate; see the library root for why this lint is off.
 #![allow(clippy::doc_markdown)]
@@ -88,6 +89,11 @@ const TREE: &[(&str, &str)] = &[
         "\\i sub/err.sql\n\
          \\echo not reached\n",
     ),
+    (
+        "stopdir.sql",
+        "\\i sub\n\
+         \\echo not reached\n",
+    ),
 ];
 
 /// What each psql is run with: arguments, and what it reads on stdin.
@@ -95,6 +101,9 @@ const RUNS: &[(&[&str], &str)] = &[
     (&["-f", "./main.sql"], "select 'from stdin';\n"),
     (&["-c", "\\ir sub/a.sql", "-c", "\\i nosuch.sql"], ""),
     (&["-v", "ON_ERROR_STOP=1", "-f", "stop.sql"], ""),
+    (&["-f", "sub"], ""),
+    (&["-c", "\\i sub", "-c", "select 'next'"], ""),
+    (&["-v", "ON_ERROR_STOP=1", "-f", "stopdir.sql"], ""),
     (
         &[],
         "\\i sub/a.sql\n\\i sub/err.sql\n\\i nosuch.sql\nselect 'last';\n",

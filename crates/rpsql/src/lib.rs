@@ -205,7 +205,9 @@ impl Executor for LiveExecutor {
             SendMode::StartPipelineMode => self.connection.enter_pipeline_mode(),
             SendMode::EndPipelineMode => self.connection.pipeline_sync(),
             SendMode::PipelineSync => self.connection.send_pipeline_sync(),
-            SendMode::Flush => self.connection.flush(),
+            // psql's connection blocks, so `PQflush` never leaves output
+            // pending (`fe-misc.c:1109`): its `1` cannot reach `common.c:1672`.
+            SendMode::Flush => self.connection.flush().map(|_| ()),
             SendMode::FlushRequest => self.connection.send_flush_request(),
             SendMode::GetResults => Ok(()),
         };

@@ -17,10 +17,10 @@
 //!   the fresh run directory it made, and whether `--datadir` already holds a
 //!   cluster. It returns a [`StartPlan`]: the `initdb` and `postgres` command
 //!   lines, the connection URI, and what `stop` may delete.
-//! - The actions — creating the run directory, minting, spawning, polling
-//!   for readiness, recording the PID for `stop` — are the next slice of
-//!   NAT-409; until they land, `pgdrop start` reports that it is not
-//!   implemented.
+//! - [`StartPlan::record`] is what `start` leaves in the data directory for
+//!   `pgdrop stop` ([`crate::stop`]): what to remove once the server is gone.
+//! - The actions — creating the run directory, minting, spawning, waiting
+//!   for readiness, writing the record — are [`crate::launch`]'s.
 //!
 //! ## The run directory
 //!
@@ -212,10 +212,13 @@ pub struct StartPlan {
     pub keep: bool,
 }
 
+/// What every run directory's name starts with; `stop` removes no other.
+pub const RUN_DIR_PREFIX: &str = "pgdrop-";
+
 /// Pure: the run directory's name, unique per process and per attempt.
 #[must_use]
 pub fn run_dir_name(pid: u32, nonce: u64) -> String {
-    format!("pgdrop-{pid}-{nonce:x}")
+    format!("{RUN_DIR_PREFIX}{pid}-{nonce:x}")
 }
 
 /// Pure: the plan for `flags`.
@@ -366,6 +369,66 @@ impl StartPlan {
     #[must_use]
     pub fn removes_datadir(&self) -> bool {
         self.origin == Origin::Minted && !self.keep
+    }
+
+    /// What `start` leaves in the data directory for `stop`.
+    #[must_use]
+    pub fn record(&self) -> Record {
+        Record {
+            removes_datadir: self.removes_datadir(),
+            removes_run_dir: !self.keep,
+            run_dir: self.run_dir.clone(),
+        }
+    }
+}
+
+/// The file in the data directory that tells `stop` what `start` made.
+/// The server ignores files it does not know in its data directory.
+pub const RECORD_FILE: &str = "pgdrop.start";
+
+/// The record's first line; a file without it is not one `start` wrote.
+const RECORD_MAGIC: &str = "pgdrop start 1";
+
+/// What `stop` removes once the server is gone. `postmaster.pid` holds the
+/// rest (the PID), for as long as the server runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub removes_datadir: bool,
+    pub removes_run_dir: bool,
+    pub run_dir: String,
+}
+
+impl Record {
+    /// Pure: the file's text. The run directory is last and runs to the
+    /// final newline, so any path survives the round trip.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let yes_no = |b: bool| if b { "yes" } else { "no" };
+        format!(
+            "{RECORD_MAGIC}\nremove_datadir={}\nremove_run_dir={}\nrun_dir={}\n",
+            yes_no(self.removes_datadir),
+            yes_no(self.removes_run_dir),
+            self.run_dir
+        )
+    }
+
+    /// Pure: [`Record::render`]'s inverse; `None` for anything else.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let rest = text.strip_prefix(RECORD_MAGIC)?.strip_prefix('\n')?;
+        let (datadir, rest) = rest.strip_prefix("remove_datadir=")?.split_once('\n')?;
+        let (run, rest) = rest.strip_prefix("remove_run_dir=")?.split_once('\n')?;
+        let run_dir = rest.strip_prefix("run_dir=")?.strip_suffix('\n')?;
+        let flag = |value: &str| match value {
+            "yes" => Some(true),
+            "no" => Some(false),
+            _ => None,
+        };
+        Some(Self {
+            removes_datadir: flag(datadir)?,
+            removes_run_dir: flag(run)?,
+            run_dir: run_dir.to_owned(),
+        })
     }
 }
 
@@ -703,6 +766,58 @@ mod tests {
              \"pid\": 4242, \"datadir\": \"/tmp/pgdrop-7-1f/data\"}\n"
         );
         assert_eq!(json_string("a\"b\\c\n\u{1}é"), "\"a\\\"b\\\\c\\n\\u0001é\"");
+    }
+
+    #[test]
+    fn the_record_says_what_stop_removes_and_round_trips() {
+        let minted = plan_in(&flags()).record();
+        assert_eq!(
+            minted,
+            Record {
+                removes_datadir: true,
+                removes_run_dir: true,
+                run_dir: "/tmp/pgdrop-7-1f".into(),
+            }
+        );
+        assert_eq!(
+            minted.render(),
+            "pgdrop start 1\nremove_datadir=yes\nremove_run_dir=yes\nrun_dir=/tmp/pgdrop-7-1f\n"
+        );
+        let kept = plan_in(&Start {
+            keep: true,
+            ..flags()
+        })
+        .record();
+        assert!(!kept.removes_datadir && !kept.removes_run_dir);
+        let existing = plan(
+            &Start {
+                datadir: Some("d".into()),
+                ..flags()
+            },
+            Path::new("/work"),
+            Path::new("/tmp/r"),
+            true,
+        )
+        .unwrap()
+        .record();
+        assert!(!existing.removes_datadir && existing.removes_run_dir);
+
+        let odd = Record {
+            run_dir: "/tmp/a\nremove_datadir=yes\n".into(),
+            ..kept
+        };
+        for record in [minted, odd] {
+            assert_eq!(Record::parse(&record.render()), Some(record));
+        }
+        for bad in [
+            "",
+            "pgdrop start 2\nremove_datadir=yes\nremove_run_dir=yes\nrun_dir=/x\n",
+            "pgdrop start 1\nremove_datadir=maybe\nremove_run_dir=yes\nrun_dir=/x\n",
+            "pgdrop start 1\nremove_datadir=yes\nremove_run_dir=yes\nrun_dir=/x",
+            "pgdrop start 1\nremove_run_dir=yes\nremove_datadir=yes\nrun_dir=/x\n",
+        ] {
+            assert_eq!(Record::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

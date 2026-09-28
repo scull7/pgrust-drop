@@ -7,11 +7,6 @@ use std::ffi::{c_int, c_void};
 /// `AC_INIT`'s `18.6` (`configure.ac:20`; `meson.build:11` agrees).
 pub const PG_VERSION_NUM: c_int = 180_006;
 
-unsafe extern "C" {
-    /// The C library's `free`, which `PQfreemem` is (`fe-exec.c:4065`).
-    fn free(ptr: *mut c_void);
-}
-
 /// `PQlibVersion`, `fe-misc.c:65`: the version this libpq is.
 #[unsafe(no_mangle)]
 pub extern "C" fn PQlibVersion() -> c_int {
@@ -35,8 +30,9 @@ pub extern "C" fn PQisthreadsafe() -> c_int {
 /// `ptr` is null or a pointer `malloc` returned that has not been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PQfreemem(ptr: *mut c_void) {
-    // SAFETY: the caller's contract is `free`'s.
-    unsafe { free(ptr) }
+    // SAFETY: the caller's contract is `free`'s, and `libc::free` is the C
+    // library's `free` (`fe-exec.c:4065`), the one `malloc` pairs with.
+    unsafe { libc::free(ptr) }
 }
 
 /// `PQfreeNotify`, `fe-exec.c:4080`: kept for binary compatibility only;

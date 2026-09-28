@@ -6,13 +6,14 @@
 //! stolen assertion through rpsql and, when the lane has one, through C psql
 //! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far:
-//! `\copyright` and `\help` (lines 75-77), `\timing`
-//! (lines 86-108), `\errverbose with no previous error` (159-164),
+//! `\copyright` and `\help` (lines 75-77), the unsupported replication
+//! command response (79-84), `\timing` (lines 86-108), the server crash
+//! (136-150), `\errverbose with no previous error` (159-164),
 //! `\errverbose after normal query with error` (170-181), the multiple
-//! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367) and
-//! `\g` output piped into a program (457-486). The `ENCODING`, notification,
-//! crash and remaining `\errverbose` cases, and the rest of the file, land
-//! with Linear NAT-400 … NAT-405.
+//! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367),
+//! `\g` output piped into a program (457-486) and COPY within pipelines
+//! (488-533). The `ENCODING`, notification and remaining `\errverbose`
+//! cases, and the rest of the file, land with Linear NAT-400 … NAT-405.
 //!
 //! The byte-diff gate NAT-398's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the
@@ -89,6 +90,9 @@ const G_PIPE_PORT: u16 = 55_408;
 const OUTPUT_REDIRECTION_PORT: u16 = 55_409;
 const COPYRIGHT_AND_HELP_PORT: u16 = 55_416;
 const HELP_SQL_GATE_PORT: u16 = 55_417;
+const UNEXPECTED_PQRESULTSTATUS_PORT: u16 = 55_418;
+const SERVER_CRASH_PORT: u16 = 55_419;
+const COPY_IN_PIPELINE_PORT: u16 = 55_421;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -215,6 +219,56 @@ fn help_sql_matches_c_psql() {
     );
 }
 
+/// `psql_fails_like()` — 001_basic.pl:33: a nonzero exit and stderr like the
+/// pattern, through one psql, in the context of a WAL sender when
+/// `replication` is given.
+fn psql_fails_like_with(
+    cluster: &Cluster,
+    psql: &Path,
+    sql: &str,
+    expected_stderr: &str,
+    test_name: &str,
+    replication: Option<&str>,
+) {
+    let PsqlOutcome { ret, stderr, .. } = match replication {
+        Some(replication) => cluster.psql_replication(psql, sql, replication),
+        None => cluster.psql(psql, sql, true),
+    };
+    let name = format!("{test_name} ({})", psql.display());
+    assert_ne!(ret, 0, "{name}: exit code not 0");
+    assert_like(&stderr, expected_stderr, &format!("{name}: matches"));
+}
+
+/// `# Test clean handling of unsupported replication command responses` —
+/// 001_basic.pl:79-84, through every psql in turn: `START_REPLICATION`
+/// over a `replication=database` connection answers with CopyBothResponse,
+/// which `AcceptResult` (`common.c:447`) reports by its number.
+#[test]
+fn handling_of_unexpected_pqresultstatus() {
+    let Some(cluster) = Cluster::start(UNEXPECTED_PQRESULTSTATUS_PORT) else {
+        return;
+    };
+    for psql in every_psql(&cluster) {
+        psql_fails_like_with(
+            &cluster,
+            &psql,
+            "START_REPLICATION 0/0",
+            "unexpected PQresultStatus: 8$",
+            "handling of unexpected PQresultStatus",
+            Some("database"),
+        );
+        // Not upstream, which matches only the end of stderr: the whole of
+        // it, and `ON_ERROR_STOP`'s `EXIT_USER`.
+        let outcome = cluster.psql_replication(&psql, "START_REPLICATION 0/0", "database");
+        assert_eq!(
+            (outcome.ret, outcome.stderr.as_str()),
+            (3, "psql:<stdin>:1: error: unexpected PQresultStatus: 8"),
+            "the whole of stderr ({})",
+            psql.display()
+        );
+    }
+}
+
 /// `# test \timing` — 001_basic.pl:86-93.
 #[test]
 fn timing_with_successful_query() {
@@ -249,6 +303,44 @@ fn timing_with_query_error() {
             &stdout,
             "(?m)^Time: 0[.,]000 ms",
             &name("timing was updated"),
+        );
+    }
+}
+
+/// `# test behavior and output on server crash` — 001_basic.pl:136-150,
+/// through every psql in turn: the backend terminating itself mid-script is
+/// reported as upstream's three lines, and psql exits 2 (`EXIT_BADCONN`)
+/// without running what follows.
+#[test]
+fn server_crash() {
+    let Some(cluster) = Cluster::start(SERVER_CRASH_PORT) else {
+        return;
+    };
+    for psql in every_psql(&cluster) {
+        let PsqlOutcome {
+            ret,
+            stdout,
+            stderr,
+        } = cluster.psql(
+            &psql,
+            "SELECT 'before' AS running;\n\
+             SELECT pg_terminate_backend(pg_backend_pid());\n\
+             SELECT 'AFTER' AS not_running;\n",
+            true,
+        );
+        let name = |what: &str| format!("server crash: {what} ({})", psql.display());
+        assert_eq!(ret, 2, "{}; stderr {stderr:?}", name("psql exit code"));
+        assert_like(&stdout, "before", &name("output before crash"));
+        assert_unlike(&stdout, "AFTER", &name("no output after crash"));
+        assert_eq!(
+            stderr,
+            "psql:<stdin>:2: FATAL:  terminating connection due to administrator command
+psql:<stdin>:2: server closed the connection unexpectedly
+\tThis probably means the server terminated abnormally
+\tbefore or while processing the request.
+psql:<stdin>:2: error: connection to server was lost",
+            "{}",
+            name("error message")
         );
     }
 }
@@ -629,6 +721,96 @@ fn g_output_piped_into_a_program() {
             &slurp(),
             "(?s)foo.*bar",
             "copy output passed to \\g pipe: the file",
+        );
+    }
+}
+
+/// `# Test COPY within pipelines.` — 001_basic.pl:488-533, in order,
+/// through every psql in turn. "These abort the connection from the
+/// frontend so they cannot be tested via SQL" (:489); the first case also
+/// waits for the server to log that it lost the protocol's synchronisation.
+#[test]
+fn copy_in_pipelines() {
+    let Some(cluster) = Cluster::start(COPY_IN_PIPELINE_PORT) else {
+        return;
+    };
+    let psqls = every_psql(&cluster);
+    cluster.safe_psql(Path::new(RPSQL), "CREATE TABLE psql_pipeline()");
+    let expected = "COPY in a pipeline is not supported, aborting connection";
+    for psql in &psqls {
+        let log_location = cluster.log_len();
+        psql_fails_like_with(
+            &cluster,
+            psql,
+            "\\startpipeline
+COPY psql_pipeline FROM STDIN;
+SELECT 'val1';
+\\syncpipeline
+\\endpipeline",
+            expected,
+            "COPY FROM in pipeline: fails",
+            None,
+        );
+        cluster.wait_for_log(
+            "FATAL: .*terminating connection because protocol synchronization was lost",
+            log_location,
+        );
+
+        // "Remove \syncpipeline here." (:505)
+        psql_fails_like_with(
+            &cluster,
+            psql,
+            "\\startpipeline
+COPY psql_pipeline TO STDOUT;
+SELECT 'val1';
+\\endpipeline",
+            expected,
+            "COPY TO in pipeline: fails",
+            None,
+        );
+
+        psql_fails_like_with(
+            &cluster,
+            psql,
+            "\\startpipeline
+\\copy psql_pipeline from stdin;
+SELECT 'val1';
+\\syncpipeline
+\\endpipeline",
+            expected,
+            "\\copy from in pipeline: fails",
+            None,
+        );
+
+        // "Sync attempt after a COPY TO/FROM." (:525)
+        psql_fails_like_with(
+            &cluster,
+            psql,
+            "\\startpipeline
+\\copy psql_pipeline to stdout;
+\\syncpipeline
+\\endpipeline",
+            expected,
+            "\\copy to in pipeline: fails",
+            None,
+        );
+
+        // Not upstream, which asks only for a nonzero exit: psql gives up
+        // with `exit(EXIT_BADCONN)` (`common.c:1943`) whatever
+        // `ON_ERROR_STOP` says, so each case above exits 2.
+        let outcome = cluster.psql(
+            psql,
+            "\\startpipeline\nCOPY psql_pipeline TO STDOUT;\n\\endpipeline",
+            true,
+        );
+        assert_eq!(
+            (outcome.ret, outcome.stderr.as_str()),
+            (
+                2,
+                "psql:<stdin>:3: COPY in a pipeline is not supported, aborting connection"
+            ),
+            "EXIT_BADCONN ({})",
+            psql.display()
         );
     }
 }

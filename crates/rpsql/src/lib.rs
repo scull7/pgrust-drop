@@ -70,8 +70,8 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, CopyRead, Env, ExecStatus, Filesystem, LoError, Params,
-    PipelineStatus, QueryResult, ResultError, Stream,
+    Connection, ConnectionError, CopyRead, Env, ExecStatus, Filesystem, LoError, Params,
+    PipelineStatus, QueryResult, ResultError, Stream, conninfo_array_parse,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
@@ -118,6 +118,9 @@ pub fn help_text(topic: HelpTopic) -> String {
 struct LiveExecutor {
     connection: Connection<Stream>,
     alive: bool,
+    /// The break [`Executor::exec`] met after it had results to hand back,
+    /// for the next [`Executor::get_result`] to report.
+    lost: Option<ConnectionError>,
     /// How many of the connection's notices have been handed out.
     notices_seen: usize,
 }
@@ -146,42 +149,54 @@ fn text_params(params: &[String]) -> Vec<Option<&[u8]>> {
 
 impl Executor for LiveExecutor {
     /// The `switch (pset.send_mode)` of `ExecQueryAndProcessResults`
-    /// (`common.c:1602`), outside pipeline mode: each extended mode is the
-    /// blocking libpq call its `PQsend…` pairs with, and `\bind`'s
-    /// parameters are all text with no types given (`common.c:1616`).
+    /// (`common.c:1602`), outside pipeline mode: each mode's `PQsend…`, as
+    /// [`Executor::send`] makes it, then `PQgetResult` up to the NULL or the
+    /// first COPY. `\bind`'s parameters are all text with no types given
+    /// (`common.c:1616`).
+    ///
+    /// A connection that breaks after some results were read keeps them:
+    /// they come back here, and the break is the next
+    /// [`Executor::get_result`]'s error, as C's `PQgetResult` hands psql
+    /// the server's `FATAL` before the error result that reports the loss
+    /// (`001_basic.pl:145`-`:150`).
     fn exec(&mut self, query: &[u8], mode: &SendMode) -> Result<Vec<QueryResult>, ErrorMessage> {
+        // `send_query` sends these through `send`; the blocking path has
+        // none, and says so as libpq would.
+        if mode.is_pipeline_control() {
+            return Err(ConnectionError::Pipeline(rlibpq::PipelineError::NotInPipelineMode).into());
+        }
         // `SetCancelConn(pset.db)` … `ResetCancelConn()` around the query, as
         // both `SendQuery` (`common.c:1173`, `:1309`) and `PSQLexec`
         // (`common.c:686`, `:690`) have it: a Ctrl-C meanwhile cancels it.
         cancel::set_cancel_conn(self.connection.get_cancel());
-        let outcome = match mode {
-            SendMode::Query => self.connection.exec(query),
-            SendMode::ExtendedClose { statement } => {
-                self.connection.close_prepared(statement.as_bytes())
+        let outcome = self.send(query, mode).and_then(|()| {
+            let mut results = Vec::new();
+            loop {
+                match self.connection.get_result() {
+                    Ok(Some(result)) => {
+                        let copy = matches!(
+                            result.status(),
+                            ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::CopyBoth
+                        );
+                        results.push(result);
+                        if copy {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) if results.is_empty() => return Err(self.failed(err)),
+                    // Not failed yet: the connection is up until psql reads
+                    // the results before the break.
+                    Err(err) => {
+                        self.lost = Some(err);
+                        break;
+                    }
+                }
             }
-            SendMode::ExtendedParse { statement } => {
-                self.connection.prepare(statement.as_bytes(), query, &[])
-            }
-            SendMode::ExtendedQueryParams { params } => {
-                self.connection
-                    .exec_params(query, &[], &Params::text(&text_params(params)))
-            }
-            SendMode::ExtendedQueryPrepared { statement, params } => self
-                .connection
-                .exec_prepared(statement.as_bytes(), &Params::text(&text_params(params))),
-            // `send_query` sends these through `send`; the blocking path has
-            // none, and says so as libpq would.
-            SendMode::PipelineSync
-            | SendMode::StartPipelineMode
-            | SendMode::EndPipelineMode
-            | SendMode::Flush
-            | SendMode::FlushRequest
-            | SendMode::GetResults => Err(ConnectionError::Pipeline(
-                rlibpq::PipelineError::NotInPipelineMode,
-            )),
-        };
+            Ok(results)
+        });
         cancel::reset_cancel_conn();
-        outcome.map_err(|err| self.failed(err))
+        outcome
     }
 
     fn get_copy_data(&mut self) -> Result<Option<Vec<u8>>, ErrorMessage> {
@@ -264,6 +279,9 @@ impl Executor for LiveExecutor {
     }
 
     fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+        if let Some(err) = self.lost.take() {
+            return Err(self.failed(err));
+        }
         // `SendQuery`'s `SetCancelConn` covers the pipeline's results too
         // (`common.c:1173`, `:1309`): a Ctrl-C while one is awaited cancels.
         cancel::set_cancel_conn(self.connection.get_cancel());
@@ -358,16 +376,21 @@ pub fn connection_keywords(session: &Session) -> Vec<(String, String)> {
 /// Action: open the connection this session asks for.
 ///
 /// `conninfo_array_parse` (`fe-connect.c:6466`, `:6602`), which
-/// `PQconnectdbParams` runs: the keywords first, then the
-/// defaults — a service file, then the environment — for whatever they left
-/// unset, so a failed service lookup is the connection's error.
+/// `PQconnectdbParams(keywords, values, true)` runs (`startup.c:277`): the
+/// keywords first, with a `dbname` that is a connection string expanded in
+/// its place, then the defaults — a service file, then the environment —
+/// for whatever they left unset, so a failed service lookup is the
+/// connection's error.
 fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
-    let mut conninfo = ConnInfo::new();
-    for (key, value) in connection_keywords(session) {
-        // Every keyword here is a row of `PQconninfoOptions[]`, so an unknown
-        // one is a bug in this function rather than in the command line.
-        let _ = conninfo.set(key.as_bytes(), value.as_bytes());
-    }
+    let keywords = connection_keywords(session);
+    let params: Vec<(&[u8], &[u8])> = keywords
+        .iter()
+        .map(|(key, value)| (key.as_bytes(), value.as_bytes()))
+        .collect();
+    let mut conninfo = match conninfo_array_parse(&params, true) {
+        Ok(conninfo) => conninfo,
+        Err(err) => return Err(ConnectionError::from(err).into()),
+    };
     if let Err(err) = conninfo.add_defaults(&Env::from_process(), &Filesystem) {
         return Err(ConnectionError::from(err).into());
     }
@@ -378,6 +401,7 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
             notices_seen: connection.notices().len(),
             connection,
             alive: true,
+            lost: None,
         }),
         Err(err) => Err(err.into()),
     }

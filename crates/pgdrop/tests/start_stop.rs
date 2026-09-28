@@ -198,6 +198,42 @@ fn a_second_start_on_a_running_datadir_fails_and_keep_keeps_it() {
     drop(running);
 }
 
+/// Review of PR #99: `start` removes, on failure and on `stop`, only a data
+/// directory it created. A directory of someone's files is refused by
+/// initdb and left as it was; an empty one is minted into, and `stop`
+/// leaves it and its cluster, taking only the record.
+#[test]
+fn a_failed_start_never_removes_a_directory_it_did_not_create() {
+    let scratch = Scratch::new("not-mine");
+    let full = scratch.0.join("full");
+    std::fs::create_dir(&full).expect("create a directory");
+    std::fs::write(full.join("notes.txt"), "mine\n").expect("write a file");
+    let failed = scratch.pgdrop(&["start", "--datadir", full.to_str().expect("UTF-8")]);
+    assert!(!failed.status.success(), "{failed:?}");
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("initdb failed"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(full.join("notes.txt"))
+            .ok()
+            .as_deref(),
+        Some("mine\n"),
+        "{stderr}"
+    );
+
+    let empty = scratch.0.join("empty");
+    std::fs::create_dir(&empty).expect("create a directory");
+    let empty = empty.to_str().expect("UTF-8");
+    let running = start(&scratch, &["--datadir", empty]);
+    let started = running.started.clone();
+    select_1(&scratch, &started);
+    let stop = scratch.pgdrop(&["stop", "--datadir", empty]);
+    assert_success(&stop, "pgdrop stop");
+    assert!(Path::new(empty).join("PG_VERSION").is_file());
+    assert!(!Path::new(empty).join("pgdrop.start").exists());
+    assert!(!Path::new(&started.run_dir()).exists());
+    drop(running);
+}
+
 /// The issue's acceptance: two concurrent starts never collide.
 #[test]
 fn two_concurrent_starts_never_collide() {

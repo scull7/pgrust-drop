@@ -15,7 +15,9 @@
 //! 7. Print the URI, PID and data directory, or `--json`, and leave the
 //!    server running.
 //!
-//! A failure after step 1 removes what `stop` would have removed.
+//! A failure after step 1 stops the server if it was spawned, then removes
+//! what `stop` would have removed: never a data directory that was there
+//! before `start` ran ([`crate::start::Origin`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -29,7 +31,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rlibpq::connection::Connection;
 use rlibpq::conninfo::{Env, parse_conninfo};
 
-use crate::start::{self, RECORD_FILE, Start, StartError, StartPlan};
+use crate::start::{self, Found, RECORD_FILE, Start, StartError, StartPlan};
 use crate::stop::{self, POLL, WAIT};
 
 /// The server's log, in the run directory.
@@ -120,11 +122,11 @@ fn launch(flags: &Start) -> Result<String, LaunchError> {
         error,
     })?;
     let run_dir = make_run_dir(&std::env::temp_dir())?;
-    let datadir_holds_cluster = flags
+    let found = flags
         .datadir
         .as_ref()
-        .is_some_and(|dir| cwd.join(dir).join("PG_VERSION").is_file());
-    let plan = match start::plan(flags, &cwd, &run_dir, datadir_holds_cluster) {
+        .map_or(Found::Nothing, |dir| look_at(&cwd.join(dir)));
+    let plan = match start::plan(flags, &cwd, &run_dir, found) {
         Ok(plan) => plan,
         Err(error) => {
             let _ = std::fs::remove_dir(&run_dir);
@@ -141,6 +143,18 @@ fn launch(flags: &Start) -> Result<String, LaunchError> {
     })
 }
 
+/// Action: what `--datadir` names, before `start` touches it. A symbolic
+/// link, even a dangling one, is something that was there.
+fn look_at(dir: &Path) -> Found {
+    if dir.join("PG_VERSION").is_file() {
+        Found::Cluster
+    } else if std::fs::symlink_metadata(dir).is_ok() {
+        Found::Other
+    } else {
+        Found::Nothing
+    }
+}
+
 /// Action: steps 3-6, for a plan whose run directory exists.
 fn bring_up(plan: &StartPlan) -> Result<String, LaunchError> {
     if let Some(args) = plan.initdb_args() {
@@ -149,19 +163,21 @@ fn bring_up(plan: &StartPlan) -> Result<String, LaunchError> {
     let log_path = Path::new(&plan.run_dir).join(SERVER_LOG);
     let mut server = spawn(plan, &log_path)?;
     let pid = server.id();
-    if let Err(error) = wait_until_ready(plan, &mut server, &log_path) {
-        if matches!(error, LaunchError::NotReady { .. }) {
-            let _ = server.kill();
-            let _ = server.wait();
-        }
+    let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
+    let ready = wait_until_ready(plan, &mut server, &log_path).and_then(|()| {
+        std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
+            what: "write",
+            path: record_path,
+            error,
+        })
+    });
+    if let Err(error) = ready {
+        // No server outlives a failed start: the cleanup that follows
+        // removes its socket directory and perhaps its data directory.
+        let _ = server.kill();
+        let _ = server.wait();
         return Err(error);
     }
-    let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
-    std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
-        what: "write",
-        path: record_path,
-        error,
-    })?;
     Ok(if plan.json {
         plan.json(pid)
     } else {

@@ -392,33 +392,39 @@ fn exec_command(
             CommandResult::SkipLine
         }
         // `exec_command_watch()` (`command.c:3370`): the arguments here, the
-        // runs where the query buffer is. Every argument has been read by
-        // now, where C reads them one at a time, stops at the first bad one
-        // (`command.c:3398`) and throws the rest away unread (`:290`). No
-        // argument has a side effect until backquotes run (NAT-405).
-        "watch" => {
-            if ctx.pipeline != PipelineStatus::Off {
-                // `command.c:3384`: refused before any argument is read.
-                logging::error(ctx.pset, "\\watch not allowed in pipeline mode", stderr);
-                // `clean_extended_state()`.
-                ctx.pset.send_mode = SendMode::Query;
-                return CommandResult::Watch(None);
-            }
-            let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
-            match crate::watch::parse_watch_args(&values, ctx.pset.watch_interval) {
-                Ok(args) => CommandResult::Watch(Some(args)),
-                Err(message) => {
-                    logging::error(ctx.pset, message, stderr);
-                    CommandResult::Watch(None)
-                }
-            }
-        }
+        // runs where the query buffer is.
+        "watch" => exec_command_watch(options, ctx, stderr),
         // `exec_command_lo()` (`command.c:2368`), for every `lo_` command
         // (`command.c:417`).
         _ if cmd.starts_with("lo_") => {
             crate::large_obj::exec_command_lo(cmd, options, ctx, out, stderr)
         }
         _ => CommandResult::Unknown,
+    }
+}
+
+/// `exec_command_watch()` (`command.c:3370`), up to `do_watch`: refused in
+/// a pipeline, else the arguments parsed. `MainLoop` runs the query and
+/// resets the buffer, whether or not they were accepted.
+fn exec_command_watch(
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    if ctx.pipeline != PipelineStatus::Off {
+        // `command.c:3384`: refused before any argument is read.
+        logging::error(ctx.pset, "\\watch not allowed in pipeline mode", stderr);
+        // `clean_extended_state()`.
+        ctx.pset.send_mode = SendMode::Query;
+        return CommandResult::Watch(None);
+    }
+    let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+    match crate::watch::parse_watch_args(&values, ctx.pset.watch_interval) {
+        Ok(args) => CommandResult::Watch(Some(args)),
+        Err(message) => {
+            logging::error(ctx.pset, message, stderr);
+            CommandResult::Watch(None)
+        }
     }
 }
 
@@ -1513,6 +1519,20 @@ mod tests {
             assert_eq!(stderr, "");
             assert_eq!(pset.send_mode, mode);
         }
+    }
+
+    #[test]
+    fn watch_is_refused_in_a_pipeline_before_its_arguments_are_read() {
+        // `command.c:3384`: the refusal comes first, so a bad argument draws
+        // no second message, and the bind is forgotten.
+        let mut pset = terse();
+        pset.send_mode = SendMode::ExtendedQueryParams {
+            params: vec!["1".into()],
+        };
+        let (status, stderr) = dispatch_in(&mut pset, "\\watch m=x", PipelineStatus::On);
+        assert_eq!(status, CommandResult::Watch(None));
+        assert_eq!(stderr, "\\watch not allowed in pipeline mode\n");
+        assert_eq!(pset.send_mode, SendMode::Query);
     }
 
     #[test]

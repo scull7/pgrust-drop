@@ -5,16 +5,19 @@
 //! pure calculations; [`do_watch`] is the loop that runs the query through
 //! [`crate::common::psql_exec_watch`] and sleeps between runs.
 //!
-//! Three things of upstream's are not here, each recorded in
+//! `^C` is [`crate::cancel`]'s: the handler sets `cancel_pressed`, which
+//! [`do_watch`] polls while it sleeps, where C's `sigwait` takes the signal
+//! (`command.c:6054`).
+//!
+//! Two things of upstream's are not here, each recorded in
 //! `docs/divergences.md`:
 //! - `PSQL_WATCH_PAGER` (`command.c:5940`): no pager is ever started, as for
 //!   every other output of this port;
-//! - SIGINT: nothing catches it yet (NAT-405), so `^C` ends the process, not
-//!   just the `\watch`; a `\watch` without a count runs until then;
 //! - the title's time is UTC in the C locale's `%c`, where C formats
 //!   `localtime` in the session's `LC_TIME`.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::{CommandSource, Executor, psql_exec_watch};
@@ -181,6 +184,28 @@ pub fn next_tick(elapsed: Duration, period: Duration, taken: u128) -> (u128, Dur
     (taken + 1, Duration::from_nanos(wait))
 }
 
+/// How often [`sleep_or_sigint`] looks at `cancel_pressed`.
+const SIGINT_POLL: Duration = Duration::from_millis(10);
+
+/// Action: `do_watch`'s `sigwait` for SIGALRM or SIGINT (`command.c:6049`-
+/// `:6071`). Sleeps `wait`, unless `cancel_pressed` is set first; returns
+/// whether it was. C blocks SIGINT across the `sigwait`, so its handler
+/// never runs and `cancel_pressed` stays clear: the flag is cleared here too,
+/// and the `^C` ends the `\watch` alone.
+fn sleep_or_sigint(wait: Duration, cancel_pressed: &AtomicBool) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if cancel_pressed.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(SIGINT_POLL));
+    }
+}
+
 /// `do_watch()` (`command.c:5873`): run `query` until the count is used
 /// up, a run returns fewer than `min_rows` rows, or a run fails, sleeping
 /// `sleep_ms` between runs. Returns `res >= 0`: an error ends the loop and
@@ -249,9 +274,16 @@ pub fn do_watch(
             continue;
         }
         out.flush_all();
+        // `command.c:6046`-`:6047`: a `^C` while the query ran is left in
+        // `cancel_pressed`, for `MainLoop` to act on (`mainloop.c:88`).
+        if session.cancel_pressed.load(Ordering::SeqCst) {
+            break res;
+        }
         let (now_taken, wait) = next_tick(start.elapsed(), period, taken);
         taken = now_taken;
-        std::thread::sleep(wait);
+        if sleep_or_sigint(wait, session.cancel_pressed) {
+            break res;
+        }
     };
 
     // `command.c:6093`: a newline, so the next prompt starts on a line of
@@ -380,5 +412,21 @@ mod tests {
         // Several missed ticks are one pending signal.
         assert_eq!(next_tick(ms(450), ms(100), 1), (4, ms(0)));
         assert_eq!(next_tick(ms(460), ms(100), 4), (5, ms(40)));
+    }
+
+    #[test]
+    fn a_sigint_ends_the_sleep_and_is_taken_as_sigwait_takes_it() {
+        // `command.c:6068`: SIGINT ends the wait at once, and C's handler,
+        // blocked across the `sigwait`, never set `cancel_pressed`.
+        let cancel_pressed = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(sleep_or_sigint(Duration::from_secs(30), &cancel_pressed));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!cancel_pressed.load(Ordering::SeqCst));
+        // Without one, the clock alone ends it (`command.c:6071`).
+        let start = Instant::now();
+        assert!(!sleep_or_sigint(Duration::from_millis(30), &cancel_pressed));
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        assert!(!sleep_or_sigint(Duration::ZERO, &cancel_pressed));
     }
 }

@@ -1030,18 +1030,17 @@ fn watch_matches_c_psql() {
     }
 }
 
-/// Pins a divergence (`docs/divergences.md`): nothing in rpsql catches
-/// SIGINT yet (NAT-405), so `^C` during a `\\watch` without a count ends the
-/// process, where C psql exits on its own terms. Which terms is a race in C:
-/// a SIGINT that `do_watch`'s `sigwait` takes (`command.c:6054`) ends only
-/// the `\\watch`, and the script carries on to exit 0; one that arrives while
-/// the query runs sets `cancel_pressed`, and `MainLoop` stops the script with
-/// `EXIT_USER` (`mainloop.c:88`-`:96`). The interval is a second and the query
-/// takes a millisecond, so it is almost always the first, but either passes.
+/// `^C` during a `\\watch` without a count, through rpsql and C psql. Where
+/// it lands is a race: a SIGINT that `do_watch`'s `sigwait` takes
+/// (`command.c:6054`), which rpsql's sleep takes from `cancel_pressed`, ends
+/// only the `\\watch`, and the script carries on to exit 0; one that arrives
+/// while the query runs sets `cancel_pressed`, and `MainLoop` stops the script
+/// with `EXIT_USER` (`mainloop.c:88`-`:96`). The interval is a second and the
+/// query takes a millisecond, so it is almost always the first, but either
+/// passes, for each side on its own.
 #[test]
-fn watch_ends_at_sigint_the_whole_process_for_now() {
+fn watch_ends_at_sigint() {
     use std::io::Write as _;
-    use std::os::unix::process::ExitStatusExt as _;
     use std::process::Stdio;
 
     let Some(cluster) = Cluster::start(WATCH_SIGINT_PORT) else {
@@ -1070,19 +1069,20 @@ fn watch_ends_at_sigint_the_whole_process_for_now() {
         assert!(kill.success(), "kill -INT");
         child.wait_with_output().expect("psql's output is read")
     };
-    let ours = interrupt(Path::new(RPSQL));
-    assert_eq!(ours.status.signal(), Some(2), "rpsql dies of SIGINT");
-    if let Some(reference) = cluster.reference_psql() {
-        let theirs = interrupt(&reference);
-        let stdout = String::from_utf8_lossy(&theirs.stdout);
-        match theirs.status.code() {
+    let ends_as_c_does = |name: &str, output: &std::process::Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match output.status.code() {
             Some(0) => assert!(
                 stdout.ends_with("\nafter\n"),
-                "C psql ends the \\watch and runs the rest of the script: {stdout:?}"
+                "{name} ends the \\watch and runs the rest of the script: {stdout:?}"
             ),
-            Some(3) => assert!(!stdout.contains("after"), "{stdout:?}"),
-            other => panic!("C psql exits 0 or 3, not {other:?} ({})", theirs.status),
+            Some(3) => assert!(!stdout.contains("after"), "{name}: {stdout:?}"),
+            other => panic!("{name} exits 0 or 3, not {other:?} ({})", output.status),
         }
+    };
+    ends_as_c_does("rpsql", &interrupt(Path::new(RPSQL)));
+    if let Some(reference) = cluster.reference_psql() {
+        ends_as_c_does("C psql", &interrupt(&reference));
     } else {
         reference::skip("psql");
     }

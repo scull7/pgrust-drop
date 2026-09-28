@@ -5,7 +5,11 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use pgdrop::dispatch::{self, Applet, Dispatch};
-use pgdrop::{install, postgres};
+use pgdrop::{allocator, install, postgres};
+
+/// mimalloc, as pgrust's own `postgres` binary has it (NAT-407).
+#[global_allocator]
+static GLOBAL: allocator::Global = allocator::Global {};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();

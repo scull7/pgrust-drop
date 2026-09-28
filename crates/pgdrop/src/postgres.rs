@@ -7,11 +7,10 @@
 //! installed first, the `ProcExitThread` unwind a clean exit turns into
 //! carried back out as the exit status, an unhandled error reported.
 //!
-//! That is the minimum NAT-381's boot test needs (`postgres --single`).
-//! What `bin/postgres.rs` does beyond it is NAT-407's: mimalloc as the global
-//! allocator and its release and statistics hooks, the debug allocation
-//! tracker, and a main-thread stack sized for the server rather than the
-//! process default.
+//! Around that, NAT-407 does what `bin/postgres.rs` and pgrust's README do
+//! outside it: mimalloc is the global allocator (`main.rs`) with its hooks
+//! installed ([`crate::allocator`]), and the server runs on a stack sized
+//! for it ([`crate::stack`]).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -63,13 +62,13 @@ pub fn run(argv0: &OsStr, args: &[OsString], stdout: &mut dyn Write) -> ExitCode
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
-        Request::Server => serve(argv0, args),
+        Request::Server => crate::stack::run_on_server_stack(|| serve(argv0, args)),
     }
 }
 
-/// Action: `bin/postgres.rs`'s `main` and `run`, minus what NAT-407 owns
-/// (see the module header), after the embedded share directory is in place
-/// ([`crate::share::prepare`], NAT-408).
+/// Action: `bin/postgres.rs`'s `main` and `run`, after the embedded share
+/// directory is in place ([`crate::share::prepare`], NAT-408), minus its
+/// debug-only instruments ([`crate::allocator`]).
 ///
 /// `pg_main` ends a clean shutdown by unwinding an `ipc::ProcExitThread`
 /// rather than calling `exit(2)`; it is caught here and its code becomes the
@@ -78,6 +77,7 @@ pub fn run(argv0: &OsStr, args: &[OsString], stdout: &mut dyn Write) -> ExitCode
 fn serve(argv0: &OsStr, args: &[OsString]) -> ExitCode {
     crate::share::prepare(&mut std::io::stderr());
     seams_init::init_all_with_transport(transport(args));
+    crate::allocator::install_hooks();
     let pg_argv = main_main::argv_from_os(std::iter::once(argv0.to_owned()).chain(args.to_vec()));
     match std::panic::catch_unwind(|| main_main::pg_main(&pg_argv)) {
         Ok(Ok(())) => ExitCode::SUCCESS,

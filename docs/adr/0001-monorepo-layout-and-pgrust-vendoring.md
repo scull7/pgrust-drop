@@ -126,4 +126,6 @@ compiles none of pgrust.
 
 **Linking.** `pgdrop` now links `main_main`. It reads only pgrust's
 `PG_BACKEND_VERSIONSTR`, for `pgdrop postgres --version`. Running the server
-in-process is NAT-407.
+in-process is NAT-407. (Since NAT-381 and NAT-407: every other `postgres`
+command line goes to `pg_main`, on mimalloc and a stack pgdrop sizes itself;
+see `crates/pgdrop/src/postgres.rs`.)

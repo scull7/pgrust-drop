@@ -84,8 +84,8 @@ pub use connection::{
 };
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,
-    conndefaults, parse_conninfo, parse_keyword_value, recognized_connection_string,
-    uri_prefix_length,
+    conndefaults, conninfo_array_parse, parse_conninfo, parse_keyword_value,
+    recognized_connection_string, uri_prefix_length,
 };
 pub use encoding::Encoding;
 pub use error::ConnError;

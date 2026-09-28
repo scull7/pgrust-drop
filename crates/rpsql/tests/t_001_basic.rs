@@ -338,3 +338,23 @@ fn a_connection_failure_exits_badconn() {
     assert!(!outcome.stderr.is_empty(), "a failure must say why");
     assert!(outcome.stdout.is_empty(), "nothing is printed on stdout");
 }
+
+/// A database name that is a connection string is expanded before anything
+/// connects (`PQconnectdbParams(…, true)`, `startup.c:277`;
+/// `conninfo_array_parse`, `fe-connect.c:6479`-`:6498`), so a malformed
+/// one is the connection's error: `psql: error: …` and exit 2
+/// (`startup.c:307`-`:311`). Diffed byte for byte against C psql, one
+/// `key=value` string and one URI; no server is needed.
+#[test]
+fn a_malformed_connection_string_is_a_connection_error() {
+    for dbname in [
+        "host=/nonexistent-pgdrop-socket-dir db",
+        "postgresql:///postgres?nokey=1",
+    ] {
+        let Some(gate) = Gate::for_tool_or_skip("psql", RPSQL) else {
+            return;
+        };
+        gate.with_args(["-X", "-c", "select 1", dbname])
+            .assert_clean();
+    }
+}

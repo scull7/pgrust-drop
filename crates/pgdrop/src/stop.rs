@@ -13,9 +13,15 @@
 //! `do_stop`'s `kill` fails "could not send stop signal" (`:1050`), exit 1.
 //! See `docs/divergences.md`.
 //!
-//! Data / Calculations / Actions: [`Stop`] is the command line, [`plan`]
-//! decides from what is on disk, and [`run`] reads the disk, signals, waits
-//! and removes.
+//! With neither `--datadir` nor any of [`crate::current::EXPLICIT_ENV`], a
+//! bare `stop` stops the current cluster, the one `start` started last
+//! ([`crate::current`]), and with no current cluster there is nothing to
+//! stop, which is success too. Whatever it stops, `stop` removes the
+//! pointer if it names that cluster.
+//!
+//! Data / Calculations / Actions: [`Stop`] is the command line, [`target`]
+//! and [`plan`] decide from what is on disk, and [`run`] reads the disk,
+//! signals, waits and removes.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -26,12 +32,13 @@ use std::time::{Duration, Instant};
 
 use usage::Args;
 
+use crate::current::{self, Pointer, PointerError};
 use crate::start::{RUN_DIR_PREFIX, Record};
 
 /// Options for `pgdrop stop`.
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stop {
-    /// Data directory of the cluster to stop (default: $PGDATA)
+    /// Data directory of the cluster to stop (default: $PGDATA, else the one pgdrop start started last)
     #[usage(long, value_name = "DIR")]
     pub datadir: Option<PathBuf>,
 }
@@ -158,6 +165,48 @@ pub fn datadir(flags: &Stop, pgdata: Option<&OsStr>, cwd: &Path) -> Result<PathB
         .ok_or(StopError::NoDatadir)
 }
 
+/// What a bare `stop` finds where the pointer lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Current<'a> {
+    /// The process has neither `XDG_RUNTIME_DIR` nor `HOME`.
+    Nowhere,
+    /// No pointer: no cluster is current.
+    Absent,
+    Names(&'a Pointer),
+}
+
+/// Which cluster `stop` stops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Datadir(PathBuf),
+    /// A bare `stop` with no current cluster: nothing to do.
+    NoneCurrent,
+}
+
+/// Pure: [`datadir`], else for a bare `stop` (`explicit` is the variable of
+/// [`crate::current::EXPLICIT_ENV`] set, if any) the current cluster.
+///
+/// # Errors
+///
+/// [`StopError::NoDatadir`]: no `--datadir` and no `PGDATA`, and either
+/// another variable names a cluster or there is nowhere a pointer could be.
+pub fn target(
+    flags: &Stop,
+    pgdata: Option<&OsStr>,
+    explicit: Option<&str>,
+    cwd: &Path,
+    current: Current<'_>,
+) -> Result<Target, StopError> {
+    match datadir(flags, pgdata, cwd) {
+        Err(StopError::NoDatadir) if explicit.is_none() => match current {
+            Current::Nowhere => Err(StopError::NoDatadir),
+            Current::Absent => Ok(Target::NoneCurrent),
+            Current::Names(pointer) => Ok(Target::Datadir(PathBuf::from(&pointer.datadir))),
+        },
+        found => found.map(Target::Datadir),
+    }
+}
+
 /// Why `stop` failed.
 #[derive(Debug)]
 pub enum StopError {
@@ -171,6 +220,8 @@ pub enum StopError {
     SingleUser(u32),
     /// `pgdrop.start` is not what `start` writes.
     BadRecord,
+    /// The current-cluster pointer could not be used.
+    Pointer(PointerError),
     /// `kill -INT` failed (`pg_ctl.c:1050`).
     Signal { pid: u32, detail: String },
     /// The server did not go within [`WAIT`], or died leaving its
@@ -202,6 +253,7 @@ impl fmt::Display for StopError {
                 "\"{}\" was not written by pgdrop start",
                 crate::start::RECORD_FILE
             ),
+            StopError::Pointer(error) => error.fmt(f),
             StopError::Signal { pid, detail } => {
                 write!(f, "could not send stop signal (PID: {pid}): {detail}")
             }
@@ -232,12 +284,30 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
         path: PathBuf::from("."),
         error,
     })?;
-    let datadir = datadir(flags, std::env::var_os("PGDATA").as_deref(), &cwd)?;
+    let location = current::location();
+    let explicit = current::explicit_env_here();
+    let pointer = match (&location, flags.datadir.is_none() && explicit.is_none()) {
+        (Some(path), true) => current::read(path).map_err(StopError::Pointer)?,
+        _ => None,
+    };
+    let found = match (&location, &pointer) {
+        (None, _) => Current::Nowhere,
+        (Some(_), None) => Current::Absent,
+        (Some(_), Some(pointer)) => Current::Names(pointer),
+    };
+    let pgdata = std::env::var_os("PGDATA");
+    let datadir = match target(flags, pgdata.as_deref(), explicit, &cwd, found)? {
+        Target::Datadir(datadir) => datadir,
+        Target::NoneCurrent => return Ok(()),
+    };
     let pidfile_path = datadir.join(PIDFILE);
     let pidfile = read_if_exists(&pidfile_path)?;
     let record = read_if_exists(&datadir.join(crate::start::RECORD_FILE))?;
     let plan = plan(&datadir, pidfile.as_deref(), record.as_deref())?;
-    if let Some(pid) = plan.signal {
+    if let Some(pid) = plan.signal
+        // A crashed server nobody has reaped yet: already stopped.
+        && !zombie(pid)
+    {
         match signal(pid, "-INT") {
             Ok(()) => wait_for_postmaster_stop(&pidfile_path, pid)?,
             // A crashed server's `postmaster.pid`: already stopped.
@@ -245,7 +315,14 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
             Err(detail) => return Err(StopError::Signal { pid, detail }),
         }
     }
-    remove_all(&plan)
+    // Before the removal: a pointer through a symbolic link is matched by
+    // resolving both, and only what is still there resolves.
+    let cleared = match &location {
+        Some(path) => current::clear_if_names(path, &datadir).map_err(StopError::Pointer),
+        None => Ok(()),
+    };
+    remove_all(&plan)?;
+    cleared
 }
 
 /// Pure: whether the `kill` utility's complaint is `ESRCH`, the process is
@@ -256,6 +333,27 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
 #[must_use]
 pub fn no_such_process(detail: &str) -> bool {
     detail.contains("No such process")
+}
+
+/// Pure: the state letter of a `/proc/<pid>/stat` line (`proc_pid_stat(5)`),
+/// the first field after the command name, which is in parentheses and may
+/// hold anything, `)` included.
+#[must_use]
+pub fn proc_stat_state(stat: &str) -> Option<char> {
+    let (_, after) = stat.rsplit_once(')')?;
+    after.trim_start().chars().next()
+}
+
+/// Action: whether `pid` has exited but not been reaped. `kill` still
+/// reaches such a process, so it looks alive to `kill -0`: a server that
+/// crashed after `start` exited is reparented to PID 1, and in a container
+/// whose PID 1 reaps nothing it stays so. Linux answers through `/proc`;
+/// elsewhere this is `false`, and `launchd` reaps.
+pub(crate) fn zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| proc_stat_state(&stat))
+        == Some('Z')
 }
 
 /// Action: the plan's removals, in order.
@@ -323,7 +421,7 @@ fn wait_for_postmaster_stop(pidfile: &Path, pid: u32) -> Result<(), StopError> {
             return Ok(());
         }
         polls = polls.wrapping_add(1);
-        if polls.is_multiple_of(LIVENESS_EVERY) && signal(pid, "-0").is_err() {
+        if polls.is_multiple_of(LIVENESS_EVERY) && (signal(pid, "-0").is_err() || zombie(pid)) {
             // `:730`-`:735`: look once more, to avoid a race with the exit.
             return if pidfile.exists() {
                 Err(StopError::DoesNotShutDown)
@@ -468,6 +566,75 @@ mod tests {
         ] {
             assert!(!no_such_process(there), "{there}");
         }
+    }
+
+    #[test]
+    fn a_bare_stop_stops_the_current_cluster_and_with_none_does_nothing() {
+        let cwd = Path::new("/work");
+        let pointer = Pointer {
+            host: "/tmp/pgdrop-1-2".into(),
+            port: 5432,
+            uri: "postgresql://postgres@%2Ftmp%2Fpgdrop-1-2:5432/postgres".into(),
+            datadir: "/tmp/pgdrop-1-2/data".into(),
+        };
+        let bare = Stop::default();
+        assert_eq!(
+            target(&bare, None, None, cwd, Current::Names(&pointer)).unwrap(),
+            Target::Datadir("/tmp/pgdrop-1-2/data".into())
+        );
+        assert_eq!(
+            target(&bare, None, None, cwd, Current::Absent).unwrap(),
+            Target::NoneCurrent
+        );
+        assert!(matches!(
+            target(&bare, None, None, cwd, Current::Nowhere),
+            Err(StopError::NoDatadir)
+        ));
+    }
+
+    #[test]
+    fn a_datadir_or_any_variable_naming_a_cluster_wins_over_the_pointer() {
+        let cwd = Path::new("/work");
+        let pointer = Pointer {
+            host: "127.0.0.1".into(),
+            port: 6543,
+            uri: "postgresql://postgres@127.0.0.1:6543/postgres".into(),
+            datadir: "/tmp/pgdrop-1-2/data".into(),
+        };
+        let current = Current::Names(&pointer);
+        let flag = Stop {
+            datadir: Some("d".into()),
+        };
+        assert_eq!(
+            target(&flag, None, None, cwd, current).unwrap(),
+            Target::Datadir("/work/d".into())
+        );
+        assert_eq!(
+            target(
+                &Stop::default(),
+                Some(OsStr::new("/env")),
+                Some("PGDATA"),
+                cwd,
+                current
+            )
+            .unwrap(),
+            Target::Datadir("/env".into())
+        );
+        assert!(matches!(
+            target(&Stop::default(), None, Some("PGHOST"), cwd, current),
+            Err(StopError::NoDatadir)
+        ));
+    }
+
+    #[test]
+    fn the_process_state_follows_the_last_parenthesis() {
+        assert_eq!(
+            proc_stat_state("4242 (postgres) S 1 4242 4242 0 -1"),
+            Some('S')
+        );
+        assert_eq!(proc_stat_state("7 (a) Z (b)) Z 1 7"), Some('Z'));
+        assert_eq!(proc_stat_state("7 (x)"), None);
+        assert_eq!(proc_stat_state("garbage"), None);
     }
 
     #[test]

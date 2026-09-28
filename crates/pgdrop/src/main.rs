@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use pgdrop::dispatch::{self, Applet, Dispatch};
-use pgdrop::{install, launch, postgres, stop};
+use pgdrop::{current, install, launch, postgres, stop};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -18,9 +18,14 @@ fn main() -> ExitCode {
                 .map_or(OsStr::new("initdb"), OsString::as_os_str);
             rinitdb::run(argv0, &applet_args, &mut stdout, &mut stderr)
         }
-        Dispatch::Applet(Applet::Psql, applet_args) => {
-            rpsql::run(&applet_args, &mut stdout, &mut stderr)
-        }
+        // `pgdrop psql` may connect to the cluster `pgdrop start` started
+        // last; a `psql` link is upstream's psql, and never does.
+        Dispatch::Applet(Applet::Psql, applet_args) => match argv.first() {
+            Some(argv0) if dispatch::applet_from_argv0(argv0).is_some() => {
+                rpsql::run(&applet_args, &mut stdout, &mut stderr)
+            }
+            _ => current::psql(&applet_args, &mut stdout, &mut stderr),
+        },
         Dispatch::Applet(Applet::Postgres, applet_args) => {
             // Unlocked: the server writes to both streams itself.
             drop((stdout, stderr));

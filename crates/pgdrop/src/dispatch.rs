@@ -115,7 +115,8 @@ pub fn dispatch(argv: &[OsString]) -> Dispatch {
 
 /// A symlink or copy named `initdb`, `psql` or `postgres` selects that applet.
 /// A trailing `.exe` is tolerated for the sake of a future Windows build.
-fn applet_from_argv0(argv0: &OsStr) -> Option<Applet> {
+#[must_use]
+pub fn applet_from_argv0(argv0: &OsStr) -> Option<Applet> {
     let path = Path::new(argv0);
     let name = path.file_name()?;
     let stem = if path.extension().is_some_and(|ext| ext == "exe") {
@@ -161,6 +162,7 @@ fn root(words: &[OsString]) -> Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::start::Port;
 
     fn argv(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -217,7 +219,7 @@ mod tests {
             Dispatch::Start(start) => assert_eq!(
                 start,
                 Start {
-                    port: 5433,
+                    port: Port::Number(5433),
                     keep: true,
                     ..Start::default()
                 }
@@ -250,6 +252,17 @@ mod tests {
         }
         match dispatch(&argv(&["pgdrop", "start"])) {
             Dispatch::Start(start) => assert_eq!(start, Start::default()),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&argv(&["pgdrop", "start", "--port", "auto", "--env"])) {
+            Dispatch::Start(start) => assert_eq!(
+                start,
+                Start {
+                    port: Port::Auto,
+                    env: true,
+                    ..Start::default()
+                }
+            ),
             other => panic!("{other:?}"),
         }
     }

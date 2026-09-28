@@ -9,9 +9,18 @@
 //! PGDROP_STARTUP_RUNS=50 cargo test --all-features --bench startup
 //! ```
 //!
-//! `harness = false`, so it prints its report straight to stdout. It does not
-//! assert on a budget yet: the budgets are set from the baselines this
-//! records (NAT-410's next slice).
+//! `harness = false`, so it prints its report straight to stdout, then the
+//! budget verdict (`pgdrop::measure::render_budget`): the p50 of the four
+//! phases' total and the binary's size against this lane's dev-profile
+//! budget. An overrun fails the run (exit 1) when `PGDROP_REQUIRE_BUDGET=1`,
+//! as CI sets it; so does a build with no budget (a release build, or a
+//! target that is not a CI lane), rather than passing ungated. Without the
+//! variable an overrun is printed, flagged, and passes: the budgets are CI
+//! runners' numbers, and a laptop's startup time says nothing about them.
+//!
+//! After the four phases it times the same life through pgdrop's own
+//! commands — `pgdrop start --json`, `pgdrop psql -c 'select 1'`, `pgdrop
+//! stop --datadir DIR` — and reports it without a budget.
 //!
 //! The server runs as `<scratch>/bin/postgres`, a hard link to pgdrop, beside
 //! a `<scratch>/share/timezone` linked to this machine's timezone database —
@@ -26,10 +35,10 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use pgdrop::measure::{self, Phase, Run, SizeBreakdown};
+use pgdrop::measure::{self, Limits, Phase, Run, Session, SizeBreakdown};
 
 const PGDROP: &str = env!("CARGO_BIN_EXE_pgdrop");
 
@@ -43,7 +52,10 @@ const PHASE_TIMEOUT: Duration = Duration::from_mins(1);
 /// its own, so the number only names the socket file.
 const PORT: &str = "5432";
 
-fn main() {
+/// Set to `1` (CI does) to fail on an overrun or a missing budget.
+const REQUIRE_BUDGET_VAR: &str = "PGDROP_REQUIRE_BUDGET";
+
+fn main() -> ExitCode {
     let runs = std::env::var("PGDROP_STARTUP_RUNS")
         .ok()
         .map_or(DEFAULT_RUNS, |value| {
@@ -70,6 +82,47 @@ fn main() {
         .map(|n| one_run(&scratch.0, &postgres, n))
         .collect();
     print!("{}", measure::render_startup(profile, &measured));
+
+    let _warm_up = one_session(&scratch.0);
+    let sessions: Vec<Session> = (1..=runs).map(|_| one_session(&scratch.0)).collect();
+    print!("{}", measure::render_sessions(profile, &sessions));
+
+    let totals: Vec<Duration> = measured.iter().map(Run::total).collect();
+    let this_build = Limits {
+        startup_p50: measure::percentile(&totals, 50),
+        binary,
+    };
+    gate(profile, &this_build)
+}
+
+/// The budget verdict, printed; failure only under `PGDROP_REQUIRE_BUDGET=1`.
+fn gate(profile: &str, this_build: &Limits) -> ExitCode {
+    let required = std::env::var_os(REQUIRE_BUDGET_VAR).is_some_and(|v| v == "1");
+    let lane = measure::Lane::of_this_build();
+    let Some((lane, budget)) = lane.zip(measure::budget_for(lane, cfg!(debug_assertions))) else {
+        println!(
+            "pgdrop budget: none for a {profile} build of this target (dev profile on a CI lane only)"
+        );
+        return if required {
+            eprintln!("{REQUIRE_BUDGET_VAR}=1 and this build has no budget");
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    };
+    let (report, within) = measure::render_budget(profile, lane, &budget, this_build);
+    print!("{report}");
+    match (within, required) {
+        (true, _) => ExitCode::SUCCESS,
+        (false, true) => {
+            eprintln!("pgdrop is over its startup or size budget (above)");
+            ExitCode::FAILURE
+        }
+        (false, false) => {
+            println!("OVER BUDGET, flagged, not enforced: {REQUIRE_BUDGET_VAR} is not 1");
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// A scratch directory under Cargo's target tmpdir — the same filesystem as
@@ -161,6 +214,77 @@ fn one_run(scratch: &Path, postgres: &Path, n: usize) -> Run {
     std::fs::remove_dir_all(&pgdata).expect("remove the cluster");
     std::fs::remove_dir_all(&socket_dir).expect("remove the socket directory");
     run
+}
+
+/// Stops the cluster `pgdrop start` made when dropped, unless `stop` already
+/// ran, so a failed assertion does not leave a server behind.
+struct Started {
+    datadir: Option<String>,
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Some(datadir) = self.datadir.take() {
+            let _ = pgdrop_command(&["stop", "--datadir", &datadir]).output();
+        }
+    }
+}
+
+/// `pgdrop ARGS`, with the environment `tests/start_stop.rs` gives it: no
+/// `PGDATA` or share overrides, the extracted share files under
+/// `<scratch>/cache` via the caller's `XDG_CACHE_HOME`.
+fn pgdrop_command(args: &[&str]) -> Command {
+    let mut command = Command::new(PGDROP);
+    command
+        .args(args)
+        .env_remove("PGDATA")
+        .env_remove(pgdrop::share::SHAREDIR_VAR)
+        .env_remove("PGRUST_TZDIR");
+    command
+}
+
+/// Action: one cluster's life through pgdrop's commands, each timed from
+/// spawn to exit. `start` puts the socket in its run directory, which holds
+/// the default data directory (`pgdrop::start`); `stop` removes both.
+fn one_session(scratch: &Path) -> Session {
+    let cache = scratch.join("cache");
+    let mut session = Session::default();
+
+    let started = Instant::now();
+    let mut start = pgdrop_command(&["start", "--json"]);
+    start.env("XDG_CACHE_HOME", &cache);
+    let json = expect_success(&mut start, "pgdrop start");
+    session.start = started.elapsed();
+    let json = String::from_utf8(json).expect("start --json is UTF-8");
+    let datadir = measure::started_datadir(&json)
+        .unwrap_or_else(|| panic!("no datadir in {json:?}"))
+        .to_owned();
+    let mut guard = Started {
+        datadir: Some(datadir.clone()),
+    };
+    let run_dir = Path::new(&datadir)
+        .parent()
+        .expect("the run directory")
+        .to_str()
+        .expect("UTF-8")
+        .to_owned();
+
+    let started = Instant::now();
+    let mut psql = pgdrop_command(&[
+        "psql", "-X", "-A", "-t", "-h", &run_dir, "-p", "5432", "-U", "postgres", "-c", "select 1",
+        "postgres",
+    ]);
+    let stdout = expect_success(&mut psql, "pgdrop psql");
+    session.select = started.elapsed();
+    assert_eq!(stdout, b"1\n", "select 1 answered {stdout:?}");
+
+    let started = Instant::now();
+    let mut stop = pgdrop_command(&["stop", "--datadir", &datadir]);
+    expect_success(&mut stop, "pgdrop stop");
+    session.stop = started.elapsed();
+    guard.datadir = None;
+    assert!(!Path::new(&run_dir).exists(), "stop left {run_dir}");
+    session
 }
 
 /// Run `command` to completion: exit 0, or panic with its stderr. Its stdout.

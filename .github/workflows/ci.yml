@@ -68,6 +68,10 @@ env:
   # #[ignore]d test (psql program_help_ok, NAT-399) is a known-unimplemented
   # feature.
   PGDROP_REQUIRE_REF: 1
+  # NAT-410: the startup-and-size step fails when this lane's dev-profile
+  # binary is over budget (20% above the lane's CI baseline, run 36291661005)
+  # or has no budget. Unset, as on a laptop, an overrun is flagged and passes.
+  PGDROP_REQUIRE_BUDGET: 1
   # pgrust's regexp_alt links RE2 when libre2 is installed and otherwise, in a
   # dev profile, falls back to its Spencer-only engine with a warning (release
   # profiles refuse to build without RE2). CI builds dev profiles only and
@@ -181,11 +185,11 @@ jobs:
       - name: test
         run: su -c 'cargo test --all-features' ci
       # NAT-410: startup time (initdb, server ready, first select 1, stop;
-      # p50/p95) and the binary's size by embedded asset, printed to the log.
-      # It builds only the bench on top of the test step's artifacts and runs
-      # in ~10 s. No budget is enforced yet: the budgets are set from the
-      # baselines these logs record, in the issue's next slice.
-      - name: startup and size report
+      # p50/p95; then start / psql / stop) and the binary's size by embedded
+      # asset, printed to the log, and gated: the total's p50 and the size
+      # against this lane's budget (PGDROP_REQUIRE_BUDGET above). It builds
+      # only the bench on top of the test step's artifacts and runs in ~20 s.
+      - name: startup and size gate
         run: su -c 'cargo test --all-features --bench startup' ci
 
   apple:
@@ -243,11 +247,11 @@ jobs:
       - name: test
         run: cargo test --all-features
       # NAT-410: startup time (initdb, server ready, first select 1, stop;
-      # p50/p95) and the binary's size by embedded asset, printed to the log.
-      # It builds only the bench on top of the test step's artifacts and runs
-      # in ~10 s. No budget is enforced yet: the budgets are set from the
-      # baselines these logs record, in the issue's next slice.
-      - name: startup and size report
+      # p50/p95; then start / psql / stop) and the binary's size by embedded
+      # asset, printed to the log, and gated: the total's p50 and the size
+      # against this lane's budget (PGDROP_REQUIRE_BUDGET above). It builds
+      # only the bench on top of the test step's artifacts and runs in ~20 s.
+      - name: startup and size gate
         run: cargo test --all-features --bench startup
 
   gnu:
@@ -330,9 +334,9 @@ jobs:
         env:
           PG_TEST_EXTRA: load_balance
       # NAT-410: startup time (initdb, server ready, first select 1, stop;
-      # p50/p95) and the binary's size by embedded asset, printed to the log.
-      # It builds only the bench on top of the test step's artifacts and runs
-      # in ~10 s. No budget is enforced yet: the budgets are set from the
-      # baselines these logs record, in the issue's next slice.
-      - name: startup and size report
+      # p50/p95; then start / psql / stop) and the binary's size by embedded
+      # asset, printed to the log, and gated: the total's p50 and the size
+      # against this lane's budget (PGDROP_REQUIRE_BUDGET above). It builds
+      # only the bench on top of the test step's artifacts and runs in ~20 s.
+      - name: startup and size gate
         run: cargo test --all-features --bench startup

@@ -9,18 +9,19 @@
 //! it, started the way C starts it ([`BACKEND_OPTIONS`], [`run`]).
 //!
 //! What the script covers so far: the superuser's name (`-U`) and password
-//! (`--pwfile`; `-W` is still refused, [`crate::cluster`]). Collation
-//! stamping and the template databases' freeze are NAT-383's later slices;
-//! until they land, a session is needed exactly when `-U` names another
+//! (`--pwfile`; `-W` is still refused, [`crate::cluster`]), then the
+//! `ANALYZE` and `VACUUM FREEZE` C runs after them, in each of the three
+//! databases ([`fixup_sessions`]). Collation stamping is NAT-383's later
+//! slice; until it lands, a session is needed exactly when `-U` names another
 //! superuser than the template's or a password is asked for
 //! ([`needs_session`]), and no server is looked for or run otherwise
 //! (`docs/divergences.md`).
 //!
-//! Data / Calculations / Actions: [`SqlStatement`], [`SuperuserPassword`]
-//! and [`Server`] are data; [`needs_session`], [`fixup_script`],
-//! [`password_from_file`], [`resolve_server`] (over a [`ServerProbe`]) and
-//! [`wait_result_to_str`] are pure; [`get_su_pwd`], [`find_server`] and
-//! [`run`] are the Actions.
+//! Data / Calculations / Actions: [`SqlStatement`], [`SuperuserPassword`],
+//! [`Database`], [`Session`] and [`Server`] are data; [`needs_session`],
+//! [`fixup_script`], [`fixup_sessions`], [`password_from_file`],
+//! [`resolve_server`] (over a [`ServerProbe`]) and [`wait_result_to_str`]
+//! are pure; [`get_su_pwd`], [`find_server`] and [`run`] are the Actions.
 
 use std::ffi::OsString;
 use std::io::{BufRead as _, Write as _};
@@ -47,8 +48,44 @@ pub const BACKEND_OPTIONS: [&str; 10] = [
     "log_checkpoints=false",
 ];
 
-/// The database the session opens (`initdb.c:3113`).
-pub const DATABASE: &str = "template1";
+/// A database a session opens.
+///
+/// C's one session opens `template1` (`initdb.c:3113`); here the template
+/// already holds `template0` and `postgres`, copied from `template1` before
+/// anything below changed it, so they are opened too ([`fixup_sessions`]).
+/// A standalone backend may open `template0`: `datallowconn` is only checked
+/// under the postmaster (`CheckMyDatabase`,
+/// `src/backend/utils/init/postinit.c:354`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Database {
+    /// `template1`, where C runs every post-bootstrap step.
+    Template1,
+    /// `template0`, `make_template0`'s copy of it (`initdb.c:2011`).
+    Template0,
+    /// `postgres`, `make_postgres`'s copy of it (`initdb.c:2065`).
+    Postgres,
+}
+
+impl Database {
+    /// The database's name, as the session's last argument.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Template1 => "template1",
+            Self::Template0 => "template0",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+/// One single-user session: the database it opens and what it is fed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// The database the session opens.
+    pub database: Database,
+    /// Its statements, in order.
+    pub script: Vec<SqlStatement>,
+}
 
 /// `BOOTSTRAP_SUPERUSERID` (`src/include/catalog/pg_authid.dat:22`): the
 /// superuser the template was minted with, whatever it is called.
@@ -184,6 +221,56 @@ pub fn fixup_script(plan: &CreatePlan, password: Option<&SuperuserPassword>) -> 
     script
 }
 
+/// The catalog [`fixup_script`] changes: `pg_authid` (`src/include/catalog/pg_authid.h:31`).
+const CHANGED_CATALOG: &str = "pg_authid";
+
+/// Pure: `vacuum_db` (`initdb.c:2001`) over what [`fixup_script`] changed,
+/// for one database: `ANALYZE` first, "so the statistics are frozen", then
+/// `VACUUM FREEZE` of the changed catalog and of `pg_statistic`, which the
+/// `ANALYZE` just wrote.
+///
+/// C analyzes and freezes all of `template1` once, after `setup_auth`
+/// (`initdb.c:3117`) and before `make_template0` and `make_postgres` copy it
+/// (`:3144`-`:3148`), so all three databases hold statistics that name the
+/// superuser as renamed and a `pg_authid` with no unfrozen or dead row. The
+/// template holds the same for its own superuser; after the fixups, only
+/// `pg_authid` differs from what C analyzed and froze, and `pg_authid` is a
+/// shared catalog whose statistics each database keeps in its own
+/// `pg_statistic`.
+fn refreeze() -> [SqlStatement; 2] {
+    [
+        SqlStatement(format!("ANALYZE {CHANGED_CATALOG}").into_bytes()),
+        SqlStatement(format!("VACUUM FREEZE {CHANGED_CATALOG}, pg_statistic").into_bytes()),
+    ]
+}
+
+/// Pure: the sessions that make the expanded template the cluster `plan`
+/// asks for, in the order they run. Empty when the template already is that
+/// cluster ([`needs_session`]).
+///
+/// `template1` runs [`fixup_script`] and then `vacuum_db`'s `ANALYZE` and
+/// `VACUUM FREEZE` over what it changed, in C's order (`initdb.c:3117`,
+/// `:3144`). `template0` and `postgres` then run the same two: C copies them
+/// from `template1` after its `vacuum_db` (`make_template0`, `:3146`;
+/// `make_postgres`, `:3148`), but the template's copies were made before the
+/// fixups, so each gets its own statistics and freeze.
+#[must_use]
+pub fn fixup_sessions(plan: &CreatePlan, password: Option<&SuperuserPassword>) -> Vec<Session> {
+    let fixups = fixup_script(plan, password);
+    if fixups.is_empty() {
+        return Vec::new();
+    }
+    let template1 = Session {
+        database: Database::Template1,
+        script: fixups.into_iter().chain(refreeze()).collect(),
+    };
+    let copies = [Database::Template0, Database::Postgres].map(|database| Session {
+        database,
+        script: refreeze().to_vec(),
+    });
+    std::iter::once(template1).chain(copies).collect()
+}
+
 /// Pure: `get_su_pwd`'s file branch (`initdb.c:1689`-`:1706`) over what
 /// reading the file gave: its first line, newline included, as
 /// `pg_get_line` returns it (`src/common/pg_get_line.c:59`), or an empty
@@ -280,14 +367,15 @@ impl Server {
 
     /// Pure: the arguments after the program name: `backend_options`, no
     /// `extra_options` (`-d`, `-n` and `--debug` are not ported yet), then
-    /// `template1` (`initdb.c:3112`). PGDATA reaches the server through the
-    /// environment, as `setup_pgdata` exports it (`initdb.c:2642`).
+    /// the database, `template1` in C (`initdb.c:3112`). PGDATA reaches the
+    /// server through the environment, as `setup_pgdata` exports it
+    /// (`initdb.c:2642`).
     #[must_use]
-    pub fn single_user_args(&self) -> Vec<OsString> {
+    pub fn single_user_args(&self, database: Database) -> Vec<OsString> {
         self.applet
             .into_iter()
             .chain(BACKEND_OPTIONS)
-            .chain([DATABASE])
+            .chain([database.name()])
             .map(OsString::from)
             .collect()
     }
@@ -295,15 +383,16 @@ impl Server {
     /// Pure: the command as C's `popen` string names it (`initdb.c:3112`),
     /// for `could not execute command` (`:753`).
     #[must_use]
-    pub fn command_text(&self) -> String {
+    pub fn command_text(&self, database: Database) -> String {
         let applet = self
             .applet
             .map(|word| format!(" {word}"))
             .unwrap_or_default();
         format!(
-            "\"{}\"{applet} {}  {DATABASE} >/dev/null",
+            "\"{}\"{applet} {}  {} >/dev/null",
             self.program.display(),
-            BACKEND_OPTIONS.join(" ")
+            BACKEND_OPTIONS.join(" "),
+            database.name()
         )
     }
 }
@@ -474,8 +563,9 @@ pub fn wait_result_to_str(code: Option<i32>, signal: Option<i32>) -> String {
     }
 }
 
-/// Action: `PG_CMD_OPEN`, every statement of `script`, `PG_CMD_CLOSE`
-/// (`initdb.c:3115`-`:3150`), with PGDATA exported as `setup_pgdata` does.
+/// Action: `PG_CMD_OPEN` on `session`'s database, every statement of its
+/// script, `PG_CMD_CLOSE` (`initdb.c:3115`-`:3150`), with PGDATA exported as
+/// `setup_pgdata` does.
 ///
 /// The server's stdout goes to `/dev/null` and its stderr is this process's,
 /// as with C's `popen`. A failed exit is `pclose_check`'s error
@@ -484,20 +574,20 @@ pub fn wait_result_to_str(code: Option<i32>, signal: Option<i32>) -> String {
 ///
 /// # Errors
 /// Those three, as [`InitdbError`]s.
-pub fn run(server: &Server, pgdata: &Path, script: &[SqlStatement]) -> Result<(), InitdbError> {
+pub fn run(server: &Server, pgdata: &Path, session: &Session) -> Result<(), InitdbError> {
     let mut child = Command::new(server.program())
-        .args(server.single_user_args())
+        .args(server.single_user_args(session.database))
         .env("PGDATA", pgdata)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .map_err(|err| InitdbError::CouldNotExecuteCommand {
-            command: server.command_text(),
+            command: server.command_text(session.database),
             reason: strerror(&err),
         })?;
     let mut output_failed = None;
     if let Some(mut stdin) = child.stdin.take() {
-        for statement in script {
+        for statement in &session.script {
             if let Err(err) = stdin.write_all(&statement.to_input()) {
                 output_failed = Some(err);
                 break;
@@ -623,6 +713,41 @@ mod tests {
     }
 
     #[test]
+    fn the_fixups_are_analyzed_and_frozen_in_every_database() {
+        // No fixup, no session: the template's statistics and freeze stand.
+        assert_eq!(fixup_sessions(&plan_for(Some("postgres")), None), []);
+
+        // vacuum_db (initdb.c:2001) after the fixups in template1, as C runs
+        // it after setup_auth; then in the two copies C makes after it.
+        let password = SuperuserPassword::new(b"pw".to_vec());
+        let sessions = fixup_sessions(&plan_with_password("alice", "/tmp/pw"), Some(&password));
+        let databases: Vec<_> = sessions.iter().map(|session| session.database).collect();
+        assert_eq!(
+            databases,
+            [Database::Template1, Database::Template0, Database::Postgres]
+        );
+        assert_eq!(
+            input(&sessions[0].script),
+            b"UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n\
+              ALTER USER \"alice\" WITH PASSWORD E'pw';\n\n\
+              ANALYZE pg_authid;\n\n\
+              VACUUM FREEZE pg_authid, pg_statistic;\n\n"
+        );
+        for copy in &sessions[1..] {
+            assert_eq!(
+                input(&copy.script),
+                b"ANALYZE pg_authid;\n\nVACUUM FREEZE pg_authid, pg_statistic;\n\n"
+            );
+        }
+        // A rename alone is three sessions too.
+        assert_eq!(fixup_sessions(&plan_for(Some("alice")), None).len(), 3);
+        assert_eq!(
+            [Database::Template1, Database::Template0, Database::Postgres].map(Database::name),
+            ["template1", "template0", "postgres"]
+        );
+    }
+
+    #[test]
     fn a_password_file_is_its_first_line_without_its_line_end() {
         let read = |line: &[u8]| password_from_file(line).map(|pw| pw.as_bytes().to_vec());
         // pg_get_line found nothing: "password file ... is empty".
@@ -697,7 +822,7 @@ mod tests {
         // initdb.c:226 and :3112.
         let server = Server::executable(PathBuf::from("/usr/lib/postgresql/bin/postgres"));
         assert_eq!(
-            server.single_user_args(),
+            server.single_user_args(Database::Template1),
             [
                 "--single",
                 "-F",
@@ -713,15 +838,28 @@ mod tests {
             ]
         );
         assert_eq!(
-            server.command_text(),
+            server.command_text(Database::Template1),
             "\"/usr/lib/postgresql/bin/postgres\" --single -F -O -j -c search_path=pg_catalog \
              -c exit_on_error=true -c log_checkpoints=false  template1 >/dev/null"
         );
+        // The copies are opened the same way; only the database differs.
+        assert_eq!(
+            server.single_user_args(Database::Template0).last(),
+            Some(&OsString::from("template0"))
+        );
+        assert!(
+            server
+                .command_text(Database::Postgres)
+                .ends_with("log_checkpoints=false  postgres >/dev/null")
+        );
         let multicall = Server::multicall(PathBuf::from("/opt/bin/pgdrop"));
-        assert_eq!(multicall.single_user_args()[..2], ["postgres", "--single"]);
+        assert_eq!(
+            multicall.single_user_args(Database::Template1)[..2],
+            ["postgres", "--single"]
+        );
         assert!(
             multicall
-                .command_text()
+                .command_text(Database::Template1)
                 .starts_with("\"/opt/bin/pgdrop\" postgres --single ")
         );
     }

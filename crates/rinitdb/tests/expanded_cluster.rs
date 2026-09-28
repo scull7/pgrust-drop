@@ -86,12 +86,21 @@ fn rinitdb_ok(before: &[&str], pgdata: &Path, env: &Environment) {
 /// The reference `postgres --single -D <pgdata> postgres` fed `sql`, or
 /// `None` (with the flagged skip printed) without one.
 fn reference_single_user(pgdata: &Path, sql: &str) -> Option<testkit::CommandOutcome> {
+    reference_single_user_in(pgdata, "postgres", sql)
+}
+
+/// [`reference_single_user`] on `database`.
+fn reference_single_user_in(
+    pgdata: &Path,
+    database: &str,
+    sql: &str,
+) -> Option<testkit::CommandOutcome> {
     let postgres = reference::find_or_skip("postgres")?;
     let argv = [
         OsString::from("--single"),
         OsString::from("-D"),
         pgdata.into(),
-        OsString::from("postgres"),
+        OsString::from(database),
     ];
     Some(testkit::run_with_stdin(&postgres, argv, sql.as_bytes()).expect("run postgres"))
 }
@@ -628,9 +637,9 @@ fn an_empty_locale_is_the_environments_like_no_switch() {
     }
 }
 
-/// A stand-in `postgres` in `tempdir`, for the single-user session
+/// A stand-in `postgres` in `tempdir`, for the single-user sessions
 /// (`rinitdb::single_user`): it answers `-V` with 18.6's
-/// `PG_BACKEND_VERSIONSTR`, and otherwise writes `PGDATA`, its arguments and
+/// `PG_BACKEND_VERSIONSTR`, and otherwise appends `PGDATA`, its arguments and
 /// its stdin to `session.log` beside itself and exits with `FAKE_EXIT`
 /// (0 by default). Named by [`SERVER_ENV`], as nothing is beside `rinitdb`.
 fn fake_postgres(tempdir: &TempDir) -> PathBuf {
@@ -641,7 +650,7 @@ fn fake_postgres(tempdir: &TempDir) -> PathBuf {
         "#!/bin/sh\n\
          if [ \"$1\" = -V ]; then echo 'postgres (PostgreSQL) 18.6'; exit 0; fi\n\
          log=\"$(dirname \"$0\")/session.log\"\n\
-         { echo \"PGDATA=$PGDATA\"; for arg in \"$@\"; do echo \"arg=$arg\"; done; cat; } > \"$log\"\n\
+         { echo \"PGDATA=$PGDATA\"; for arg in \"$@\"; do echo \"arg=$arg\"; done; cat; } >> \"$log\"\n\
          exit \"${FAKE_EXIT:-0}\"\n",
     )
     .expect("write the stand-in postgres");
@@ -721,9 +730,27 @@ fn an_unusable_server_override_is_an_error() {
     assert!(!pgdata.exists());
 }
 
-/// The session is started as `initialize_data_directory` starts it
+/// `vacuum_db`'s two statements over `pg_authid` (`initdb.c:2004`), as the
+/// stand-in's log shows them after a session's other input.
+const REFREEZE: &str = "ANALYZE pg_authid;\n\nVACUUM FREEZE pg_authid, pg_statistic;\n\n";
+
+/// What [`fake_postgres`] logs for one session on `database` fed `input`.
+fn session_log(pgdata: &Path, database: &str, input: &str) -> String {
+    format!(
+        "PGDATA={}\n\
+         arg=--single\narg=-F\narg=-O\narg=-j\n\
+         arg=-c\narg=search_path=pg_catalog\narg=-c\narg=exit_on_error=true\n\
+         arg=-c\narg=log_checkpoints=false\narg={database}\n\
+         {input}",
+        pgdata.display()
+    )
+}
+
+/// The sessions are started as `initialize_data_directory` starts C's one
 /// (`initdb.c:226`, `:3112`; PGDATA exported, `:2642`), after the cluster is
-/// written, and is fed the rename.
+/// written: `template1` is fed the rename and then `vacuum_db`'s statements
+/// over `pg_authid`, and `template0` and `postgres`, which C copies after
+/// `vacuum_db` (`:3144`-`:3148`), are fed those statements too.
 #[test]
 fn another_superuser_is_renamed_in_a_single_user_session() {
     let tempdir = TempDir::new("single-user-args");
@@ -737,14 +764,16 @@ fn another_superuser_is_renamed_in_a_single_user_session() {
     let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
     assert_eq!(
         log,
-        format!(
-            "PGDATA={}\n\
-             arg=--single\narg=-F\narg=-O\narg=-j\n\
-             arg=-c\narg=search_path=pg_catalog\narg=-c\narg=exit_on_error=true\n\
-             arg=-c\narg=log_checkpoints=false\narg=template1\n\
-             UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n",
-            pgdata.display()
-        )
+        [
+            session_log(
+                &pgdata,
+                "template1",
+                &format!("UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n{REFREEZE}"),
+            ),
+            session_log(&pgdata, "template0", REFREEZE),
+            session_log(&pgdata, "postgres", REFREEZE),
+        ]
+        .concat()
     );
     assert!(pgdata.join("global/pg_control").is_file());
 }
@@ -878,12 +907,16 @@ fn a_password_file_is_set_in_the_single_user_session() {
         format!("{}\n", rinitdb::report::trust_warning())
     );
     let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
+    let pgdata = tempdir.join("data");
     assert!(
-        log.ends_with(
-            "arg=template1\n\
-             UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n\
-             ALTER USER \"alice\" WITH PASSWORD E'it''s\\\\secret';\n\n"
-        ),
+        log.starts_with(&session_log(
+            &pgdata,
+            "template1",
+            &format!(
+                "UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n\
+                 ALTER USER \"alice\" WITH PASSWORD E'it''s\\\\secret';\n\n{REFREEZE}"
+            )
+        )),
         "{log}"
     );
 
@@ -898,7 +931,11 @@ fn a_password_file_is_set_in_the_single_user_session() {
     assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
     let log = std::fs::read_to_string(tempdir.join("session.log")).expect("session.log");
     assert!(
-        log.ends_with("arg=template1\nALTER USER \"postgres\" WITH PASSWORD E'pw';\n\n"),
+        log.starts_with(&session_log(
+            &tempdir.join("data"),
+            "template1",
+            &format!("ALTER USER \"postgres\" WITH PASSWORD E'pw';\n\n{REFREEZE}")
+        )),
         "{log}"
     );
 }
@@ -1047,4 +1084,134 @@ fn the_superuser_password_matches_reference_initdb() {
         "{ours}"
     );
     assert_eq!(normalize_scram(&ours), normalize_scram(&theirs));
+}
+
+/// What a database keeps of `vacuum_db` (`initdb.c:2001`) over `pg_authid`:
+/// its statistics on that shared catalog, and whether the superuser's row
+/// and every `pg_statistic` row are older than the table's `relfrozenxid`,
+/// which `VACUUM FREEZE` only advances past rows it froze. An unfrozen row
+/// written after the last freeze is newer.
+///
+/// With `mask_correlation`, a slot's numbers are `<correlation>` when the
+/// slot is `STATISTIC_KIND_CORRELATION` (3,
+/// `src/include/catalog/pg_statistic.h:222`): a correlation is of the heap's
+/// physical row order, which a rename by `UPDATE` changes where C's name in
+/// `postgres.bki` does not (`docs/divergences.md`).
+fn freeze_queries(mask_correlation: bool) -> String {
+    let statistics = if mask_correlation {
+        let slots = (1..=5)
+            .map(|slot| {
+                format!(
+                    "case stakind{slot} when 3 then '<correlation>' else stanumbers{slot}::text \
+                     end as stanumbers{slot}, stavalues{slot}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "select starelid, staattnum, stainherit, stanullfrac, stawidth, stadistinct, \
+             stakind1, stakind2, stakind3, stakind4, stakind5, {slots} from pg_statistic"
+        )
+    } else {
+        "select * from pg_statistic".to_owned()
+    };
+    format!(
+        "{statistics} where starelid = 'pg_authid'::regclass order by staattnum;\n\
+         select (select relfrozenxid::text::int8 from pg_class \
+         where oid = 'pg_authid'::regclass) > xmin::text::int8 as superuser_frozen \
+         from pg_authid where oid = 10;\n\
+         select bool_and(xmin::text::int8 < (select relfrozenxid::text::int8 from pg_class \
+         where oid = 'pg_statistic'::regclass)) as statistics_frozen from pg_statistic;\n"
+    )
+}
+
+/// Gate: in `template1`, `template0` and `postgres`, `-U alice` (with and
+/// without `--pwfile`) leaves the statistics on `pg_authid` the reference
+/// initdb leaves — naming `alice`, as C's `vacuum_db` analyzed `pg_authid`
+/// after `setup_auth` and before `make_template0` and `make_postgres`
+/// copied `template1` (`initdb.c:3117`, `:3144`-`:3148`) — and the
+/// superuser's row and `pg_statistic` frozen, as C's are. The reference
+/// `postgres` runs our sessions and reads both clusters.
+///
+/// With `--pwfile` the statistics are C's byte for byte: C's `ALTER USER`
+/// moves the superuser's row to the end of the heap as the rename does
+/// here. A rename alone leaves it where `postgres.bki` put it in C, so the
+/// correlations are masked for that case ([`freeze_queries`]).
+#[test]
+fn the_superuser_is_analyzed_and_frozen_in_every_database_as_in_reference_initdb() {
+    let tempdir = TempDir::new("single-user-freeze-gate");
+    let Some(initdb) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let Some(postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
+    let pwfile = tempdir.join("pwfile");
+    std::fs::write(&pwfile, "freeze-gate\n").expect("write the password file");
+    let with_password = [
+        OsString::from("--pwfile"),
+        pwfile.into(),
+        OsString::from("-A"),
+        OsString::from("trust"),
+    ];
+    for (tag, extra, mask_correlation) in [
+        ("rename", &[][..], true),
+        ("password", &with_password[..], false),
+    ] {
+        let queries = freeze_queries(mask_correlation);
+        let common: Vec<OsString> = args(&["-U", "alice", "--no-sync"])
+            .into_iter()
+            .chain(extra.iter().cloned())
+            .collect();
+        let ours = tempdir.join(&format!("ours-{tag}"));
+        let mut argv = common.clone();
+        argv.push(ours.clone().into());
+        let outcome = testkit::run_in(
+            Path::new(RINITDB),
+            &argv,
+            &[],
+            &with_server(Some(&postgres)),
+        )
+        .expect("run rinitdb");
+        assert_eq!(outcome.status, Some(0), "{tag}: {}", outcome.stderr_text());
+        assert_eq!(outcome.stderr_text(), "", "{tag}");
+
+        let theirs = tempdir.join(&format!("theirs-{tag}"));
+        let mut argv = common;
+        argv.extend(args(&["--no-locale", "-E", "UTF8"]));
+        argv.push(theirs.clone().into());
+        let outcome = testkit::run(&initdb, &argv).expect("run the reference initdb");
+        assert_eq!(outcome.status, Some(0), "{tag}: {}", outcome.stderr_text());
+
+        for database in ["template1", "template0", "postgres"] {
+            let read = |pgdata: &Path| {
+                let outcome =
+                    reference_single_user_in(pgdata, database, &queries).expect("found above");
+                assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+                outcome.stdout_text()
+            };
+            let (ours, theirs) = (read(&ours), read(&theirs));
+            let context = format!("{tag}, {database}\nours: {ours}");
+            assert!(
+                single_user_values(&ours, "stavalues1")
+                    .iter()
+                    .any(|values| values.starts_with("{alice,")),
+                "{context}"
+            );
+            if mask_correlation {
+                assert!(ours.contains("<correlation>"), "{context}");
+            }
+            assert_eq!(
+                single_user_values(&ours, "superuser_frozen"),
+                ["t"],
+                "{context}"
+            );
+            assert_eq!(
+                single_user_values(&ours, "statistics_frozen"),
+                ["t"],
+                "{context}"
+            );
+            assert_eq!(ours, theirs, "{tag}, {database}");
+        }
+    }
 }

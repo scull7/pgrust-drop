@@ -25,7 +25,9 @@ thiserror = "2"
 signal-hook = "0.3"
 # rlibpq's readiness wait, `rustix::event::poll` (owner, 2026-09-27; ADR-0010).
 rustix = { version = "1", default-features = false, features = ["event", "std"] }
-# rlibpq-ffi's C-library calls: `free` for `PQfreemem` (owner, 2026-09-27).
+# libc, declared once for both users: rlibpq-ffi's C-library calls (`free`
+# for `PQfreemem`; owner, 2026-09-27) and pgdrop's stack rlimit and signal
+# mask (NAT-407; inside the pgrust tree approved for pgdrop, 2026-09-23).
 libc = "0.2"
 
 testkit = { path = "crates/testkit" }
@@ -57,11 +59,11 @@ runtime = { git = "https://github.com/scull7/pgrust", rev = "75f1d3985d9841de3dd
 # Registry crates main_main already links (its Cargo.toml asks for these
 # exact requirements), named by pgdrop for what bin/postgres.rs does with
 # them: mimalloc as the global allocator and its extended C API for the hooks
-# above; libc for the stack rlimit and the signal mask (NAT-407). Inside the
-# pgrust tree the owner approved for pgdrop (2026-09-23); no new crate.
+# above; libc for the stack rlimit and the signal mask (NAT-407; the `libc`
+# entry is the one above, shared with rlibpq-ffi). Inside the pgrust tree the
+# owner approved for pgdrop (2026-09-23); no new crate.
 mimalloc = "0.1"
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
-libc = "0.2"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

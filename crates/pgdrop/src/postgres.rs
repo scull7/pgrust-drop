@@ -55,6 +55,12 @@ pub fn transport(args: &[OsString]) -> seams_init::Transport {
 ///
 /// Write failures on the version line are ignored and the exit status is
 /// still 0, as `main.c:170`'s unchecked `fputs` is.
+///
+/// Must be called while the process is still single-threaded: a server
+/// command line goes through [`crate::stack::run_on_server_stack`], which
+/// writes the environment (`RUST_MIN_STACK`). `main` calls it before
+/// starting any thread; a caller that has threads of its own (NAT-409's
+/// `start`, say) must run it in a fresh process instead.
 pub fn run(argv0: &OsStr, args: &[OsString], stdout: &mut dyn Write) -> ExitCode {
     match request(args) {
         Request::Version => {

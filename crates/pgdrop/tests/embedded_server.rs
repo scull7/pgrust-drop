@@ -125,9 +125,14 @@ fn pgdrop_postgres_single_answers_select_version() {
 /// `src/test/regress/expected/infinite_recurse.out:21`-`:24`: SQLSTATE 54001,
 /// "stack depth limit exceeded" — the guard fires before the stack ends,
 /// rather than the server dying of SIGSEGV. (Single-user mode has no
-/// `\set VERBOSITY`; its error report goes to stderr in full, so the test
-/// looks for the primary message there. The `powerpc64` skip at `:16`-`:20`
-/// does not apply to the lanes this runs on.)
+/// `\set VERBOSITY`; its error report goes to stderr as a server-log line,
+/// so the test runs under `-c log_error_verbosity=verbose`, whose line
+/// carries the SQLSTATE after the severity
+/// (`src/backend/utils/error/elog.c:3240`-`:3241`), and looks for
+/// `ERROR:  54001: stack depth limit exceeded` there; 54001 is
+/// `ERRCODE_STATEMENT_TOO_COMPLEX`, `src/backend/utils/errcodes.txt:417`.
+/// The `powerpc64` skip at `:16`-`:20` does not apply to the lanes this runs
+/// on.)
 ///
 /// Run under pgrust's README's `-c max_stack_depth=60000`, which C's own
 /// check refuses unless the stack rlimit is at least that plus
@@ -154,7 +159,12 @@ fn infinite_recurse() {
     pgdrop_initdb(&pgdata);
     let (stdout, stderr) = single(
         &pgdata,
-        &["-c", "max_stack_depth=60000"],
+        &[
+            "-c",
+            "max_stack_depth=60000",
+            "-c",
+            "log_error_verbosity=verbose",
+        ],
         &server_env(&scratch.0),
         "show max_stack_depth;\n\
          create function infinite_recurse() returns int as 'select infinite_recurse()' language sql;\n\
@@ -166,7 +176,7 @@ fn infinite_recurse() {
         "stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("ERROR:  stack depth limit exceeded"),
+        stderr.contains("ERROR:  54001: stack depth limit exceeded"),
         "stderr: {stderr}"
     );
 }

@@ -128,4 +128,5 @@ compiles none of pgrust.
 `PG_BACKEND_VERSIONSTR`, for `pgdrop postgres --version`. Running the server
 in-process is NAT-407. (Since NAT-381 and NAT-407: every other `postgres`
 command line goes to `pg_main`, on mimalloc and a stack pgdrop sizes itself;
-see `crates/pgdrop/src/postgres.rs`.)
+see `crates/pgdrop/src/postgres.rs`. mimalloc is the global allocator of the
+whole executable, so every applet, `initdb` and `psql` included, runs on it.)

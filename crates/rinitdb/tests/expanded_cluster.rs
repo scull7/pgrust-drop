@@ -1020,7 +1020,12 @@ fn the_superuser_password_matches_reference_initdb() {
     )
     .expect("run rinitdb");
     assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
-    assert_eq!(outcome.stderr_text(), "");
+    // No -A: C's trust warning (initdb.c:3521) is all of stderr.
+    let ours_stderr = outcome.stderr_text();
+    assert_eq!(
+        ours_stderr,
+        format!("{}\n", rinitdb::report::trust_warning())
+    );
 
     let theirs = tempdir.join("theirs");
     let mut argv = common.to_vec();
@@ -1028,6 +1033,7 @@ fn the_superuser_password_matches_reference_initdb() {
     argv.push(theirs.clone().into());
     let outcome = testkit::run(&initdb, &argv).expect("run the reference initdb");
     assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    assert_eq!(outcome.stderr_text(), ours_stderr);
 
     let read = |pgdata: &Path| {
         let outcome = reference_single_user(pgdata, SUPERUSER_QUERIES).expect("found above");

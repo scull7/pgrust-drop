@@ -4,9 +4,10 @@
 //! value that the caller owns, so every calculation that reads settings can be
 //! unit-tested with a settings value built in the test.
 //!
-//! Only the fields this port has reached are present; the one-shot `\g`,
-//! `\gset` and pipeline fields belong to NAT-402/NAT-403/NAT-404 and are not
-//! declared as dead weight here. `\crosstabview`'s is (NAT-404).
+//! Only the fields this port has reached are present; the one-shot
+//! `\gset` and `\gexec` fields belong to NAT-402 and are not declared as
+//! dead weight here. `\crosstabview`'s, `\g`'s and the pipeline's are
+//! (NAT-404).
 
 use rlibpq::{ContextVisibility, QueryResult, Verbosity};
 
@@ -381,12 +382,9 @@ pub struct PrintQueryOpt {
     pub title: Option<String>,
 }
 
-/// `PSQL_SEND_MODE` (`settings.h:71`), for the modes this port has, each
-/// carrying the `stmtName` and `bind_params` it reads, so a mode cannot be
-/// set without its arguments or keep a stale one.
-///
-/// The pipeline modes (`PSQL_SEND_PIPELINE_SYNC` … `PSQL_SEND_GET_RESULTS`)
-/// come with the pipeline commands.
+/// `PSQL_SEND_MODE` (`settings.h:71`), each variant carrying the `stmtName`
+/// and `bind_params` it reads, so a mode cannot be set without its arguments
+/// or keep a stale one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SendMode {
     /// `PSQL_SEND_QUERY`: the simple query protocol.
@@ -415,6 +413,59 @@ pub enum SendMode {
         /// `bind_params`
         params: Vec<String>,
     },
+    /// `PSQL_SEND_PIPELINE_SYNC`: `\syncpipeline`, `PQsendPipelineSync`.
+    PipelineSync,
+    /// `PSQL_SEND_START_PIPELINE_MODE`: `\startpipeline`,
+    /// `PQenterPipelineMode`.
+    StartPipelineMode,
+    /// `PSQL_SEND_END_PIPELINE_MODE`: `\endpipeline`, `PQpipelineSync`, then
+    /// every result, then `PQexitPipelineMode`.
+    EndPipelineMode,
+    /// `PSQL_SEND_FLUSH`: `\flush`, `PQflush`.
+    Flush,
+    /// `PSQL_SEND_FLUSH_REQUEST`: `\flushrequest`, `PQsendFlushRequest`.
+    FlushRequest,
+    /// `PSQL_SEND_GET_RESULTS`: `\getresults`, which sends nothing and reads
+    /// [`PipelineCounters::requested_results`] results.
+    GetResults,
+}
+
+impl SendMode {
+    /// The modes that drive a pipeline rather than send a statement: they
+    /// are sent even when the query buffer is empty, and only the pipeline
+    /// path of `ExecQueryAndProcessResults` knows them.
+    #[must_use]
+    pub fn is_pipeline_control(&self) -> bool {
+        matches!(
+            self,
+            Self::PipelineSync
+                | Self::StartPipelineMode
+                | Self::EndPipelineMode
+                | Self::Flush
+                | Self::FlushRequest
+                | Self::GetResults
+        )
+    }
+}
+
+/// `piped_commands`, `piped_syncs`, `available_results` and
+/// `requested_results` (`settings.h:126`-`:131`): psql's own account of a
+/// pipeline, which `PIPELINE_COMMAND_COUNT`, `PIPELINE_SYNC_COUNT` and
+/// `PIPELINE_RESULT_COUNT` publish (`SetPipelineVariables`, `common.c:536`).
+///
+/// Upstream's are `int`s that only its underflow guards keep from going
+/// negative; unsigned counters with saturating decrements say the same.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineCounters {
+    /// `piped_commands`: commands sent since the last sync or flush request.
+    pub piped_commands: usize,
+    /// `piped_syncs`: syncs sent whose `PGRES_PIPELINE_SYNC` is unread.
+    pub piped_syncs: usize,
+    /// `available_results`: results the server has been asked to send.
+    pub available_results: usize,
+    /// `requested_results`: how many results, syncs included, the current
+    /// `\getresults` or `\endpipeline` still wants.
+    pub requested_results: usize,
 }
 
 /// `PsqlSettings` (`settings.h:101`), minus the fields this port has not
@@ -462,6 +513,8 @@ pub struct PsqlSettings {
     /// (`settings.h:120`-`:124`): how the next `SendQuery` sends its query,
     /// which it resets (`clean_extended_state`, `common.c:2781`).
     pub send_mode: SendMode,
+    /// The pipeline counters (`settings.h:126`-`:131`).
+    pub pipeline: PipelineCounters,
 
     // The remaining fields are the ones `settings.h:161` says are set by the
     // assign hooks in `vars`; `crate::variables::VariableSpace::settings`
@@ -533,6 +586,7 @@ impl Default for PsqlSettings {
             crosstab: None,
             gsavepopt: None,
             send_mode: SendMode::Query,
+            pipeline: PipelineCounters::default(),
             // `SetVariableBool(pset.vars, "AUTOCOMMIT")` at `startup.c:202`.
             autocommit: true,
             on_error_stop: false,

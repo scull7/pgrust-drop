@@ -19,9 +19,13 @@
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
 //! `\errverbose`, `\cd`, and `\i` and `\ir` over `path.c`'s file-name
 //! calculations ([`path`]) and a nested [`mainloop::process_file`]. NAT-404
-//! adds `\crosstabview` ([`crosstab`], `crosstabview.c`), and `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
+//! adds `\crosstabview` ([`crosstab`], `crosstabview.c`), `\g`, `\gx`,
+//! `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
-//! ([`settings::SendMode`]). NAT-405 adds Ctrl-C ([`cancel`],
+//! ([`settings::SendMode`]), and the pipeline commands `\startpipeline`,
+//! `\sendpipeline`, `\syncpipeline`, `\flush`, `\flushrequest`,
+//! `\getresults` and `\endpipeline` on rlibpq's pipeline mode
+//! ([`settings::PipelineCounters`]). NAT-405 adds Ctrl-C ([`cancel`],
 //! `fe_utils/cancel.c`): a SIGINT cancels the running query. `\d` is
 //! NAT-401's and interactive input is NAT-405's.
 //!
@@ -59,7 +63,8 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, Params, QueryResult, Stream,
+    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, Params, PipelineStatus,
+    QueryResult, ResultError, Stream,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
@@ -101,6 +106,27 @@ pub fn help_text(topic: HelpTopic) -> String {
 struct LiveExecutor {
     connection: Connection<Stream>,
     alive: bool,
+    /// How many of the connection's notices have been handed out.
+    notices_seen: usize,
+}
+
+impl LiveExecutor {
+    /// `err` as psql sees it: an argument or state refused before anything
+    /// was sent leaves the connection as it was; anything else broke it.
+    fn failed(&mut self, err: ConnectionError) -> ErrorMessage {
+        if !matches!(
+            err,
+            ConnectionError::Argument(_) | ConnectionError::Pipeline(_)
+        ) {
+            self.alive = false;
+        }
+        err.into()
+    }
+}
+
+/// `\bind`'s parameters as libpq takes them: all text (`common.c:1616`).
+fn text_params(params: &[String]) -> Vec<Option<&[u8]>> {
+    params.iter().map(|p| Some(p.as_bytes())).collect()
 }
 
 impl Executor for LiveExecutor {
@@ -109,9 +135,6 @@ impl Executor for LiveExecutor {
     /// blocking libpq call its `PQsend…` pairs with, and `\bind`'s
     /// parameters are all text with no types given (`common.c:1616`).
     fn exec(&mut self, query: &[u8], mode: &SendMode) -> Result<Vec<QueryResult>, ErrorMessage> {
-        let text = |params: &[String]| -> Vec<Option<Vec<u8>>> {
-            params.iter().map(|p| Some(p.as_bytes().to_vec())).collect()
-        };
         // `SetCancelConn(pset.db)` … `ResetCancelConn()` around the query, as
         // both `SendQuery` (`common.c:1173`, `:1309`) and `PSQLexec`
         // (`common.c:686`, `:690`) have it: a Ctrl-C meanwhile cancels it.
@@ -125,34 +148,94 @@ impl Executor for LiveExecutor {
                 self.connection.prepare(statement.as_bytes(), query, &[])
             }
             SendMode::ExtendedQueryParams { params } => {
-                let owned = text(params);
-                let values: Vec<Option<&[u8]>> = owned.iter().map(Option::as_deref).collect();
                 self.connection
-                    .exec_params(query, &[], &Params::text(&values))
+                    .exec_params(query, &[], &Params::text(&text_params(params)))
             }
-            SendMode::ExtendedQueryPrepared { statement, params } => {
-                let owned = text(params);
-                let values: Vec<Option<&[u8]>> = owned.iter().map(Option::as_deref).collect();
-                self.connection
-                    .exec_prepared(statement.as_bytes(), &Params::text(&values))
-            }
+            SendMode::ExtendedQueryPrepared { statement, params } => self
+                .connection
+                .exec_prepared(statement.as_bytes(), &Params::text(&text_params(params))),
+            // `send_query` sends these through `send`; the blocking path has
+            // none, and says so as libpq would.
+            SendMode::PipelineSync
+            | SendMode::StartPipelineMode
+            | SendMode::EndPipelineMode
+            | SendMode::Flush
+            | SendMode::FlushRequest
+            | SendMode::GetResults => Err(ConnectionError::Pipeline(
+                rlibpq::PipelineError::NotInPipelineMode,
+            )),
         };
         cancel::reset_cancel_conn();
-        outcome.map_err(|err| {
-            // An argument or state refused before anything was sent leaves
-            // the connection as it was; anything else broke it.
-            if !matches!(
-                err,
-                ConnectionError::Argument(_) | ConnectionError::Pipeline(_)
-            ) {
-                self.alive = false;
-            }
-            err.into()
-        })
+        outcome.map_err(|err| self.failed(err))
     }
 
     fn connected(&self) -> bool {
         self.alive
+    }
+
+    fn abandon(&mut self) {
+        self.alive = false;
+    }
+
+    fn pipeline_status(&self) -> PipelineStatus {
+        self.connection.pipeline_status()
+    }
+
+    /// The `switch (pset.send_mode)` of `ExecQueryAndProcessResults`
+    /// (`common.c:1602`-`:1724`), each mode's non-blocking libpq call.
+    fn send(&mut self, query: &[u8], mode: &SendMode) -> Result<(), ErrorMessage> {
+        let outcome = match mode {
+            // `common.c:1713`: in a pipeline a plain query goes through the
+            // extended protocol, which is all a pipeline can carry.
+            SendMode::Query if self.connection.pipeline_status() != PipelineStatus::Off => self
+                .connection
+                .send_query_params(query, &[], &Params::text(&[])),
+            SendMode::Query => self.connection.send_query(query),
+            SendMode::ExtendedClose { statement } => {
+                self.connection.send_close_prepared(statement.as_bytes())
+            }
+            SendMode::ExtendedParse { statement } => {
+                self.connection
+                    .send_prepare(statement.as_bytes(), query, &[])
+            }
+            SendMode::ExtendedQueryParams { params } => {
+                self.connection
+                    .send_query_params(query, &[], &Params::text(&text_params(params)))
+            }
+            SendMode::ExtendedQueryPrepared { statement, params } => self
+                .connection
+                .send_query_prepared(statement.as_bytes(), &Params::text(&text_params(params))),
+            SendMode::StartPipelineMode => self.connection.enter_pipeline_mode(),
+            SendMode::EndPipelineMode => self.connection.pipeline_sync(),
+            SendMode::PipelineSync => self.connection.send_pipeline_sync(),
+            // psql's connection blocks, so `PQflush` never leaves output
+            // pending (`fe-misc.c:1109`): its `1` cannot reach `common.c:1672`.
+            SendMode::Flush => self.connection.flush().map(|_| ()),
+            SendMode::FlushRequest => self.connection.send_flush_request(),
+            SendMode::GetResults => Ok(()),
+        };
+        outcome.map_err(|err| self.failed(err))
+    }
+
+    fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+        // `SendQuery`'s `SetCancelConn` covers the pipeline's results too
+        // (`common.c:1173`, `:1309`): a Ctrl-C while one is awaited cancels.
+        cancel::set_cancel_conn(self.connection.get_cancel());
+        let outcome = self.connection.get_result();
+        cancel::reset_cancel_conn();
+        outcome.map_err(|err| self.failed(err))
+    }
+
+    fn exit_pipeline_mode(&mut self) -> Result<(), ErrorMessage> {
+        self.connection
+            .exit_pipeline_mode()
+            .map_err(|err| self.failed(err))
+    }
+
+    fn take_notices(&mut self) -> Vec<ResultError> {
+        let notices = self.connection.notices()[self.notices_seen..].to_vec();
+        self.notices_seen += notices.len();
+        notices
     }
 }
 
@@ -194,7 +277,10 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
         return Err(ConnectionError::from(err).into());
     }
     match Connection::connect(&conninfo) {
+        // The startup exchange's notices are not psql's to print: its
+        // notice processor is installed after the connection is made.
         Ok(connection) => Ok(LiveExecutor {
+            notices_seen: connection.notices().len(),
             connection,
             alive: true,
         }),
@@ -377,7 +463,14 @@ fn run_action(
             if session.pset.echo == settings::Echo::All {
                 let _ = writeln!(stdout, "{sql}");
             }
-            if send_query(executor, sql.as_bytes(), &mut session.pset, stdout, stderr) {
+            if send_query(
+                executor,
+                sql.as_bytes(),
+                &mut session.pset,
+                &mut session.vars,
+                stdout,
+                stderr,
+            ) {
                 EXIT_SUCCESS
             } else {
                 EXIT_FAILURE
@@ -399,6 +492,7 @@ fn run_action(
                     &mut scanner,
                     &mut session.pset,
                     &mut session.vars,
+                    executor.pipeline_status(),
                     stdout,
                     stderr,
                 )

@@ -34,6 +34,9 @@ readonly REQUIRED_PATHS=(
   crates/_support/seams_init/Cargo.toml
   crates/backend/storage/ipc/ipc/Cargo.toml
   crates/backend/utils/error/elog/Cargo.toml
+  crates/_support/mcx/Cargo.toml
+  crates/backend/postmaster/memwatchdog/Cargo.toml
+  crates/backend/executor/runtime/Cargo.toml
   crates/backend/commands/collationcmds/src/import.rs
   crates/backend/commands/collationcmds/src/builtins.rs
 )

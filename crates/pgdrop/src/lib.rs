@@ -10,8 +10,8 @@
 //!
 //! [`postgres`] links pgrust's `main_main` (NAT-376) and hands every command
 //! line but `--version` to its `pg_main`, with the share files the server
-//! reads embedded and extracted by [`share`] (NAT-408); the rest of
-//! embedding the server (allocator, stack: NAT-407) is still to come.
+//! reads embedded and extracted by [`share`] (NAT-408), on mimalloc
+//! ([`allocator`]) and a stack sized for the server ([`stack`]) (NAT-407).
 //!
 //! [`start`] is `pgdrop start` (NAT-409): so far its flags and the pure plan
 //! they become; minting, spawning and `stop` are the next slice.
@@ -27,9 +27,11 @@
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
+pub mod allocator;
 pub mod dispatch;
 pub mod install;
 pub mod measure;
 pub mod postgres;
 pub mod share;
+pub mod stack;
 pub mod start;

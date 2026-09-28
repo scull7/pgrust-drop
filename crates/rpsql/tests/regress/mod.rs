@@ -336,8 +336,31 @@ impl Cluster {
         vars: &[(&str, &str)],
         script: &str,
     ) -> Vec<u8> {
+        self.run_script_in(psql, dbname, vars, &[], script)
+    }
+
+    /// [`Cluster::run_script`] with `env` added to psql's environment, as
+    /// `pg_regress` adds `PG_ABS_BUILDDIR` and friends.
+    ///
+    /// # Panics
+    /// As [`Cluster::run_script`].
+    pub fn run_script_env(&self, psql: &Path, script: &str, env: &[(&str, &Path)]) -> Vec<u8> {
+        self.run_script_in(psql, "postgres", &[], env, script)
+    }
+
+    /// Action: [`Cluster::run_script_with`] with `env` added to psql's
+    /// environment as well.
+    fn run_script_in(
+        &self,
+        psql: &Path,
+        dbname: &str,
+        vars: &[(&str, &str)],
+        env: &[(&str, &Path)],
+        script: &str,
+    ) -> Vec<u8> {
         let (mut reader, writer) = std::io::pipe().expect("a pipe for 2>&1");
         let mut command = Command::new(psql);
+        command.envs(env.iter().copied());
         command.args(["-X", "-a", "-q", "-d", dbname]).args([
             "-v",
             "HIDE_TABLEAM=on",

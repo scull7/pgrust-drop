@@ -563,6 +563,9 @@ pub struct PsqlSettings {
     pub show_all_results: bool,
     /// `show_context`: current context display level.
     pub show_context: ContextVisibility,
+    /// `gfname`: the file or `|command` of a `\g` whose query is being
+    /// sent, reset after every `SendQuery` (`common.c:1312`).
+    pub gfname: Option<Vec<u8>>,
 }
 
 impl Default for PsqlSettings {
@@ -612,6 +615,7 @@ impl Default for PsqlSettings {
             // `startup.c:206`.
             show_all_results: true,
             show_context: ContextVisibility::Errors,
+            gfname: None,
         }
     }
 }

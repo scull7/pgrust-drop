@@ -4,7 +4,8 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
-//! NAT-400 adds `\pset`, NAT-403 `\timing`, `\errverbose` and `\copy`,
+//! NAT-400 adds `\pset`, NAT-403 `\timing`, `\errverbose`, `\copy`, `\o`,
+//! `\getenv` and `\g`'s file or pipe,
 //! NAT-404 `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
 //! `\bind`, `\bind_named` and `\close_prepared`, and the pipeline commands
 //! `\startpipeline`, `\sendpipeline`, `\syncpipeline`, `\flush`,
@@ -20,6 +21,7 @@ use rlibpq::{ContextVisibility, PipelineStatus, Verbosity};
 use crate::common::{CommandSource, Executor};
 use crate::crosstab::CtvArgs;
 use crate::logging;
+use crate::output::Output;
 use crate::scan::{Scanner, VariableSource};
 use crate::settings::{Expanded, PsqlSettings, SendMode};
 use crate::slash::SlashOption;
@@ -107,7 +109,7 @@ pub fn dispatch_slash(
     vars: &mut VariableSpace,
     executor: &mut dyn Executor,
     source: &mut CommandSource<'_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> CommandResult {
     // The lexer reads the variable space while the command writes to it;
@@ -122,7 +124,7 @@ pub fn dispatch_slash(
             pipeline: executor.pipeline_status(),
             executor: &mut *executor,
         };
-        handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
+        handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), out, stderr)
     };
     // `\pset` wrote `working.popt`; a `\set` of a hooked variable wrote the
     // variable space, whose settings are re-derived on top.
@@ -138,15 +140,7 @@ pub fn dispatch_slash(
     }
     if let CommandResult::Copy(args) = status {
         // `exec_command_copy()` (`command.c:963`).
-        return if crate::copy::do_copy(
-            args.as_deref(),
-            executor,
-            pset,
-            vars,
-            source,
-            stdout,
-            stderr,
-        ) {
+        return if crate::copy::do_copy(args.as_deref(), executor, pset, vars, source, out, stderr) {
             CommandResult::SkipLine
         } else {
             CommandResult::Error
@@ -163,7 +157,7 @@ pub fn handle_slash_cmds(
     scanner: &mut Scanner,
     ctx: &mut CommandContext<'_>,
     vars_view: &dyn VariableSource,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> CommandResult {
     let cmd = scanner.slash_command();
@@ -175,8 +169,18 @@ pub fn handle_slash_cmds(
         scanner.slash_command_end();
         return CommandResult::Copy(line);
     }
-    let options = scanner.slash_options(vars_view);
-    let status = exec_command(&cmd, &options, ctx, stdout, stderr);
+    // `\g` and `\o` take a file or a `|command` first (`OT_FILEPIPE`,
+    // `command.c:1749`, `:2466`), and `\o` strips its trailing semicolons.
+    let mut options: Vec<SlashOption> = match cmd.as_str() {
+        "g" | "gx" => g_options(scanner, vars_view),
+        "o" | "out" => scanner
+            .slash_option_filepipe(vars_view, true)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    options.extend(scanner.slash_options(vars_view));
+    let status = exec_command(&cmd, &options, ctx, out, stderr);
 
     let status = if status == CommandResult::Unknown {
         logging::error(ctx.pset, format!("invalid command \\{cmd}"), stderr);
@@ -202,6 +206,32 @@ pub fn handle_slash_cmds(
     status
 }
 
+/// `\g`'s arguments as `exec_command_g` (`command.c:1749`-`:1760`) scans
+/// them: the first is `OT_FILEPIPE`; one that opens a `(` is followed by
+/// `OT_NORMAL` print options up to the one that closes it
+/// (`process_command_g_options`, `command.c:1800`), and then by the file
+/// name, `OT_FILEPIPE` again.
+fn g_options(scanner: &mut Scanner, vars: &dyn VariableSource) -> Vec<SlashOption> {
+    let mut options = Vec::new();
+    let Some(first) = scanner.slash_option_filepipe(vars, false) else {
+        return options;
+    };
+    let open = first.value.starts_with('(');
+    let mut closed = first.value.ends_with(')');
+    options.push(first);
+    if open {
+        while !closed {
+            let Some(option) = scanner.slash_option(vars) else {
+                break;
+            };
+            closed = option.value.ends_with(')');
+            options.push(option);
+        }
+        options.extend(scanner.slash_option_filepipe(vars, false));
+    }
+    options
+}
+
 /// How many arguments each implemented command consumes; the rest draw
 /// upstream's "extra argument … ignored" warning.
 fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
@@ -210,8 +240,8 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         // `\bind_named`, whose parameters run to the end of the command.
         "echo" | "qecho" | "warn" | "set" | "bind" | "bind_named" => return Vec::new(),
         "c" | "connect" | "crosstabview" => 4,
-        "pset" => 2,
-        "unset" | "timing" | "parse" | "close_prepared" | "getresults" => 1,
+        "pset" | "getenv" => 2,
+        "unset" | "timing" | "parse" | "close_prepared" | "getresults" | "o" | "out" => 1,
         "g" | "gx" => GArgs::split(options).consumed,
         // `exec_command_lo` always reads two (`command.c:2378`-`:2381`).
         _ if cmd.starts_with("lo_") => 2,
@@ -228,7 +258,7 @@ fn exec_command(
     cmd: &str,
     options: &[SlashOption],
     ctx: &mut CommandContext<'_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> CommandResult {
     match cmd {
@@ -307,16 +337,33 @@ fn exec_command(
             ctx.pset.crosstab = Some(args);
             CommandResult::Send
         }
-        // `exec_command_echo()` (`command.c:1559`).
+        // `exec_command_echo()` (`command.c:1559`): `\qecho` writes to
+        // `pset.queryFout`, `\warn` to stderr, `\echo` to stdout
+        // (`command.c:1569`-`:1574`).
         "echo" | "qecho" | "warn" => {
-            let sink: &mut dyn Write = if cmd == "warn" { stderr } else { stdout };
+            let sink: &mut dyn Write = match cmd {
+                "warn" => stderr,
+                "qecho" => out.query_fout(),
+                _ => &mut *out.stdout,
+            };
             let _ = sink.write_all(&echo_text(options));
             CommandResult::SkipLine
         }
+        // `exec_command_getenv()` (`command.c:1892`).
+        "getenv" => exec_command_getenv(cmd, options, ctx, stderr),
+        // `exec_command_out()` (`command.c:2459`).
+        "o" | "out" => {
+            let fname = options.first().map(|o| filename(&o.value));
+            if out.set_query_fout(fname.as_deref(), ctx.pset, ctx.vars, stderr) {
+                CommandResult::SkipLine
+            } else {
+                CommandResult::Error
+            }
+        }
         // `exec_command_pset()` (`command.c:2695`).
-        "pset" => exec_command_pset(options, ctx, stdout, stderr),
+        "pset" => exec_command_pset(options, ctx, &mut *out.stdout, stderr),
         // `exec_command_set()` (`command.c:2881`).
-        "set" => exec_command_set(options, ctx, stdout, stderr),
+        "set" => exec_command_set(options, ctx, &mut *out.stdout, stderr),
         // `exec_command_unset()` (`command.c:3238`).
         "unset" => {
             let Some(name) = options.first() else {
@@ -332,16 +379,16 @@ fn exec_command(
             }
         }
         // `exec_command_timing()` (`command.c:3166`).
-        "timing" => exec_command_timing(options, ctx, stdout, stderr),
+        "timing" => exec_command_timing(options, ctx, &mut *out.stdout, stderr),
         // `exec_command_errverbose()` (`command.c:1643`).
         "errverbose" => {
-            exec_command_errverbose(ctx.pset, stdout, stderr);
+            exec_command_errverbose(ctx.pset, &mut *out.stdout, stderr);
             CommandResult::SkipLine
         }
         // `exec_command_lo()` (`command.c:2368`), for every `lo_` command
         // (`command.c:417`).
         _ if cmd.starts_with("lo_") => {
-            crate::large_obj::exec_command_lo(cmd, options, ctx, stdout, stderr)
+            crate::large_obj::exec_command_lo(cmd, options, ctx, out, stderr)
         }
         _ => CommandResult::Unknown,
     }
@@ -488,11 +535,9 @@ impl<'a> GArgs<'a> {
 }
 
 /// `exec_command_g()` (`command.c:1739`): send the query buffer, with the
-/// parenthesized print options in force for this one query and, for `\gx`,
-/// expanded output on.
-///
-/// Sending the output to a file or a pipe instead (`pset.gfname`) is
-/// NAT-403's, and a file name is refused rather than ignored.
+/// parenthesized print options in force for this one query, for `\gx`
+/// expanded output on, and its tuples going to the file or pipe named, if
+/// one is (`pset.gfname`).
 fn exec_command_g(
     cmd: &str,
     options: &[SlashOption],
@@ -532,17 +577,14 @@ fn exec_command_g(
         ctx.pset.send_mode = SendMode::Query;
         return CommandResult::Error;
     }
-    if args.fname.is_some() && success {
-        let message = format!("\\{cmd} to a file or pipe is not implemented yet (Linear NAT-403)");
-        logging::error(ctx.pset, message, stderr);
-        success = false;
-    }
     if !success {
         if let Some(saved) = ctx.pset.gsavepopt.take() {
             ctx.pset.popt = saved;
         }
         return CommandResult::Error;
     }
+    // `command.c:1771`-`:1777`.
+    ctx.pset.gfname = args.fname.map(filename);
     if cmd == "gx" {
         // Save the settings if not done already, then force expanded=on
         // (`command.c:1779`).
@@ -552,6 +594,37 @@ fn exec_command_g(
         ctx.pset.popt.topt.expanded = Expanded::On;
     }
     CommandResult::Send
+}
+
+/// A `\g` or `\o` argument as a file name: `expand_tilde()`
+/// (`common.c:2697`) over `HOME`.
+fn filename(value: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let home = std::env::var_os("HOME");
+    crate::copy::expand_tilde(value.as_bytes(), home.as_deref().map(OsStrExt::as_bytes))
+}
+
+/// `exec_command_getenv()` (`command.c:1892`): copy an environment variable
+/// into a psql variable, if it is set.
+fn exec_command_getenv(
+    cmd: &str,
+    options: &[SlashOption],
+    ctx: &mut CommandContext<'_>,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    let (Some(myvar), Some(envvar)) = (options.first(), options.get(1)) else {
+        return missing_required_argument(cmd, ctx.pset, stderr);
+    };
+    let Some(value) = std::env::var_os(&envvar.value) else {
+        return CommandResult::SkipLine;
+    };
+    match ctx.vars.set(&myvar.value, Some(&value.to_string_lossy())) {
+        Ok(()) => CommandResult::SkipLine,
+        Err(err) => {
+            logging::error(ctx.pset, &err.message, stderr);
+            CommandResult::Error
+        }
+    }
 }
 
 /// The pure half of `exec_command_echo` (`command.c:1559`): the bytes `\echo`
@@ -760,7 +833,7 @@ mod tests {
                 &mut scanner,
                 &mut ctx,
                 &NoVariables,
-                &mut stdout,
+                &mut Output::new(&mut stdout),
                 &mut stderr,
             )
         };
@@ -918,7 +991,7 @@ mod tests {
             &mut vars,
             &mut NoServer,
             &mut CommandSource::file(&mut &b""[..]),
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         assert_eq!(status, CommandResult::Error);
@@ -946,7 +1019,7 @@ mod tests {
             &mut vars,
             &mut NoServer,
             &mut CommandSource::file(&mut &b""[..]),
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
 
@@ -1057,7 +1130,7 @@ mod tests {
             &mut vars,
             &mut Piped(pipeline),
             &mut CommandSource::file(&mut &b""[..]),
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         (status, String::from_utf8(stderr).unwrap())
@@ -1237,17 +1310,20 @@ mod tests {
     }
 
     #[test]
-    fn g_to_a_file_is_refused_not_ignored() {
+    fn g_options_then_a_file_or_a_pipe() {
+        // `command.c:1749`-`:1777`: the options, then the file name scanned
+        // `OT_FILEPIPE` again, so a pipe takes the rest of the line.
         let mut pset = terse();
-        let before = pset.popt.clone();
         let (status, stderr) = dispatch_on(&mut pset, "\\g (border=2) out.txt");
-        assert_eq!(status, CommandResult::Error);
-        assert_eq!(
-            stderr,
-            "\\g to a file or pipe is not implemented yet (Linear NAT-403)\n"
-        );
-        assert_eq!(pset.popt, before);
-        assert_eq!(pset.gsavepopt, None);
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(stderr, "");
+        assert_eq!(pset.popt.topt.border, 2);
+        assert_eq!(pset.gfname.as_deref(), Some(&b"out.txt"[..]));
+        let mut pset = terse();
+        let (status, stderr) = dispatch_on(&mut pset, "\\gx (border=2 tuples_only) | cat 'a b'");
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(stderr, "");
+        assert_eq!(pset.gfname.as_deref(), Some(&b"| cat 'a b'"[..]));
     }
 
     #[test]
@@ -1401,7 +1477,7 @@ mod tests {
             &mut vars,
             &mut NoServer,
             &mut CommandSource::file(&mut &b""[..]),
-            &mut stdout,
+            &mut Output::new(&mut stdout),
             &mut stderr,
         );
         (
@@ -1529,6 +1605,95 @@ mod tests {
         assert_eq!(
             run_from("\\lo", located).3,
             "psql:a.sql:3: error: invalid command \\lo\n"
+        );
+    }
+    #[test]
+    fn g_names_its_file_and_sends() {
+        // `command.c:1771`-`:1786`: `pset.gfname`, then `PSQL_CMD_SEND`.
+        let (status, pset, _, err) = run_from("\\g /tmp/out", PsqlSettings::default());
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(pset.gfname.as_deref(), Some(&b"/tmp/out"[..]));
+        assert_eq!(err, "");
+        let (status, pset, _, _) = run_from("\\g", PsqlSettings::default());
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(pset.gfname, None);
+        let (_, pset, _, _) = run_from("\\g | cat > x", PsqlSettings::default());
+        assert_eq!(pset.gfname.as_deref(), Some(&b"| cat > x"[..]));
+    }
+
+    #[test]
+    fn g_warns_about_a_second_argument() {
+        let (status, _, _, err) = run_from("\\g a b", PsqlSettings::default());
+        assert_eq!(status, CommandResult::Send);
+        assert_eq!(err, "psql: warning: \\g: extra argument \"b\" ignored\n");
+    }
+
+    #[test]
+    fn getenv_copies_a_set_environment_variable_only() {
+        // `command.c:1892`; `psql.sql:1509` reads `PG_ABS_BUILDDIR` this way.
+        let path = std::env::var("PATH").expect("PATH is set");
+        let run1 = run("\\getenv p PATH");
+        assert_eq!(run1.result, CommandResult::SkipLine);
+        assert_eq!(run1.vars.get("p"), Some(path.as_str()));
+        let unset = run("\\getenv p RPSQL_TEST_NO_SUCH_VARIABLE");
+        assert_eq!(unset.result, CommandResult::SkipLine);
+        assert_eq!(unset.vars.get("p"), None);
+        let missing = run("\\getenv p");
+        assert_eq!(missing.result, CommandResult::Error);
+        assert_eq!(
+            missing.stderr,
+            "psql: error: \\getenv: missing required argument\n"
+        );
+    }
+
+    #[test]
+    fn o_moves_query_output_and_qecho_with_it_but_not_echo() {
+        // `command.c:1569`-`:1574`: `\qecho` writes to `pset.queryFout`,
+        // `\echo` to stdout; `\o` alone goes back to stdout.
+        let dir = std::env::temp_dir().join(format!("rpsql-o-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("o.out");
+        let mut vars = VariableSpace::new();
+        let mut pset = PsqlSettings::default();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = Output::new(&mut stdout);
+            for line in [
+                format!("\\o {};", file.display()),
+                "\\qecho to the file".to_string(),
+                "\\echo to stdout".to_string(),
+                "\\o".to_string(),
+                "\\qecho to stdout again".to_string(),
+            ] {
+                let mut scanner = Scanner::new();
+                scanner.setup(line.as_bytes(), true);
+                let mut buf = Vec::new();
+                scanner.scan(&mut buf, &NoVariables);
+                let status = dispatch_slash(
+                    &mut scanner,
+                    &mut pset,
+                    &mut vars,
+                    &mut NoServer,
+                    &mut CommandSource::file(&mut &b""[..]),
+                    &mut out,
+                    &mut stderr,
+                );
+                assert_eq!(status, CommandResult::SkipLine, "{line}");
+            }
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"to the file\n");
+        assert_eq!(stdout, b"to stdout\nto stdout again\n");
+        assert!(stderr.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn o_to_a_file_that_cannot_be_opened_is_an_error() {
+        let (status, _, _, err) = run_from("\\o /nonexistent/dir/f", PsqlSettings::default());
+        assert_eq!(status, CommandResult::Error);
+        assert_eq!(
+            err,
+            "psql: error: /nonexistent/dir/f: No such file or directory\n"
         );
     }
 }

@@ -16,7 +16,8 @@
 //!   `pg_ctl`; without them the gate prints `SKIP (flagged, not silent)`.
 //!
 //! Sections are cut by `regress::split`, keyed by `psql.sql`'s own comment
-//! headers. They are ported in NAT-400's slices, and NAT-403's for `\copy`; a
+//! headers. They are ported in NAT-400's slices, and NAT-403's for `\copy`,
+//! `\g` and `\o`; a
 //! section with no gate here yet is one a later slice owns.
 
 // Integration tests are their own crate; see the library root for why this lint is off.
@@ -30,6 +31,7 @@ use rlibpq::{Backend, FieldDescription, QueryResult, QueryRunner, TransactionSta
 use rpsql::print::{PrintError, print_query};
 use rpsql::pset::do_pset;
 use rpsql::settings::{PrintQueryOpt, PsqlSettings};
+use testkit::reference;
 
 use regress::{
     Cluster, PSQL_OUT, PSQL_SQL, Section, first_difference, section, sections, sha256_hex, split,
@@ -229,6 +231,7 @@ const EXTENDED_QUERY_SECTIONS_PORT: u16 = 55_495;
 const SHOW_ALL_PSET_OPTIONS_PORT: u16 = 55_490;
 const OUTPUT_FORMAT_SECTIONS_PORT: u16 = 55_491;
 const COPY_MUST_SKIP_IN_LINE_DATA_PORT: u16 = 55_492;
+const G_AND_O_WITH_FILE_PORT: u16 = 55_493;
 
 /// [`regress::gate_section`] for rpsql.
 fn gate_section(cluster: &Cluster, section: &Section<'_>) {
@@ -357,4 +360,62 @@ fn copy_must_skip_in_line_data_even_if_the_issued_copy_command_fails() {
         &cluster,
         &section("-- \\copy must skip in-line data, even if the issued COPY command fails."),
     );
+}
+
+/// `psql.sql`'s sections from `-- \g with file` (`psql.sql:1507`) up to the
+/// `\copy` one after them, which are the `\g with file`, `\o with file` and
+/// `Multiple COPY TO STDOUT with output file` topics and the checks that read
+/// their files back: the SQL and the `psql.out` slice, each concatenated.
+fn g_and_o_with_file() -> (String, String, usize) {
+    let sections = split(PSQL_SQL, PSQL_OUT).expect("the vendored files split");
+    let first = sections
+        .iter()
+        .position(|s| s.sql.starts_with("--\n-- \\g with file\n"))
+        .expect("psql.sql has a \\g with file section");
+    let end = sections[first..]
+        .iter()
+        .position(|s| s.header.starts_with("-- \\copy must skip in-line data"))
+        .expect("the \\copy section follows")
+        + first;
+    let sql = sections[first..end].iter().map(|s| s.sql).collect();
+    let expected = sections[first..end].iter().map(|s| s.expected).collect();
+    (sql, expected, sections[first].sql_line)
+}
+
+/// `-- \g with file`, `-- \o with file` and `-- Multiple COPY TO STDOUT with
+/// output file` (`psql.sql:1507`-`:1568`): query output, COPY data and status
+/// lines sent to files by `\g` and `\o`, then loaded back with a server-side
+/// `COPY … FROM` and selected, so the files' bytes land in `psql.out`.
+///
+/// `pg_regress` gives psql `PG_ABS_BUILDDIR`, which the section reads with
+/// `\getenv` to find its `results/` directory; the gate gives it a directory
+/// of the cluster's own. The regression database's `onek` is stood in for by
+/// the one column the section reads, `unique1`, holding `onek`'s 0 … 999.
+#[test]
+fn g_and_o_with_file_match_psql_out() {
+    let Some(cluster) = Cluster::start(G_AND_O_WITH_FILE_PORT) else {
+        return;
+    };
+    let (sql, expected, sql_line) = g_and_o_with_file();
+    cluster.safe_psql(
+        Path::new(RPSQL),
+        "CREATE TABLE onek AS SELECT g AS unique1 FROM generate_series(0, 999) g",
+    );
+    let builddir = cluster.tempdir("abs_builddir");
+    std::fs::create_dir_all(builddir.join("results")).expect("results/ is created");
+    let env = [("PG_ABS_BUILDDIR", builddir.as_path())];
+
+    let ours = cluster.run_script_env(Path::new(RPSQL), &sql, &env);
+    if let Some(diff) = first_difference(expected.as_bytes(), &ours) {
+        panic!("rpsql, psql.sql:{sql_line}: {diff}");
+    }
+    match cluster.reference_psql() {
+        Some(psql) => {
+            let theirs = cluster.run_script_env(&psql, &sql, &env);
+            if let Some(diff) = first_difference(&theirs, &ours) {
+                panic!("rpsql vs C psql (psql.sql:{sql_line}): {diff}");
+            }
+        }
+        None => reference::skip("psql"),
+    }
 }

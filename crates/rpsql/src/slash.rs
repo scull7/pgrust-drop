@@ -83,6 +83,29 @@ impl Scanner {
     /// `psql_scan_slash_option(OT_NORMAL)` (`psqlscanslash.l:539`): the next
     /// argument, or `None` at end of command.
     pub fn slash_option(&mut self, vars: &dyn VariableSource) -> Option<SlashOption> {
+        self.slash_option_with(vars, false, false)
+    }
+
+    /// `psql_scan_slash_option(OT_FILEPIPE, NULL, semicolon)`
+    /// (`psqlscanslash.l:165`): a `|` at the start of the argument makes it
+    /// the whole rest of the line, `|` included, as `\g` and `\o` take a
+    /// pipe; anything else is an ordinary argument. With `semicolon`, the
+    /// argument's unquoted trailing semicolons are stripped, and for a pipe
+    /// its trailing semicolons and whitespace (`:604`, `:635`).
+    pub fn slash_option_filepipe(
+        &mut self,
+        vars: &dyn VariableSource,
+        semicolon: bool,
+    ) -> Option<SlashOption> {
+        self.slash_option_with(vars, true, semicolon)
+    }
+
+    fn slash_option_with(
+        &mut self,
+        vars: &dyn VariableSource,
+        filepipe: bool,
+        semicolon: bool,
+    ) -> Option<SlashOption> {
         // <xslashargstart>: discard whitespace before the argument.
         let skip = self
             .rest()
@@ -95,9 +118,30 @@ impl Scanner {
         if rest.is_empty() || rest[0] == b'\\' {
             return None;
         }
+        if filepipe && rest[0] == b'|' {
+            // "treat like whole-string case" (`psqlscanslash.l:167`): the
+            // `|` is echoed, so every later space is kept too.
+            let mut line = rest.to_vec();
+            self.skip(line.len());
+            if semicolon {
+                while line
+                    .last()
+                    .is_some_and(|&c| c == b';' || c.is_ascii_whitespace() || c == 0x0b)
+                {
+                    line.pop();
+                }
+            }
+            return Some(SlashOption {
+                value: String::from_utf8_lossy(&line).into_owned(),
+                quote: None,
+            });
+        }
 
         let mut out = Vec::new();
         let mut quote: Option<char> = None;
+        // `unquoted_option_chars`: how many bytes at the end of the argument
+        // were not quoted, which bounds the semicolons that may be stripped.
+        let mut unquoted = 0usize;
         loop {
             let rest = self.rest().to_vec();
             if rest.is_empty() {
@@ -112,32 +156,54 @@ impl Scanner {
             match c {
                 b'\'' => {
                     quote = Some('\'');
+                    unquoted = 0;
                     self.skip(1);
                     self.read_single_quoted(&mut out);
                 }
                 b'"' => {
                     quote = Some('"');
+                    unquoted = 0;
                     self.skip(1);
                     out.push(b'"');
                     self.read_double_quoted(&mut out);
                 }
                 b'`' => {
                     quote = Some('`');
+                    unquoted = 0;
                     self.skip(1);
                     let n = self.rest().iter().take_while(|&&b| b != b'`').count();
                     out.extend_from_slice(&self.rest()[..n]);
                     self.skip(n + usize::from(self.rest().len() > n));
                 }
-                b':' => {
-                    if self.read_variable(&mut out, vars) {
+                b':' => match self.read_variable(&mut out, vars) {
+                    VariableRule::Substituted => {
                         quote = Some(':');
+                        unquoted = 0;
                     }
-                }
+                    VariableRule::Unset => unquoted = 0,
+                    VariableRule::Tested => {}
+                    VariableRule::Colon => unquoted += 1,
+                },
                 _ => {
                     self.skip(1);
                     out.push(c);
+                    unquoted += 1;
                 }
             }
+        }
+
+        // Strip any unquoted trailing semicolons if requested
+        // (`psqlscanslash.l:604`).
+        if semicolon {
+            while unquoted > 0 && out.last() == Some(&b';') {
+                out.pop();
+                unquoted -= 1;
+            }
+        }
+        // "An unquoted empty argument isn't possible unless we are at end of
+        // command. Return NULL instead." (`psqlscanslash.l:661`).
+        if out.is_empty() && quote.is_none() {
+            return None;
         }
 
         Some(SlashOption {
@@ -239,9 +305,9 @@ impl Scanner {
         }
     }
 
-    /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`).
-    /// Returns whether a substitution actually happened.
-    fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> bool {
+    /// The `:`-prefixed rules of `<xslasharg>` (`psqlscanslash.l:230`-`:312`),
+    /// and which of them matched.
+    fn read_variable(&mut self, out: &mut Vec<u8>, vars: &dyn VariableSource) -> VariableRule {
         let rest = self.rest().to_vec();
 
         if let Some(&delim @ (b'\'' | b'"')) = rest.get(1) {
@@ -265,12 +331,12 @@ impl Scanner {
                 });
                 self.skip(3 + len);
                 out.extend_from_slice(value.as_bytes());
-                return true;
+                return VariableRule::Substituted;
             }
             // Throw back everything but the colon.
             self.skip(1);
             out.push(b':');
-            return false;
+            return VariableRule::Colon;
         }
 
         if rest.get(1) == Some(&b'{') && rest.get(2) == Some(&b'?') {
@@ -283,11 +349,11 @@ impl Scanner {
                 let set = vars.get_variable(&name, QuoteType::Plain).is_some();
                 self.skip(4 + len);
                 out.extend_from_slice(if set { b"TRUE" } else { b"FALSE" });
-                return false;
+                return VariableRule::Tested;
             }
             self.skip(1);
             out.push(b':');
-            return false;
+            return VariableRule::Colon;
         }
 
         let len = rest[1..]
@@ -297,20 +363,33 @@ impl Scanner {
         if len == 0 {
             self.skip(1);
             out.push(b':');
-            return false;
+            return VariableRule::Colon;
         }
         let name = String::from_utf8_lossy(&rest[1..=len]).into_owned();
         self.skip(1 + len);
         if let Some(value) = vars.get_variable(&name, QuoteType::Plain) {
             out.extend_from_slice(value.as_bytes());
-            true
+            VariableRule::Substituted
         } else {
             // The value is emitted as typed when the variable is unset.
             out.push(b':');
             out.extend_from_slice(name.as_bytes());
-            false
+            VariableRule::Unset
         }
     }
+}
+
+/// Which `:` rule of `<xslasharg>` matched, for the argument's quote mark
+/// and its count of unquoted trailing bytes.
+enum VariableRule {
+    /// `:name` set, or `:'name'` / `:"name"`: the quote mark becomes `:`.
+    Substituted,
+    /// `:name` unset: echoed as typed, but counted as quoted.
+    Unset,
+    /// `:{?name}`, which touches neither.
+    Tested,
+    /// A lone `:`, thrown back as an ordinary character.
+    Colon,
 }
 
 #[cfg(test)]
@@ -435,6 +514,44 @@ mod tests {
             dequote_downcase_identifier(b"\"A\"B", false),
             b"AB".to_vec()
         );
+    }
+
+    /// The command name and its `OT_FILEPIPE` argument.
+    fn filepipe(line: &str, semicolon: bool) -> Option<SlashOption> {
+        let mut scanner = Scanner::new();
+        scanner.setup(line.as_bytes(), true);
+        let mut buf = Vec::new();
+        assert_eq!(
+            scanner.scan(&mut buf, &NoVariables).0,
+            ScanResult::Backslash
+        );
+        scanner.slash_command();
+        scanner.slash_option_filepipe(&NoVariables, semicolon)
+    }
+
+    #[test]
+    fn a_pipe_takes_the_rest_of_the_line_as_typed() {
+        // `psqlscanslash.l:165`: `|` at the start makes it `OT_WHOLE_LINE`,
+        // quotes, variables, backslashes and all.
+        let pipe = filepipe("\\g | cat 'a b' :x \\\\ \\echo  ", false).unwrap();
+        assert_eq!(pipe.value, "| cat 'a b' :x \\\\ \\echo  ");
+        assert_eq!(pipe.quote, None);
+        // `\o` strips its trailing semicolons and whitespace (`:635`).
+        assert_eq!(filepipe("\\o |cat ; ;  ", true).unwrap().value, "|cat");
+        // A `|` later in the argument is an ordinary character.
+        assert_eq!(filepipe("\\g a|b c", false).unwrap().value, "a|b");
+    }
+
+    #[test]
+    fn only_unquoted_trailing_semicolons_are_stripped() {
+        // `psqlscanslash.l:604`: `unquoted_option_chars` bounds the strip.
+        assert_eq!(filepipe("\\o f;;", true).unwrap().value, "f");
+        assert_eq!(filepipe("\\o 'f;';", true).unwrap().value, "f;");
+        assert_eq!(filepipe("\\g f;", false).unwrap().value, "f;");
+        // Nothing left and nothing quoted is no argument at all (`:661`).
+        assert_eq!(filepipe("\\o ;", true), None);
+        assert_eq!(filepipe("\\o ''", true).unwrap().value, "");
+        assert_eq!(filepipe("\\o", true), None);
     }
 
     fn whole_line(line: &str) -> Option<Vec<u8>> {

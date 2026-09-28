@@ -140,7 +140,7 @@ fn every_upstream_citation_lands_where_it_says() {
     let anchored = checker.anchored();
     eprintln!("{anchored} upstream citations checked against REL_18_6");
     // Guard against a lint that passes because it stopped recognising
-    // citations: the repo had 3,370 when this was written, and only grows.
+    // citations: the repo had 3,404 when this was written, and only grows.
     assert!(
         anchored >= FLOOR,
         "only {anchored} upstream citations were found; the scanner has stopped seeing them"

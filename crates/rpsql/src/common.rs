@@ -569,39 +569,41 @@ fn send_query_simple(
 }
 
 /// The results of one query in the order `PQgetResult` hands them out:
-/// first what [`Executor::exec`] collected, then — if that stopped at a COPY
-/// — whatever [`Executor::get_result`] has after the data transfer.
+/// first what [`Executor::exec`] collected, then whatever
+/// [`Executor::get_result`] has after them — the rest of a COPY's command
+/// once its data is transferred, or the break the connection met after the
+/// results it had read.
 struct Results {
     queue: VecDeque<QueryResult>,
     more: bool,
+    /// The break [`Results::next`] met, for [`Results::finish`] to report.
+    broken: Option<ErrorMessage>,
 }
 
 impl Results {
     fn new(first: Vec<QueryResult>) -> Self {
-        // After a COPY the rest is still to be read; after an error, the
-        // connection may have broken behind it, which only the next
-        // `PQgetResult` tells (`001_basic.pl:145`-`:150`).
-        let more = first.last().is_some_and(|r| {
-            matches!(
-                r.status(),
-                ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::FatalError
-            )
-        });
+        // psql reads to the NULL (`common.c:2164`). After a COPY the rest is
+        // still to be read; after any other result, the connection may have
+        // broken behind it, which only the next `PQgetResult` tells
+        // (`001_basic.pl:145`-`:150`). With nothing broken it is the NULL
+        // again, as `PQgetResult` answers once a command is done.
+        let more = !first.is_empty();
         Self {
             queue: first.into(),
             more,
+            broken: None,
         }
     }
 
-    /// `PQgetResult()`. A broken connection is logged as libpq's message
-    /// and ends the results, as the NULL that follows libpq's error result
-    /// does.
+    /// `PQgetResult()`. A broken connection ends the results, as the NULL
+    /// that follows libpq's error result does; the error itself is logged
+    /// by [`Results::finish`], after the result before it has been printed,
+    /// as psql handles that error result after it.
     fn next(
         &mut self,
         executor: &mut dyn Executor,
         pset: &PsqlSettings,
         stderr: &mut dyn Write,
-        ok: &mut bool,
     ) -> Option<QueryResult> {
         if let Some(result) = self.queue.pop_front() {
             return Some(result);
@@ -616,11 +618,20 @@ impl Results {
         match result {
             Ok(result) => result,
             Err(err) => {
-                logging::info(pset, err.as_bytes(), stderr);
-                *ok = false;
+                self.broken = Some(err);
                 self.more = false;
                 None
             }
+        }
+    }
+
+    /// The error result libpq makes of a broken connection
+    /// (`pqReadData`'s `server closed the connection unexpectedly`, `fe-misc.c:833`),
+    /// which psql logs and counts as a failure (`common.c:1825`-`:1843`).
+    fn finish(&mut self, pset: &PsqlSettings, stderr: &mut dyn Write, ok: &mut bool) {
+        if let Some(err) = self.broken.take() {
+            logging::info(pset, err.as_bytes(), stderr);
+            *ok = false;
         }
     }
 }
@@ -733,7 +744,7 @@ fn exec_query_and_process_results(
     let mut elapsed_msec = 0.0;
     let mut gfile = GFile::Unopened;
 
-    let mut result = results.next(executor, pset, stderr, &mut success);
+    let mut result = results.next(executor, pset, stderr);
     while let Some(current) = result {
         let status = current.status();
         if !accept_result(status) {
@@ -753,7 +764,7 @@ fn exec_query_and_process_results(
             result = if status == ExecStatus::CopyBoth {
                 None
             } else {
-                results.next(executor, pset, stderr, &mut success)
+                results.next(executor, pset, stderr)
             };
             elapsed_msec = now();
             continue;
@@ -785,7 +796,7 @@ fn exec_query_and_process_results(
             current = final_result;
         }
 
-        let next = results.next(executor, pset, stderr, &mut success);
+        let next = results.next(executor, pset, stderr);
         let last = next.is_none();
         elapsed_msec = now();
 
@@ -805,6 +816,7 @@ fn exec_query_and_process_results(
     // A broken connection ends the results with its error logged, which
     // upstream's loop reports as an error result: `CheckConnection` then
     // (`common.c:1836`), before the `\g` file is closed.
+    results.finish(pset, stderr, &mut success);
     check_connection(executor, pset, out, stderr);
 
     // `common.c:2252`: close the `\g` file if we opened it.
@@ -1604,6 +1616,64 @@ mod tests {
         assert!(!ok);
         assert_eq!(err, b"psql: no such database \"\xc3\x28\"\n");
         assert!(!err.contains(&0xEF), "no U+FFFD may appear: {err:?}");
+    }
+
+    /// A connection that breaks after a `TUPLES_OK` (`SELECT 'before' \;`
+    /// and then a statement the backend dies in): the rows are printed,
+    /// then the break is logged at the statement's line and
+    /// `CheckConnection` sees the connection down, as C psql's next
+    /// `PQgetResult` (`common.c:2164`) makes it.
+    #[test]
+    fn a_break_after_tuples_ok_is_reported_after_the_rows() {
+        struct BreaksAfterRows {
+            alive: bool,
+        }
+        impl Executor for BreaksAfterRows {
+            fn exec(
+                &mut self,
+                _query: &[u8],
+                _mode: &SendMode,
+            ) -> Result<Vec<QueryResult>, ErrorMessage> {
+                Ok(one_row())
+            }
+            fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+                // `LiveExecutor::failed`: the break takes the connection down.
+                self.alive = false;
+                Err(ErrorMessage::new(
+                    b"server closed the connection unexpectedly".to_vec(),
+                ))
+            }
+            fn connected(&self) -> bool {
+                self.alive
+            }
+            fn abandon(&mut self) {
+                self.alive = false;
+            }
+        }
+
+        let mut executor = BreaksAfterRows { alive: true };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // Interactive, so that `CheckConnection` reports the loss rather
+        // than ending the test process with `EXIT_BADCONN`.
+        let mut pset = PsqlSettings {
+            cur_cmd_interactive: true,
+            inputfile: Some("<stdin>".into()),
+            lineno: 1,
+            ..PsqlSettings::default()
+        };
+        let ok = send(&mut executor, b"select 1", &mut pset, &mut out, &mut err);
+
+        assert!(!ok);
+        assert!(!executor.connected());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            " ?column? \n----------\n        1\n(1 row)\n\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "psql:<stdin>:1: server closed the connection unexpectedly\n"
+        );
     }
 
     /// `AcceptResult`'s `default:` arm (`common.c:445`): COPY BOTH and

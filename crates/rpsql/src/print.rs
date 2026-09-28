@@ -1300,7 +1300,7 @@ fn print_unaligned_vertical(cont: &TableContent<'_>) -> Vec<u8> {
         }
     }
 
-    // As in `print_unaligned_text` (`print.c:575`).
+    // As in `print_unaligned_text` (`print.c:501`).
     if opt.stop_table && need_recordsep {
         if opt.record_sep.separator_zero {
             print_separator(&mut out, &opt.record_sep);

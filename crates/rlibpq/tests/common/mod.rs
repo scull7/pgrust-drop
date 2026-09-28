@@ -373,7 +373,8 @@ pub fn wait_for_connection_state(monitor: &mut Connection, pid: i32, wait: &Wait
     }
 }
 
-/// `send_cancellable_query`, `libpq_pipeline.c:172`: once `conn`'s backend
+/// `send_cancellable_query` (`libpq_pipeline.c:169`), whose body is
+/// `send_cancellable_query_impl` (`:172`): once `conn`'s backend
 /// is idle, send `SELECT pg_sleep($1)` for `PG_TEST_TIMEOUT_DEFAULT` seconds
 /// (180 when unset), and return once the sleep is running — "if the query is
 /// not running yet, the cancel request that we send won't have any effect".
@@ -391,7 +392,8 @@ pub fn send_cancellable_query(conn: &mut Connection, monitor: &mut Connection) {
     wait_for_connection_state(monitor, pid, &WaitFor::Event("PgSleep"));
 }
 
-/// `confirm_query_canceled`, `libpq_pipeline.c:95`: the next result is a
+/// `confirm_query_canceled` (`libpq_pipeline.c:93`), whose body is
+/// `confirm_query_canceled_impl` (`:95`): the next result is a
 /// failure with SQLSTATE 57014, and the rest of the input is consumed.
 pub fn confirm_query_canceled(conn: &mut Connection) {
     let result = conn

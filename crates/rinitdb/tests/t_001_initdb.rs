@@ -1100,7 +1100,7 @@ fn expand_control_file(datadir: &Path, checksums: DataChecksums) -> SystemIdenti
 /// `pg_controldata` is a PostgreSQL binary, so without PostgreSQL 18 on the box
 /// the first half prints `SKIP (flagged, not silent)`. The second half is not a
 /// weakened version of it — the pattern is the stolen one, run unchanged over
-/// the line `pg_controldata.c:337` prints — so the assertion is still made.
+/// the line `src/bin/pg_controldata/pg_controldata.c:337` prints — so the assertion is still made.
 fn assert_data_page_checksum_version(datadir: &Path, expected: u32) {
     let pattern = testkit::Pattern::new(&format!("Data page checksum version:.*{expected}"))
         .expect("compile the stolen pattern");

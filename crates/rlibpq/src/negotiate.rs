@@ -436,7 +436,7 @@ mod tests {
     }
 
     /// The checks run in `pqConnectOptions2`'s order, so the first failure
-    /// is C's: sslrootcert before sslmode (`:1750`'s comment), sslmode before
+    /// is C's: sslrootcert before sslmode (`fe-connect.c:1750`'s comment), sslmode before
     /// sslnegotiation, both before gssencmode.
     #[test]
     fn the_first_failing_check_is_the_one_c_reports() {

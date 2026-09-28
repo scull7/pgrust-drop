@@ -6,7 +6,7 @@
 //! steal for it — `src/interfaces/libpq/t/` has none that drives
 //! `PQputCopyData` or `PQgetCopyData`, and `libpq_pipeline.c` has no COPY
 //! test — so the cases are named for what they pin. The reference side is
-//! psql's `\copy … to stdout` (`do_copy`, `copy.c:268`, which runs
+//! psql's `\copy … to stdout` (`do_copy`, `src/bin/psql/copy.c:268`, which runs
 //! `COPY … TO STDOUT` and hands the data to `handleCopyOut`, `copy.c:434`, a
 //! `PQgetCopyData` loop), so both sides are one libpq each, reading the same
 //! server.

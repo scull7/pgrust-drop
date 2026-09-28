@@ -1056,7 +1056,7 @@ fn test_transaction() {
 ///
 /// It runs under protocol 3.0, the one this crate speaks, which is
 /// `001_libpq_pipeline.pl:78`'s "libpq_pipeline cancel with protocol 3.0".
-/// `PQsetnonblocking(conn, 1)` (`:253`) has no counterpart: this crate's
+/// `PQsetnonblocking(conn, 1)` (`libpq_pipeline.c:253`) has no counterpart: this crate's
 /// sends always block, and every send here is one short message.
 #[test]
 fn test_cancel_blocking() {

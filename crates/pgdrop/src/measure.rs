@@ -80,7 +80,7 @@ pub const LOCK_FILE_LINE_PID: usize = 1;
 /// `postmaster.pid`? `src/bin/pg_ctl/pg_ctl.c:606`-`:643`: the file must
 /// reach the status line, name this process, and say `ready   ` or
 /// `standby ` (`pidfile.h:53`-`:54`, blank-padded to a fixed width). pg_ctl's
-/// start-time check (`:622`) is left out: the bench removes each cluster, so
+/// start-time check (`pg_ctl.c:622`) is left out: the bench removes each cluster, so
 /// no stale file can name a live process.
 #[must_use]
 pub fn postmaster_ready(pidfile: &str, pid: u32) -> bool {

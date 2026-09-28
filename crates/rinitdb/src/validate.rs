@@ -206,10 +206,21 @@ pub struct CreatePlan {
     pub sync_data_files: bool,
 }
 
+/// `-s`/`--show`: print the settings block and exit 0 (`initdb.c:2805`-`:2819`),
+/// before anything is made and before any check C runs after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowPlan {
+    pub pgdata: PathBuf,
+    /// `username` as `main` leaves it (`initdb.c:3475`): `-U`, else the
+    /// effective user; `None` when neither is known.
+    pub username: Option<String>,
+}
+
 /// What one validated command line asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
     Sync(SyncPlan),
+    Show(ShowPlan),
     Create(CreatePlan),
 }
 
@@ -261,6 +272,15 @@ pub fn validate(
 
     let pgdata = require_datadir(datadir, env)?;
 
+    // initdb.c:2678, in setup_bin_paths right after setup_pgdata.
+    if options
+        .input_dir
+        .as_deref()
+        .is_some_and(|dir| !dir.starts_with('/'))
+    {
+        return Err(InitdbError::InputFileLocationNotAbsolute);
+    }
+
     // initdb.c:3478 — after setup_bin_paths and get_id().
     let username = options
         .username
@@ -270,6 +290,12 @@ pub fn validate(
         && name.starts_with("pg_")
     {
         return Err(InitdbError::SuperuserNameDisallowed { name: name.clone() });
+    }
+
+    // initdb.c:2818 — `-s` exits from setup_data_file_paths, before
+    // setup_locale_encoding and create_data_directory judge anything.
+    if options.show {
+        return Ok(Plan::Show(ShowPlan { pgdata, username }));
     }
 
     // initdb.c:2424 (setlocales) and :2685 (setup_locale_encoding).
@@ -867,6 +893,73 @@ mod tests {
                 name: "pg_test".to_owned()
             }
         );
+    }
+
+    // --- -L and -s ----------------------------------------------------------
+
+    #[test]
+    fn a_relative_input_file_location_is_fatal_after_the_data_directory() {
+        // initdb.c:2679, reached from setup_bin_paths after setup_pgdata.
+        assert_eq!(
+            failure(&["-L", "share", "/tmp/data"], &FakeFs::empty()),
+            InitdbError::InputFileLocationNotAbsolute
+        );
+        assert_eq!(
+            failure(&["-L", "share"], &FakeFs::empty()),
+            InitdbError::NoDataDirectory
+        );
+        assert!(matches!(
+            check(
+                &["-L", "/usr/share/postgresql", "/tmp/data"],
+                &FakeFs::empty()
+            ),
+            Ok(Plan::Create(_))
+        ));
+    }
+
+    #[test]
+    fn show_exits_before_the_locale_and_the_data_directory_are_judged() {
+        // initdb.c:2818 exits from setup_data_file_paths; setlocales,
+        // setup_locale_encoding and create_data_directory all come later.
+        let fs = FakeFs::with("/tmp/data", DirState::NotEmpty);
+        assert_eq!(
+            check(
+                &[
+                    "-s",
+                    "--locale-provider",
+                    "builtin",
+                    "-E",
+                    "nope",
+                    "/tmp/data"
+                ],
+                &fs
+            ),
+            Ok(Plan::Show(ShowPlan {
+                pgdata: PathBuf::from("/tmp/data"),
+                username: Some("alice".to_owned()),
+            }))
+        );
+    }
+
+    #[test]
+    fn show_still_runs_every_check_before_it() {
+        // initdb.c:3479 (the superuser name), :2625 (setup_pgdata) and :3438
+        // (--sync-only returns before -s is looked at).
+        assert_eq!(
+            failure(&["-s", "-U", "pg_x", "/tmp/data"], &FakeFs::empty()),
+            InitdbError::SuperuserNameDisallowed {
+                name: "pg_x".to_owned()
+            }
+        );
+        assert_eq!(
+            failure(&["-s"], &FakeFs::empty()),
+            InitdbError::NoDataDirectory
+        );
+        let fs = FakeFs::with("/tmp/data", DirState::NotEmpty);
+        assert!(matches!(
+            check(&["-s", "-S", "/tmp/data"], &fs),
+            Ok(Plan::Sync(_))
+        ));
     }
 
     // --- locales and encodings --------------------------------------------

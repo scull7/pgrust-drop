@@ -338,7 +338,9 @@ fn create_plan(argv: &[OsString]) -> rinitdb::validate::CreatePlan {
     };
     match rinitdb::validate(&options, &rinitdb::Environment::default(), &rinitdb::RealFs) {
         Ok(rinitdb::Plan::Create(create)) => create,
-        Ok(rinitdb::Plan::Sync(_)) => panic!("{argv:?} should not be --sync-only"),
+        Ok(rinitdb::Plan::Sync(_) | rinitdb::Plan::Show(_)) => {
+            panic!("{argv:?} should not be --sync-only or -s")
+        }
         Err(err) => panic!("{argv:?}: {}", err.render()),
     }
 }

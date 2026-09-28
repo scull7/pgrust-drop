@@ -1,8 +1,8 @@
 //! Everything initdb prints on the happy path, byte for byte against C
-//! initdb (Linear NAT-387): the preamble, the progress lines of
-//! `initialize_data_directory`, the sync line or the `--no-sync` note, the
-//! `trust` warning and the closing instructions (`src/bin/initdb/initdb.c`,
-//! `main` from `:3481` to `:3562`).
+//! initdb (Linear NAT-387): the `-d`/`-n` notices, the preamble, the `-s`/`-d`
+//! settings block, the progress lines of `initialize_data_directory`, the
+//! sync line or the `--no-sync` note, the `trust` warning and the closing
+//! instructions (`src/bin/initdb/initdb.c`, `main` from `:3481` to `:3562`).
 //!
 //! `001_initdb.pl` asserts none of this — its `command_ok` cases only need
 //! exit 0 — so these gates are this port's own, over command lines taken from
@@ -10,9 +10,12 @@
 //!
 //! Each side runs in a directory of its own with the data directory given as
 //! the relative `data`, so both print the same path and no normalizer is
-//! needed for it. The one normalizer is `pg-ctl-directory`: the closing
+//! needed for it. The normalizers are `pg-ctl-directory` — the closing
 //! instructions name the `pg_ctl` beside initdb's own `argv[0]`, and the two
-//! binaries live in two directories. Both run under `LC_ALL=C`, `TZ=UTC` and
+//! binaries live in two directories — and, for `-s` and `-d` only,
+//! `install-directories` for the same reason and `backend-log` for the
+//! bootstrap backend's DEBUG log, which this port has no backend to write.
+//! Both run under `LC_ALL=C`, `TZ=UTC` and
 //! a `USER` that is the real user, because this port reads the effective user
 //! from `USER` and does not consult the environment's locale
 //! (`docs/divergences.md`), and with `-E UTF8 -U postgres`, the encoding and
@@ -27,7 +30,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use testkit::normalize::{PATCHED_SUCCESS, PATCHED_SUCCESS_LINE, PG_CTL_DIRECTORY};
+use testkit::normalize::{
+    BACKEND_LOG, INSTALL_DIRECTORIES, Normalizer, PATCHED_SUCCESS, PATCHED_SUCCESS_LINE,
+    PG_CTL_DIRECTORY,
+};
 use testkit::{CommandOutcome, Environment, Scope, reference};
 
 const RINITDB: &str = env!("CARGO_BIN_EXE_rinitdb");
@@ -101,19 +107,33 @@ fn run_in_dir(bin: &Path, argv: &[OsString], cwd: &Path, env: &Environment) -> C
 /// its own working directory (made ready by `prepare`), all three streams
 /// compared.
 fn gate(tag: &str, argv: &[&str], prepare: impl Fn(&Path)) {
+    gate_with(tag, &[argv, &["data"]].concat(), prepare, &[], |_| ());
+}
+
+/// [`gate`] with the whole command line given, `extra` normalizers on top of
+/// `pg-ctl-directory`, and `after` handed each side's working directory once
+/// both have run.
+fn gate_with(
+    tag: &str,
+    argv: &[&str],
+    prepare: impl Fn(&Path),
+    extra: &[Normalizer],
+    after: impl Fn(&Path),
+) {
     let Some(initdb) = reference::find("initdb") else {
         reference::skip("initdb");
         return;
     };
     let tempdir = TempDir::new(tag);
-    let mut argv = args(argv);
-    argv.push(OsString::from("data"));
+    let argv = args(argv);
     let env = gate_env();
     let [theirs, ours] =
         [(initdb.as_path(), "c"), (Path::new(RINITDB), "rinitdb")].map(|(bin, side)| {
             let cwd = tempdir.side(side);
             prepare(&cwd);
-            run_in_dir(bin, &argv, &cwd, &env)
+            let outcome = run_in_dir(bin, &argv, &cwd, &env);
+            after(&cwd);
+            outcome
         });
     assert_eq!(
         theirs.status,
@@ -121,7 +141,7 @@ fn gate(tag: &str, argv: &[&str], prepare: impl Fn(&Path)) {
         "C initdb {argv:?} ({tag}): {}",
         theirs.stderr_text()
     );
-    let mut normalizers = vec![PG_CTL_DIRECTORY];
+    let mut normalizers = [&[PG_CTL_DIRECTORY], extra].concat();
     if prints_patched_success(&theirs.stdout_text()) {
         reference::announce_skip(&format!(
             "{}: the reference initdb at {} prints a bare `{PATCHED_SUCCESS_LINE}` where upstream \
@@ -244,6 +264,101 @@ fn a_posix_lc_messages_is_reported_like_reference_initdb() {
         &[&TEMPLATE_ARGS[..], &["--no-sync", "--lc-messages", "POSIX"]].concat(),
         nothing,
     );
+}
+
+/// `-s` (`initdb.c:2805`-`:2819`): the ownership lines on stdout, the
+/// settings block on stderr, exit 0, and nothing made. The data directory is
+/// given as `./data//`, which `setup_pgdata` canonicalizes (`:2634`) before
+/// the block names it; the `-E`/`-T` values are ones C only judges after `-s`
+/// has exited.
+#[test]
+fn show_matches_reference_initdb() {
+    gate_with(
+        "show",
+        &[
+            "-s", "-U", "postgres", "-E", "LATIN1", "-T", "nope", "./data//",
+        ],
+        nothing,
+        &[INSTALL_DIRECTORIES],
+        |cwd| assert!(!cwd.join("data").exists(), "-s made {}", cwd.display()),
+    );
+}
+
+/// `--show` with `--debug` and `--no-clean`: both notices, in command-line
+/// order, ahead of the ownership lines (`initdb.c:3298`, `:3302`).
+#[test]
+fn show_with_the_notices_matches_reference_initdb() {
+    gate_with(
+        "show-notices",
+        &["--no-clean", "-U", "postgres", "--show", "--debug", "data"],
+        nothing,
+        &[INSTALL_DIRECTORIES],
+        |cwd| assert!(!cwd.join("data").exists(), "-s made {}", cwd.display()),
+    );
+}
+
+/// `-d -n`: the notices, the settings block on stderr under the ownership
+/// lines, then an ordinary run. C's stderr also carries the bootstrap
+/// backend's `-d 5` log (`initdb.c:1616`), which `backend-log` drops.
+#[test]
+fn debug_and_no_clean_match_reference_initdb() {
+    gate_with(
+        "debug",
+        &[&TEMPLATE_ARGS[..], &["-d", "-n", "--no-sync", "data"]].concat(),
+        nothing,
+        &[INSTALL_DIRECTORIES, BACKEND_LOG],
+        |_| (),
+    );
+}
+
+/// `-s` as this port prints it, pinned whole, so a machine without the
+/// reference still checks every byte: `PGPATH` is this executable's own
+/// directory and `share_path` what `get_share_path` makes of it
+/// (`docs/divergences.md`), or `-L` canonicalized; no `USER` leaves the
+/// ownership lines out and the superuser name empty.
+#[test]
+fn rinitdb_prints_upstreams_settings_block() {
+    let tempdir = TempDir::new("show-own");
+    let cwd = tempdir.side("rinitdb");
+    let exe = std::fs::canonicalize(RINITDB).expect("canonicalize the binary");
+    let exe = exe.to_string_lossy();
+    let bindir = rinitdb::path::get_parent_directory(&exe);
+    let block = |pgdata: &str, share: &str, user: &str| {
+        format!(
+            "VERSION=18.6\nPGDATA={pgdata}\nshare_path={share}\nPGPATH={bindir}\n\
+             POSTGRES_SUPERUSERNAME={user}\nPOSTGRES_BKI={share}/postgres.bki\n\
+             POSTGRESQL_CONF_SAMPLE={share}/postgresql.conf.sample\n\
+             PG_HBA_SAMPLE={share}/pg_hba.conf.sample\n\
+             PG_IDENT_SAMPLE={share}/pg_ident.conf.sample\n"
+        )
+    };
+
+    let env = Environment::inherited()
+        .with("USER", "alice")
+        .with("PGDATA", "/tmp/./x/../pgdata/");
+    let outcome = run_in_dir(Path::new(RINITDB), &args(&["-n", "-s"]), &cwd, &env);
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    assert_eq!(
+        outcome.stdout_text(),
+        "Running in no-clean mode.  Mistakes will not be cleaned up.\n\
+         The files belonging to this database system will be owned by user \"alice\".\n\
+         This user must also own the server process.\n\n"
+    );
+    assert_eq!(
+        outcome.stderr_text(),
+        block("/tmp/pgdata", &rinitdb::path::get_share_path(&exe), "alice")
+    );
+
+    let env = Environment::inherited()
+        .without("USER")
+        .without("LOGNAME")
+        .without("PGDATA");
+    let argv = args(&["--show", "-L", "/opt//pg/share/", "data"]);
+    let outcome = run_in_dir(Path::new(RINITDB), &argv, &cwd, &env);
+    assert_eq!(outcome.status, Some(0), "{}", outcome.stderr_text());
+    assert_eq!(outcome.stdout_text(), "");
+    assert_eq!(outcome.stderr_text(), block("data", "/opt/pg/share", ""));
+    assert!(!cwd.join("data").exists());
 }
 
 /// This port's own stdout, pinned whole, so a machine without the reference

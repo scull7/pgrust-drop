@@ -1,6 +1,7 @@
-//! What C initdb tells the user along the success path: the preamble,
-//! the progress lines of `initialize_data_directory`, the `trust` warning and
-//! the closing instructions (`src/bin/initdb/initdb.c`).
+//! What C initdb tells the user along the success path: the preamble, the
+//! `-s`/`-d` settings block, the progress lines of
+//! `initialize_data_directory`, the `trust` warning and the closing
+//! instructions (`src/bin/initdb/initdb.c`).
 //!
 //! Pure text over what the run has decided; `crate::run` writes it. A
 //! progress line is split where C splits it: the part `printf` writes before
@@ -10,7 +11,7 @@
 
 use crate::conf::{self, Settings};
 use crate::control::DataChecksums;
-use crate::help::PROGNAME;
+use crate::help::{PG_VERSION, PROGNAME};
 use crate::path;
 
 /// `initdb.c:3481`: whose files these are, printed once the superuser name
@@ -20,6 +21,42 @@ pub fn owned_by(effective_user: &str) -> String {
     format!(
         "The files belonging to this database system will be owned by user \"{effective_user}\".\n\
          This user must also own the server process.\n\n"
+    )
+}
+
+/// What `-s` and `-d` show on stderr (`initdb.c:2805`-`:2816`): the inputs
+/// `setup_bin_paths` and `setup_data_file_paths` settled on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownSettings<'a> {
+    /// `pg_data` after `setup_pgdata`'s `canonicalize_path` (`initdb.c:2634`).
+    pub pgdata: &'a str,
+    /// `share_path`: `-L`, or `get_share_path` of the executable
+    /// (`initdb.c:2673`-`:2681`).
+    pub share_path: &'a str,
+    /// `bin_path`, the executable's directory (`initdb.c:2669`-`:2671`).
+    pub bin_path: &'a str,
+    /// `username`: `-U`, else the effective user (`initdb.c:3475`).
+    pub username: &'a str,
+}
+
+/// `initdb.c:2807`: the settings block, one `NAME=value` per line. The four
+/// input files are `set_input`'s `"%s/%s"` of `share_path` and their names
+/// (`:986`, `:2794`-`:2797`).
+#[must_use]
+pub fn shown_settings(shown: &ShownSettings<'_>) -> String {
+    let ShownSettings {
+        pgdata,
+        share_path,
+        bin_path,
+        username,
+    } = shown;
+    format!(
+        "VERSION={PG_VERSION}\n\
+         PGDATA={pgdata}\nshare_path={share_path}\nPGPATH={bin_path}\n\
+         POSTGRES_SUPERUSERNAME={username}\nPOSTGRES_BKI={share_path}/postgres.bki\n\
+         POSTGRESQL_CONF_SAMPLE={share_path}/postgresql.conf.sample\n\
+         PG_HBA_SAMPLE={share_path}/pg_hba.conf.sample\n\
+         PG_IDENT_SAMPLE={share_path}/pg_ident.conf.sample\n"
     )
 }
 
@@ -241,6 +278,27 @@ pub fn success(start_command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_block_is_upstreams_bytes() {
+        assert_eq!(
+            shown_settings(&ShownSettings {
+                pgdata: "data",
+                share_path: "/usr/local/pgsql/share",
+                bin_path: "/usr/local/pgsql/bin",
+                username: "postgres",
+            }),
+            "VERSION=18.6\n\
+             PGDATA=data\n\
+             share_path=/usr/local/pgsql/share\n\
+             PGPATH=/usr/local/pgsql/bin\n\
+             POSTGRES_SUPERUSERNAME=postgres\n\
+             POSTGRES_BKI=/usr/local/pgsql/share/postgres.bki\n\
+             POSTGRESQL_CONF_SAMPLE=/usr/local/pgsql/share/postgresql.conf.sample\n\
+             PG_HBA_SAMPLE=/usr/local/pgsql/share/pg_hba.conf.sample\n\
+             PG_IDENT_SAMPLE=/usr/local/pgsql/share/pg_ident.conf.sample\n"
+        );
+    }
 
     #[test]
     fn the_preamble_is_upstreams_bytes() {

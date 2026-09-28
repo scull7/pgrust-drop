@@ -139,6 +139,42 @@ pub const PATCHED_SUCCESS: Normalizer = Normalizer {
     apply: patched_success,
 };
 
+/// `initdb -s` and `-d` name the directories of the installation they run
+/// from, and the reference and the candidate are two installations.
+///
+/// Upstream: `src/bin/initdb/initdb.c:2807` prints `share_path=` and
+/// `PGPATH=` (`setup_bin_paths`, `:2669`-`:2681`) and four input files that
+/// `set_input` builds as `share_path` + `/` + a fixed name (`:986`,
+/// `:2794`-`:2797`).
+///
+/// Only the directories go. `share_path=` and `PGPATH=` lose their values;
+/// `POSTGRES_BKI=`, `POSTGRESQL_CONF_SAMPLE=`, `PG_HBA_SAMPLE=` and
+/// `PG_IDENT_SAMPLE=` lose a leading `share_path/` only when it is the
+/// `share_path` the same text printed, so a file name that changed or a file
+/// that is not under the share directory still differs. Every other line —
+/// `VERSION=`, `PGDATA=`, `POSTGRES_SUPERUSERNAME=` — is kept as it is.
+pub const INSTALL_DIRECTORIES: Normalizer = Normalizer {
+    name: "install-directories",
+    justification: "initdb -s names its installation's share and bin directories (src/bin/initdb/initdb.c:2807)",
+    apply: install_directories,
+};
+
+/// `initdb -d` runs the bootstrap backend with `-d 5` (`initdb.c:1616`),
+/// whose DEBUG log — hundreds of thousands of lines, each stamped with a
+/// time and a PID — goes to initdb's stderr. This port creates the cluster
+/// from its template and runs no bootstrap backend (ADR-0002), so it has no
+/// such lines to print; `docs/divergences.md` records it.
+///
+/// Upstream: `src/backend/utils/misc/guc_tables.c:4317`, the default
+/// `log_line_prefix` `%m [%p] `. Only a line that begins with exactly that
+/// prefix — `YYYY-MM-DD HH:MM:SS.mmm <zone> [<pid>] ` — is dropped; initdb's
+/// own lines (`initdb: warning: …`, the settings block) are kept.
+pub const BACKEND_LOG: Normalizer = Normalizer {
+    name: "backend-log",
+    justification: "initdb -d passes -d 5 to its bootstrap backend, whose log this port has no backend to write (src/bin/initdb/initdb.c:1616)",
+    apply: backend_log,
+};
+
 /// What a distribution-patched initdb prints in place of the instructions.
 pub const PATCHED_SUCCESS_LINE: &str = "Success.";
 
@@ -151,6 +187,11 @@ pub const DEFAULT: [Normalizer; 3] = [TIMING, PID, SYSTEM_IDENTIFIER];
 
 /// Placeholder written in place of the directory of `pg_ctl`.
 pub const PG_CTL_PLACEHOLDER: &str = "<bindir>/pg_ctl";
+
+/// Placeholder written in place of an installation's share directory.
+pub const SHARE_DIRECTORY_PLACEHOLDER: &str = "<sharedir>";
+/// Placeholder written in place of an installation's bin directory.
+pub const BIN_DIRECTORY_PLACEHOLDER: &str = "<bindir>";
 
 /// Placeholder written in place of an elapsed time.
 pub const ELAPSED_PLACEHOLDER: &str = "Time: <elapsed>";
@@ -238,6 +279,71 @@ fn strip_pg_ctl_directory(line: &str) -> Option<String> {
         return None;
     }
     Some(format!("{INDENT}{PG_CTL_PLACEHOLDER} -D {rest}"))
+}
+
+fn install_directories(text: &str) -> String {
+    const SHARE_PATH: &str = "share_path=";
+    const PGPATH: &str = "PGPATH=";
+    const INPUT_FILES: [&str; 4] = [
+        "POSTGRES_BKI=",
+        "POSTGRESQL_CONF_SAMPLE=",
+        "PG_HBA_SAMPLE=",
+        "PG_IDENT_SAMPLE=",
+    ];
+    let share_path = text
+        .lines()
+        .find_map(|line| line.strip_prefix(SHARE_PATH))
+        .map(|dir| format!("{dir}/"));
+    map_lines(text, |line| {
+        if line.starts_with(SHARE_PATH) {
+            return format!("{SHARE_PATH}{SHARE_DIRECTORY_PLACEHOLDER}");
+        }
+        if line.starts_with(PGPATH) {
+            return format!("{PGPATH}{BIN_DIRECTORY_PLACEHOLDER}");
+        }
+        let under_share = INPUT_FILES.iter().find_map(|key| {
+            let file = line
+                .strip_prefix(key)?
+                .strip_prefix(share_path.as_deref()?)?;
+            Some(format!("{key}{SHARE_DIRECTORY_PLACEHOLDER}/{file}"))
+        });
+        under_share.unwrap_or_else(|| line.to_owned())
+    })
+}
+
+fn backend_log(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| !has_log_line_prefix(line))
+        .collect()
+}
+
+/// `%m [%p] ` (`guc_tables.c:4317`): `%m` is `log_line_prefix`'s time with
+/// milliseconds, `YYYY-MM-DD HH:MM:SS.mmm` and a zone abbreviation
+/// (`elog.c`'s `get_formatted_log_time`), `%p` the PID.
+fn has_log_line_prefix(line: &str) -> bool {
+    const TIME_SHAPE: &[u8] = b"dddd-dd-dd dd:dd:dd.ddd ";
+    let bytes = line.as_bytes();
+    let time_ok = bytes.len() > TIME_SHAPE.len()
+        && TIME_SHAPE
+            .iter()
+            .zip(bytes)
+            .all(|(shape, byte)| match shape {
+                b'd' => byte.is_ascii_digit(),
+                other => other == byte,
+            });
+    if !time_ok {
+        return false;
+    }
+    let Some((zone, rest)) = line[TIME_SHAPE.len()..].split_once(' ') else {
+        return false;
+    };
+    let Some(pid) = rest
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+    else {
+        return false;
+    };
+    !zone.is_empty() && !pid.0.is_empty() && pid.0.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn patched_success(text: &str) -> String {
@@ -540,6 +646,80 @@ mod tests {
             assert_eq!(normalize(untouched), untouched);
         }
     }
+    const C_SETTINGS: &str = "VERSION=18.6\nPGDATA=data\n\
+        share_path=/usr/share/postgresql/18\nPGPATH=/usr/lib/postgresql/18/bin\n\
+        POSTGRES_SUPERUSERNAME=postgres\n\
+        POSTGRES_BKI=/usr/share/postgresql/18/postgres.bki\n\
+        POSTGRESQL_CONF_SAMPLE=/usr/share/postgresql/18/postgresql.conf.sample\n\
+        PG_HBA_SAMPLE=/usr/share/postgresql/18/pg_hba.conf.sample\n\
+        PG_IDENT_SAMPLE=/usr/share/postgresql/18/pg_ident.conf.sample\n";
+
+    #[test]
+    fn the_install_directories_are_replaced_and_the_file_names_kept() {
+        let ours = C_SETTINGS
+            .replace("/usr/share/postgresql/18", "/usr/local/pgsql/share")
+            .replace("/usr/lib/postgresql/18/bin", "/work/target/debug");
+        assert_eq!(
+            INSTALL_DIRECTORIES.normalize(C_SETTINGS),
+            INSTALL_DIRECTORIES.normalize(&ours)
+        );
+        assert_eq!(
+            INSTALL_DIRECTORIES.normalize(C_SETTINGS),
+            "VERSION=18.6\nPGDATA=data\nshare_path=<sharedir>\nPGPATH=<bindir>\n\
+             POSTGRES_SUPERUSERNAME=postgres\nPOSTGRES_BKI=<sharedir>/postgres.bki\n\
+             POSTGRESQL_CONF_SAMPLE=<sharedir>/postgresql.conf.sample\n\
+             PG_HBA_SAMPLE=<sharedir>/pg_hba.conf.sample\n\
+             PG_IDENT_SAMPLE=<sharedir>/pg_ident.conf.sample\n"
+        );
+    }
+
+    #[test]
+    fn a_different_file_data_directory_or_user_still_differs() {
+        let normalized = INSTALL_DIRECTORIES.normalize(C_SETTINGS);
+        for changed in [
+            C_SETTINGS.replace("postgres.bki", "template.bki"),
+            C_SETTINGS.replace(
+                "PG_HBA_SAMPLE=/usr/share/postgresql/18/",
+                "PG_HBA_SAMPLE=/etc/",
+            ),
+            C_SETTINGS.replace("PGDATA=data", "PGDATA=./data"),
+            C_SETTINGS.replace("USERNAME=postgres", "USERNAME=alice"),
+            C_SETTINGS.replace("VERSION=18.6", "VERSION=18.5"),
+        ] {
+            assert_ne!(
+                INSTALL_DIRECTORIES.normalize(&changed),
+                normalized,
+                "{changed}"
+            );
+        }
+        assert_eq!(
+            INSTALL_DIRECTORIES.normalize("  PGPATH=/x\nshare_path\n"),
+            "  PGPATH=/x\nshare_path\n"
+        );
+    }
+
+    #[test]
+    fn only_lines_with_the_backend_log_prefix_are_dropped() {
+        let c = "VERSION=18.6\n\
+                 2026-09-28 00:15:48.146 UTC [1921420] DEBUG:  invoking IpcMemoryCreate(size=1)\n\
+                 2026-09-28 00:15:48.159 +03 [7] NOTICE:  database system is shut down\n\
+                 initdb: warning: enabling \"trust\" authentication for local connections\n";
+        assert_eq!(
+            BACKEND_LOG.normalize(c),
+            "VERSION=18.6\n\
+             initdb: warning: enabling \"trust\" authentication for local connections\n"
+        );
+        for kept in [
+            "2026-09-28 00:15:48 UTC [1] no milliseconds\n",
+            "2026-09-28 00:15:48.146 UTC [pid] DEBUG:  x\n",
+            "2026-09-28 00:15:48.146 UTC 1921420 DEBUG:  x\n",
+            "x 2026-09-28 00:15:48.146 UTC [1] DEBUG:  x\n",
+            "2026-09-28 00:15:48.146 UTC [1]",
+        ] {
+            assert_eq!(BACKEND_LOG.normalize(kept), kept, "{kept:?}");
+        }
+    }
+
     #[test]
     fn the_upstream_instructions_fold_to_the_patched_line() {
         let upstream = "ok\n\nSuccess. You can now start the database server using:\n\n    \

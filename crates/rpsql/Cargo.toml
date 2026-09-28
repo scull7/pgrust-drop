@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 rlibpq = { workspace = true }
+signal-hook = { workspace = true }
 usage = { workspace = true }
 
 [dev-dependencies]

@@ -1,7 +1,6 @@
-# ADR-0009: rpsql's SIGINT handler declares its three C calls itself
+# ADR-0009: rpsql's SIGINT handler is installed with `signal-hook`
 
-Status: proposed (NAT-405, 2026-09-27) — needs the owner's acceptance in the
-PR that introduces it, because it is the first `unsafe` code in an MIT crate.
+Status: accepted — decided 2026-09-27 by Nathan (owner), NAT-405.
 
 ## Context
 
@@ -11,50 +10,45 @@ psql. Upstream installs `handle_sigint` for SIGINT with `pqsignal`
 (`src/bin/psql/common.c:323`) and sends the cancel request itself with
 `PQcancel`, reporting on stderr with a bare `write()` (`cancel.c:163`-`:173`).
 
-The Rust standard library has no way to install a signal handler. Every
-alternative needs a C call:
+The Rust standard library has no way to install a signal handler, so some C
+call is unavoidable. The alternatives, briefly:
 
-| option                                        | cost                                                                                           |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| the `libc` crate                              | a new dependency; not approved (AGENTS.md)                                                     |
-| `signal-hook` or `ctrlc`                      | new dependencies, both built on `libc`; not approved                                           |
-| hand-declared `extern "C"` for what is needed | `unsafe` in `rpsql`, which is `#![deny(unsafe_code)]`; no new dependency                       |
-| no handler                                    | SIGINT's default action ends rpsql: NAT-405's Acceptance cannot be met                         |
+- **Hand-declared `extern "C"`** for `signal(2)`, `write(2)` and `errno`
+  (PR #61): no new dependency, but new `unsafe` code in an MIT crate that is
+  `#![deny(unsafe_code)]`. **Rejected** by the owner.
+- **`libc` directly**: still `unsafe` at every call.
+- **`ctrlc`**: SIGINT only, no hook for `cancel_pressed` in the handler itself.
+- **`signal-hook`** (MIT/Apache-2.0): safe APIs for exactly the two things
+  needed. **Chosen.**
 
 ## Decision
 
-`crates/rpsql/src/cancel.rs` declares exactly three C library symbols in one
-private module, `sys`, the only place in the crate where `unsafe_code` is
-allowed:
+`signal-hook` 0.3 is an approved dependency of `rpsql` (owner, 2026-09-27).
+`crates/rpsql/src/cancel.rs` uses only its safe API:
 
-- `signal(SIGINT, handler)`: BSD semantics on glibc, musl and Darwin — the
-  handler stays installed and interrupted system calls restart — which is what
-  `pqsignal` asks `sigaction` for with `SA_RESTART` (`src/port/pqsignal.c:141`).
-  `sigaction` itself was not used because `struct sigaction`'s layout differs
-  between the three C libraries, and `signal`'s signature does not.
-- `write(fd, buf, len)`: the one call the handler makes, and how the report
-  reaches descriptor 2, as `write_stderr` does (`cancel.c:31`).
-- the thread's `errno` (`__errno_location` on Linux, `__error` on Darwin), saved
-  and restored around the handler as `pqsignal`'s `wrapper_handler` does
-  (`pqsignal.c:88`, `:112`).
+- `signal_hook::flag::register(SIGINT, cancel_pressed)`: the handler sets
+  `cancel_pressed`, as `psql_cancel_callback` does.
+- `signal_hook::iterator::Signals` on a thread of its own, `psql-cancel`:
+  woken by each SIGINT, it sends the cancel request and writes the report,
+  holding the mutex around `cancelConn` — the shape of the Windows arm of
+  `cancel.c` (`:195`-`:224`), which also cancels from a thread of its own
+  under `cancelConnLock`. `rlibpq::Cancel::cancel` allocates, so it is not
+  async-signal-safe and cannot run in the handler.
 
-`SIGINT` is 2 on every target rpsql ships to (ADR-0007).
-
-The handler does only what is async-signal-safe: it stores `cancel_pressed` in
-an atomic and writes one byte to a non-blocking Unix datagram socket.
-`rlibpq::Cancel::cancel` allocates, so it is not called from the handler; a
-thread woken by that byte sends the request and writes the report, holding the
-mutex around `cancelConn` — the shape of the Windows arm of `cancel.c`
-(`:195`-`:224`), which also cancels from a thread of its own under
-`cancelConnLock`.
+`signal-hook` installs its handler with `SA_RESTART` and saves and restores
+`errno` around it, as `pqsignal` does (`src/port/pqsignal.c:141`, `:88`,
+`:112`). The report goes to a duplicate of descriptor 2, as `write_stderr`
+writes to it directly (`cancel.c:31`), because the main thread holds `std`'s
+`Stderr` lock for the whole session.
 
 ## Consequences
 
-- `rlibpq`, `rinitdb` and `testkit` stay `#![deny(unsafe_code)]`, and so does
-  every module of `rpsql` but `cancel::sys`.
-- No new dependency. When ADR-0005's `redox_liner` lands, `libc` enters the
-  tree through `termion`; that does not approve `libc` as a direct dependency,
-  and this module does not need it.
+- `rpsql` stays `#![deny(unsafe_code)]` with no exception; so do `rlibpq`,
+  `rinitdb` and `testkit`. The `unsafe` lives inside `signal-hook` and its
+  registry.
+- New crates in `rpsql`'s tree: `signal-hook`, `signal-hook-registry`, `errno`
+  and `libc`, all MIT or Apache-2.0. None is a pgrust crate, so the license
+  wall (ADR-0003) is unaffected.
 - The cancel is sent a thread hop after the signal, not inside it; the window
   that opens is recorded in `docs/divergences.md`; it is timing-only and no
   test pins it.

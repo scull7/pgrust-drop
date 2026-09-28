@@ -20,6 +20,8 @@ publish = false
 # All CLIs use usage-rs (owner decision, 2026-09-16). Aliased to `usage` in each crate.
 usage = { package = "usage-rs", version = "6" }
 thiserror = "2"
+# rpsql's SIGINT handler (owner, 2026-09-27; ADR-0009).
+signal-hook = "0.3"
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

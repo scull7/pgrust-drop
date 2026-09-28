@@ -297,7 +297,7 @@ fn create_cluster(
     let mut progress = Progress::default();
     let created =
         initialize_data_directory(plan, options, &settings, session, &mut progress, stdout)
-        .and_then(|()| sync_new_cluster(plan, stdout, stderr));
+            .and_then(|()| sync_new_cluster(plan, stdout, stderr));
     if let Err(err) = created {
         let _ = writeln!(stderr, "{}", err.render());
         return clean_up_and_fail(&progress, options, stderr);

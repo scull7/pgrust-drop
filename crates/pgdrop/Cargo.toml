@@ -34,6 +34,12 @@ main_main = { workspace = true }
 seams_init = { workspace = true }
 ipc = { workspace = true }
 elog = { workspace = true }
+mcx = { workspace = true }
+memwatchdog = { workspace = true }
+runtime = { workspace = true }
+mimalloc = { workspace = true }
+libmimalloc-sys = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

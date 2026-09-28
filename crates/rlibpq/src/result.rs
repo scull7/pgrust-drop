@@ -12,22 +12,29 @@ use crate::encoding::Encoding;
 /// `ExecStatusType`, `libpq-fe.h:122`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecStatus {
-    EmptyQuery,
-    CommandOk,
-    TuplesOk,
-    CopyOut,
-    CopyIn,
-    BadResponse,
-    NonfatalError,
-    FatalError,
-    CopyBoth,
-    SingleTuple,
-    PipelineSync,
-    PipelineAborted,
-    TuplesChunk,
+    EmptyQuery = 0,
+    CommandOk = 1,
+    TuplesOk = 2,
+    CopyOut = 3,
+    CopyIn = 4,
+    BadResponse = 5,
+    NonfatalError = 6,
+    FatalError = 7,
+    CopyBoth = 8,
+    SingleTuple = 9,
+    PipelineSync = 10,
+    PipelineAborted = 11,
+    TuplesChunk = 12,
 }
 
 impl ExecStatus {
+    /// The enumerator's value in `libpq-fe.h:124`-`:142`, which is what a
+    /// `%d` of `PQresultStatus` prints.
+    #[must_use]
+    pub fn number(self) -> i32 {
+        self as i32
+    }
+
     /// `pgresStatus[]`, `fe-exec.c:33` — what `PQresStatus` returns.
     #[must_use]
     pub fn as_str(self) -> &'static str {

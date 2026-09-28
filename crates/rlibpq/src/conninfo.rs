@@ -788,6 +788,57 @@ pub fn parse_conninfo(conninfo: &[u8]) -> Result<ConnInfo, ConnError> {
     }
 }
 
+/// `conninfo_array_parse` (`fe-connect.c:6466`) with `use_defaults` false:
+/// what `PQconnectdbParams` makes of its keyword and value arrays, before
+/// [`ConnInfo::add_defaults`].
+///
+/// A pair with an empty value is skipped (`:6518`); a later one replaces an
+/// earlier one, stored as given, with no `requiressl` rewrite. With
+/// `expand_dbname`, the first `dbname` is parsed as a connection string when
+/// [`recognized_connection_string`] says it is one (`:6484`-`:6501`), and
+/// every option that string sets replaces what came before it (`:6541`),
+/// while the pairs after it still override it.
+///
+/// # Errors
+/// [`ConnError::InvalidConnectionOption`] for a keyword with no row in
+/// `PQconninfoOptions[]` (`:6530`), or what [`parse_conninfo`] reports for
+/// the expanded `dbname`, which is judged first.
+pub fn conninfo_array_parse(
+    params: &[(&[u8], &[u8])],
+    expand_dbname: bool,
+) -> Result<ConnInfo, ConnError> {
+    let mut dbname_options = None;
+    if expand_dbname
+        && let Some((_, value)) = params.iter().find(|(key, _)| *key == b"dbname")
+        && recognized_connection_string(value)
+    {
+        dbname_options = Some(parse_conninfo(value)?);
+    }
+
+    let mut options = ConnInfo::new();
+    for &(key, value) in params {
+        if value.is_empty() {
+            continue;
+        }
+        let index = ConnInfo::index_of(key)
+            .ok_or_else(|| ConnError::InvalidConnectionOption(key.into()))?;
+        match dbname_options.take() {
+            Some(parsed) if key == b"dbname" => {
+                for (slot, parsed) in options.values.iter_mut().zip(parsed.values) {
+                    if parsed.is_some() {
+                        *slot = parsed;
+                    }
+                }
+            }
+            other => {
+                dbname_options = other;
+                options.values[index] = Some(value.into());
+            }
+        }
+    }
+    Ok(options)
+}
+
 /// `conninfo_parse` (`fe-connect.c:6290`) with `use_defaults` false: a string
 /// of `key = value` pairs, where a value may be `'`-quoted and `\` escapes the
 /// next byte in either form.
@@ -903,6 +954,43 @@ fn read_quoted_value(buf: &[u8], cp: &mut usize) -> Result<Vec<u8>, ConnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `conninfo_array_parse` as `PQconnectdbParams(…, expand_dbname = 1)`
+    /// runs it for psql (`src/bin/psql/startup.c:277`): `dbname` a
+    /// connection string supplies its options where it stands, empty values
+    /// are skipped, and a plain `dbname` stays a name.
+    #[test]
+    fn conninfo_array_parse_expands_dbname() {
+        let params: [(&[u8], &[u8]); 4] = [
+            (b"host", b"h1"),
+            (b"port", b""),
+            (b"dbname", b"dbname=postgres replication=database host=h2"),
+            (b"fallback_application_name", b"psql"),
+        ];
+        let options = conninfo_array_parse(&params, true).expect("parses");
+        assert_eq!(options.get("dbname"), Some(&b"postgres"[..]));
+        assert_eq!(options.get("replication"), Some(&b"database"[..]));
+        assert_eq!(options.get("host"), Some(&b"h2"[..]));
+        assert_eq!(options.get("port"), None);
+        assert_eq!(options.get("fallback_application_name"), Some(&b"psql"[..]));
+
+        let options = conninfo_array_parse(&params, false).expect("parses");
+        assert_eq!(
+            options.get("dbname"),
+            Some(&b"dbname=postgres replication=database host=h2"[..])
+        );
+        assert_eq!(options.get("host"), Some(&b"h1"[..]));
+
+        let plain: [(&[u8], &[u8]); 2] = [(b"dbname", b"mydb"), (b"user", b"u")];
+        let options = conninfo_array_parse(&plain, true).expect("parses");
+        assert_eq!(options.get("dbname"), Some(&b"mydb"[..]));
+
+        let bad: [(&[u8], &[u8]); 1] = [(b"dbname", b"nosuch=1")];
+        assert!(matches!(
+            conninfo_array_parse(&bad, true),
+            Err(ConnError::InvalidConnectionOption(_))
+        ));
+    }
 
     /// No files at all: every test here that names no service.
     const NO_FILES: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

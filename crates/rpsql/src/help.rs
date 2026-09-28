@@ -482,6 +482,164 @@ pub fn help_variables() -> String {
         .replace("{field_sep}", DEFAULT_FIELD_SEP)
 }
 
+/// `print_copyright()` (`help.c:755`): the `\copyright` text, the newline
+/// `puts` adds included.
+pub const COPYRIGHT: &str = "PostgreSQL Database Management System
+(also known as Postgres, formerly known as Postgres95)
+
+Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+
+Portions Copyright (c) 1994, The Regents of the University of California
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose, without fee, and without a written agreement
+is hereby granted, provided that the above copyright notice and this
+paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR
+DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ON AN \"AS IS\" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
+PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+
+";
+
+/// The screen width `helpSQL` assumes when it cannot ask the terminal
+/// (`help.c:612`, `:616`).
+pub const DEFAULT_SCREEN_WIDTH: usize = 80;
+
+/// `pg_strncasecmp(s1, s2, n) == 0` (`src/port/pgstrcasecmp.c`), for the
+/// ASCII both sides here are made of: the first `n` bytes agree ignoring
+/// case, a string's end counting as a NUL.
+fn strncase_eq(s1: &[u8], s2: &[u8], n: usize) -> bool {
+    for i in 0..n {
+        let c1 = s1.get(i).copied().unwrap_or(0).to_ascii_lowercase();
+        let c2 = s2.get(i).copied().unwrap_or(0).to_ascii_lowercase();
+        if c1 != c2 {
+            return false;
+        }
+        if c1 == 0 {
+            break;
+        }
+    }
+    true
+}
+
+/// `helpSQL()` (`help.c:593`): what `\help` prints for `topic`, which the
+/// caller has already stripped of trailing spaces and semicolons.
+///
+/// Without a topic, every command name in columns as wide as
+/// `screen_width` allows; with one, each command it names — an exact name,
+/// else the commands that begin with its first two words, else with its
+/// first word — or a "No help available" note. The pager is not ported, so
+/// the text is returned whole for the caller to write to stdout, where
+/// `PageOutput` sends it when it does not page.
+#[must_use]
+pub fn help_sql(topic: Option<&[u8]>, screen_width: usize) -> Vec<u8> {
+    let table = crate::sql_help::ql_help();
+    let mut output = Vec::new();
+    let topic = match topic {
+        Some(topic) if !topic.is_empty() => topic,
+        _ => {
+            // `help.c:597`-`:641`.
+            let width = crate::sql_help::ql_max_cmd_len() + 1;
+            let ncolumns = (screen_width.saturating_sub(3) / width).max(1);
+            let nrows = table.len().div_ceil(ncolumns);
+            let cmd = |k: usize| table.get(k).map_or("", |e| e.cmd.as_str());
+            output.extend_from_slice(b"Available help:\n");
+            for i in 0..nrows {
+                output.extend_from_slice(b"  ");
+                for j in 0..ncolumns - 1 {
+                    output.extend_from_slice(format!("{:<width$}", cmd(i + j * nrows)).as_bytes());
+                }
+                let last = i + (ncolumns - 1) * nrows;
+                if last < table.len() {
+                    output.extend_from_slice(cmd(last).as_bytes());
+                }
+                output.push(b'\n');
+            }
+            return output;
+        }
+    };
+
+    // `help.c:652`-`:737`: len is how much of the topic is compared with the
+    // names; first all of it, then its first two words, then its first.
+    let star = topic == b"*";
+    let mut len = topic.len();
+    let mut found = false;
+    for pass in 1..=3 {
+        if pass > 1 {
+            // `while (j < len && topic[j++] != ' ') wordlen++;`, twice on
+            // pass 2: `j` steps past the space that stops it.
+            let mut wordlen = 1;
+            let mut j = 1;
+            let word = |wordlen: &mut usize, j: &mut usize| {
+                while *j < len {
+                    let c = topic[*j];
+                    *j += 1;
+                    if c == b' ' {
+                        break;
+                    }
+                    *wordlen += 1;
+                }
+            };
+            word(&mut wordlen, &mut j);
+            if pass == 2 && j < len {
+                wordlen += 1;
+                word(&mut wordlen, &mut j);
+            }
+            if wordlen >= len {
+                // Failed to shorten input, so try next pass if any.
+                continue;
+            }
+            len = wordlen;
+        }
+
+        for entry in table {
+            let cmd = entry.cmd.as_bytes();
+            if !(strncase_eq(topic, cmd, len) || star) {
+                continue;
+            }
+            found = true;
+            output.extend_from_slice(b"Command:     ");
+            output.extend_from_slice(cmd);
+            output.extend_from_slice(b"\nDescription: ");
+            output.extend_from_slice(entry.help.as_bytes());
+            output.extend_from_slice(b"\nSyntax:\n");
+            output.extend_from_slice(entry.syntax.as_bytes());
+            output.extend_from_slice(
+                format!(
+                    "\n\nURL: https://www.postgresql.org/docs/{}/{}.html\n\n",
+                    crate::PG_MAJORVERSION,
+                    entry.docbook_id
+                )
+                .as_bytes(),
+            );
+            // If we have an exact match, exit.  Fixes \h SELECT.
+            if topic.eq_ignore_ascii_case(cmd) {
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+
+    if !found {
+        // `help.c:739`-`:746`.
+        output.extend_from_slice(b"No help available for \"");
+        output.extend_from_slice(topic);
+        output.extend_from_slice(b"\".\nTry \\h with no arguments to see available help.\n");
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +724,87 @@ mod tests {
                 assert!(!text.contains(placeholder), "{placeholder} left unfilled");
             }
         }
+    }
+
+    fn help(topic: &str) -> String {
+        String::from_utf8(help_sql(Some(topic.as_bytes()), DEFAULT_SCREEN_WIDTH)).unwrap()
+    }
+
+    fn commands(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("Command:     "))
+            .collect()
+    }
+
+    #[test]
+    fn copyright_is_print_copyright_with_puts_newline() {
+        assert!(COPYRIGHT.starts_with("PostgreSQL Database Management System\n"));
+        assert!(COPYRIGHT.contains("ON AN \"AS IS\" BASIS,"));
+        assert!(COPYRIGHT.ends_with("MODIFICATIONS.\n\n"));
+    }
+
+    #[test]
+    fn no_topic_lists_every_command_in_columns_down_then_across() {
+        let table = crate::sql_help::ql_help();
+        let text = String::from_utf8(help_sql(None, DEFAULT_SCREEN_WIDTH)).unwrap();
+        assert_eq!(text, String::from_utf8(help_sql(Some(b""), 80)).unwrap());
+        let lines: Vec<&str> = text.lines().collect();
+        // (80 - 3) / 33 = 2 columns, so ceil(185 / 2) = 93 rows.
+        assert_eq!(lines.len(), 1 + table.len().div_ceil(2));
+        assert_eq!(lines[0], "Available help:");
+        assert_eq!(lines[1], format!("  {:<33}{}", table[0].cmd, table[93].cmd));
+        // The last row has no second column: nothing after the padding.
+        assert_eq!(lines[93], format!("  {:<33}", table[92].cmd));
+    }
+
+    #[test]
+    fn a_narrow_screen_still_gets_one_column() {
+        let table = crate::sql_help::ql_help();
+        let text = String::from_utf8(help_sql(None, 0)).unwrap();
+        assert_eq!(text.lines().count(), 1 + table.len());
+        assert_eq!(text.lines().nth(1), Some("  ABORT"));
+    }
+
+    #[test]
+    fn an_exact_name_stops_at_that_command() {
+        // `\h SELECT` would otherwise also print SELECT INTO.
+        let text = help("select");
+        assert_eq!(commands(&text), ["SELECT"]);
+        assert!(text.starts_with(
+            "Command:     SELECT\nDescription: retrieve rows from a table or view\nSyntax:\n"
+        ));
+        assert!(text.ends_with("\n\nURL: https://www.postgresql.org/docs/18/sql-select.html\n\n"));
+    }
+
+    #[test]
+    fn a_prefix_lists_every_command_it_begins() {
+        assert_eq!(
+            commands(&help("DROP TABL")),
+            ["DROP TABLE", "DROP TABLESPACE"]
+        );
+        assert_eq!(commands(&help("DROP TABLE")), ["DROP TABLE"]);
+        assert_eq!(commands(&help("ABO")), ["ABORT"]);
+    }
+
+    #[test]
+    fn a_longer_topic_falls_back_to_two_words_then_one() {
+        assert_eq!(
+            commands(&help("drop table foo")),
+            ["DROP TABLE", "DROP TABLESPACE"]
+        );
+        assert_eq!(commands(&help("abort now please")), ["ABORT"]);
+    }
+
+    #[test]
+    fn a_star_prints_everything() {
+        assert_eq!(commands(&help("*")).len(), crate::sql_help::ql_help().len());
+    }
+
+    #[test]
+    fn nothing_found_says_so_with_the_topic_as_given() {
+        assert_eq!(
+            help_sql(Some(b"no\xffsuch"), DEFAULT_SCREEN_WIDTH),
+            b"No help available for \"no\xffsuch\".\nTry \\h with no arguments to see available help.\n"
+        );
     }
 }

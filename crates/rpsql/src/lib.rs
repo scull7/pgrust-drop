@@ -17,8 +17,10 @@
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
-//! `\errverbose`, `copy.c` ([`copy`]): `\copy` and the COPY data transfer, and
-//! `-o`, `\o` and `\g`'s files and pipes ([`output`]).
+//! `\errverbose`, `copy.c` ([`copy`]): `\copy` and the COPY data transfer,
+//! `-o`, `\o` and `\g`'s files and pipes ([`output`]), and `\copyright` and
+//! `\help` ([`help`]) over the `QL_HELP` table PostgreSQL's `create_help.pl`
+//! generates ([`sql_help`]).
 //! NAT-404 adds `\crosstabview` ([`crosstab`],
 //! `crosstabview.c`), `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
@@ -59,6 +61,7 @@ pub mod pset;
 pub mod scan;
 pub mod settings;
 pub mod slash;
+pub mod sql_help;
 pub mod startup;
 pub mod variables;
 
@@ -82,6 +85,10 @@ use crate::variables::VarView;
 
 /// The psql version this port tracks (`PG_VERSION` in `pg_config.h`).
 pub const PG_VERSION: &str = "18.6";
+
+/// Its major version (`PG_MAJORVERSION` in `pg_config.h`), which names the
+/// documentation `\help` links to (`help.c:716`).
+pub const PG_MAJORVERSION: &str = "18";
 
 /// `showVersion()` (`startup.c:844`).
 #[must_use]

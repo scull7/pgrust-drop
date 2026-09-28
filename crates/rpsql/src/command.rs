@@ -169,6 +169,27 @@ pub fn handle_slash_cmds(
         scanner.slash_command_end();
         return CommandResult::Copy(line);
     }
+    // `exec_command_help()` (`command.c:2024`): `\h` and `\help` take the
+    // line whole too, trailing semicolons and spaces stripped (`:2029`,
+    // `psqlscanslash.l:643`). `helpSQL()` writes to `PageOutput()`
+    // (`help.c:704`), stdout when not paging, never to `\o`'s file.
+    if cmd == "h" || cmd == "help" {
+        let topic = scanner.slash_option_whole_line().map(|mut line| {
+            while line
+                .last()
+                .is_some_and(|c| *c == b';' || c.is_ascii_whitespace() || *c == 0x0b)
+            {
+                line.pop();
+            }
+            line
+        });
+        let _ = out.stdout.write_all(&crate::help::help_sql(
+            topic.as_deref(),
+            crate::help::DEFAULT_SCREEN_WIDTH,
+        ));
+        scanner.slash_command_end();
+        return CommandResult::SkipLine;
+    }
     // `\g` and `\o` take a file or a `|command` first (`OT_FILEPIPE`,
     // `command.c:1749`, `:2466`), and `\o` strips its trailing semicolons.
     let mut options: Vec<SlashOption> = match cmd.as_str() {
@@ -327,6 +348,8 @@ fn exec_command(
         "sendpipeline" => exec_command_sendpipeline(ctx, stderr),
         // `exec_command_connect()` (`command.c:638`).
         "c" | "connect" => CommandResult::Connect(Box::new(ConnectRequest::from_options(options))),
+        // `exec_command_copyright()` (`command.c:985`).
+        "copyright" => exec_command_copyright(out),
         // `exec_command_crosstabview()` (`command.c:997`): keep up to four
         // arguments for the next `SendQuery`, and send.
         "crosstabview" => {
@@ -739,6 +762,13 @@ fn exec_command_timing(
     }
 }
 
+/// `exec_command_copyright()` (`command.c:985`): `print_copyright()`
+/// (`help.c:755`) `puts` it to stdout, not to `\\o`'s `pset.queryFout`.
+fn exec_command_copyright(out: &mut Output<'_>) -> CommandResult {
+    let _ = out.stdout.write_all(crate::help::COPYRIGHT.as_bytes());
+    CommandResult::SkipLine
+}
+
 /// `exec_command_errverbose()` (`command.c:1643`): the last failed result,
 /// again, at `PQERRORS_VERBOSE` with `PQSHOW_CONTEXT_ALWAYS`.
 fn exec_command_errverbose(pset: &PsqlSettings, stdout: &mut dyn Write, stderr: &mut dyn Write) {
@@ -1036,6 +1066,39 @@ mod tests {
         let (status, _, stderr) = dispatch("\\copy t sideways 'f' \\\\ \\echo x");
         assert_eq!(status, CommandResult::Error);
         assert_eq!(stderr, "psql: error: \\copy: parse error at \"sideways\"\n");
+    }
+
+    #[test]
+    fn help_takes_the_whole_line_less_trailing_semicolons_and_spaces() {
+        // `command.c:2029`, `psqlscanslash.l:643`: `\\` is part of the topic.
+        let run = |line: &str| {
+            let out = run(line);
+            assert_eq!(out.result, CommandResult::SkipLine);
+            assert_eq!(out.stderr, "");
+            out.stdout
+        };
+        let rest = run("\\h  nosuch \\\\ \\echo x");
+        assert!(
+            rest.starts_with("No help available for \"nosuch \\\\ \\echo x\"."),
+            "{rest}"
+        );
+        assert_eq!(
+            run("\\help SELECT ;; \t"),
+            String::from_utf8(crate::help::help_sql(Some(b"SELECT"), 80)).unwrap()
+        );
+        assert!(run("\\h ;").starts_with("Available help:\n"));
+        assert!(run("\\help").starts_with("Available help:\n"));
+    }
+
+    #[test]
+    fn copyright_prints_and_warns_of_an_extra_argument() {
+        let out = run("\\copyright now");
+        assert_eq!(out.result, CommandResult::SkipLine);
+        assert_eq!(out.stdout, crate::help::COPYRIGHT);
+        assert_eq!(
+            out.stderr,
+            "psql: warning: \\copyright: extra argument \"now\" ignored\n"
+        );
     }
 
     #[test]

@@ -334,6 +334,129 @@ fn role_names_cannot_begin_with_pg_() {
     gate_strictly(&argv);
 }
 
+/// ```perl
+/// mkdir $datadir;
+/// {
+///     local (%ENV) = %ENV;
+///     delete $ENV{TZ};
+///     command_ok(
+///         [
+///             'initdb', '--no-sync',
+///             '--text-search-config' => 'german',
+///             '--set' => 'default_text_search_config=german',
+///             '--waldir' => $xlogdir,
+///             $datadir
+///         ],
+///         'successful creation');
+/// ```
+/// — 001_initdb.pl:40-59. `$xlogdir` is left empty at `:32`.
+///
+/// Without `--username` the superuser is the effective user
+/// (`get_id`, `initdb.c:3474`), so unless that is `postgres` a single-user
+/// session renames the template's (`rinitdb::single_user`). It runs under the
+/// reference `postgres`; without one, under a stand-in that takes the session
+/// and exits 0, with the narrowing flagged.
+///
+/// Beyond `command_ok`: stdout is empty (NAT-387), stderr is
+/// `setup_text_search`'s warning alone (`initdb.c:2859`, naming `C`; see
+/// `docs/divergences.md`), `pg_wal` points at `$xlogdir`, and
+/// `postgresql.conf` holds one `default_text_search_config` line, `-T`'s
+/// replaced in place by the `--set` (`initdb.c:1345`, `:1430`). With a
+/// reference `initdb`, that line and the time zone lines are C's, byte for
+/// byte, from the same command line in the same environment.
+#[cfg(unix)]
+#[test]
+fn successful_creation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tempdir = TempDir::new("successful-creation");
+    let conf_lines = |datadir: &Path| -> Vec<String> {
+        std::fs::read_to_string(datadir.join("postgresql.conf"))
+            .expect("read postgresql.conf")
+            .lines()
+            .filter(|line| {
+                line.starts_with("default_text_search_config")
+                    || line.starts_with("timezone")
+                    || line.starts_with("log_timezone")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let make = |initdb: &Path, name: &str, env: &Environment| {
+        let xlogdir = tempdir.join(&format!("{name}-pgxlog"));
+        let datadir = tempdir.join(&format!("{name}-data"));
+        std::fs::create_dir(&xlogdir).expect("mkdir $xlogdir");
+        std::fs::create_dir(&datadir).expect("mkdir $datadir");
+        let argv: Vec<OsString> = args(&[
+            "--no-sync",
+            "--text-search-config",
+            "german",
+            "--set",
+            "default_text_search_config=german",
+            "--waldir",
+        ])
+        .into_iter()
+        .chain([OsString::from(&xlogdir), OsString::from(&datadir)])
+        .collect();
+        let outcome =
+            testkit::run_in(initdb, &argv, &[], &env.clone().without("TZ")).expect("run initdb");
+        let violations = testkit::checks::command_ok(&outcome);
+        assert!(
+            violations.is_empty(),
+            "{} {argv:?}: {violations:?}\nstderr: {}",
+            initdb.display(),
+            outcome.stderr_text()
+        );
+        (xlogdir, datadir, outcome)
+    };
+
+    let server = if let Some(postgres) = reference::find("postgres") {
+        postgres
+    } else {
+        reference::announce_skip(&format!(
+            "{}: no reference postgres, so the superuser rename of successful_creation runs \
+             under a stand-in that only takes the session",
+            reference::SKIP_FLAG
+        ));
+        let path = tempdir.join("postgres");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n[ \"$1\" = -V ] && echo 'postgres (PostgreSQL) 18.6' && exit 0\n\
+             cat > /dev/null\nexit 0\n",
+        )
+        .expect("write the stand-in postgres");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in postgres executable");
+        path
+    };
+    let env = Environment::inherited().with(rinitdb::single_user::SERVER_ENV, &server);
+    let (xlogdir, datadir, outcome) = make(Path::new(RINITDB), "ours", &env);
+    assert_eq!(outcome.stdout_text(), "");
+    assert_eq!(
+        outcome.stderr_text(),
+        "initdb: warning: specified text search configuration \"german\" might not match \
+         locale \"C\"\n"
+    );
+    assert_eq!(
+        std::fs::read_link(datadir.join("pg_wal")).expect("pg_wal is a symlink"),
+        xlogdir
+    );
+    let ours = conf_lines(&datadir);
+    assert_eq!(
+        ours.iter()
+            .filter(|line| line.starts_with("default_text_search_config"))
+            .collect::<Vec<_>>(),
+        ["default_text_search_config = german"],
+        "{ours:?}"
+    );
+
+    let Some(reference) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let (_, theirs, _) = make(&reference, "theirs", &Environment::inherited());
+    assert_eq!(ours, conf_lines(&theirs));
+}
+
 /// Parse and validate a cluster-creation command line the way `run` does, and
 /// hand back the plan the layout is calculated from.
 ///

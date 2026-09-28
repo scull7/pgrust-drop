@@ -34,8 +34,8 @@ rpsql = { workspace = true }
 # `start` waits for the server by connecting until ReadyForQuery (NAT-409).
 rlibpq = { workspace = true }
 # `start --foreground` forwards SIGINT/SIGTERM/SIGHUP/SIGQUIT to the server
-# (NAT-409). Already in pgdrop's tree through rpsql (ADR-0009) and pgrust;
-# see ADR-0009's amendment.
+# (NAT-409). Already in pgdrop's tree, through rpsql only (ADR-0009); the
+# direct edge awaits the owner's approval, see ADR-0009's amendment.
 signal-hook = { workspace = true }
 main_main = { workspace = true }
 seams_init = { workspace = true }

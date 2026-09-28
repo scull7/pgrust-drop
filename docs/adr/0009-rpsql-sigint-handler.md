@@ -62,11 +62,23 @@ writes to it directly (`cancel.c:31`), because the main thread holds `std`'s
 starts. It must survive SIGINT, SIGTERM, SIGHUP and SIGQUIT and forward them
 to the server, as pg_ctl forwards SIGINT while it waits for a server to start
 (`src/bin/pg_ctl/pg_ctl.c:851`-`:872`). It uses the same crate, safe API only:
-`signal_hook::iterator::Signals` on a thread of its own, which sends the
-server its shutdown signal through `pgdrop stop`'s `kill`. `pgdrop` stays
+`signal_hook::iterator::Signals`; the server gets its shutdown signal
+through `pgdrop stop`'s `kill`. `pgdrop` stays
 `#![deny(unsafe_code)]`.
 
-This adds no dependency. `signal-hook` is already in `pgdrop`'s tree through
-`rpsql` (this ADR) and through pgrust, whose whole transitive tree is
-approved for `pgdrop` (owner, 2026-09-23; ADR-0001's second amendment).
-`pgdrop` now names it directly, and `Cargo.lock` gains only that edge.
+This adds no crate to the build, but it adds an edge: `signal-hook` is
+already in `pgdrop`'s tree through `rpsql` (this ADR), and only through
+`rpsql`; it is not in pgrust's tree, so the owner's 2026-09-23 approval of
+that tree (ADR-0001's second amendment) does not cover it. `pgdrop` now
+names it directly, and `Cargo.lock` gains only the `pgdrop → signal-hook`
+edge. This ADR's approval (owner, 2026-09-27) is scoped to `rpsql`.
+
+**Owner approval of the direct `pgdrop` edge: pending** (requested on
+NAT-409, 2026-09-27). Until it is recorded here, PR #101 does not merge.
+If it is refused, `--foreground` loses its signal forwarding.
+
+The forwarding is single-threaded: the thread that reaps the server is the
+one that signals it, so a signal never reaches a PID the server has given
+up. It forwards between connection attempts while the server starts, then
+sleeps on the caught signals, SIGCHLD among them, and on each wake forwards
+what came before it asks whether the server has exited.

@@ -18,7 +18,8 @@
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
 //! `\errverbose`, `\cd`, and `\i` and `\ir` over `path.c`'s file-name
-//! calculations ([`path`]) and a nested [`mainloop::process_file`]. NAT-404
+//! calculations ([`path`]) and a nested [`mainloop::process_file`], and
+//! `\encoding`, the `ENCODING` variable and `PrintNotifications`. NAT-404
 //! adds `\crosstabview` ([`crosstab`], `crosstabview.c`), `\g`, `\gx`,
 //! `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
@@ -63,12 +64,12 @@ use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
 
 use rlibpq::{
-    ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem, Params, PipelineStatus,
-    QueryResult, ResultError, Stream,
+    ConnInfo, Connection, ConnectionError, Encoding, Env, ExecStatus, Filesystem, Params,
+    PipelineStatus, QueryResult, ResultError, Stream,
 };
 
 use crate::command::{CommandResult, dispatch_slash};
-use crate::common::{ErrorMessage, Executor, send_query};
+use crate::common::{ErrorMessage, Executor, Notification, send_query};
 use crate::mainloop::Session as LoopSession;
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
@@ -108,6 +109,8 @@ struct LiveExecutor {
     alive: bool,
     /// How many of the connection's notices have been handed out.
     notices_seen: usize,
+    /// How many of the connection's notifications have been handed out.
+    notifications_seen: usize,
 }
 
 impl LiveExecutor {
@@ -237,6 +240,48 @@ impl Executor for LiveExecutor {
         self.notices_seen += notices.len();
         notices
     }
+
+    fn client_encoding(&self) -> Encoding {
+        self.connection.client_encoding()
+    }
+
+    /// `PQsetClientEncoding` (`fe-connect.c:7736`): `-1` unless the command
+    /// came back COMMAND_OK (`:7763`). A connection that breaks meanwhile is
+    /// `-1` too, and is then given up like any other.
+    fn set_client_encoding(&mut self, encoding: &[u8]) -> bool {
+        // `conn->status != CONNECTION_OK` (`fe-connect.c:7743`).
+        if !self.alive {
+            return false;
+        }
+        match self.connection.set_client_encoding(encoding) {
+            Ok(result) => result.is_some_and(|r| r.status() == ExecStatus::CommandOk),
+            Err(err) => {
+                self.failed(err);
+                false
+            }
+        }
+    }
+
+    /// `PQconsumeInput` reads what the server has already sent without
+    /// waiting, and `PQisBusy` parses it, which is where `PQnotifies` finds
+    /// a notification another session sent since the last query. As in
+    /// `PrintNotifications`, a failure to read is not reported here.
+    fn take_notifications(&mut self) -> Vec<Notification> {
+        if self.alive {
+            let _ = self.connection.consume_input();
+            let _ = self.connection.is_busy();
+        }
+        let notifications = self.connection.notifications()[self.notifications_seen..]
+            .iter()
+            .map(|(be_pid, relname, extra)| Notification {
+                relname: relname.clone(),
+                be_pid: *be_pid,
+                extra: extra.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.notifications_seen += notifications.len();
+        notifications
+    }
 }
 
 /// The connection keyword/value array `main()` builds (`startup.c:254`).
@@ -281,6 +326,7 @@ fn connect(session: &Session) -> Result<LiveExecutor, ErrorMessage> {
         // notice processor is installed after the connection is made.
         Ok(connection) => Ok(LiveExecutor {
             notices_seen: connection.notices().len(),
+            notifications_seen: 0,
             connection,
             alive: true,
         }),
@@ -354,6 +400,9 @@ fn run_session(mut session: Session, stdout: &mut impl Write, stderr: &mut impl 
             return ExitCode::from(EXIT_BADCONN);
         }
     };
+    // `SyncVariables` (`startup.c:330`; `command.c:4580`, `:4590`), as far
+    // as the client encoding goes.
+    common::sync_encoding(&executor, &mut session.pset, &mut session.vars);
     // `startup.c:314`, once the connection is up.
     cancel::setup_cancel_handler();
 
@@ -499,17 +548,12 @@ fn run_action(
             } else {
                 CommandResult::Error
             };
-            let status = match &status {
-                CommandResult::Include(request) => {
-                    let mut loop_session = LoopSession {
-                        pset: &mut session.pset,
-                        vars: &mut session.vars,
-                        cancel_pressed: &cancel::CANCEL_PRESSED,
-                    };
-                    mainloop::include(request, &mut loop_session, executor, stdout, stderr)
-                }
-                _ => status,
+            let mut loop_session = LoopSession {
+                pset: &mut session.pset,
+                vars: &mut session.vars,
+                cancel_pressed: &cancel::CANCEL_PRESSED,
             };
+            let status = mainloop::perform(status, &mut loop_session, executor, stdout, stderr);
             if status == CommandResult::Error {
                 EXIT_FAILURE
             } else {

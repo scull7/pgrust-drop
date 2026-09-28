@@ -234,6 +234,41 @@ fn a_failed_start_never_removes_a_directory_it_did_not_create() {
     drop(running);
 }
 
+/// Review of PR #99: a server that crashed leaves its `postmaster.pid`
+/// naming a process that is gone. `stop` takes that as already stopped
+/// (`pg_ctl stop` fails "could not send stop signal") and removes what
+/// `start` recorded, twice over.
+#[test]
+fn stop_after_a_crash_is_already_stopped() {
+    let scratch = Scratch::new("crashed");
+    let datadir = scratch.0.join("data");
+    let run_dir = scratch.0.join("pgdrop-crashed-run");
+    std::fs::create_dir(&datadir).expect("create the data directory");
+    std::fs::create_dir(&run_dir).expect("create the run directory");
+    let mut gone = Command::new("true").spawn().expect("run true");
+    let pid = gone.id();
+    gone.wait().expect("wait for true");
+    std::fs::write(datadir.join("postmaster.pid"), format!("{pid}\n")).expect("write");
+    std::fs::write(
+        datadir.join("pgdrop.start"),
+        format!(
+            "pgdrop start 1\nremove_datadir=yes\nremove_run_dir=yes\nrun_dir={}\n",
+            run_dir.display()
+        ),
+    )
+    .expect("write");
+    let datadir = datadir.to_str().expect("UTF-8");
+    for attempt in ["pgdrop stop", "second pgdrop stop"] {
+        let stop = scratch.pgdrop(&["stop", "--datadir", datadir]);
+        assert_success(&stop, attempt);
+        assert!(stop.stderr.is_empty(), "{stop:?}");
+        assert!(
+            !Path::new(datadir).exists() && !run_dir.exists(),
+            "{attempt}"
+        );
+    }
+}
+
 /// The issue's acceptance: two concurrent starts never collide.
 #[test]
 fn two_concurrent_starts_never_collide() {
@@ -285,6 +320,6 @@ fn stop_without_a_datadir_says_so() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "pgdrop: error: no data directory specified and environment variable PGDATA unset\n"
+        "pgdrop: error: no database directory specified and environment variable PGDATA unset\n"
     );
 }

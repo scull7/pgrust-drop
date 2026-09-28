@@ -9,8 +9,9 @@
 //! data; `ExecQueryAndProcessResults` calls them for every COPY, `\copy` or
 //! not ([`crate::common`]).
 //!
-//! `PROGRAM` is parsed but not run: it opens a shell with `popen`, which
-//! lands with `\g |` and `\o |`, the other two commands that pipe to one.
+//! `PROGRAM` runs its command through `/bin/sh` with a pipe to psql
+//! ([`crate::output::popen`]), and its exit status becomes `SHELL_ERROR` and
+//! `SHELL_EXIT_CODE`, as `\g |` and `\o |` do.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -21,6 +22,9 @@ use rlibpq::{ExecStatus, QueryResult};
 
 use crate::common::{CommandSource, CopyIo, CopyStream, Executor, send_query_with};
 use crate::logging;
+use crate::output::{
+    Output, PopenMode, pclose, popen, set_shell_result_variables, wait_result_to_str,
+};
 use crate::settings::PsqlSettings;
 use crate::variables::VariableSpace;
 
@@ -406,16 +410,24 @@ pub fn parse_slash_copy(
 
 /// `do_copy()` (`copy.c:268`): run `\copy`'s whole line.
 ///
-/// The file is opened here and handed to `SendQuery` as `pset.copyStream`;
-/// `\copy … from stdin` and `… to stdout` use the command source and stdout,
-/// as upstream does by pointing `copyStream` at them.
+/// The file or program is opened here and handed to `SendQuery` as
+/// `pset.copyStream`; `\copy … from stdin` and `… to stdout` use the command
+/// source and `pset.queryFout`, as upstream does by pointing `copyStream` at
+/// them.
+///
+/// # Panics
+/// Never: `popen` pipes the end it was asked to, and a program's pipe is
+/// closed only after it was opened.
+// One function of upstream's, whose streams must outlive the query that
+// borrows them; splitting it would only move the borrows around.
+#[allow(clippy::too_many_lines)]
 pub fn do_copy(
     args: Option<&[u8]>,
     executor: &mut dyn Executor,
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
     source: &mut CommandSource<'_>,
-    stdout: &mut dyn Write,
+    out: &mut Output<'_>,
     stderr: &mut dyn Write,
 ) -> bool {
     let home = std::env::var_os("HOME");
@@ -436,21 +448,50 @@ pub fn do_copy(
     let mut stdin_lock: std::io::StdinLock<'static>;
     let mut file_reader: BufReader<File>;
     let mut file_writer: Option<BufWriter<File>> = None;
+    let mut program: Option<std::process::Child> = None;
+    let mut program_reader: Option<BufReader<std::process::ChildStdout>> = None;
+    let mut program_writer: Option<BufWriter<std::process::ChildStdin>> = None;
     let stream = match &options.file {
-        CopyFile::Program(_) => {
-            logging::error(
-                pset,
-                "\\copy … PROGRAM is not implemented yet (Linear NAT-403)",
-                stderr,
-            );
-            return false;
+        // `copy.c:291`-`:293`, `:309`-`:312`: `fflush(NULL)`, then `popen`.
+        CopyFile::Program(command) => {
+            out.flush_all();
+            let _ = stderr.flush();
+            let mode = if options.from {
+                PopenMode::Read
+            } else {
+                PopenMode::Write
+            };
+            let mut child = match popen(command, mode) {
+                Ok(child) => child,
+                Err(err) => {
+                    let mut message = b"could not execute command \"".to_vec();
+                    message.extend_from_slice(command);
+                    message.extend_from_slice(b"\": ");
+                    message.extend_from_slice(strerror(&err).as_bytes());
+                    logging::error(pset, message, stderr);
+                    return false;
+                }
+            };
+            let stream = if options.from {
+                let pipe = child.stdout.take().expect("popen(\"r\") pipes stdout");
+                CopyStream::Read {
+                    reader: program_reader.insert(BufReader::new(pipe)),
+                    is_tty: false,
+                }
+            } else {
+                let pipe = child.stdin.take().expect("popen(\"w\") pipes stdin");
+                CopyStream::Write(program_writer.insert(BufWriter::new(pipe)))
+            };
+            program = Some(child);
+            stream
         }
         // `copy.c:298`-`:301`, `:317`-`:320`: stdin is the command source
         // and stdout is `pset.queryFout`; pstdin is psql's own stdin, which
         // is the command source too when that is stdin, and pstdout is
-        // stdout, which `pset.queryFout` is until `\o` exists.
+        // psql's own stdout.
         CopyFile::Stdio => CopyStream::Default,
-        CopyFile::PsqlStdio if !options.from || source.is_stdin => CopyStream::Default,
+        CopyFile::PsqlStdio if !options.from => CopyStream::Stdout,
+        CopyFile::PsqlStdio if source.is_stdin => CopyStream::Default,
         CopyFile::PsqlStdio => {
             let stdin = std::io::stdin();
             let is_tty = stdin.is_terminal();
@@ -478,29 +519,54 @@ pub fn do_copy(
 
     // `copy.c:369`: run it like a user command, with `copystream` as the
     // data's source or sink.
-    let ok = {
+    let mut ok = {
         let mut io = CopyIo {
             source,
             stream,
             copy_from_stdin: Some(usize::from(options.from)),
         };
-        send_query_with(
-            executor,
-            &options.query(),
-            pset,
-            vars,
-            &mut io,
-            stdout,
-            stderr,
-        )
+        send_query_with(executor, &options.query(), pset, vars, &mut io, out, stderr)
     };
 
-    // `copy.c:399`: `fclose`, whose flush can still fail.
-    if let (Some(mut writer), CopyFile::Path(path)) = (file_writer, &options.file)
-        && let Err(err) = writer.flush()
-    {
-        logging::error(pset, file_message(path, &strerror(&err)), stderr);
-        return false;
+    match &options.file {
+        // `copy.c:378`-`:395`: `pclose`, whose flush of what is still
+        // buffered can fail unseen, and whose status is judged and kept.
+        CopyFile::Program(command) => {
+            if let Some(mut writer) = program_writer {
+                let _ = writer.flush();
+            }
+            drop(program_reader);
+            let pclose_rc = pclose(program.expect("the program was started"));
+            let status = pclose_rc.as_ref().map_or(-1, |&rc| rc);
+            if status != 0 {
+                let message = match &pclose_rc {
+                    Err(err) => format!(
+                        "could not close pipe to external command: {}",
+                        strerror(err)
+                    )
+                    .into_bytes(),
+                    Ok(rc) => {
+                        let mut message = command.clone();
+                        message.extend_from_slice(b": ");
+                        message.extend_from_slice(wait_result_to_str(*rc, "").as_bytes());
+                        message
+                    }
+                };
+                logging::error(pset, message, stderr);
+                ok = false;
+            }
+            set_shell_result_variables(vars, status);
+        }
+        // `copy.c:399`: `fclose`, whose flush can still fail.
+        CopyFile::Path(path) => {
+            if let Some(mut writer) = file_writer
+                && let Err(err) = writer.flush()
+            {
+                logging::error(pset, file_message(path, &strerror(&err)), stderr);
+                ok = false;
+            }
+        }
+        CopyFile::Stdio | CopyFile::PsqlStdio => {}
     }
     ok
 }
@@ -869,28 +935,124 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_program_is_refused_before_anything_runs() {
-        // `PROGRAM` lands with `\g |`; until then it is refused, not run
-        // (docs/divergences.md), and no query reaches the server.
-        let mut server = CopyServer::default();
+    /// A server that answers `\copy`'s query with COPY OUT (sending `rows`)
+    /// or COPY IN (keeping what it receives), then `COPY n`.
+    #[derive(Default)]
+    struct ProgramServer {
+        rows: VecDeque<Vec<u8>>,
+        received: Vec<u8>,
+        tag: Option<QueryResult>,
+    }
+
+    impl Executor for ProgramServer {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            let from = query.windows(10).any(|w| w == b"FROM STDIN");
+            self.tag = Some(command_complete(if from { "COPY 2" } else { "COPY 1" }));
+            Ok(vec![QueryResult::new(if from {
+                ExecStatus::CopyIn
+            } else {
+                ExecStatus::CopyOut
+            })])
+        }
+        fn get_result(&mut self) -> Result<Option<QueryResult>, ErrorMessage> {
+            Ok(self.tag.take())
+        }
+        fn get_copy_data(&mut self) -> Result<Option<Vec<u8>>, ErrorMessage> {
+            Ok(self.rows.pop_front())
+        }
+        fn put_copy_data(&mut self, data: &[u8]) -> Result<(), ErrorMessage> {
+            self.received.extend_from_slice(data);
+            Ok(())
+        }
+        fn put_copy_end(&mut self, _error: Option<&[u8]>) -> Result<(), ErrorMessage> {
+            Ok(())
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+        fn abandon(&mut self) {}
+    }
+
+    /// `do_copy(line)` against `server`: success, stdout, stderr and the
+    /// variables after it.
+    fn run_copy(line: &str, server: &mut ProgramServer) -> (bool, String, String, VariableSpace) {
         let mut input: &[u8] = b"";
         let mut source = CommandSource::file(&mut input);
+        let mut vars = VariableSpace::new();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        assert!(!do_copy(
-            Some(b"t to program 'cat'"),
-            &mut server,
+        let ok = do_copy(
+            Some(line.as_bytes()),
+            server,
             &mut PsqlSettings::default(),
-            &mut VariableSpace::new(),
+            &mut vars,
             &mut source,
-            &mut out,
+            &mut Output::new(&mut out),
             &mut err,
-        ));
-        assert!(out.is_empty());
-        assert_eq!(
-            String::from_utf8(err).unwrap(),
-            "psql: error: \\copy \u{2026} PROGRAM is not implemented yet (Linear NAT-403)\n"
         );
+        (
+            ok,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            vars,
+        )
+    }
+
+    #[test]
+    fn a_program_is_fed_copy_out_and_its_failure_is_reported_and_kept() {
+        // `copy.c:378`-`:394`: the data reaches the program; its nonzero
+        // status fails the `\copy` with `wait_result_to_str`'s words, and
+        // lands in `SHELL_ERROR` / `SHELL_EXIT_CODE` either way.
+        let dir = std::env::temp_dir().join(format!("rpsql-copy-program-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out");
+        let mut server = ProgramServer {
+            rows: VecDeque::from([b"a\n".to_vec()]),
+            ..ProgramServer::default()
+        };
+        let line = format!("t to program 'cat > {}; exit 3'", file.display());
+        let (ok, out, err, vars) = run_copy(&line, &mut server);
+        assert!(!ok);
+        assert_eq!(std::fs::read(&file).unwrap(), b"a\n");
+        // The status line goes to `pset.queryFout`; the data did not.
+        assert_eq!(out, "COPY 1\n");
+        assert_eq!(
+            err,
+            format!(
+                "psql: error: cat > {}; exit 3: child process exited with exit code 3\n",
+                file.display()
+            )
+        );
+        assert_eq!(vars.get("SHELL_ERROR"), Some("true"));
+        assert_eq!(vars.get("SHELL_EXIT_CODE"), Some("3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_feeds_copy_in_and_a_clean_exit_is_kept_too() {
+        let mut server = ProgramServer::default();
+        let (ok, out, err, vars) = run_copy(r"t from program 'printf ''1\n2\n'''", &mut server);
+        assert!(ok, "{err}");
+        assert_eq!(server.received, b"1\n2\n");
+        assert_eq!(out, "COPY 2\n");
+        assert_eq!(vars.get("SHELL_ERROR"), Some("false"));
+        assert_eq!(vars.get("SHELL_EXIT_CODE"), Some("0"));
+    }
+
+    #[test]
+    fn copy_to_pstdout_goes_to_stdout_and_its_status_is_suppressed_there() {
+        // `copy.c:320`: pstdout is psql's own stdout. With `pset.queryFout`
+        // stdout too, the status line is suppressed (`common.c:965`).
+        let mut server = ProgramServer {
+            rows: VecDeque::from([b"x\n".to_vec()]),
+            ..ProgramServer::default()
+        };
+        let (ok, out, _, _) = run_copy("t to pstdout", &mut server);
+        assert!(ok);
+        assert_eq!(out, "x\n");
     }
 
     #[test]

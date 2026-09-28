@@ -8,9 +8,10 @@
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
 //! (lines 86-108), `\errverbose with no previous error` (159-164),
 //! `\errverbose after normal query with error` (170-181), the multiple
-//! `-c`/`-f` switches (212-343) and `\copy from with DEFAULT` (345-367). The
-//! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
-//! `\errverbose` cases, and the rest of the file, land with Linear
+//! `-c`/`-f` switches (212-343), `\copy from with DEFAULT` (345-367) and
+//! `\g` output piped into a program (457-486). The `\copyright`, `\help`,
+//! `ENCODING`, notification, crash and remaining `\errverbose` cases, and the
+//! rest of the file, land with Linear
 //! NAT-400 … NAT-405.
 //!
 //! The byte-diff gate NAT-398's Acceptance names —
@@ -84,6 +85,8 @@ const ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT: u16 = 55_404;
 const MULTIPLE_C_AND_F_SWITCHES_PORT: u16 = 55_405;
 const COPY_FROM_WITH_DEFAULT_PORT: u16 = 55_406;
 const COPY_ROUND_TRIP_PORT: u16 = 55_407;
+const G_PIPE_PORT: u16 = 55_408;
+const OUTPUT_REDIRECTION_PORT: u16 = 55_409;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -481,6 +484,67 @@ fn psql_like_with(
     assert_like(&stdout, expected_stdout, &format!("{name}: matches"));
 }
 
+/// `# Test \g output piped into a program.` — 001_basic.pl:457-486.
+///
+/// "The program is perl -pe '' to simply copy the input to the output"
+/// (:458); upstream names its own perl, `$^X`, and here it is the `perl` on
+/// `PATH`, which every lane's image carries. Each psql writes the one file
+/// in turn, and each file is read back before the next psql overwrites it.
+#[test]
+fn g_output_piped_into_a_program() {
+    let Some(cluster) = Cluster::start(G_PIPE_PORT) else {
+        return;
+    };
+    let tempdir = cluster.tempdir("g-pipe");
+    let g_file = tempdir.join("g_file_1.out");
+    let pipe_cmd = format!("perl -pe '' >{}", g_file.display());
+    let slurp = || std::fs::read_to_string(&g_file).expect("the pipe wrote its file");
+
+    for psql in every_psql(&cluster) {
+        psql_like_with(
+            &cluster,
+            &psql,
+            &format!("SELECT 'one' \\g | {pipe_cmd}"),
+            "",
+            "one command \\g",
+        );
+        assert_like(&slurp(), "one", "one command \\g: the file");
+
+        psql_like_with(
+            &cluster,
+            &psql,
+            &format!("SELECT 'two' \\; SELECT 'three' \\g | {pipe_cmd}"),
+            "",
+            "two commands \\g",
+        );
+        assert_like(&slurp(), "(?s)two.*three", "two commands \\g: the file");
+
+        psql_like_with(
+            &cluster,
+            &psql,
+            &format!("\\set SHOW_ALL_RESULTS 0\nSELECT 'four' \\; SELECT 'five' \\g | {pipe_cmd}"),
+            "",
+            "two commands \\g with only last result",
+        );
+        let c3 = slurp();
+        assert_like(&c3, "five", "two commands \\g with only last result: five");
+        assert_unlike(&c3, "four", "two commands \\g with only last result: four");
+
+        psql_like_with(
+            &cluster,
+            &psql,
+            &format!("copy (values ('foo'),('bar')) to stdout \\g | {pipe_cmd}"),
+            "",
+            "copy output passed to \\g pipe",
+        );
+        assert_like(
+            &slurp(),
+            "(?s)foo.*bar",
+            "copy output passed to \\g pipe: the file",
+        );
+    }
+}
+
 /// The script [`copy_round_trip_matches_c_psql`] runs, from the directory
 /// its files are written to. Rows carry every byte COPY's text and CSV
 /// formats escape — tab, newline, carriage return, backslash, a lone `\.`,
@@ -572,6 +636,136 @@ fn copy_round_trip_matches_c_psql() {
     // The script ran to the end without an error on either side.
     assert_eq!(ours.ret, 0, "stderr {:?}", ours.stderr);
     assert_eq!(ours.stderr, "", "no stderr");
+}
+
+/// The script [`output_redirection_matches_c_psql`] runs, from the directory
+/// its files are written to: `\o` and `\g` to files and pipes, `\copy` to and
+/// from programs, the `SHELL_ERROR` / `SHELL_EXIT_CODE` each pipe leaves —
+/// a clean exit, an exit code, a signal and a missing command — and where
+/// COPY data and status lines go while `\o` is in force.
+///
+/// Every program that psql writes to reads all of its input before it
+/// exits, and none writes to psql's stdout, so no line depends on how the
+/// shell and psql interleave. (A `\g` pipe whose command exits unread makes
+/// C psql's `could not print result table: Broken pipe` a race between the
+/// shell's exit and psql's `fflush`, so the signal case is a `\copy … from
+/// program` instead, which psql only reads.)
+const OUTPUT_REDIRECTION_SQL: &str = r"\o | cat > o_pipe.out
+select 1 as one;
+\qecho qecho line
+\echo echo line
+\o
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+\o |cat >/dev/null; exit 3
+\o
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+select 2 as two \g | cat > g_pipe.out
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+select 3 \g |cat >/dev/null; exit 4
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+select 'again' as a \g g_file.out
+\g g_file_2.out
+select 1 \g /nonexistent/dir/g.out
+\copy (select 'prog') to program 'cat > prog.out'
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+\copy (select 1) to program 'cat >/dev/null; exit 7'
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+create temp table p (x text);
+\copy p from program 'printf ''a\nb\n'''
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+\copy p from program 'no_such_command_rpsql 2>/dev/null'
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+\copy p from program 'kill -TERM $$'
+\echo :SHELL_ERROR :SHELL_EXIT_CODE
+select * from p;
+\o o_file.out;
+select 'to the o file';
+copy (values ('x'),('y')) to stdout;
+\copy (values ('z')) to stdout
+\copy (values ('w')) to pstdout
+select 'g beats o' \g g_over_o.out
+\o
+\o /nonexistent/dir/o.out
+select 'still stdout';
+";
+
+/// The files [`OUTPUT_REDIRECTION_SQL`] writes.
+const OUTPUT_REDIRECTION_FILES: [&str; 7] = [
+    "o_pipe.out",
+    "g_pipe.out",
+    "g_file.out",
+    "g_file_2.out",
+    "prog.out",
+    "o_file.out",
+    "g_over_o.out",
+];
+
+/// `\o`, `\g`, `-o` and `\copy … program` against PGDG psql: stdout, stderr,
+/// the exit status and every file written must be the same bytes. Not an
+/// upstream test — upstream has no psql to compare against — but the
+/// behaviours are `001_basic.pl:457`'s and `psql.sql:1507`'s, extended to
+/// the pipe statuses neither of them checks.
+#[test]
+fn output_redirection_matches_c_psql() {
+    let Some(cluster) = Cluster::start(OUTPUT_REDIRECTION_PORT) else {
+        return;
+    };
+    let Some(reference) = cluster.reference_psql() else {
+        reference::skip("psql");
+        return;
+    };
+    let run = |psql: &Path, name: &str| {
+        let dir = cluster.tempdir(name);
+        let mut command = cluster.command(psql);
+        command.args(["-X", "-f", "-"]).current_dir(&dir);
+        let script = regress::run(command, OUTPUT_REDIRECTION_SQL.as_bytes());
+        // `-o` (`startup.c:594`), and `-o` that cannot be opened.
+        let mut command = cluster.command(psql);
+        command
+            .args(["-X", "-o", "o_option.out", "-c", "select 'dash o'", "-c"])
+            .arg("\\echo to stdout")
+            .current_dir(&dir);
+        let option = regress::run(command, b"");
+        let mut command = cluster.command(psql);
+        command
+            .args(["-X", "-o", "/nonexistent/dir/o", "-c", "select 1"])
+            .current_dir(&dir);
+        let bad_option = regress::run(command, b"");
+        let files: Vec<Vec<u8>> = OUTPUT_REDIRECTION_FILES
+            .iter()
+            .chain(&["o_option.out"])
+            .map(|f| std::fs::read(dir.join(f)).unwrap_or_else(|e| panic!("{name}: {f}: {e}")))
+            .collect();
+        ([script, option, bad_option], files)
+    };
+    let (ours, our_files) = run(Path::new(RPSQL), "redirection-rpsql");
+    let (theirs, their_files) = run(&reference, "redirection-psql");
+
+    for (what, (ours, theirs)) in ["the script", "-o", "a bad -o"]
+        .iter()
+        .zip(ours.iter().zip(&theirs))
+    {
+        assert_eq!(
+            ours.ret, theirs.ret,
+            "{what}: exit status; rpsql stderr {:?}",
+            ours.stderr
+        );
+        assert_eq!(ours.stderr, theirs.stderr, "{what}: stderr");
+        assert_eq!(ours.stdout, theirs.stdout, "{what}: stdout");
+    }
+    for ((name, ours), theirs) in OUTPUT_REDIRECTION_FILES
+        .iter()
+        .chain(&["o_option.out"])
+        .zip(&our_files)
+        .zip(&their_files)
+    {
+        assert!(
+            ours == theirs,
+            "{name} differs from C psql's: {:?} vs {:?}",
+            String::from_utf8_lossy(ours),
+            String::from_utf8_lossy(theirs)
+        );
+    }
 }
 
 /// The Acceptance gate for `--help`, `--help=commands` and `--help=variables`:

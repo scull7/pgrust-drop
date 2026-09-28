@@ -15357,6 +15357,7 @@ version = "0.1.0"
 dependencies = [
  "redox_liner",
  "rlibpq",
+ "rustix",
  "signal-hook",
  "termion",
  "testkit",

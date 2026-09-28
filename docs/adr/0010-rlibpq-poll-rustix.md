@@ -63,3 +63,17 @@ whether libpq waits on it.
 - `Connection<S>` needs `S: Socket` (`Read + Write` plus `wait`), so a
   scripted test stream implements `wait`; the scripted streams never return
   `WouldBlock`, so theirs is `unreachable!`.
+
+## Amendment, 2026-09-28: the `pty` feature for `rpsql`'s tests
+
+`rpsql`'s interactive gates need a pseudo-terminal
+(`crates/rpsql/tests/pty/mod.rs`), which the standard library cannot open.
+It used to declare `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` as
+`extern "C"` behind `#[allow(unsafe_code)]`. The owner approved (2026-09-28,
+NAT-405) `rustix`'s `pty` feature (which enables `fs`) **as an `rpsql`
+dev-dependency only**: `rustix = { workspace = true, features = ["pty"] }`
+under `[dev-dependencies]`. The workspace entry is unchanged (`event` +
+`std`), so `rlibpq` and every non-test build keep exactly the features
+above; the helper uses only the safe `rustix::pty::{openpt, grantpt,
+unlockpt, ptsname}` and has no `unsafe` code. `ptsname` is re-entrant there,
+so the lock the helper held around C's static buffer is gone.

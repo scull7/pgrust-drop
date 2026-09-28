@@ -120,7 +120,8 @@ container does not change that.
   2026-09-17; pgrust (`main_main`, rev-pinned git dependency, ADR-0001) and
   its whole transitive dependency tree, **in `pgdrop` only** — owner,
   2026-09-23; `rustix` (rlibpq's readiness wait, `event` + `std` features
-  only, ADR-0010) — owner, 2026-09-27; `libc` (rlibpq-ffi's C-library calls;
+  only, ADR-0010) — owner, 2026-09-27; plus its `pty` feature as an `rpsql`
+  dev-dependency only (the test pty helper) — owner, 2026-09-28, NAT-405; `libc` (rlibpq-ffi's C-library calls;
   `free` for `PQfreemem`) — owner, 2026-09-27; `signal-hook` (rpsql's SIGINT
   handler, ADR-0009) and `termion` (rpsql's raw mode and session-lived key
   iterator only, ADR-0005 amendment) — owner, 2026-09-27; musl (Alpine) is a

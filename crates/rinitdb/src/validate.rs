@@ -175,6 +175,15 @@ pub struct SyncPlan {
     pub sync_data_files: bool,
 }
 
+/// Where `get_su_pwd` (`initdb.c:1657`) reads the superuser's password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordSource {
+    /// `-W`/`--pwprompt`: `simple_prompt` on the terminal (`initdb.c:1670`).
+    Prompt,
+    /// `--pwfile=FILE`: its first line (`initdb.c:1689`).
+    File(PathBuf),
+}
+
 /// A validated request to create a cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePlan {
@@ -195,6 +204,8 @@ pub struct CreatePlan {
     /// The superuser name, `None` when neither `--username` nor the
     /// environment settled it.
     pub username: Option<String>,
+    /// `-W` or `--pwfile`; never both (`initdb.c:3454`).
+    pub password: Option<PasswordSource>,
     /// `-c NAME=VALUE`, split and kept in command-line order (`initdb.c:3278`).
     pub gucs: Vec<(String, String)>,
     /// `do_sync` (`initdb.c:164`): false under `--no-sync`, which prints the
@@ -258,6 +269,19 @@ pub fn validate(
     if options.pwprompt && options.pwfile.is_some() {
         return Err(InitdbError::PasswordPromptAndFile);
     }
+    let password = if options.pwprompt {
+        Some(PasswordSource::Prompt)
+    } else {
+        options
+            .pwfile
+            .as_deref()
+            .map(|file| PasswordSource::File(PathBuf::from(file)))
+    };
+    // initdb.c:3463. check_authmethod_valid (:3460) is not ported yet, so a
+    // misspelt method reaches the configuration file instead of failing here.
+    if password.is_none() && crate::conf::AuthMethods::resolve(options).need_password() {
+        return Err(InitdbError::PasswordRequired);
+    }
 
     let pgdata = require_datadir(datadir, env)?;
 
@@ -290,6 +314,7 @@ pub fn validate(
         datlocale,
         encoding,
         username,
+        password,
         gucs,
         do_sync: !options.no_sync,
         sync_method,
@@ -780,6 +805,43 @@ mod tests {
             failure(&["--pwprompt", "--pwfile", "/tmp/pw"], &FakeFs::empty()),
             InitdbError::PasswordPromptAndFile
         );
+    }
+
+    #[test]
+    fn password_authentication_on_both_sides_needs_a_password() {
+        // initdb.c:2597 (check_need_password), before setup_pgdata at :3470.
+        for both in [
+            &["-A", "md5"][..],
+            &["-A", "password"],
+            &["--auth-local=scram-sha-256", "--auth-host=md5"],
+        ] {
+            assert_eq!(
+                failure(both, &FakeFs::empty()),
+                InitdbError::PasswordRequired,
+                "{both:?}"
+            );
+        }
+        // One side without a password method, or a password to use: fine.
+        for fine in [
+            &["-A", "md5", "--auth-local=peer", "-D", "/tmp/x"][..],
+            &["--auth-host=scram-sha-256", "-D", "/tmp/x"],
+            &["-A", "md5", "--pwfile", "/tmp/pw", "-D", "/tmp/x"],
+            &["-A", "scram-sha-256", "-W", "-D", "/tmp/x"],
+        ] {
+            assert!(
+                matches!(check(fine, &FakeFs::empty()), Ok(Plan::Create(_))),
+                "{fine:?}"
+            );
+        }
+        assert_eq!(
+            created(&["--pwfile", "/tmp/pw", "-D", "/tmp/x"], &FakeFs::empty()).password,
+            Some(PasswordSource::File(PathBuf::from("/tmp/pw")))
+        );
+        assert_eq!(
+            created(&["-W", "-D", "/tmp/x"], &FakeFs::empty()).password,
+            Some(PasswordSource::Prompt)
+        );
+        assert_eq!(created(&["-D", "/tmp/x"], &FakeFs::empty()).password, None);
     }
 
     #[test]

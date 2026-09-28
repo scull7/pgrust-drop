@@ -412,6 +412,7 @@ mod tests {
             datlocale: None,
             encoding: None,
             username: Some("postgres".to_owned()),
+            password: None,
             gucs: Vec::new(),
             do_sync: true,
             sync_method: crate::sync::SyncMethod::Fsync,

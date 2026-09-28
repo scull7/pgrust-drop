@@ -137,6 +137,14 @@ impl AuthMethods {
         methods
     }
 
+    /// `check_need_password` (`initdb.c:2597`): both sides authenticate
+    /// with a password, so the superuser needs one.
+    #[must_use]
+    pub fn need_password(&self) -> bool {
+        let by_password = |method: &str| matches!(method, "md5" | "password" | "scram-sha-256");
+        by_password(&self.local) && by_password(&self.host)
+    }
+
     /// `initdb.c:1518` — `@authcomment@` is the warning when either side trusts.
     #[must_use]
     pub fn auth_comment(&self) -> &'static str {

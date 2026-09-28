@@ -154,17 +154,16 @@ pub fn run_with(
 /// Ahead of all of that, as `setup_bin_paths` (`initdb.c:3472`) is ahead of
 /// the `--waldir` failure and the warning in C, the `postgres` for the
 /// single-user session is found — but only when there is a session to run
-/// ([`single_user::fixup_script`] is not empty; `docs/divergences.md`).
+/// ([`single_user::needs_session`]; `docs/divergences.md`). The password is
+/// read after the warning, as `get_su_pwd` (`initdb.c:3502`) runs after
+/// `setup_text_search` (`:3492`).
 fn create_cluster(
     plan: &CreatePlan,
     options: &Options,
     embedded: Option<&single_user::Server>,
     stderr: &mut impl Write,
 ) -> ExitCode {
-    let script = single_user::fixup_script(plan);
-    let server = if script.is_empty() {
-        None
-    } else {
+    let server = if single_user::needs_session(plan) {
         match single_user::find_server(embedded) {
             Ok(server) => Some(server),
             Err(err) => {
@@ -172,8 +171,9 @@ fn create_cluster(
                 return ExitCode::from(EXIT_FAILURE);
             }
         }
+    } else {
+        None
     };
-    let session = server.as_ref().map(|server| (server, script.as_slice()));
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
     let can_make = cluster::check_template_can_make(options, plan);
     match can_make {
@@ -189,6 +189,18 @@ fn create_cluster(
             }
         }
     }
+    // initdb.c:3501, after the warning and before the first mkdir: a
+    // failure here is pg_fatal with nothing made yet to take back.
+    let password = match plan.password.as_ref().map(single_user::get_su_pwd) {
+        None => None,
+        Some(Ok(password)) => password,
+        Some(Err(err)) => {
+            let _ = writeln!(stderr, "{}", err.render());
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let script = single_user::fixup_script(plan, password.as_ref());
+    let session = server.as_ref().map(|server| (server, script.as_slice()));
     let mut progress = Progress::default();
     let created = initialize_data_directory(plan, options, session, &mut progress)
         .and_then(|()| sync_new_cluster(plan, stderr));

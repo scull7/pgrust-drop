@@ -34,7 +34,8 @@ use live::Cluster;
 /// text parameter with binary results, then a binary `int4` parameter with
 /// binary results, each printed by `show_binary_results`, which finds its
 /// columns with `PQfnumber`. The example prints `tuple 0` both times: each
-/// result has one row, and `i` (`:73`, `:102`) counts that result's rows.
+/// result has one row, and `i` (`testlibpq3.c:73`, `:102`) counts that
+/// result's rows.
 #[test]
 fn testlibpq3_prints_both_binary_results_as_its_header_states() {
     let Some(cluster) = Cluster::start("trust", 55_492) else {

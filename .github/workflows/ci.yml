@@ -39,6 +39,15 @@ name: ci
 # from going cold instead: main saves one per lane, a pull request that does
 # not change a manifest restores it by exact key and saves nothing, and the
 # schedule restores them often enough that GitHub's 7-day eviction never fires.
+#
+# Timeout (NAT-607): every lane stops at 20 minutes. GitHub's default is 6
+# hours, and a hung test (apple, run 36410890371: start_stop.rs's
+# two_concurrent_starts_never_collide) held a runner for 2 hours until someone
+# cancelled it. 20 minutes clears the slowest cold lane measured (musl, 11m39s
+# of compilation alone) and is still well past the 15-minute cold cap, so only
+# a hang or an already-P0 regression ever reaches it. Job-level only: plain
+# `cargo test` has no per-test timeout, and a step-level one on `test` would
+# add a second number without failing any sooner in practice.
 
 on:
   push:
@@ -72,6 +81,7 @@ env:
 jobs:
   musl:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # GitHub offers no Alpine runner image; a container is the supported way to
     # get a musl userland. This is CI configuration only: nothing in the
     # product or the developer workflow may require a container runtime.
@@ -181,6 +191,7 @@ jobs:
   apple:
     needs: musl
     runs-on: macos-15
+    timeout-minutes: 20
     env:
       PGDROP_REF_BIN_APPLE: /opt/homebrew/opt/postgresql@18/bin
     steps:
@@ -242,6 +253,7 @@ jobs:
   gnu:
     needs: musl
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       PGDROP_REF_BIN_GNU: /usr/lib/postgresql/18/bin
     steps:

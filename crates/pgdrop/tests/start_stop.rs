@@ -385,14 +385,20 @@ fn two_concurrent_starts_never_collide() {
 }
 
 /// `--foreground`: `start` stays attached to the server it prints, forwards
-/// SIGINT (Ctrl-C) and SIGTERM to it as a fast shutdown, as pg_ctl forwards
+/// SIGINT (Ctrl-C), SIGTERM and SIGHUP to it as a fast shutdown and SIGQUIT
+/// as an immediate one (`postmaster.c:2056`-`:2062`), as pg_ctl forwards
 /// SIGINT while it waits for a server (`pg_ctl.c:851`-`:872`), and once the
 /// server has exited removes what `stop` would and exits 0. The server's log
 /// is on `start`'s stderr, and none of it on stdout.
 #[test]
-fn foreground_forwards_sigint_and_sigterm_and_cleans_up() {
+fn foreground_forwards_shutdown_signals_and_cleans_up() {
     let scratch = Scratch::new("foreground");
-    for signal in ["-INT", "-TERM"] {
+    for (signal, request) in [
+        ("-INT", "fast shutdown request"),
+        ("-TERM", "fast shutdown request"),
+        ("-HUP", "fast shutdown request"),
+        ("-QUIT", "immediate shutdown request"),
+    ] {
         let mut attached = start_attached(&scratch, signal, &[]);
         let started = attached.started.clone();
         assert_ne!(started.pid, attached.child.id(), "the server is a child");
@@ -414,7 +420,7 @@ fn foreground_forwards_sigint_and_sigterm_and_cleans_up() {
         assert!(!Path::new(&run_dir).exists(), "{signal}: {run_dir}");
         let stderr = attached.stderr();
         assert!(
-            stderr.contains("fast shutdown request"),
+            stderr.contains(&format!("received {request}")),
             "{signal}: {stderr}"
         );
     }

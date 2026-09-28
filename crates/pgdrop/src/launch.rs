@@ -31,6 +31,13 @@
 //! `trap_sigint_during_startup` (`pg_ctl.c:851`-`:872`), which forwards
 //! SIGINT while pg_ctl waits for the server, kept for the server's whole
 //! life. `pgdrop stop` works on a foreground cluster as on any other.
+//!
+//! No thread forwards: the one that reaps the server is the one that
+//! signals it, so a signal never goes to a PID the server no longer holds.
+//! While `start` waits for the server to be ready it forwards between
+//! connection attempts; once attached it sleeps on its signals, SIGCHLD
+//! among them, and on each wake forwards what came, then asks whether the
+//! server has exited.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -41,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use rlibpq::connection::Connection;
@@ -147,22 +154,27 @@ struct Launched {
     attached: Option<Attached>,
 }
 
-/// `--foreground`'s running server and the plan that made it.
+/// `--foreground`'s running server, the signals it forwards, and the plan
+/// that made it.
 struct Attached {
     plan: StartPlan,
     server: Child,
+    signals: Forwarder,
 }
 
 impl Attached {
-    /// Action: wait for the server to exit (the forwarder turns a signal
-    /// into its shutdown), then remove what `stop` would. A `pgdrop stop`
-    /// may have removed it first; what is already gone is fine.
+    /// Action: wait for the server to exit, forwarding every signal as its
+    /// shutdown, then remove what `stop` would. A `pgdrop stop` may have
+    /// removed it first; what is already gone is fine.
     fn wait(mut self) -> Result<(), LaunchError> {
-        let status = self.server.wait().map_err(|error| LaunchError::Io {
-            what: "wait for",
-            path: PathBuf::from(&self.plan.datadir),
-            error,
-        });
+        let status = self
+            .signals
+            .wait(&mut self.server)
+            .map_err(|error| LaunchError::Io {
+                what: "wait for",
+                path: PathBuf::from(&self.plan.datadir),
+                error,
+            });
         remove_what_stop_removes(&self.plan, true);
         match status? {
             status if status.success() => Ok(()),
@@ -197,13 +209,63 @@ pub fn shutdown_signal(received: i32) -> &'static str {
 /// The signals `--foreground` catches and forwards.
 pub const FORWARDED: [i32; 4] = [SIGINT, SIGTERM, SIGHUP, SIGQUIT];
 
+/// `--foreground`'s signals, caught from before the server exists: the
+/// [`FORWARDED`] ones, and SIGCHLD, which wakes [`Forwarder::wait`] when
+/// the server exits.
+struct Forwarder(Signals);
+
+impl Forwarder {
+    /// Action: catch them.
+    fn new() -> io::Result<Self> {
+        Signals::new(FORWARDED.iter().chain(&[SIGCHLD])).map(Self)
+    }
+
+    /// Action: whether a signal to forward came, taking what came; for
+    /// before the server exists, when there is no one to forward it to.
+    fn interrupted(&mut self) -> bool {
+        self.0.pending().any(|received| received != SIGCHLD)
+    }
+
+    /// Action: send `server` [`shutdown_signal`] for every signal that came
+    /// since the last look, without waiting. `server` is not reaped yet: the
+    /// caller reaps it, after.
+    fn forward_pending(&mut self, server: &Child) {
+        for received in self.0.pending() {
+            forward(server, received);
+        }
+    }
+
+    /// Action: reap `server`, forwarding every signal until it has gone.
+    /// A SIGCHLD that comes between `try_wait` and `wait` is pending, so
+    /// `wait` returns at once.
+    fn wait(&mut self, server: &mut Child) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = server.try_wait()? {
+                return Ok(status);
+            }
+            for received in self.0.wait() {
+                forward(server, received);
+            }
+        }
+    }
+}
+
+/// Action: the server's shutdown for one signal `start` received; nothing
+/// for SIGCHLD. A server that has exited but is not yet reaped still holds
+/// its PID, and a signal to it is lost, which is fine.
+fn forward(server: &Child, received: i32) {
+    if received != SIGCHLD {
+        let _ = stop::signal(server.id(), shutdown_signal(received));
+    }
+}
+
 /// Action: steps 1-6 of the module header; what to print, and the server
 /// to wait for with `--foreground`.
 fn launch(flags: &Start) -> Result<Launched, LaunchError> {
     // Caught from the start: a Ctrl-C while `start` mints is held until the
     // cleanup can run, rather than ending it with the run directory left.
     let signals = if flags.foreground {
-        Some(Signals::new(FORWARDED).map_err(|error| LaunchError::Io {
+        Some(Forwarder::new().map_err(|error| LaunchError::Io {
             what: "catch signals for",
             path: PathBuf::from("pgdrop start --foreground"),
             error,
@@ -231,7 +293,11 @@ fn launch(flags: &Start) -> Result<Launched, LaunchError> {
     match bring_up(&plan, signals) {
         Ok((text, server)) => Ok(Launched {
             text,
-            attached: server.map(|server| Attached { plan, server }),
+            attached: server.map(|(server, signals)| Attached {
+                plan,
+                server,
+                signals,
+            }),
         }),
         Err(error) => {
             // What `stop` would remove, less the record, which is written last.
@@ -254,17 +320,17 @@ fn look_at(dir: &Path) -> Found {
 }
 
 /// Action: steps 3-6, for a plan whose run directory exists: what to
-/// print, and with `--foreground` the server. `signals` (`--foreground`)
-/// are forwarded to the server from the moment it exists.
+/// print, and with `--foreground` the server and its signals. `signals`
+/// (`--foreground`) are forwarded to the server from the moment it exists.
 fn bring_up(
     plan: &StartPlan,
-    mut signals: Option<Signals>,
-) -> Result<(String, Option<Child>), LaunchError> {
+    mut signals: Option<Forwarder>,
+) -> Result<(String, Option<(Child, Forwarder)>), LaunchError> {
     if let Some(args) = plan.initdb_args() {
         mint(&args)?;
     }
     if let Some(signals) = &mut signals
-        && signals.pending().next().is_some()
+        && signals.interrupted()
     {
         return Err(LaunchError::Interrupted);
     }
@@ -276,11 +342,8 @@ fn bring_up(
     };
     let mut server = spawn(plan, log)?;
     let pid = server.id();
-    if let Some(signals) = signals {
-        forward(pid, signals);
-    }
     let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
-    let ready = wait_until_ready(plan, &mut server, log).and_then(|()| {
+    let ready = wait_until_ready(plan, &mut server, signals.as_mut(), log).and_then(|()| {
         std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
             what: "write",
             path: record_path,
@@ -303,20 +366,7 @@ fn bring_up(
             plan.datadir
         )
     };
-    Ok((text, plan.foreground.then_some(server)))
-}
-
-/// Action: a thread that sends the server [`shutdown_signal`] for every
-/// signal `start` receives. A signal after the server has gone finds no
-/// process, which is fine; the thread ends with `start`.
-fn forward(pid: u32, mut signals: Signals) {
-    let _ = std::thread::Builder::new()
-        .name("pgdrop-forward".to_owned())
-        .spawn(move || {
-            for received in signals.forever() {
-                let _ = stop::signal(pid, shutdown_signal(received));
-            }
-        });
+    Ok((text, signals.map(|signals| (server, signals))))
 }
 
 /// Action: a fresh `<tmp>/pgdrop-<pid>-<nonce>`, `0700` (the server's
@@ -425,10 +475,12 @@ fn stderr_copy() -> io::Result<Stdio> {
 
 /// Action: step 5. A refused connection is the server still starting
 /// (no socket yet, or "the database system is starting up"); any failure
-/// is retried while the server lives.
+/// is retried while the server lives. `signals` (`--foreground`) are
+/// forwarded between attempts.
 fn wait_until_ready(
     plan: &StartPlan,
     server: &mut Child,
+    mut signals: Option<&mut Forwarder>,
     log_path: Option<&Path>,
 ) -> Result<(), LaunchError> {
     let log = || log_path.map(|path| std::fs::read_to_string(path).unwrap_or_default());
@@ -449,6 +501,9 @@ fn wait_until_ready(
         if let Ok(mut connection) = Connection::connect(&conninfo) {
             let _ = connection.terminate();
             return Ok(());
+        }
+        if let Some(signals) = signals.as_deref_mut() {
+            signals.forward_pending(server);
         }
         let status = server.try_wait().map_err(|error| LaunchError::Io {
             what: "wait for",

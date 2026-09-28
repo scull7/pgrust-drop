@@ -55,3 +55,18 @@ writes to it directly (`cancel.c:31`), because the main thread holds `std`'s
 - Interactive mode's `siglongjmp` out of waiting for input
   (`common.c:315`-`:319`) has no Rust equivalent; NAT-405's line-editor slice
   handles SIGINT at the prompt through the editor instead.
+
+## Amendment 2026-09-27: `pgdrop start --foreground` uses it too
+
+`pgdrop start --foreground` (NAT-409) stays attached to the server it
+starts. It must survive SIGINT, SIGTERM, SIGHUP and SIGQUIT and forward them
+to the server, as pg_ctl forwards SIGINT while it waits for a server to start
+(`src/bin/pg_ctl/pg_ctl.c:851`-`:872`). It uses the same crate, safe API only:
+`signal_hook::iterator::Signals` on a thread of its own, which sends the
+server its shutdown signal through `pgdrop stop`'s `kill`. `pgdrop` stays
+`#![deny(unsafe_code)]`.
+
+This adds no dependency. `signal-hook` is already in `pgdrop`'s tree through
+`rpsql` (this ADR) and through pgrust, whose whole transitive tree is
+approved for `pgdrop` (owner, 2026-09-23; ADR-0001's second amendment).
+`pgdrop` now names it directly, and `Cargo.lock` gains only that edge.

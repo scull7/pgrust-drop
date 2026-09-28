@@ -18,6 +18,19 @@
 //! A failure after step 1 stops the server if it was spawned, then removes
 //! what `stop` would have removed: never a data directory that was there
 //! before `start` ran ([`crate::start::Origin`]).
+//!
+//! ## `--foreground`
+//!
+//! The same steps, attached: the server stays in `start`'s process group,
+//! its output goes to `start`'s stderr (stdout carries only step 7), and
+//! after step 7 `start` waits for it to exit, removes what `stop` would
+//! remove, and exits 0 if the server did. SIGINT, SIGTERM and SIGHUP to
+//! `start` are forwarded to the server as SIGINT, a fast shutdown, and
+//! SIGQUIT as SIGQUIT, an immediate one ([`shutdown_signal`];
+//! `postmaster.c:2052`-`:2062`). That is pg_ctl's
+//! `trap_sigint_during_startup` (`pg_ctl.c:851`-`:872`), which forwards
+//! SIGINT while pg_ctl waits for the server, kept for the server's whole
+//! life. `pgdrop stop` works on a foreground cluster as on any other.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -27,6 +40,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use rlibpq::connection::Connection;
 use rlibpq::conninfo::{Env, parse_conninfo};
@@ -44,8 +60,8 @@ const RUN_DIR_ATTEMPTS: u64 = 16;
 #[derive(Debug)]
 pub enum LaunchError {
     Plan(StartError),
-    /// `--foreground` is the next slice of NAT-409.
-    Foreground,
+    /// `--foreground` was sent a signal before the server was spawned.
+    Interrupted,
     Io {
         what: &'static str,
         path: PathBuf,
@@ -53,23 +69,34 @@ pub enum LaunchError {
     },
     /// rinitdb failed; what it printed.
     Initdb(Vec<u8>),
-    /// The server exited before it accepted a connection; its log.
+    /// The server exited before it accepted a connection; its log, `None`
+    /// when it went to stderr (`--foreground`).
     ServerExited {
         status: ExitStatus,
-        log: String,
+        log: Option<String>,
     },
     /// The server did not accept a connection within [`WAIT`]; its log.
     NotReady {
-        log: String,
+        log: Option<String>,
     },
+    /// `--foreground`: the server exited unsuccessfully after it was ready.
+    ServerFailed(ExitStatus),
+}
+
+/// `"; its log:\n…"`, or where it went instead.
+fn log_tail(log: Option<&String>) -> String {
+    match log {
+        Some(log) => format!("; its log:\n{}", log.trim_end()),
+        None => "; its log is above".to_owned(),
+    }
 }
 
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LaunchError::Plan(error) => error.fmt(f),
-            LaunchError::Foreground => {
-                write!(f, "--foreground is not implemented yet (Linear NAT-409)")
+            LaunchError::Interrupted => {
+                write!(f, "interrupted before the server was started")
             }
             LaunchError::Io { what, path, error } => {
                 write!(f, "could not {what} \"{}\": {error}", path.display())
@@ -81,15 +108,16 @@ impl fmt::Display for LaunchError {
             ),
             LaunchError::ServerExited { status, log } => write!(
                 f,
-                "the server exited during startup ({status}); its log:\n{}",
-                log.trim_end()
+                "the server exited during startup ({status}){}",
+                log_tail(log.as_ref())
             ),
             LaunchError::NotReady { log } => write!(
                 f,
-                "the server did not accept a connection within {} seconds; its log:\n{}",
+                "the server did not accept a connection within {} seconds{}",
                 WAIT.as_secs(),
-                log.trim_end()
+                log_tail(log.as_ref())
             ),
+            LaunchError::ServerFailed(status) => write!(f, "the server exited ({status})"),
         }
     }
 }
@@ -98,12 +126,13 @@ impl std::error::Error for LaunchError {}
 
 /// Action: `pgdrop start`.
 pub fn run(flags: &Start, stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
-    match launch(flags) {
-        Ok(text) => {
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
-            ExitCode::SUCCESS
-        }
+    let result = launch(flags).and_then(|launched| {
+        let _ = stdout.write_all(launched.text.as_bytes());
+        let _ = stdout.flush();
+        launched.attached.map_or(Ok(()), Attached::wait)
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(stderr, "pgdrop: error: {error}");
             ExitCode::FAILURE
@@ -111,11 +140,77 @@ pub fn run(flags: &Start, stdout: &mut impl Write, stderr: &mut impl Write) -> E
     }
 }
 
-/// Action: steps 1-6 of the module header; what to print.
-fn launch(flags: &Start) -> Result<String, LaunchError> {
-    if flags.foreground {
-        return Err(LaunchError::Foreground);
+/// A started cluster: what to print, and with `--foreground` the server
+/// to wait for.
+struct Launched {
+    text: String,
+    attached: Option<Attached>,
+}
+
+/// `--foreground`'s running server and the plan that made it.
+struct Attached {
+    plan: StartPlan,
+    server: Child,
+}
+
+impl Attached {
+    /// Action: wait for the server to exit (the forwarder turns a signal
+    /// into its shutdown), then remove what `stop` would. A `pgdrop stop`
+    /// may have removed it first; what is already gone is fine.
+    fn wait(mut self) -> Result<(), LaunchError> {
+        let status = self.server.wait().map_err(|error| LaunchError::Io {
+            what: "wait for",
+            path: PathBuf::from(&self.plan.datadir),
+            error,
+        });
+        remove_what_stop_removes(&self.plan, true);
+        match status? {
+            status if status.success() => Ok(()),
+            status => Err(LaunchError::ServerFailed(status)),
+        }
     }
+}
+
+/// Action: what `stop` would remove for `plan`, from the plan rather than
+/// the record on disk (which `stop` may have taken already, or `start` not
+/// yet written).
+fn remove_what_stop_removes(plan: &StartPlan, with_record: bool) {
+    let record = plan.record().render();
+    if let Ok(mut cleanup) = stop::plan(Path::new(&plan.datadir), None, Some(&record)) {
+        if !with_record {
+            cleanup.remove_record = None;
+        }
+        let _ = stop::remove_all(&cleanup);
+    }
+}
+
+/// Pure: the signal `--foreground` sends the server for one it received:
+/// SIGQUIT is an immediate shutdown, and every other it catches a fast one,
+/// what `pgdrop stop` asks for (`postmaster.c:2056`-`:2062`). Not SIGTERM
+/// as such, a smart shutdown that waits out every client, nor SIGHUP, a
+/// reload: a hung-up terminal or a supervisor's SIGTERM means stop now.
+#[must_use]
+pub fn shutdown_signal(received: i32) -> &'static str {
+    if received == SIGQUIT { "-QUIT" } else { "-INT" }
+}
+
+/// The signals `--foreground` catches and forwards.
+pub const FORWARDED: [i32; 4] = [SIGINT, SIGTERM, SIGHUP, SIGQUIT];
+
+/// Action: steps 1-6 of the module header; what to print, and the server
+/// to wait for with `--foreground`.
+fn launch(flags: &Start) -> Result<Launched, LaunchError> {
+    // Caught from the start: a Ctrl-C while `start` mints is held until the
+    // cleanup can run, rather than ending it with the run directory left.
+    let signals = if flags.foreground {
+        Some(Signals::new(FORWARDED).map_err(|error| LaunchError::Io {
+            what: "catch signals for",
+            path: PathBuf::from("pgdrop start --foreground"),
+            error,
+        })?)
+    } else {
+        None
+    };
     let cwd = std::env::current_dir().map_err(|error| LaunchError::Io {
         what: "read the current directory",
         path: PathBuf::from("."),
@@ -133,14 +228,17 @@ fn launch(flags: &Start) -> Result<String, LaunchError> {
             return Err(LaunchError::Plan(error));
         }
     };
-    bring_up(&plan).inspect_err(|_| {
-        // What `stop` would remove, less the record, which is written last.
-        let record = plan.record().render();
-        if let Ok(mut cleanup) = stop::plan(Path::new(&plan.datadir), None, Some(&record)) {
-            cleanup.remove_record = None;
-            let _ = stop::remove_all(&cleanup);
+    match bring_up(&plan, signals) {
+        Ok((text, server)) => Ok(Launched {
+            text,
+            attached: server.map(|server| Attached { plan, server }),
+        }),
+        Err(error) => {
+            // What `stop` would remove, less the record, which is written last.
+            remove_what_stop_removes(&plan, false);
+            Err(error)
         }
-    })
+    }
 }
 
 /// Action: what `--datadir` names, before `start` touches it. A symbolic
@@ -155,16 +253,34 @@ fn look_at(dir: &Path) -> Found {
     }
 }
 
-/// Action: steps 3-6, for a plan whose run directory exists.
-fn bring_up(plan: &StartPlan) -> Result<String, LaunchError> {
+/// Action: steps 3-6, for a plan whose run directory exists: what to
+/// print, and with `--foreground` the server. `signals` (`--foreground`)
+/// are forwarded to the server from the moment it exists.
+fn bring_up(
+    plan: &StartPlan,
+    mut signals: Option<Signals>,
+) -> Result<(String, Option<Child>), LaunchError> {
     if let Some(args) = plan.initdb_args() {
         mint(&args)?;
     }
+    if let Some(signals) = &mut signals
+        && signals.pending().next().is_some()
+    {
+        return Err(LaunchError::Interrupted);
+    }
     let log_path = Path::new(&plan.run_dir).join(SERVER_LOG);
-    let mut server = spawn(plan, &log_path)?;
+    let log = if plan.foreground {
+        None
+    } else {
+        Some(log_path.as_path())
+    };
+    let mut server = spawn(plan, log)?;
     let pid = server.id();
+    if let Some(signals) = signals {
+        forward(pid, signals);
+    }
     let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
-    let ready = wait_until_ready(plan, &mut server, &log_path).and_then(|()| {
+    let ready = wait_until_ready(plan, &mut server, log).and_then(|()| {
         std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
             what: "write",
             path: record_path,
@@ -178,7 +294,7 @@ fn bring_up(plan: &StartPlan) -> Result<String, LaunchError> {
         let _ = server.wait();
         return Err(error);
     }
-    Ok(if plan.json {
+    let text = if plan.json {
         plan.json(pid)
     } else {
         format!(
@@ -186,7 +302,21 @@ fn bring_up(plan: &StartPlan) -> Result<String, LaunchError> {
             plan.uri(),
             plan.datadir
         )
-    })
+    };
+    Ok((text, plan.foreground.then_some(server)))
+}
+
+/// Action: a thread that sends the server [`shutdown_signal`] for every
+/// signal `start` receives. A signal after the server has gone finds no
+/// process, which is fine; the thread ends with `start`.
+fn forward(pid: u32, mut signals: Signals) {
+    let _ = std::thread::Builder::new()
+        .name("pgdrop-forward".to_owned())
+        .spawn(move || {
+            for received in signals.forever() {
+                let _ = stop::signal(pid, shutdown_signal(received));
+            }
+        });
 }
 
 /// Action: a fresh `<tmp>/pgdrop-<pid>-<nonce>`, `0700` (the server's
@@ -247,25 +377,50 @@ fn mint(args: &[String]) -> Result<(), LaunchError> {
     }
 }
 
-/// Action: `<this binary> postgres <server args>`, detached; see step 4.
-fn spawn(plan: &StartPlan, log_path: &Path) -> Result<Child, LaunchError> {
+/// Action: `<this binary> postgres <server args>`. With a log file,
+/// detached (step 4); without one (`--foreground`), in this process group,
+/// its stdout and stderr both this process's stderr.
+fn spawn(plan: &StartPlan, log_path: Option<&Path>) -> Result<Child, LaunchError> {
     let io_error = |what, path: &Path| {
         let path = path.to_path_buf();
         move |error| LaunchError::Io { what, path, error }
     };
     let exe = std::env::current_exe().map_err(io_error("find", Path::new("pgdrop")))?;
-    let log = File::create(log_path).map_err(io_error("create", log_path))?;
-    let log_too = log.try_clone().map_err(io_error("open", log_path))?;
+    let (out, err) = match log_path {
+        Some(log_path) => {
+            let log = File::create(log_path).map_err(io_error("create", log_path))?;
+            let log_too = log.try_clone().map_err(io_error("open", log_path))?;
+            (Stdio::from(log), Stdio::from(log_too))
+        }
+        None => (
+            stderr_copy().map_err(io_error("duplicate", Path::new("stderr")))?,
+            Stdio::inherit(),
+        ),
+    };
     let mut command = Command::new(&exe);
     command
         .arg("postgres")
         .args(plan.server_args())
         .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(log_too);
+        .stdout(out)
+        .stderr(err);
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    if log_path.is_some() {
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    }
     command.spawn().map_err(io_error("run", &exe))
+}
+
+/// Action: a copy of this process's stderr, for the server's stdout.
+#[cfg(unix)]
+fn stderr_copy() -> io::Result<Stdio> {
+    use std::os::fd::AsFd;
+    Ok(Stdio::from(io::stderr().as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(not(unix))]
+fn stderr_copy() -> io::Result<Stdio> {
+    Ok(Stdio::inherit())
 }
 
 /// Action: step 5. A refused connection is the server still starting
@@ -274,9 +429,9 @@ fn spawn(plan: &StartPlan, log_path: &Path) -> Result<Child, LaunchError> {
 fn wait_until_ready(
     plan: &StartPlan,
     server: &mut Child,
-    log_path: &Path,
+    log_path: Option<&Path>,
 ) -> Result<(), LaunchError> {
-    let log = || std::fs::read_to_string(log_path).unwrap_or_default();
+    let log = || log_path.map(|path| std::fs::read_to_string(path).unwrap_or_default());
     // Nothing from the environment or the service files: the URI is the
     // whole of it, so a PGSSLMODE or PGOPTIONS cannot keep `start` waiting.
     let conninfo = parse_conninfo(plan.uri().as_bytes())
@@ -297,7 +452,7 @@ fn wait_until_ready(
         }
         let status = server.try_wait().map_err(|error| LaunchError::Io {
             what: "wait for",
-            path: log_path.to_path_buf(),
+            path: PathBuf::from(&plan.datadir),
             error,
         })?;
         if let Some(status) = status {
@@ -307,5 +462,29 @@ fn wait_until_ready(
             return Err(LaunchError::NotReady { log: log() });
         }
         std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `postmaster.c:2056`-`:2062`: SIGINT is a fast shutdown, SIGQUIT an
+    /// immediate one; SIGTERM (smart) and SIGHUP (reload) become fast.
+    #[test]
+    fn every_caught_signal_becomes_a_fast_shutdown_but_sigquit() {
+        assert_eq!(shutdown_signal(SIGINT), "-INT");
+        assert_eq!(shutdown_signal(SIGTERM), "-INT");
+        assert_eq!(shutdown_signal(SIGHUP), "-INT");
+        assert_eq!(shutdown_signal(SIGQUIT), "-QUIT");
+    }
+
+    #[test]
+    fn a_log_that_went_to_stderr_is_said_to_be_above() {
+        assert_eq!(log_tail(None), "; its log is above");
+        assert_eq!(
+            log_tail(Some(&"FATAL:  no\n\n".to_owned())),
+            "; its log:\nFATAL:  no"
+        );
     }
 }

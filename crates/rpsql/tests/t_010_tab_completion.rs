@@ -323,6 +323,7 @@ fn assert_history_file_is_0600(historyfile: &Path) {
 /// which turned `\warn cd` into `warn cd`, a query buffer line (NAT-405).
 /// Lines of odd and even length both come after an Enter here, and the
 /// multi-line statement still waits for its semicolon (`mainloop.c:420`).
+/// The same holds where the next line is COPY data, not the editor's.
 #[test]
 fn a_paste_keeps_the_first_byte_of_every_line() {
     let Some(cluster) = Cluster::start(PASTE_PORT) else {
@@ -350,13 +351,31 @@ fn a_paste_keeps_the_first_byte_of_every_line() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    // The Enter ending `COPY … FROM STDIN;` may share a read with the first
+    // byte of the data, which is the COPY reader's `fgets` (`copy.c:610`),
+    // not the line editor's: a lost `x` stored `yz` and began the next query
+    // `xselect`. The two COPY lines are 18 and 19 bytes long, so their Enters
+    // fall on both sides of a two-byte read.
+    check_completion(
+        &mut h,
+        rpsql,
+        b"create table t (a text);\ncopy t from stdin;\nxyz\nuvw\n\\.\n\
+          select string_agg(a, ',' order by a) from t;\n\
+          copy t  from stdin;\npq\n\\.\n\
+          select string_agg(a, '+' order by a) from t;\n",
+        "(?s)\\nuvw,xyz\\r?\\n.*\\npq\\+uvw\\+xyz\\r?\\n",
+        "pasted COPY data keeps its first byte, and so does the next query",
+    );
     let status = h.quit();
     assert!(status.success(), "rpsql returned {status}");
     assert_history_file_is_0600(&historyfile);
     assert_eq!(
         String::from_utf8_lossy(&std::fs::read(&historyfile).expect("a history file")),
         "\\echo 'background_psql: ready'\n\\warn 'background_psql: ready'\n\
-         \\echo ab\n\\warn cd\n\\echo e\n\\echo fgh\nselect\u{1}4 + 2;\n\\echo end\n\\q\n",
+         \\echo ab\n\\warn cd\n\\echo e\n\\echo fgh\nselect\u{1}4 + 2;\n\\echo end\n\
+         create table t (a text);\ncopy t from stdin;\n\
+         select string_agg(a, ',' order by a) from t;\ncopy t  from stdin;\n\
+         select string_agg(a, '+' order by a) from t;\n\\q\n",
         "the history file holds each pasted line whole"
     );
 }

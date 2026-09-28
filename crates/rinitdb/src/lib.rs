@@ -306,8 +306,8 @@ fn create_cluster(
     };
     // initdb.c:3504.
     let _ = stdout.write_all(b"\n");
-    let script = single_user::fixup_script(plan, password.as_ref());
-    let session = server.as_ref().map(|server| (server, script.as_slice()));
+    let sessions = single_user::fixup_sessions(plan, password.as_ref());
+    let session = server.as_ref().map(|server| (server, sessions.as_slice()));
 
     let mut progress = Progress::default();
     let created =
@@ -428,13 +428,13 @@ fn step<T>(
 /// what `bootstrap_template1` (`:3097`) makes in C, so they are its
 /// progress line; the template already carries everything else the
 /// post-bootstrap session (`:3108`) adds, so its line runs only the
-/// single-user session, where C runs its own (`:3115`), when `session` has
-/// one to run.
+/// single-user sessions, where C runs its own (`:3115`), when `session` has
+/// any to run.
 fn initialize_data_directory(
     plan: &CreatePlan,
     options: &Options,
     settings: &Settings,
-    session: Option<(&single_user::Server, &[single_user::SqlStatement])>,
+    session: Option<(&single_user::Server, &[single_user::Session])>,
     progress: &mut Progress,
     stdout: &mut impl Write,
 ) -> Result<(), InitdbError> {
@@ -478,8 +478,10 @@ fn initialize_data_directory(
         image::expand(&entries(rest)?, &plan.pgdata, plan.perm)
     })?;
     step(stdout, report::PERFORMING_POST_BOOTSTRAP, || {
-        if let Some((server, script)) = session {
-            single_user::run(server, &plan.pgdata, script)?;
+        if let Some((server, sessions)) = session {
+            for session in sessions {
+                single_user::run(server, &plan.pgdata, session)?;
+            }
         }
         Ok(())
     })

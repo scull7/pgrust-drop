@@ -10,7 +10,7 @@
 //!
 //! The same session runs against rpsql and, where this lane has one, against
 //! C psql. Past upstream's pattern checks, the history file each writes on
-//! `\q` (`finishInput`, `input.c:535`) is diffed byte for byte, when C psql's
+//! `\q` (`finishInput`, `input.c:540`) is diffed byte for byte, when C psql's
 //! was written by GNU readline: libedit writes its own format, so on such a
 //! lane that one diff is flagged as skipped.
 //!
@@ -300,7 +300,21 @@ fn session(cluster: &Cluster, psql: &Path, ours: bool) -> Vec<u8> {
     let status = h.quit();
     assert!(status.success(), "{} returned {status}", psql.display());
 
+    if ours {
+        assert_history_file_is_0600(&historyfile);
+    }
     std::fs::read(&historyfile).expect("psql wrote its history file")
+}
+
+/// `saveHistory` creates the file `0600` (`input.c:452`): its entries can
+/// carry passwords.
+fn assert_history_file_is_0600(historyfile: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(historyfile)
+        .expect("a history file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "history file mode {mode:o}");
 }
 
 /// Not upstream, and rpsql only: lines pasted in one write, where each line's
@@ -338,6 +352,7 @@ fn a_paste_keeps_the_first_byte_of_every_line() {
     }
     let status = h.quit();
     assert!(status.success(), "rpsql returned {status}");
+    assert_history_file_is_0600(&historyfile);
     assert_eq!(
         String::from_utf8_lossy(&std::fs::read(&historyfile).expect("a history file")),
         "\\echo 'background_psql: ready'\n\\warn 'background_psql: ready'\n\

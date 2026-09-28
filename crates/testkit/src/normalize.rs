@@ -84,13 +84,16 @@ pub const SYSTEM_IDENTIFIER: Normalizer = Normalizer {
 /// Upstream: `src/bin/initdb/initdb.c` prints
 /// `puts("initdb (PostgreSQL) " PG_VERSION)`, and `configure.ac`'s
 /// `--with-extra-version` is the only thing that appends a parenthesized
-/// suffix to that `PG_VERSION`.
+/// suffix to that `PG_VERSION`. `initdb -s` and `-d` print the same
+/// `PG_VERSION` again as the first line of their settings block,
+/// `VERSION=%s` (`initdb.c:2807`), and that line is the other shape handled.
 ///
 /// Unlike the three above this one *removes* rather than substitutes: the
 /// candidate has no suffix at all, so writing a placeholder would move the
 /// difference instead of settling it. It is deliberately narrow — it fires
 /// only on a whole line of the shape `<progname> (PostgreSQL) <version>
-/// (<extra>)` and never touches the version itself, so `18.6` and `19.1`
+/// (<extra>)` or `VERSION=<version> (<extra>)` and never touches the version
+/// itself, so `18.6` and `19.1`
 /// still differ after it. A normalizer that made those two compare equal
 /// would destroy exactly what the gate exists to prove.
 pub const EXTRA_VERSION: Normalizer = Normalizer {
@@ -205,6 +208,9 @@ const SYSTEM_IDENTIFIER_LABEL: &str = "Database system identifier:";
 /// The fixed middle of upstream's version line, the only anchor this file has
 /// for one: `progname`, the version and any suffix are all build-dependent.
 const VERSION_MARKER: &str = " (PostgreSQL) ";
+
+/// The settings block's version line, `VERSION=%s` (`initdb.c:2807`).
+const SETTINGS_VERSION: &str = "VERSION=";
 
 fn timing(text: &str) -> String {
     map_lines(text, |line| {
@@ -383,6 +389,13 @@ fn extra_version(text: &str) -> String {
 /// without them the marker would fire in the middle of prose, over a token
 /// that is not a version, or over a trailing word that is not a suffix at all.
 fn strip_extra_version(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix(SETTINGS_VERSION) {
+        let (version, suffix) = rest.split_once(' ')?;
+        if !is_version(version) || !is_parenthesized(suffix) {
+            return None;
+        }
+        return Some(format!("{SETTINGS_VERSION}{version}"));
+    }
     let (progname, rest) = line.split_once(VERSION_MARKER)?;
     let (version, suffix) = rest.split_once(' ')?;
     if !is_progname(progname) || !is_version(version) || !is_parenthesized(suffix) {
@@ -553,6 +566,28 @@ mod tests {
         assert_eq!(
             extra_version("initdb (PostgreSQL) 18.6 (a (nested) one)"),
             "initdb (PostgreSQL) 18.6 (a (nested) one)"
+        );
+    }
+
+    #[test]
+    fn the_settings_block_version_line_loses_its_suffix_too() {
+        assert_eq!(
+            extra_version("VERSION=18.6 (Ubuntu 18.6-1.pgdg24.04+2)\nPGDATA=data\n"),
+            "VERSION=18.6\nPGDATA=data\n"
+        );
+        for kept in [
+            "VERSION=18.6",
+            "VERSION=18.6 trailing",
+            "VERSION=x (Ubuntu)",
+            "VERSION=18.6 (a (nested) one)",
+            " VERSION=18.6 (Ubuntu)",
+            "PG_VERSION=18.6 (Ubuntu)",
+        ] {
+            assert_eq!(extra_version(kept), kept);
+        }
+        assert_ne!(
+            extra_version("VERSION=18.6 (Ubuntu)"),
+            extra_version("VERSION=18.5")
         );
     }
 

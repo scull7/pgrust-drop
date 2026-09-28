@@ -13,8 +13,10 @@
 //! needed for it. The normalizers are `pg-ctl-directory` — the closing
 //! instructions name the `pg_ctl` beside initdb's own `argv[0]`, and the two
 //! binaries live in two directories — and, for `-s` and `-d` only,
-//! `install-directories` for the same reason and `backend-log` for the
-//! bootstrap backend's DEBUG log, which this port has no backend to write.
+//! `install-directories` for the same reason, `extra-version` for a
+//! distribution's suffix on the block's `VERSION=` line, and `backend-log`
+//! for the bootstrap backend's DEBUG log, which this port has no backend to
+//! write.
 //! Both run under `LC_ALL=C`, `TZ=UTC` and
 //! a `USER` that is the real user, because this port reads the effective user
 //! from `USER` and does not consult the environment's locale
@@ -31,8 +33,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use testkit::normalize::{
-    BACKEND_LOG, INSTALL_DIRECTORIES, Normalizer, PATCHED_SUCCESS, PATCHED_SUCCESS_LINE,
-    PG_CTL_DIRECTORY,
+    BACKEND_LOG, EXTRA_VERSION, INSTALL_DIRECTORIES, Normalizer, PATCHED_SUCCESS,
+    PATCHED_SUCCESS_LINE, PG_CTL_DIRECTORY,
 };
 use testkit::{CommandOutcome, Environment, Scope, reference};
 
@@ -279,7 +281,7 @@ fn show_matches_reference_initdb() {
             "-s", "-U", "postgres", "-E", "LATIN1", "-T", "nope", "./data//",
         ],
         nothing,
-        &[INSTALL_DIRECTORIES],
+        &[EXTRA_VERSION, INSTALL_DIRECTORIES],
         |cwd| assert!(!cwd.join("data").exists(), "-s made {}", cwd.display()),
     );
 }
@@ -292,7 +294,7 @@ fn show_with_the_notices_matches_reference_initdb() {
         "show-notices",
         &["--no-clean", "-U", "postgres", "--show", "--debug", "data"],
         nothing,
-        &[INSTALL_DIRECTORIES],
+        &[EXTRA_VERSION, INSTALL_DIRECTORIES],
         |cwd| assert!(!cwd.join("data").exists(), "-s made {}", cwd.display()),
     );
 }
@@ -306,7 +308,7 @@ fn debug_and_no_clean_match_reference_initdb() {
         "debug",
         &[&TEMPLATE_ARGS[..], &["-d", "-n", "--no-sync", "data"]].concat(),
         nothing,
-        &[INSTALL_DIRECTORIES, BACKEND_LOG],
+        &[EXTRA_VERSION, INSTALL_DIRECTORIES, BACKEND_LOG],
         |_| (),
     );
 }

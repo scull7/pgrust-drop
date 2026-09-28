@@ -30,6 +30,9 @@ harness = false
 usage = { workspace = true }
 rinitdb = { workspace = true }
 rpsql = { workspace = true }
+# Workspace-internal (MIT, ported from C; already in the build through rpsql):
+# `start` waits for the server by connecting until ReadyForQuery (NAT-409).
+rlibpq = { workspace = true }
 main_main = { workspace = true }
 seams_init = { workspace = true }
 ipc = { workspace = true }
@@ -37,10 +40,6 @@ elog = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }
-# Workspace-internal, test-only: tests/pg_config_agreement.rs compares
-# rinitdb's pg_config constants with rlibpq's (NAT-428). rlibpq is already in
-# the build through rpsql; this edge only makes it nameable from a test.
-rlibpq = { workspace = true }
 
 [lints]
 workspace = true

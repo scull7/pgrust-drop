@@ -5,7 +5,7 @@
 //! usage-rs parser: an applet is selected either by `argv[0]`'s basename (a
 //! symlink named `initdb`) or by the first word (`pgdrop initdb`), and every
 //! remaining word is handed over verbatim. Only pgdrop's own surface —
-//! `start`, `install-links`, `--help`, `--version` — is a usage-rs command
+//! `start`, `stop`, `install-links`, `--help`, `--version` — is a usage-rs command
 //! (ADR-0004).
 
 use std::ffi::{OsStr, OsString};
@@ -15,6 +15,7 @@ use usage::{Cli, Subcommands};
 
 use crate::install::InstallLinks;
 use crate::start::Start;
+use crate::stop::Stop;
 
 /// The tools pgdrop can stand in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,8 @@ enum Command {
     Postgres,
     /// Start an ephemeral cluster for a test suite
     Start(Start),
+    /// Stop a cluster `start` started, and remove what it made
+    Stop(Stop),
     /// Create initdb, psql and postgres symlinks to this binary in DIR
     InstallLinks(InstallLinks),
 }
@@ -81,6 +84,8 @@ pub enum Dispatch {
     Applet(Applet, Vec<OsString>),
     /// `pgdrop start …`
     Start(Start),
+    /// `pgdrop stop …`
+    Stop(Stop),
     /// `pgdrop install-links DIR`
     InstallLinks(InstallLinks),
     /// Rendered root help page.
@@ -139,6 +144,9 @@ fn root(words: &[OsString]) -> Dispatch {
         Ok(Pgdrop {
             command: Command::Start(start),
         }) => Dispatch::Start(start),
+        Ok(Pgdrop {
+            command: Command::Stop(stop),
+        }) => Dispatch::Stop(stop),
         Ok(Pgdrop {
             command: Command::InstallLinks(args),
         }) => Dispatch::InstallLinks(args),
@@ -247,6 +255,23 @@ mod tests {
     }
 
     #[test]
+    fn stop_parses_its_datadir() {
+        match dispatch(&argv(&["pgdrop", "stop", "--datadir", "/tmp/d"])) {
+            Dispatch::Stop(stop) => assert_eq!(
+                stop,
+                Stop {
+                    datadir: Some("/tmp/d".into())
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&argv(&["pgdrop", "stop"])) {
+            Dispatch::Stop(stop) => assert_eq!(stop, Stop::default()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn install_links_parses_its_directory_and_force() {
         match dispatch(&argv(&["pgdrop", "install-links", "/tmp/bin"])) {
             Dispatch::InstallLinks(args) => assert_eq!(
@@ -279,7 +304,14 @@ mod tests {
     fn root_help_version_and_errors() {
         match dispatch(&argv(&["pgdrop", "--help"])) {
             Dispatch::PrintHelp(text) => {
-                for name in ["initdb", "psql", "postgres", "start", "install-links"] {
+                for name in [
+                    "initdb",
+                    "psql",
+                    "postgres",
+                    "start",
+                    "stop",
+                    "install-links",
+                ] {
                     assert!(text.contains(name), "help lacks {name}:\n{text}");
                 }
             }

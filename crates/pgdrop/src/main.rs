@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use pgdrop::dispatch::{self, Applet, Dispatch};
-use pgdrop::{install, postgres};
+use pgdrop::{install, launch, postgres, stop};
 
 fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
@@ -30,13 +30,8 @@ fn main() -> ExitCode {
             postgres::run(argv0, &applet_args, &mut std::io::stdout())
         }
         Dispatch::InstallLinks(link_args) => install::run(&link_args, &mut stdout, &mut stderr),
-        Dispatch::Start(_) => {
-            let _ = writeln!(
-                stderr,
-                "pgdrop: error: `start` is not implemented yet (Linear NAT-409)"
-            );
-            ExitCode::FAILURE
-        }
+        Dispatch::Start(start_args) => launch::run(&start_args, &mut stdout, &mut stderr),
+        Dispatch::Stop(stop_args) => stop::run(&stop_args, &mut stderr),
         Dispatch::PrintHelp(text) => {
             let _ = stdout.write_all(text.as_bytes());
             ExitCode::SUCCESS

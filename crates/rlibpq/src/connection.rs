@@ -363,7 +363,7 @@ pub fn startup_parameters(conninfo: &ConnInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
     parameters
 }
 
-/// `pg_strong_random`, `src/port/pg_strong_random.c:140` — the arm that reads
+/// `pg_strong_random`, `src/port/pg_strong_random.c:150` — the arm that reads
 /// `/dev/urandom` when there is no OpenSSL and no Windows CryptoAPI, which is
 /// this build.
 ///
@@ -2824,7 +2824,7 @@ mod tests {
 
     /// The blocking calls are refused in pipeline mode before anything is
     /// sent or read, with upstream's message (`fe-exec.c:2378`), and so is
-    /// `PQsendQuery` (`:1461`).
+    /// `PQsendQuery`, in `PQsendQueryInternal` (`:1461`).
     #[test]
     fn a_blocking_call_in_pipeline_mode_sends_nothing() {
         let mut script = auth_ok();

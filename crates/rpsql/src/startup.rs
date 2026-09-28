@@ -147,7 +147,7 @@ pub struct Options {
     pub positional: Vec<String>,
 }
 
-/// One entry of `SimpleActionList` (`startup.c:53`-`:58`).
+/// One entry of `SimpleActionList`, a `SimpleActionListCell` (`startup.c:53`-`:58`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// `ACT_SINGLE_QUERY`: `-c` with SQL.

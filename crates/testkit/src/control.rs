@@ -38,7 +38,7 @@ const OFF_DATA_CHECKSUM_VERSION: usize = 252;
 /// The fields of `pg_control` the stolen assertions read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlData {
-    /// `Database system identifier` (`pg_controldata.c:242`).
+    /// `Database system identifier` (`src/bin/pg_controldata/pg_controldata.c:242`).
     pub system_identifier: u64,
     /// `pg_control version number` (`pg_controldata.c:238`).
     pub pg_control_version: u32,

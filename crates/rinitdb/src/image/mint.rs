@@ -59,9 +59,9 @@ pub const HOST_QUERY: &str = "SELECT coalesce((SELECT collversion FROM pg_collat
 /// backend's stdout.
 ///
 /// Each non-NULL attribute of a result row is one line,
-/// `\t%2d: <name> = "<value>"\t(typeid = …)` (`printatt`, called by
-/// `debugtup`, `src/backend/access/common/printtup.c:423` and `:462` at
-/// `REL_18_6`). The value is not escaped, so this takes it up to the `"\t`
+/// `\t%2d: <name> = "<value>"\t(typeid = …)` (`printatt`,
+/// `src/backend/access/common/printtup.c:423`, called by `debugtup`, `:462`,
+/// at `REL_18_6`). The value is not escaped, so this takes it up to the `"\t`
 /// that closes it. `None` when no such line is there: the column was NULL,
 /// or the statement failed (single-user mode still exits 0; the error went
 /// to stderr).

@@ -468,8 +468,8 @@ fn utf_mblen(c: u8) -> usize {
     }
 }
 
-/// `pg_mule_mblen`, `wchar.c:815`, over `IS_LC1`, `IS_LCPRV1`, `IS_LC2`,
-/// `IS_LCPRV2` (`pg_wchar.h:126`, `:155`, `:147`, `:167`).
+/// `pg_mule_mblen`, `wchar.c:815`, over `IS_LC1` (`pg_wchar.h:126`),
+/// `IS_LCPRV1` (`:155`), `IS_LC2` (`:147`) and `IS_LCPRV2` (`:167`).
 fn mule_mblen(c: u8) -> usize {
     if (0x81..=0x8d).contains(&c) {
         2

@@ -583,7 +583,7 @@ fn exec_command_g(
         }
         return CommandResult::Error;
     }
-    // `command.c:1771`-`:1777`.
+    // `command.c:1772`-`:1778`.
     ctx.pset.gfname = args.fname.map(filename);
     if cmd == "gx" {
         // Save the settings if not done already, then force expanded=on

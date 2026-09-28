@@ -2614,10 +2614,8 @@ mod tests {
             assert!(send_query(
                 &mut executor,
                 b"select 1",
-                &mut Session {
-                    pset: &mut pset,
-                    vars: &mut vars,
-                },
+                &mut pset,
+                &mut vars,
                 &mut CommandSource::file(&mut empty),
                 None,
                 &mut output,

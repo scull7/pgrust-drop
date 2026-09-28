@@ -102,7 +102,8 @@ applies the matching `main` ruleset (owner-run, needs `gh` as a repository
 admin). CI runs musl first (`container: alpine`), then gnu and apple via
 `needs: musl`, on pull requests, pushes to `main` and a twice-weekly schedule
 (so `main` holds a warm cache for every lane, NAT-598); all three are required
-checks, each budgeted under 5 minutes warm. Docker is not a
+checks, each budgeted under 5 minutes warm and stopped at 20 (`timeout-minutes`,
+NAT-607), so a hung test fails fast. Docker is not a
 dependency of the product, the harness or the developer workflow — CI's
 container does not change that.
 

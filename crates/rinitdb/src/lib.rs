@@ -247,7 +247,7 @@ fn preamble(run: &Run<'_>, settings: &Settings, stdout: &mut impl Write, stderr:
         text.push_str(&report::owned_by(user));
     }
     text.push_str(&report::locale_configuration(
-        &report::Locales::of_template(settings),
+        &report::Locales::of_template(settings, cluster::catalog_locales(run.options)),
     ));
     if run.options.encoding.is_none() {
         text.push_str(&report::default_encoding(cluster::TEMPLATE_ENCODING));

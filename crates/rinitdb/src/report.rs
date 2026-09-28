@@ -36,14 +36,14 @@ pub struct Locales<'a> {
 }
 
 impl<'a> Locales<'a> {
-    /// A cluster made from the template: `lc_collate` and `lc_ctype` are C
-    /// (anything else is refused, `crate::cluster::check_template_can_make`)
-    /// and the other four are what `postgresql.conf` gets.
+    /// A cluster made from the template: `lc_collate` and `lc_ctype` as
+    /// `crate::cluster::catalog_locales` names them (a C locale; anything
+    /// else is refused), and the other four as `postgresql.conf` gets them.
     #[must_use]
-    pub fn of_template(settings: &'a Settings) -> Self {
+    pub fn of_template(settings: &'a Settings, (lc_collate, lc_ctype): (&'a str, &'a str)) -> Self {
         Self {
-            lc_collate: "C",
-            lc_ctype: "C",
+            lc_collate,
+            lc_ctype,
             lc_messages: &settings.lc_messages,
             lc_monetary: &settings.lc_monetary,
             lc_numeric: &settings.lc_numeric,
@@ -271,7 +271,7 @@ mod tests {
     fn one_locale_line_when_all_six_agree_and_the_table_otherwise() {
         let settings = Settings::default();
         assert_eq!(
-            locale_configuration(&Locales::of_template(&settings)),
+            locale_configuration(&Locales::of_template(&settings, ("C", "C"))),
             "The database cluster will be initialized with locale \"C\".\n"
         );
         let settings = Settings {
@@ -279,7 +279,7 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            locale_configuration(&Locales::of_template(&settings)),
+            locale_configuration(&Locales::of_template(&settings, ("C", "C"))),
             "The database cluster will be initialized with this locale configuration:\n\
              \x20 locale provider:   libc\n\
              \x20 LC_COLLATE:  C\n\

@@ -269,6 +269,106 @@ fn tsdicts_ispell_and_tsearch_english_stem() {
     );
 }
 
+/// Asked of a cluster `001_initdb.pl`'s "successful creation" made: the
+/// configuration `-T`/`--set` chose, and what it does to German text.
+const TEXT_SEARCH_QUERIES: &str = "show default_text_search_config;\n\
+     select to_tsvector('Die Häuser der Stadt waren schön') as v;\n";
+
+/// `<initdb>`, from `scratch`'s [`server_env`] with no `PGDROP_POSTGRES` and
+/// `TZ` deleted, on `001_initdb.pl`'s "successful creation" command line
+/// (`t/001_initdb.pl:40`-`:59`): exit 0; the data directory and stderr.
+fn initdb_german(
+    scratch: &Path,
+    initdb: &Path,
+    first_word: Option<&str>,
+    name: &str,
+) -> (PathBuf, String) {
+    let xlogdir = scratch.join(format!("{name}-pgxlog"));
+    let pgdata = scratch.join(format!("{name}-data"));
+    std::fs::create_dir(&xlogdir).expect("mkdir $xlogdir");
+    std::fs::create_dir(&pgdata).expect("mkdir $datadir");
+    let argv: Vec<OsString> = first_word
+        .into_iter()
+        .chain([
+            "--no-sync",
+            "--text-search-config",
+            "german",
+            "--set",
+            "default_text_search_config=german",
+            "--waldir",
+        ])
+        .map(OsString::from)
+        .chain([xlogdir.into(), pgdata.clone().into()])
+        .collect();
+    let env = server_env(scratch)
+        .without(rinitdb::single_user::SERVER_ENV)
+        .without("TZ");
+    let outcome = testkit::run_in(initdb, &argv, &[], &env).expect("run initdb");
+    let stderr = outcome.stderr_text();
+    assert_eq!(outcome.status, Some(0), "{argv:?}\nstderr: {stderr}");
+    (pgdata, stderr)
+}
+
+/// NAT-383, `-T`: `001_initdb.pl`'s "successful creation" command line
+/// through `pgdrop initdb`, and pgrust then parses German with the German
+/// configuration it names. The values are the reference server's own on
+/// the reference `initdb`'s cluster, from 18.6 on this command line, and
+/// with a reference installation they are compared live as well.
+#[test]
+fn successful_creation_is_german_under_pgrust() {
+    let scratch = Scratch::new("text-search");
+    let pgrust = install(&scratch.0);
+    let pgdrop = link_pgdrop(&scratch.0, "pgdrop");
+    let (pgdata, stderr) = initdb_german(&scratch.0, &pgdrop, Some("initdb"), "ours");
+    // setup_text_search's warning (initdb.c:2859) and, when the superuser is
+    // renamed to the effective user, pgrust's own LOG lines.
+    for line in stderr.lines() {
+        assert!(
+            line == "initdb: warning: specified text search configuration \"german\" \
+                     might not match locale \"C\""
+                || line.contains(" LOG:  "),
+            "stderr: {stderr}"
+        );
+    }
+    let stdout = single(
+        &pgrust,
+        &pgdata,
+        &server_env(&scratch.0),
+        TEXT_SEARCH_QUERIES,
+    );
+    let answers = |stdout: &str| {
+        [
+            values(stdout, "default_text_search_config"),
+            values(stdout, "v"),
+        ]
+        .concat()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    let ours = answers(&stdout);
+    assert_eq!(
+        ours,
+        ["german", "'haus':2 'schon':6 'stadt':4"],
+        "stdout: {stdout}"
+    );
+
+    let Some(reference_initdb) = reference::find_or_skip("initdb") else {
+        return;
+    };
+    let Some(reference_postgres) = reference::find_or_skip("postgres") else {
+        return;
+    };
+    let (theirs, _) = initdb_german(&scratch.0, &reference_initdb, None, "theirs");
+    let stdout = single(
+        &reference_postgres,
+        &theirs,
+        &Environment::inherited(),
+        TEXT_SEARCH_QUERIES,
+    );
+    assert_eq!(answers(&stdout), ours, "stdout: {stdout}");
+}
+
 /// `<initdb> [initdb] -U alice --no-sync <pgdata>` in `scratch`'s
 /// [`server_env`] with no `PGDROP_POSTGRES`: exit 0, and nothing on stderr
 /// but pgrust's own LOG lines. pgrust's `--single` ends a session with status

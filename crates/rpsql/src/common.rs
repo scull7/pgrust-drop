@@ -393,6 +393,25 @@ pub fn accept_result(status: ExecStatus) -> bool {
     )
 }
 
+/// Action: `AcceptResult`'s `default:` arm (`common.c:445`-`:448`): a
+/// status psql has no case for — COPY BOTH, which only a replication
+/// connection returns, or SINGLE TUPLE — is an error reported by its number.
+/// The failures `accept_result` rejects by name are not reported here.
+fn report_unexpected_status(status: ExecStatus, pset: &PsqlSettings, stderr: &mut dyn Write) {
+    if !accept_result(status)
+        && !matches!(
+            status,
+            ExecStatus::PipelineAborted
+                | ExecStatus::BadResponse
+                | ExecStatus::NonfatalError
+                | ExecStatus::FatalError
+        )
+    {
+        let message = format!("unexpected PQresultStatus: {}", status.number());
+        logging::error(pset, message, stderr);
+    }
+}
+
 /// `PQresultErrorMessage`: `pqBuildErrorMessage3`'s rendering of a failed
 /// result at the configured verbosity (`common.c:1831`). Empty for a
 /// `PGRES_PIPELINE_ABORTED` result, which carries no error.
@@ -559,9 +578,15 @@ struct Results {
 
 impl Results {
     fn new(first: Vec<QueryResult>) -> Self {
-        let more = first
-            .last()
-            .is_some_and(|r| matches!(r.status(), ExecStatus::CopyIn | ExecStatus::CopyOut));
+        // After a COPY the rest is still to be read; after an error, the
+        // connection may have broken behind it, which only the next
+        // `PQgetResult` tells (`001_basic.pl:145`-`:150`).
+        let more = first.last().is_some_and(|r| {
+            matches!(
+                r.status(),
+                ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::FatalError
+            )
+        });
         Self {
             queue: first.into(),
             more,
@@ -698,6 +723,8 @@ fn exec_query_and_process_results(
         // `psql:<stdin>:2: server closed the connection unexpectedly`.
         Err(err) => {
             logging::info(pset, err.as_bytes(), stderr);
+            // `common.c:1733`.
+            check_connection(executor, pset, out, stderr);
             return (false, now());
         }
     };
@@ -710,6 +737,7 @@ fn exec_query_and_process_results(
     while let Some(current) = result {
         let status = current.status();
         if !accept_result(status) {
+            report_unexpected_status(status, pset, stderr);
             // `common.c:1825`-`:1843`: an error is reported whether or not it
             // is the last result, as `PQresultErrorMessage` renders it at the
             // configured verbosity, and kept for `\errverbose`.
@@ -717,6 +745,7 @@ fn exec_query_and_process_results(
             if !message.is_empty() {
                 logging::info(pset, &message, stderr);
             }
+            check_connection(executor, pset, out, stderr);
             clear_or_save_result(&current, pset);
             success = false;
             // `common.c:1851`: a COPY BOTH ends the loop; anything else moves
@@ -773,12 +802,16 @@ fn exec_query_and_process_results(
         }
         result = next;
     }
+    // A broken connection ends the results with its error logged, which
+    // upstream's loop reports as an error result: `CheckConnection` then
+    // (`common.c:1836`), before the `\g` file is closed.
+    check_connection(executor, pset, out, stderr);
 
     // `common.c:2252`: close the `\g` file if we opened it.
     gfile.close(vars);
 
     // `common.c:2290`: may need this to recover from conn loss during COPY.
-    if !executor.connected() {
+    if !check_connection(executor, pset, out, stderr) {
         return (false, elapsed_msec);
     }
 
@@ -803,9 +836,33 @@ fn exec_query_and_process_results(
     (success, elapsed_msec)
 }
 
+/// Action: `CheckConnection()` (`common.c:356`): is the connection still
+/// up? A lost one ends a non-interactive psql with `EXIT_BADCONN` (`:366`)
+/// once what it has printed is flushed. An interactive psql's
+/// `PQreset` (`:370`) is not reached yet: rpsql has no interactive mode
+/// (Linear NAT-405), so a lost connection there is reported as lost.
+fn check_connection(
+    executor: &dyn Executor,
+    pset: &PsqlSettings,
+    out: &mut Output<'_>,
+    stderr: &mut dyn Write,
+) -> bool {
+    if executor.connected() {
+        return true;
+    }
+    if !pset.cur_cmd_interactive {
+        logging::error(pset, "connection to server was lost", stderr);
+        out.flush_all();
+        let _ = stderr.flush();
+        std::process::exit(i32::from(EXIT_BADCONN));
+    }
+    false
+}
+
 /// `exit(EXIT_BADCONN)` after `pg_log_info(message)`, which is how
 /// `ExecQueryAndProcessResults` gives up on a connection whose protocol state
-/// it can no longer trust (`common.c:1942`, `:1989`).
+/// it can no longer trust (`common.c:1943`, `:1990`). It ends the process, so
+/// it is proved live, not by unit tests: `t_001_basic::copy_in_pipelines`.
 fn abort_connection(
     pset: &PsqlSettings,
     message: &str,
@@ -1184,10 +1241,12 @@ fn exec_pipelined(
     while let Some(current) = result.take() {
         let status = current.status();
         if !accept_result(status) {
+            report_unexpected_status(status, pset, stderr);
             let error = result_error_message(&current, pset);
             if !error.is_empty() {
                 logging::info(pset, &error, stderr);
             }
+            check_connection(executor, pset, out, stderr);
             clear_or_save_result(&current, pset);
             success = false;
             if status == ExecStatus::PipelineAborted {
@@ -1209,15 +1268,15 @@ fn exec_pipelined(
         }
 
         if matches!(status, ExecStatus::CopyIn | ExecStatus::CopyOut) && in_pipeline(executor) {
-            // `common.c:1919`: COPY breaks a pipeline's synchronisation in
-            // ways psql cannot track, so upstream gives the connection up.
-            logging::info(
+            // `common.c:1919`-`:1943`: COPY breaks a pipeline's
+            // synchronisation in ways psql cannot track, so upstream gives
+            // the connection up and exits with `EXIT_BADCONN` on the spot.
+            abort_connection(
                 pset,
-                b"COPY in a pipeline is not supported, aborting connection",
+                "COPY in a pipeline is not supported, aborting connection",
+                out,
                 stderr,
             );
-            executor.abandon();
-            return false;
         }
 
         if status == ExecStatus::PipelineSync {
@@ -1304,8 +1363,10 @@ fn exec_pipelined(
     set_pipeline_variables(&pset.pipeline, vars);
 
     if let Some(ConnectionLost(err)) = broken {
-        // At info level, as the non-pipeline path reports it (`common.c:1834`).
+        // At info level, as the non-pipeline path reports it (`common.c:1834`),
+        // then `CheckConnection` (`:1836`).
         logging::info(pset, err.as_bytes(), stderr);
+        check_connection(executor, pset, out, stderr);
         return false;
     }
     success
@@ -1532,17 +1593,41 @@ mod tests {
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let ok = send(
-            &mut Broken,
-            b"select 1",
-            &mut PsqlSettings::default(),
-            &mut out,
-            &mut err,
-        );
+        // Interactive, so that `CheckConnection` reports the loss rather
+        // than ending the test process with `EXIT_BADCONN`.
+        let mut pset = PsqlSettings {
+            cur_cmd_interactive: true,
+            ..PsqlSettings::default()
+        };
+        let ok = send(&mut Broken, b"select 1", &mut pset, &mut out, &mut err);
 
         assert!(!ok);
         assert_eq!(err, b"psql: no such database \"\xc3\x28\"\n");
         assert!(!err.contains(&0xEF), "no U+FFFD may appear: {err:?}");
+    }
+
+    /// `AcceptResult`'s `default:` arm (`common.c:445`): COPY BOTH and
+    /// SINGLE TUPLE are reported by number, a failure psql names is not.
+    #[test]
+    fn an_unexpected_status_is_reported_by_its_number() {
+        let pset = PsqlSettings::default();
+        for (status, expected) in [
+            (
+                ExecStatus::CopyBoth,
+                &b"psql: error: unexpected PQresultStatus: 8\n"[..],
+            ),
+            (
+                ExecStatus::SingleTuple,
+                b"psql: error: unexpected PQresultStatus: 9\n",
+            ),
+            (ExecStatus::FatalError, b""),
+            (ExecStatus::PipelineAborted, b""),
+            (ExecStatus::TuplesOk, b""),
+        ] {
+            let mut err = Vec::new();
+            report_unexpected_status(status, &pset, &mut err);
+            assert_eq!(err, expected, "{status:?}");
+        }
     }
 
     #[test]
@@ -2360,30 +2445,6 @@ mod tests {
                 ("PIPELINE_RESULT_COUNT", "0".to_string()),
             ]
         );
-    }
-
-    #[test]
-    fn copy_in_a_pipeline_gives_the_connection_up() {
-        // `common.c:1919`-`:1943`: upstream logs and exits with
-        // EXIT_BADCONN rather than drive a COPY inside a pipeline.
-        let mut executor = Pipe::new(vec![Some(QueryResult::new(ExecStatus::CopyIn))]);
-        let (mut pset, mut vars) = (PsqlSettings::default(), VariableSpace::new());
-        for mode in [SendMode::StartPipelineMode, bind()] {
-            assert!(pipe(&mut executor, mode, &mut pset, &mut vars).0);
-        }
-        let (ok, out, err) = pipe(
-            &mut executor,
-            SendMode::EndPipelineMode,
-            &mut pset,
-            &mut vars,
-        );
-        assert!(!ok);
-        assert_eq!(out, "");
-        assert_eq!(
-            err,
-            "COPY in a pipeline is not supported, aborting connection\n"
-        );
-        assert!(!executor.connected());
     }
 
     #[test]

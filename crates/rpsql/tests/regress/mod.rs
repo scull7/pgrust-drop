@@ -410,10 +410,30 @@ impl Cluster {
     /// # Panics
     /// As [`run`].
     pub fn psql(&self, psql: &Path, sql: &str, on_error_stop: bool) -> PsqlOutcome {
+        self.psql_in("postgres", psql, sql, on_error_stop)
+    }
+
+    /// Action: [`Cluster::psql`] with `replication => $replication`
+    /// (`Cluster.pm:2138`), which appends ` replication=$replication` to the
+    /// connection string `--dbname` is given.
+    ///
+    /// # Panics
+    /// As [`run`].
+    pub fn psql_replication(&self, psql: &Path, sql: &str, replication: &str) -> PsqlOutcome {
+        self.psql_in(
+            &format!("dbname=postgres replication={replication}"),
+            psql,
+            sql,
+            true,
+        )
+    }
+
+    /// [`Cluster::psql`] with `dbname` as `--dbname`'s argument.
+    fn psql_in(&self, dbname: &str, psql: &Path, sql: &str, on_error_stop: bool) -> PsqlOutcome {
         let mut command = self.command(psql);
         command
             .args(["--no-psqlrc", "--no-align", "--tuples-only", "--quiet"])
-            .args(["--dbname", "postgres", "--file", "-"]);
+            .args(["--dbname", dbname, "--file", "-"]);
         if on_error_stop {
             command.args(["--variable", "ON_ERROR_STOP=1"]);
         }
@@ -434,6 +454,32 @@ impl Cluster {
             outcome.stderr
         );
         outcome.stdout
+    }
+
+    /// `-s $node->logfile`: the server log's length so far, the offset a
+    /// later [`Cluster::wait_for_log`] reads from.
+    pub fn log_len(&self) -> u64 {
+        std::fs::metadata(self.dir.join("log")).map_or(0, |m| m.len())
+    }
+
+    /// Action: `$node->wait_for_log($regexp, $offset)` (`Cluster.pm:3493`):
+    /// poll the server log from `offset` every 0.1 s until `pattern`
+    /// matches, and return the offset past what was read.
+    ///
+    /// # Panics
+    /// After 180 s (`timeout_default`, `Utils.pm:173`) without a match, as
+    /// upstream `croak`s.
+    pub fn wait_for_log(&self, pattern: &str, offset: u64) -> u64 {
+        let re = testkit::pattern::Pattern::new(pattern).expect("a supported pattern");
+        for _ in 0..1800 {
+            let log = std::fs::read(self.dir.join("log")).unwrap_or_default();
+            let from = usize::try_from(offset).map_or(log.len(), |o| o.min(log.len()));
+            if re.is_match(&String::from_utf8_lossy(&log[from..])) {
+                return log.len() as u64;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("timed out waiting for match: {pattern}");
     }
 
     /// A directory of the cluster's own for a test's files, like

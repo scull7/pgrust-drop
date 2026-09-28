@@ -49,6 +49,12 @@ iterator and drives `liner::Editor` with `liner::Emacs` itself, as
 no crate to the build: redox_liner already depends on termion 4. `rpsql`
 stays `#![deny(unsafe_code)]` with no exception.
 
+The iterator reads stdin through `input::KeyBytes`, one byte a read or two
+after ESC, because even a session-lived iterator parks the second byte of a
+two-byte read until its next key: behind the Enter of `COPY … FROM STDIN;`
+that byte is the COPY data's, which the COPY reader then never saw (PR #98
+review, 2026-09-28).
+
 Rejected: a `[patch]` of liner (kept as the fallback, and as an optional
 follow-up to send upstream), replacing the editor, termios through libc or
 `stty`, and shipping the bug. rustyline and reedline are not options.

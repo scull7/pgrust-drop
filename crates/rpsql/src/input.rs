@@ -237,10 +237,14 @@ impl liner::Completer for NoCompletion {
 /// first byte died with the iterator (a pasted `\echo ab\n\warn cd\n` gave
 /// `warn cd`). One iterator for the whole session keeps that byte, as
 /// readline's one input stream does (ADR-0005, 2026-09-27 amendment).
+///
+/// Even one iterator keeps that second byte to itself until its next key, so
+/// it reads through [`KeyBytes`], which never gives it a byte past the key
+/// it is parsing.
 pub struct LinerEditor {
     context: liner::Context,
     /// The session's only key source: see above.
-    keys: termion::input::Keys<std::io::Stdin>,
+    keys: termion::input::Keys<KeyBytes>,
     /// `psql_history`
     file: Option<PathBuf>,
     /// This session's entries, `history_lines_added` of them.
@@ -265,7 +269,7 @@ impl LinerEditor {
         }
         Self {
             context,
-            keys: std::io::stdin().keys(),
+            keys: KeyBytes.keys(),
             file,
             added: Vec::new(),
         }
@@ -294,6 +298,33 @@ impl LinerEditor {
                 strerror(&err)
             )
         })
+    }
+}
+
+/// The process's stdin as termion's key iterator should see it: one byte a
+/// read, or two when the first is ESC. termion reads two bytes at a time to
+/// tell a lone ESC from an escape sequence, and parks the second in its own
+/// `leftover` when the first is a key by itself. Parked behind the Enter that
+/// ends `COPY … FROM STDIN;`, that byte is the first of the COPY data, which
+/// `StdinLines` then never sees: a pasted `xyz` row went in as `yz`, and the
+/// `x` began the next query. Handing termion no second byte unless it follows
+/// ESC leaves every byte past the key in stdin's buffer, where the COPY reader
+/// and upstream's one `FILE *` find it. stdin is locked only for each read,
+/// as `StdinLines` locks it.
+pub struct KeyBytes;
+
+impl std::io::Read for KeyBytes {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let mut stdin = std::io::stdin().lock();
+        let avail = stdin.fill_buf()?;
+        let n = match avail.first() {
+            None => 0,
+            Some(&0x1B) => avail.len().min(out.len()).min(2),
+            Some(_) => out.len().min(1),
+        };
+        out[..n].copy_from_slice(&avail[..n]);
+        stdin.consume(n);
+        Ok(n)
     }
 }
 

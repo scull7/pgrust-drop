@@ -2,7 +2,8 @@
 //! decides, done.
 //!
 //! 1. Create the run directory, `0700`, retrying on a name already taken.
-//! 2. [`crate::start::plan`].
+//! 2. Claim an absent `--datadir` with `create_dir`, then
+//!    [`crate::start::plan`].
 //! 3. Mint the data directory with rinitdb, in this process.
 //! 4. Spawn `<this binary> postgres <server args>` in a process group of its
 //!    own (a terminal's Ctrl-C at the shell that ran `start` does not reach
@@ -122,13 +123,20 @@ fn launch(flags: &Start) -> Result<String, LaunchError> {
         error,
     })?;
     let run_dir = make_run_dir(&std::env::temp_dir())?;
-    let found = flags
-        .datadir
-        .as_ref()
-        .map_or(Found::Nothing, |dir| look_at(&cwd.join(dir)));
+    let datadir = flags.datadir.as_ref().map(|dir| cwd.join(dir));
+    let found = match datadir.as_deref().map(claim).transpose() {
+        Ok(found) => found.unwrap_or(Found::Nothing),
+        Err(error) => {
+            let _ = std::fs::remove_dir(&run_dir);
+            return Err(error);
+        }
+    };
     let plan = match start::plan(flags, &cwd, &run_dir, found) {
         Ok(plan) => plan,
         Err(error) => {
+            if let (Some(dir), Found::Nothing) = (&datadir, found) {
+                let _ = std::fs::remove_dir(dir);
+            }
             let _ = std::fs::remove_dir(&run_dir);
             return Err(LaunchError::Plan(error));
         }
@@ -141,6 +149,33 @@ fn launch(flags: &Start) -> Result<String, LaunchError> {
             let _ = stop::remove_all(&cleanup);
         }
     })
+}
+
+/// Action: what `--datadir` names, claimed when it is absent: its parents
+/// made, then the directory itself with `create_dir`, `0700` as `initdb`
+/// makes it (`pg_dir_create_mode`, `src/common/file_perm.c:18`). Two
+/// concurrent starts on one absent directory cannot both get
+/// [`Found::Nothing`]: the loser's `create_dir` fails `AlreadyExists` and it
+/// looks again, so it never takes the winner's directory for one it may
+/// remove.
+fn claim(dir: &Path) -> Result<Found, LaunchError> {
+    let found = look_at(dir);
+    if found != Found::Nothing {
+        return Ok(found);
+    }
+    let failed = |error| LaunchError::Io {
+        what: "create directory",
+        path: dir.to_path_buf(),
+        error,
+    };
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(failed)?;
+    }
+    match create_private_dir(dir) {
+        Ok(()) => Ok(Found::Nothing),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(look_at(dir)),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 /// Action: what `--datadir` names, before `start` touches it. A symbolic
@@ -307,5 +342,23 @@ fn wait_until_ready(
             return Err(LaunchError::NotReady { log: log() });
         }
         std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_start_that_creates_an_absent_datadir_finds_nothing() {
+        let tmp = make_run_dir(&std::env::temp_dir()).unwrap();
+        let dir = tmp.join("parent").join("data");
+        assert_eq!(claim(&dir).unwrap(), Found::Nothing);
+        assert!(dir.is_dir());
+        // The loser of a race: the directory is the winner's now.
+        assert_eq!(claim(&dir).unwrap(), Found::Other);
+        std::fs::write(dir.join("PG_VERSION"), "18\n").unwrap();
+        assert_eq!(claim(&dir).unwrap(), Found::Cluster);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

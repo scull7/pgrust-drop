@@ -190,7 +190,9 @@ impl Listen {
 /// What `--datadir` named before `start` touched it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Found {
-    /// Nothing there (or no `--datadir`): `initdb` creates the directory.
+    /// Nothing there (or no `--datadir`): `start` claims the directory
+    /// with `create_dir` before `initdb` runs into it, so of two concurrent
+    /// starts on one absent `--datadir` only one ever finds this.
     Nothing,
     /// Something that is not a cluster: an empty directory `initdb` fills,
     /// or anything else, which `initdb` refuses.

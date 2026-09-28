@@ -9,11 +9,15 @@
 //! What counts as a citation, in a line of any text file in the repo:
 //!
 //! - `name.c:NNN`, with or without a directory prefix
-//!   (`src/bin/initdb/initdb.c:2634`, `t/001_basic.pl:153`), and ranges
+//!   (`src/bin/initdb/initdb.c:2634`, `t/001_basic.pl:153`), or a `Makefile`,
+//!   `GNUmakefile` or `configure` (`src/port/Makefile:142`), and ranges
 //!   `name.c:NNN-MMM`, `name.c:NNN-:MMM`, `` `name.c:NNN`-`:MMM` ``;
 //! - a backticked continuation `` `:NNN` `` (or a range of them), which cites
-//!   the file of the backticked file name right before it, or failing that
-//!   the file of the previous citation in the same repo file.
+//!   the file of the previous citation in the same repo file, or of a
+//!   backticked upstream file name after it. A backticked name of our own
+//!   code (`docs/divergences.md`) is a cross-reference in passing and does
+//!   not change it; after a citation or name that failed, the continuation
+//!   fails the same way.
 //!
 //! What fails:
 //!
@@ -125,6 +129,20 @@ fn extension(path: &str) -> Option<&str> {
         && ext.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
         && ext.bytes().all(|b| b.is_ascii_alphanumeric()))
     .then_some(ext)
+}
+
+/// Upstream files with no extension that are cited by line.
+const BARE_NAMES: &[&str] = &["Makefile", "GNUmakefile", "configure"];
+
+/// Whether a path as written can be cited by line: it has an extension, or
+/// its last component is one of [`BARE_NAMES`] (`src/port/Makefile:142`,
+/// `configure:591`).
+fn citable(path: &str) -> bool {
+    extension(path).is_some()
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|base| BARE_NAMES.contains(&base))
 }
 
 /// A path as written, minus leading punctuation that cannot start one.
@@ -271,7 +289,7 @@ pub fn scan(text: &str) -> Vec<Citation> {
                     .rposition(|&c| !is_path_byte(c))
                     .map_or(0, |k| k + 1);
                 let raw = trim_path(std::str::from_utf8(&b[from..i]).unwrap_or(""));
-                if extension(raw).is_none() {
+                if !citable(raw) {
                     i = p;
                     continue;
                 }
@@ -327,6 +345,8 @@ pub enum Problem {
     Orphan,
     /// The file has `len` lines.
     PastEnd { path: String, len: usize },
+    /// The file is in the tag's listing but could not be read.
+    Unreadable { path: String },
     /// The identifier is defined in the file, but neither on the cited lines
     /// nor around them; `defined` is where it is.
     Misplaced {
@@ -375,6 +395,7 @@ impl fmt::Display for Finding {
             Problem::PastEnd { path, len } => {
                 write!(f, "{path} has only {len} lines")
             }
+            Problem::Unreadable { path } => write!(f, "cannot read {path} in the upstream tree"),
             Problem::Misplaced {
                 path,
                 ident,
@@ -497,6 +518,7 @@ pub struct Checker<'a, U: Upstream> {
     anchored: usize,
 }
 
+#[derive(Clone)]
 enum Resolved {
     Upstream(String),
     Local,
@@ -574,40 +596,45 @@ impl<'a, U: Upstream> Checker<'a, U> {
         let mut findings = Vec::new();
         // Directories of the upstream files cited so far, oldest first.
         let mut hints: Vec<String> = Vec::new();
-        // The file a bare continuation cites; `None` after a local citation.
-        let mut last: Option<String> = None;
-        let mut seen_any = false;
+        // What a bare continuation cites: the file of the last citation or
+        // backticked upstream file name, whatever became of it. A
+        // continuation after a citation of our own code is ours; one after a
+        // file that failed to resolve fails the same way, rather than falling
+        // back to an older file.
+        let mut last = Resolved::Failed(Problem::Orphan);
         for citation in scan(text) {
             if citation.mention {
                 let written = citation.path.as_deref().unwrap_or_default();
-                if let Resolved::Upstream(path) = self.resolve(file, written, &hints) {
-                    let dir = dir_of(&path).to_owned();
-                    if hints.last() != Some(&dir) {
-                        hints.push(dir);
+                match self.resolve(file, written, &hints) {
+                    Resolved::Upstream(path) => {
+                        let dir = dir_of(&path).to_owned();
+                        if hints.last() != Some(&dir) {
+                            hints.push(dir);
+                        }
+                        last = Resolved::Upstream(path);
                     }
-                    last = Some(path);
-                    seen_any = true;
+                    // A mention of our own code is a cross-reference in
+                    // passing (`docs/divergences.md`), and a backticked `x.y`
+                    // that names no file anywhere is as likely a field
+                    // (`popt.topt.encoding`) or a generated file
+                    // (`pg_config_paths.h`): neither changes the file a
+                    // continuation cites. An upstream name the tag has twice
+                    // does, and fails it.
+                    Resolved::Local | Resolved::Failed(Problem::NoSuchFile) => {}
+                    ambiguous @ Resolved::Failed(_) => last = ambiguous,
                 }
                 continue;
             }
             let resolved = match &citation.path {
                 Some(written) => self.resolve(file, written, &hints),
-                None => match &last {
-                    Some(path) => Resolved::Upstream(path.clone()),
-                    None if seen_any => Resolved::Local,
-                    None => Resolved::Failed(Problem::Orphan),
-                },
+                None => last.clone(),
             };
-            seen_any = true;
+            if citation.path.is_some() {
+                last = resolved.clone();
+            }
             let path = match resolved {
-                Resolved::Local => {
-                    last = None;
-                    continue;
-                }
+                Resolved::Local => continue,
                 Resolved::Failed(problem) => {
-                    if citation.path.is_some() {
-                        last = None;
-                    }
                     if !citation.allowed {
                         findings.push(Finding {
                             file: file.to_owned(),
@@ -623,7 +650,6 @@ impl<'a, U: Upstream> Checker<'a, U> {
             if hints.last() != Some(&dir) {
                 hints.push(dir);
             }
-            last = Some(path.clone());
             if citation.allowed {
                 continue;
             }
@@ -642,7 +668,11 @@ impl<'a, U: Upstream> Checker<'a, U> {
     /// whether its identifier is there.
     fn anchor(&mut self, path: &str, citation: &Citation) -> Option<Problem> {
         self.anchored += 1;
-        let lines = self.upstream.lines(path)?;
+        let Some(lines) = self.upstream.lines(path) else {
+            return Some(Problem::Unreadable {
+                path: path.to_owned(),
+            });
+        };
         let len = lines.len();
         if citation.start == 0 || citation.end > len || citation.start > len {
             return Some(Problem::PastEnd {
@@ -824,6 +854,21 @@ InitControlFile(uint64 sysidentifier)\n\
     }
 
     #[test]
+    fn a_makefile_or_configure_is_cited_too() {
+        let found = scan("`src/port/Makefile:142`, `configure:591`, `:966`, key:1");
+        let short: Vec<(Option<&str>, usize)> =
+            found.iter().map(|c| (c.path.as_deref(), c.start)).collect();
+        assert_eq!(
+            short,
+            [
+                (Some("src/port/Makefile"), 142),
+                (Some("configure"), 591),
+                (None, 966)
+            ]
+        );
+    }
+
+    #[test]
     fn a_line_past_the_end_fails() {
         let got = check("docs/x.md", "xlog.c:9-10");
         assert_eq!(
@@ -875,6 +920,56 @@ InitControlFile(uint64 sysidentifier)\n\
         assert_eq!(
             check("docs/x.md", "`:4`"),
             ["docs/x.md:1: `:4`: a continuation with no file cited before it"]
+        );
+    }
+
+    #[test]
+    fn a_continuation_takes_the_upstream_file_named_last() {
+        // `docs/divergences.md` is ours and mentioned in passing: `:1` after
+        // it still cites `xlog.c`.
+        assert_eq!(
+            check(
+                "docs/x.md",
+                "`xlog.c:9` (`docs/divergences.md`), `InitControlFile` `:1`"
+            ),
+            ["docs/x.md:1: `:1`: `InitControlFile` is not at \
+              src/backend/access/transam/xlog.c:1; it is defined at \
+              src/backend/access/transam/xlog.c:2-7"]
+        );
+        // A file the tag has twice fails its continuation, rather than
+        // leaving it to `xlog.c`.
+        let got = check("docs/x.md", "`xlog.c:9` `common.c` `:1`");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].starts_with("docs/x.md:1: `:1`: REL_18_6 has 2 files"),
+            "{got:?}"
+        );
+        // So does a continuation after a citation that failed.
+        assert_eq!(
+            check("docs/x.md", "`xlog.c:9` `nosuch.c:1` and `:2`"),
+            [
+                "docs/x.md:1: `nosuch.c:1`: no such file in REL_18_6",
+                "docs/x.md:1: `:2`: no such file in REL_18_6",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_the_tree_cannot_read_fails() {
+        let mut up = tree();
+        up.files.remove("src/bin/psql/common.c");
+        let local = BTreeSet::new();
+        let mut checker = Checker::new(&mut up, &local);
+        let got: Vec<String> = checker
+            .check("docs/x.md", "src/bin/psql/common.c:1")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "docs/x.md:1: src/bin/psql/common.c:1: cannot read src/bin/psql/common.c in the upstream tree"
+            ]
         );
     }
 

@@ -218,15 +218,16 @@ fn assert_success(output: &Output, what: &str) {
     );
 }
 
-/// `select 1` through `pgdrop psql` on the cluster's socket. (`pgdrop psql
-/// "$uri"` needs rpsql to expand a URI given as the database name, which it
-/// does not do yet.)
+/// `select 1` through `pgdrop psql "$uri"`, the URI `start` printed, which
+/// psql expands as a connection string (`startup.c:277`). The environment
+/// names another host and user, so only the URI can get it there.
 fn select_1(scratch: &Scratch, started: &Started) {
-    let run_dir = started.run_dir();
-    let output = scratch.pgdrop(&[
-        "psql", "-X", "-A", "-t", "-h", &run_dir, "-p", "5432", "-U", "postgres", "-c", "select 1",
-        "postgres",
-    ]);
+    let output = scratch
+        .command(&["psql", "-X", "-A", "-t", "-c", "select 1", &started.uri])
+        .env("PGHOST", scratch.0.join("nowhere"))
+        .env("PGUSER", "nobody")
+        .output()
+        .expect("run pgdrop psql");
     assert_success(&output, "pgdrop psql");
     assert_eq!(output.stdout, b"1\n");
 }

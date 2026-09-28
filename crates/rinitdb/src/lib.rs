@@ -199,8 +199,8 @@ fn create_cluster(
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    let script = single_user::fixup_script(plan, password.as_ref());
-    let session = server.as_ref().map(|server| (server, script.as_slice()));
+    let sessions = single_user::fixup_sessions(plan, password.as_ref());
+    let session = server.as_ref().map(|server| (server, sessions.as_slice()));
     let mut progress = Progress::default();
     let created = initialize_data_directory(plan, options, session, &mut progress)
         .and_then(|()| sync_new_cluster(plan, stderr));
@@ -223,12 +223,12 @@ fn create_cluster(
 /// top-level `PG_VERSION` (`:3087`), the configuration files (`setup_config`,
 /// `:3094`). Then the image, and the files only a template needs: a
 /// `pg_control` and a first WAL segment of this cluster's own. Last the
-/// single-user session, where C runs its own (`:3115`), when `session` has
-/// one to run.
+/// single-user sessions, where C runs its own (`:3115`), when `session` has
+/// any to run.
 fn initialize_data_directory(
     plan: &CreatePlan,
     options: &Options,
-    session: Option<(&single_user::Server, &[single_user::SqlStatement])>,
+    session: Option<(&single_user::Server, &[single_user::Session])>,
     progress: &mut Progress,
 ) -> Result<(), InitdbError> {
     create_directories(plan, progress)?;
@@ -261,8 +261,10 @@ fn initialize_data_directory(
     image::expand(&entries(config)?, &plan.pgdata, plan.perm)?;
     image::expand(&template, &plan.pgdata, plan.perm)?;
     image::expand(&entries(rest)?, &plan.pgdata, plan.perm)?;
-    if let Some((server, script)) = session {
-        single_user::run(server, &plan.pgdata, script)?;
+    if let Some((server, sessions)) = session {
+        for session in sessions {
+            single_user::run(server, &plan.pgdata, session)?;
+        }
     }
     Ok(())
 }

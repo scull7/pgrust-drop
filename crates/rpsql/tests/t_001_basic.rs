@@ -738,24 +738,6 @@ fn copy_in_pipelines() {
     cluster.safe_psql(Path::new(RPSQL), "CREATE TABLE psql_pipeline()");
     let expected = "COPY in a pipeline is not supported, aborting connection";
     for psql in &psqls {
-        // Not upstream, which asks only for a nonzero exit: psql gives up
-        // with `exit(EXIT_BADCONN)` (`common.c:1943`) whatever
-        // `ON_ERROR_STOP` says, so every case below exits 2.
-        let outcome = cluster.psql(
-            psql,
-            "\\startpipeline\nCOPY psql_pipeline TO STDOUT;\n\\endpipeline",
-            true,
-        );
-        assert_eq!(
-            (outcome.ret, outcome.stderr.as_str()),
-            (
-                2,
-                "psql:<stdin>:3: COPY in a pipeline is not supported, aborting connection"
-            ),
-            "EXIT_BADCONN ({})",
-            psql.display()
-        );
-
         let log_location = cluster.log_len();
         psql_fails_like_with(
             &cluster,
@@ -811,6 +793,24 @@ SELECT 'val1';
             expected,
             "\\copy to in pipeline: fails",
             None,
+        );
+
+        // Not upstream, which asks only for a nonzero exit: psql gives up
+        // with `exit(EXIT_BADCONN)` (`common.c:1943`) whatever
+        // `ON_ERROR_STOP` says, so each case above exits 2.
+        let outcome = cluster.psql(
+            psql,
+            "\\startpipeline\nCOPY psql_pipeline TO STDOUT;\n\\endpipeline",
+            true,
+        );
+        assert_eq!(
+            (outcome.ret, outcome.stderr.as_str()),
+            (
+                2,
+                "psql:<stdin>:3: COPY in a pipeline is not supported, aborting connection"
+            ),
+            "EXIT_BADCONN ({})",
+            psql.display()
         );
     }
 }

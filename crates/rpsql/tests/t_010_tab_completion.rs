@@ -40,6 +40,11 @@ const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 const TAB_COMPLETION_PORT: u16 = 55_410;
 const PASTE_PORT: u16 = 55_411;
 
+/// Not upstream: 010 prints no query results, but the checks here that go
+/// beyond it do. On a pseudo-terminal of zero rows C psql pages every result
+/// (`PageOutput`, `print.c:3104`-`:3106`), so its output would go to `less`.
+const NO_PAGER: &[&str] = &["--pset=pager=off"];
+
 /// `$PostgreSQL::Test::Utils::timeout_default` (`Utils.pm:172`-`:174`).
 const TIMEOUT_DEFAULT_SECS: u64 = 180;
 const TIMEOUT_DEFAULT: Duration = Duration::from_secs(TIMEOUT_DEFAULT_SECS);
@@ -55,9 +60,15 @@ struct InteractivePsql {
     seen: usize,
 }
 
-/// `$node->interactive_psql('postgres', history_file => $historyfile)`
+/// `$node->interactive_psql('postgres', history_file => $historyfile,
+/// extra_params => …)`
 /// (`Cluster.pm:2401`-`:2436`), then `wait_connect` (`BackgroundPsql.pm:147`).
-fn interactive_psql(cluster: &Cluster, psql: &Path, history_file: &Path) -> InteractivePsql {
+fn interactive_psql(
+    cluster: &Cluster,
+    psql: &Path,
+    history_file: &Path,
+    extra_params: &[&str],
+) -> InteractivePsql {
     let pty = pty::open().expect("a pseudo-terminal");
     let mut command = cluster.command(psql);
     command
@@ -74,6 +85,8 @@ fn interactive_psql(cluster: &Cluster, psql: &Path, history_file: &Path) -> Inte
             "--dbname",
             "postgres",
         ])
+        // Cluster.pm:2432-:2433.
+        .args(extra_params)
         .stdin(Stdio::from(
             pty.slave.try_clone().expect("the slave, twice"),
         ))
@@ -224,7 +237,7 @@ fn session(cluster: &Cluster, psql: &Path, ours: bool) -> Vec<u8> {
     let _ = std::fs::remove_file(&historyfile);
 
     // 010_tab_completion.pl:81.
-    let mut h = interactive_psql(cluster, psql, &historyfile);
+    let mut h = interactive_psql(cluster, psql, &historyfile, NO_PAGER);
 
     // :97-:109 SEL<tab>, and the completion checks from :112 on, wait for
     // tab completion; clear_query (:112) waits for `\r` (NAT-402).
@@ -304,7 +317,7 @@ fn a_paste_keeps_the_first_byte_of_every_line() {
     let historyfile = Path::new(env!("CARGO_TARGET_TMPDIR")).join("010_rpsql_paste_history.txt");
     let _ = std::fs::remove_file(&historyfile);
     let rpsql = Path::new(RPSQL);
-    let mut h = interactive_psql(&cluster, rpsql, &historyfile);
+    let mut h = interactive_psql(&cluster, rpsql, &historyfile, NO_PAGER);
 
     check_completion(
         &mut h,

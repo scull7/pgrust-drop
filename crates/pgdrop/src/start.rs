@@ -34,8 +34,11 @@
 use std::fmt::{self, Write as _};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use usage::Args;
+
+use crate::current::Pointer;
 
 /// Options for `pgdrop start`.
 // One field per flag, as the issue specifies them; the typed [`StartPlan`]
@@ -46,15 +49,18 @@ pub struct Start {
     /// Data directory to use; created from the template unless it already holds a cluster (default: a new temporary one)
     #[usage(long, value_name = "DIR")]
     pub datadir: Option<PathBuf>,
-    /// TCP port to listen on, on 127.0.0.1; 0 means unix socket only
-    #[usage(long, default = "0")]
-    pub port: u16,
+    /// TCP port to listen on, on 127.0.0.1; 0 means unix socket only, auto a free one
+    #[usage(long, default = "0", value_name = "PORT")]
+    pub port: Port,
     /// Run the server in the foreground instead of detaching it
     #[usage(long)]
     pub foreground: bool,
-    /// Print {"uri": …, "pid": …, "datadir": …} on stdout
+    /// Print {"uri": …, "pid": …, "datadir": …, "port": …} on stdout
     #[usage(long)]
     pub json: bool,
+    /// Print export PGHOST=… PGPORT=… PGUSER=… PGDATA=… on stdout, for a shell's eval
+    #[usage(long)]
+    pub env: bool,
     /// Keep the data directory when the cluster stops
     #[usage(long)]
     pub keep: bool,
@@ -153,6 +159,47 @@ fn canonical_name(name: &str) -> String {
     name.replace('-', "_").to_ascii_lowercase()
 }
 
+/// `--port`: a number, or `auto` for a free one `start` picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Port {
+    /// `--port N`; 0 is [`Listen::UnixOnly`].
+    Number(u16),
+    /// `--port auto`: a port the kernel says is free on [`TCP_HOST`], tried
+    /// again with another if the server finds it taken.
+    Auto,
+}
+
+impl Default for Port {
+    fn default() -> Self {
+        Port::Number(0)
+    }
+}
+
+impl FromStr for Port {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw == "auto" {
+            return Ok(Port::Auto);
+        }
+        raw.parse()
+            .map(Port::Number)
+            .map_err(|_| format!("invalid port \"{raw}\": a number from 0 to 65535, or auto"))
+    }
+}
+
+impl Port {
+    /// The listener a fixed `--port` names; `None` for `auto`, whose port
+    /// the caller picks.
+    #[must_use]
+    pub fn fixed(self) -> Option<Listen> {
+        match self {
+            Port::Number(port) => Some(Listen::from_port(port)),
+            Port::Auto => None,
+        }
+    }
+}
+
 /// Where the server listens besides its socket directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listen {
@@ -213,6 +260,17 @@ pub enum Origin {
     Existing,
 }
 
+/// What `start` prints once the server is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// `uri:`, `pid:` and `datadir:` lines.
+    Text,
+    /// `--json`: one JSON object.
+    Json,
+    /// `--env`: one `export` line for a shell's `eval`.
+    Env,
+}
+
 /// Everything `start` will do, decided before it does any of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartPlan {
@@ -222,9 +280,12 @@ pub struct StartPlan {
     pub datadir: String,
     pub origin: Origin,
     pub listen: Listen,
+    /// `--port auto`: [`StartPlan::listen`] was picked, and another port may
+    /// be tried when the server finds it taken.
+    pub auto_port: bool,
     pub settings: Vec<Setting>,
     pub foreground: bool,
-    pub json: bool,
+    pub output: Output,
     /// `stop` leaves the run directory and a data directory it created alone.
     pub keep: bool,
 }
@@ -243,33 +304,35 @@ pub fn run_dir_name(pid: u32, nonce: u64) -> String {
 /// `cwd` makes a relative `--datadir` absolute (the URI and `--json` name
 /// it, and a caller may be in another directory); `run_dir` is the fresh
 /// directory the caller created; `found` is what `--datadir` named before
-/// `start` touched it (a default datadir is always [`Found::Nothing`]).
+/// `start` touched it (a default datadir is always [`Found::Nothing`]);
+/// `listen` is [`Port::fixed`], or for `--port auto` the port the caller
+/// picked.
 ///
 /// # Errors
 ///
-/// A bad `--set`, a path that is not UTF-8 (the server takes its command
-/// line as text, `main_main::argv_from_os`), or a socket path too long for
-/// `sun_path`.
+/// A bad `--set`, `--env` with `--json`, a path that is not UTF-8 (the
+/// server takes its command line as text, `main_main::argv_from_os`), or a
+/// socket path too long for `sun_path`.
 pub fn plan(
     flags: &Start,
     cwd: &Path,
     run_dir: &Path,
     found: Found,
+    listen: Listen,
 ) -> Result<StartPlan, StartError> {
     let settings = flags
         .set
         .iter()
         .map(|raw| Setting::parse(raw))
         .collect::<Result<Vec<_>, _>>()?;
-    let listen = Listen::from_port(flags.port);
+    let output = match (flags.json, flags.env) {
+        (true, true) => return Err(StartError::EnvAndJson),
+        (true, false) => Output::Json,
+        (false, true) => Output::Env,
+        (false, false) => Output::Text,
+    };
     let run_dir = utf8(cwd.join(run_dir))?;
-    let socket = socket_path(&run_dir, listen.port());
-    if socket.len() >= UNIXSOCK_PATH_BUFLEN {
-        return Err(StartError::SocketPathTooLong {
-            path: socket,
-            max: UNIXSOCK_PATH_BUFLEN - 1,
-        });
-    }
+    check_socket_path(&run_dir, listen)?;
     let (datadir, origin) = match &flags.datadir {
         Some(dir) => (
             cwd.join(dir),
@@ -286,11 +349,24 @@ pub fn plan(
         run_dir,
         origin,
         listen,
+        auto_port: flags.port == Port::Auto,
         settings,
         foreground: flags.foreground,
-        json: flags.json,
+        output,
         keep: flags.keep,
     })
+}
+
+/// Pure: refuse a socket path that does not fit `sun_path`.
+fn check_socket_path(run_dir: &str, listen: Listen) -> Result<(), StartError> {
+    let socket = socket_path(run_dir, listen.port());
+    if socket.len() >= UNIXSOCK_PATH_BUFLEN {
+        return Err(StartError::SocketPathTooLong {
+            path: socket,
+            max: UNIXSOCK_PATH_BUFLEN - 1,
+        });
+    }
+    Ok(())
 }
 
 fn utf8(path: PathBuf) -> Result<String, StartError> {
@@ -307,6 +383,20 @@ pub fn socket_path(dir: &str, port: u16) -> String {
 }
 
 impl StartPlan {
+    /// Pure: the same plan on another TCP port, for `--port auto`'s retry.
+    ///
+    /// # Errors
+    ///
+    /// The socket path, whose name carries the port, no longer fits.
+    pub fn on_port(&self, port: NonZeroU16) -> Result<StartPlan, StartError> {
+        let listen = Listen::Tcp(port);
+        check_socket_path(&self.run_dir, listen)?;
+        Ok(StartPlan {
+            listen,
+            ..self.clone()
+        })
+    }
+
     /// The `initdb` arguments that mint the data directory, as
     /// `Cluster.pm:643` runs it (`--no-sync`, `--auth trust`), plus a fixed
     /// superuser for a fixed URI; `None` for an existing cluster.
@@ -363,29 +453,70 @@ impl StartPlan {
         args
     }
 
+    /// The host a client names: [`TCP_HOST`] with a TCP port, otherwise
+    /// the socket directory.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        match self.listen {
+            Listen::UnixOnly => &self.run_dir,
+            Listen::Tcp(_) => TCP_HOST,
+        }
+    }
+
     /// The connection URI. With a TCP port, `postgresql://postgres@127.0.0.1:N/postgres`;
     /// otherwise the socket directory, percent-encoded as the host
     /// (`doc/src/sgml/libpq.sgml:1067`).
     #[must_use]
     pub fn uri(&self) -> String {
-        let host = match self.listen {
-            Listen::UnixOnly => percent_encode(&self.run_dir),
-            Listen::Tcp(_) => TCP_HOST.to_owned(),
-        };
-        format!(
-            "postgresql://{SUPERUSER}@{host}:{}/{DATABASE}",
-            self.listen.port()
-        )
+        uri_for(self.host(), self.listen.port())
+    }
+
+    /// The URI of the server's own socket, whatever else it listens on:
+    /// no other server can answer on it, where a TCP port may have been
+    /// taken by someone else between `start` picking it and the server
+    /// binding it.
+    #[must_use]
+    pub fn socket_uri(&self) -> String {
+        uri_for(&self.run_dir, self.listen.port())
     }
 
     /// The `--json` line for a server with process ID `pid`.
     #[must_use]
     pub fn json(&self, pid: u32) -> String {
         format!(
-            "{{\"uri\": {}, \"pid\": {pid}, \"datadir\": {}}}\n",
+            "{{\"uri\": {}, \"pid\": {pid}, \"datadir\": {}, \"port\": {}}}\n",
             json_string(&self.uri()),
-            json_string(&self.datadir)
+            json_string(&self.datadir),
+            self.listen.port()
         )
+    }
+
+    /// The `--env` line: libpq's variables for [`StartPlan::uri`]'s host,
+    /// port and user (`doc/src/sgml/libpq.sgml`, "Environment Variables"),
+    /// and `PGDATA` for `pgdrop stop` and pg_ctl. `PGUSER` too: without it
+    /// a client connects as the operating-system user, whom the cluster
+    /// does not know.
+    #[must_use]
+    pub fn env(&self) -> String {
+        format!(
+            "export PGHOST={} PGPORT={} PGUSER={} PGDATA={}\n",
+            shell_quote(self.host()),
+            shell_quote(&self.listen.port().to_string()),
+            shell_quote(SUPERUSER),
+            shell_quote(&self.datadir)
+        )
+    }
+
+    /// What `start` leaves for a bare `pgdrop psql` and `pgdrop stop`
+    /// ([`crate::current`]).
+    #[must_use]
+    pub fn pointer(&self) -> Pointer {
+        Pointer {
+            host: self.host().to_owned(),
+            port: self.listen.port(),
+            uri: self.uri(),
+            datadir: self.datadir.clone(),
+        }
     }
 
     /// Whether `stop` removes the data directory.
@@ -474,6 +605,22 @@ pub fn quote_directory(dir: &str) -> String {
     }
 }
 
+/// Pure: `postgresql://postgres@<host>:<port>/postgres`, the host
+/// percent-encoded.
+fn uri_for(host: &str, port: u16) -> String {
+    format!(
+        "postgresql://{SUPERUSER}@{}:{port}/{DATABASE}",
+        percent_encode(host)
+    )
+}
+
+/// Pure: one POSIX shell word, single-quoted (XCU 2.2.2): nothing inside
+/// is special but `'`, which ends the quote, so it is written `'\''`.
+#[must_use]
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// Pure: RFC 3986 percent-encoding of everything but the unreserved
 /// characters, which libpq decodes in every URI component
 /// (`conninfo_uri_decode`, `src/interfaces/libpq/fe-connect.c:7186`).
@@ -525,6 +672,8 @@ pub enum StartError {
     NotUtf8(PathBuf),
     /// `<run>/.s.PGSQL.<port>` does not fit `sun_path`.
     SocketPathTooLong { path: String, max: usize },
+    /// `--env` and `--json` both.
+    EnvAndJson,
 }
 
 impl fmt::Display for StartError {
@@ -545,6 +694,7 @@ impl fmt::Display for StartError {
                 "Unix-domain socket path \"{path}\" is too long (maximum {max} bytes); \
                  set TMPDIR to a shorter directory"
             ),
+            StartError::EnvAndJson => write!(f, "--env and --json cannot be used together"),
         }
     }
 }
@@ -559,8 +709,22 @@ mod tests {
         Start::default()
     }
 
+    /// [`plan`] with the listener `--port` names, and 54321 for `auto`.
+    fn plan4(
+        flags: &Start,
+        cwd: &Path,
+        run_dir: &Path,
+        found: Found,
+    ) -> Result<StartPlan, StartError> {
+        let listen = flags
+            .port
+            .fixed()
+            .unwrap_or(Listen::Tcp(NonZeroU16::new(54321).unwrap()));
+        plan(flags, cwd, run_dir, found, listen)
+    }
+
     fn plan_in(flags: &Start) -> StartPlan {
-        plan(
+        plan4(
             flags,
             Path::new("/work"),
             Path::new("/tmp/pgdrop-7-1f"),
@@ -648,7 +812,7 @@ mod tests {
         assert_eq!(minted.origin, Origin::Created);
         assert!(minted.removes_datadir());
 
-        let existing = plan(
+        let existing = plan4(
             &named,
             Path::new("/work"),
             Path::new("/tmp/r"),
@@ -668,7 +832,7 @@ mod tests {
             datadir: Some("mine".into()),
             ..flags()
         };
-        let filled = plan(
+        let filled = plan4(
             &named,
             Path::new("/work"),
             Path::new("/tmp/r"),
@@ -726,7 +890,7 @@ mod tests {
             ]
         );
         let tcp = plan_in(&Start {
-            port: 6543,
+            port: Port::Number(6543),
             ..flags()
         });
         let args = tcp.server_args();
@@ -744,7 +908,7 @@ mod tests {
             ..flags()
         };
         assert_eq!(
-            plan(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
+            plan4(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
             Err(StartError::SetWithoutValue("fsync".into()))
         );
     }
@@ -753,9 +917,9 @@ mod tests {
     fn a_socket_path_that_overflows_sun_path_is_refused() {
         // `<dir>/.s.PGSQL.5432` is 14 bytes longer than `<dir>`.
         let fits = format!("/{}", "d".repeat(UNIXSOCK_PATH_BUFLEN - 16));
-        assert!(plan(&flags(), Path::new("/"), Path::new(&fits), Found::Nothing).is_ok());
+        assert!(plan4(&flags(), Path::new("/"), Path::new(&fits), Found::Nothing).is_ok());
         let long = format!("{fits}d");
-        match plan(&flags(), Path::new("/"), Path::new(&long), Found::Nothing) {
+        match plan4(&flags(), Path::new("/"), Path::new(&long), Found::Nothing) {
             Err(StartError::SocketPathTooLong { path, max }) => {
                 assert_eq!(path.len(), UNIXSOCK_PATH_BUFLEN);
                 assert_eq!(max, UNIXSOCK_PATH_BUFLEN - 1);
@@ -781,7 +945,7 @@ mod tests {
         );
         assert_eq!(
             plan_in(&Start {
-                port: 6543,
+                port: Port::Number(6543),
                 ..flags()
             })
             .uri(),
@@ -794,7 +958,7 @@ mod tests {
     /// URI reserves.
     #[test]
     fn the_uri_round_trips_through_libpqs_parser() {
-        let odd = plan(
+        let odd = plan4(
             &flags(),
             Path::new("/"),
             Path::new("/tmp/odd dir:@?#%/pgdrop-1-2"),
@@ -813,9 +977,134 @@ mod tests {
         assert_eq!(
             plan_in(&flags()).json(4242),
             "{\"uri\": \"postgresql://postgres@%2Ftmp%2Fpgdrop-7-1f:5432/postgres\", \
-             \"pid\": 4242, \"datadir\": \"/tmp/pgdrop-7-1f/data\"}\n"
+             \"pid\": 4242, \"datadir\": \"/tmp/pgdrop-7-1f/data\", \"port\": 5432}\n"
         );
         assert_eq!(json_string("a\"b\\c\n\u{1}é"), "\"a\\\"b\\\\c\\n\\u0001é\"");
+    }
+
+    #[test]
+    fn port_is_a_number_or_auto() {
+        assert_eq!("0".parse(), Ok(Port::Number(0)));
+        assert_eq!("6543".parse(), Ok(Port::Number(6543)));
+        assert_eq!("auto".parse(), Ok(Port::Auto));
+        for bad in ["", "AUTO", "-1", "65536", "many"] {
+            assert!(bad.parse::<Port>().is_err(), "{bad:?}");
+        }
+        assert_eq!(Port::default(), Port::Number(0));
+        assert_eq!(Port::Number(0).fixed(), Some(Listen::UnixOnly));
+        assert_eq!(Port::Auto.fixed(), None);
+    }
+
+    #[test]
+    fn port_auto_listens_on_the_picked_port_and_a_retry_moves_only_the_port() {
+        let auto = plan_in(&Start {
+            port: Port::Auto,
+            ..flags()
+        });
+        assert!(auto.auto_port);
+        assert_eq!(auto.listen, Listen::Tcp(NonZeroU16::new(54321).unwrap()));
+        assert_eq!(auto.uri(), "postgresql://postgres@127.0.0.1:54321/postgres");
+        assert_eq!(
+            auto.socket_uri(),
+            "postgresql://postgres@%2Ftmp%2Fpgdrop-7-1f:54321/postgres"
+        );
+        let moved = auto.on_port(NonZeroU16::new(40000).unwrap()).unwrap();
+        assert_eq!(
+            moved.uri(),
+            "postgresql://postgres@127.0.0.1:40000/postgres"
+        );
+        assert_eq!(
+            StartPlan {
+                listen: auto.listen,
+                ..moved.clone()
+            },
+            auto
+        );
+        assert!(!plan_in(&flags()).auto_port);
+        // The socket name carries the port: a retry re-checks sun_path.
+        let tight = format!("/{}", "d".repeat(UNIXSOCK_PATH_BUFLEN - 16));
+        let four = plan4(
+            &Start {
+                port: Port::Number(5432),
+                ..flags()
+            },
+            Path::new("/"),
+            Path::new(&tight),
+            Found::Nothing,
+        )
+        .unwrap();
+        assert!(four.on_port(NonZeroU16::new(9999).unwrap()).is_ok());
+        assert!(matches!(
+            four.on_port(NonZeroU16::new(10000).unwrap()),
+            Err(StartError::SocketPathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn env_exports_host_port_user_and_datadir_single_quoted() {
+        assert_eq!(
+            plan_in(&Start {
+                env: true,
+                ..flags()
+            })
+            .env(),
+            "export PGHOST='/tmp/pgdrop-7-1f' PGPORT='5432' PGUSER='postgres' \
+             PGDATA='/tmp/pgdrop-7-1f/data'\n"
+        );
+        let odd = plan4(
+            &Start {
+                port: Port::Number(6543),
+                ..flags()
+            },
+            Path::new("/"),
+            Path::new("/tmp/it's $x"),
+            Found::Nothing,
+        )
+        .unwrap();
+        assert_eq!(
+            odd.env(),
+            "export PGHOST='127.0.0.1' PGPORT='6543' PGUSER='postgres' \
+             PGDATA='/tmp/it'\\''s $x/data'\n"
+        );
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn env_json_and_text_are_one_output_each() {
+        assert_eq!(plan_in(&flags()).output, Output::Text);
+        let json = Start {
+            json: true,
+            ..flags()
+        };
+        assert_eq!(plan_in(&json).output, Output::Json);
+        let env = Start {
+            env: true,
+            ..flags()
+        };
+        assert_eq!(plan_in(&env).output, Output::Env);
+        assert_eq!(
+            plan4(
+                &Start { env: true, ..json },
+                Path::new("/"),
+                Path::new("/tmp/r"),
+                Found::Nothing
+            ),
+            Err(StartError::EnvAndJson)
+        );
+    }
+
+    #[test]
+    fn the_pointer_names_the_host_port_uri_and_datadir() {
+        let pointer = plan_in(&flags()).pointer();
+        assert_eq!(
+            pointer,
+            Pointer {
+                host: "/tmp/pgdrop-7-1f".into(),
+                port: 5432,
+                uri: "postgresql://postgres@%2Ftmp%2Fpgdrop-7-1f:5432/postgres".into(),
+                datadir: "/tmp/pgdrop-7-1f/data".into(),
+            }
+        );
     }
 
     #[test]
@@ -839,7 +1128,7 @@ mod tests {
         })
         .record();
         assert!(!kept.removes_datadir && !kept.removes_run_dir);
-        let existing = plan(
+        let existing = plan4(
             &Start {
                 datadir: Some("d".into()),
                 ..flags()
@@ -887,7 +1176,7 @@ mod tests {
             ..flags()
         };
         assert_eq!(
-            plan(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
+            plan4(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
             Err(StartError::NotUtf8(raw.into()))
         );
     }

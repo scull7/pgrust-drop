@@ -2,18 +2,26 @@
 //! decides, done.
 //!
 //! 1. Create the run directory, `0700`, retrying on a name already taken.
+//!    With `--port auto`, pick a port: bind `127.0.0.1:0` and take the
+//!    port the kernel chose ([`PortPicker`]).
 //! 2. [`crate::start::plan`].
 //! 3. Mint the data directory with rinitdb, in this process.
 //! 4. Spawn `<this binary> postgres <server args>` in a process group of its
 //!    own (a terminal's Ctrl-C at the shell that ran `start` does not reach
-//!    it), stdin from `/dev/null`, stdout and stderr to `<run>/server.log`.
-//! 5. Connect with rlibpq until a connection reaches `ReadyForQuery`, as
-//!    long as the server is alive, for at most pg_ctl's 60 seconds.
+//!    it), stdin from `/dev/null`, stdout and stderr appended to
+//!    `<run>/server.log`.
+//! 5. Connect with rlibpq, on the server's own socket, until a connection
+//!    reaches `ReadyForQuery`, as long as the server is alive, for at most
+//!    pg_ctl's 60 seconds. With `--port auto`, a server that exits while its
+//!    port is in use lost it to someone else between step 1 and its bind
+//!    (`EADDRINUSE`): pick another and go back to step 4, at most
+//!    [`AUTO_PORT_ATTEMPTS`] times in all.
 //! 6. Write [`crate::start::Record`] into the data directory for `stop`.
 //!    Only now: until the server holds the data directory's lock, a record
 //!    written there could overwrite the one of a server already running in it.
-//! 7. Print the URI, PID and data directory, or `--json`, and leave the
-//!    server running.
+//!    Then make it the current cluster ([`crate::current`]).
+//! 7. Print the URI, PID and data directory, or `--json`, or `--env`, and
+//!    leave the server running.
 //!
 //! A failure after step 1 stops the server if it was spawned, then removes
 //! what `stop` would have removed: never a data directory that was there
@@ -24,7 +32,8 @@
 //! The same steps, attached: the server stays in `start`'s process group,
 //! its output goes to `start`'s stderr (stdout carries only step 7), and
 //! after step 7 `start` waits for it to exit, removes what `stop` would
-//! remove, and exits 0 if the server did. SIGINT, SIGTERM and SIGHUP to
+//! remove (and the pointer, if it still names this cluster), and exits 0 if
+//! the server did. SIGINT, SIGTERM and SIGHUP to
 //! `start` are forwarded to the server as SIGINT, a fast shutdown, and
 //! SIGQUIT as SIGQUIT, an immediate one ([`shutdown_signal`];
 //! `postmaster.c:2052`-`:2062`). That is pg_ctl's
@@ -44,6 +53,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
+use std::net::TcpListener;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -54,7 +65,8 @@ use signal_hook::iterator::Signals;
 use rlibpq::connection::Connection;
 use rlibpq::conninfo::{Env, parse_conninfo};
 
-use crate::start::{self, Found, RECORD_FILE, Start, StartError, StartPlan};
+use crate::current;
+use crate::start::{self, Found, Listen, Output, RECORD_FILE, Start, StartError, StartPlan};
 use crate::stop::{self, POLL, WAIT};
 
 /// The server's log, in the run directory.
@@ -62,6 +74,15 @@ pub const SERVER_LOG: &str = "server.log";
 
 /// Names `start` tries before it gives up on the temporary directory.
 const RUN_DIR_ATTEMPTS: u64 = 16;
+
+/// Ports `--port auto` tries, in all, before it gives up.
+pub const AUTO_PORT_ATTEMPTS: u32 = 8;
+
+/// Debug builds only, for the tests: a comma-separated list of ports
+/// `--port auto` tries before it asks the kernel, so a test can hand it one
+/// it holds and see the retry.
+#[cfg(debug_assertions)]
+pub const TEST_AUTO_PORTS: &str = "PGDROP_TEST_AUTO_PORTS";
 
 /// Why `start` failed.
 #[derive(Debug)]
@@ -88,6 +109,13 @@ pub enum LaunchError {
     },
     /// `--foreground`: the server exited unsuccessfully after it was ready.
     ServerFailed(ExitStatus),
+    /// `--port auto`: every port picked was taken before the server bound it.
+    NoFreePort {
+        attempts: u32,
+        last: u16,
+    },
+    /// The current-cluster pointer could not be written.
+    Pointer(current::PointerError),
 }
 
 /// `"; its log:\n…"`, or where it went instead.
@@ -125,6 +153,12 @@ impl fmt::Display for LaunchError {
                 log_tail(log.as_ref())
             ),
             LaunchError::ServerFailed(status) => write!(f, "the server exited ({status})"),
+            LaunchError::NoFreePort { attempts, last } => write!(
+                f,
+                "--port auto found no free port: each of the {attempts} it picked was taken \
+                 before the server could listen on it (the last, {last})"
+            ),
+            LaunchError::Pointer(error) => error.fmt(f),
         }
     }
 }
@@ -176,6 +210,9 @@ impl Attached {
                 error,
             });
         remove_what_stop_removes(&self.plan, true);
+        if let Some(path) = current::location() {
+            let _ = current::clear_if_names(&path, Path::new(&self.plan.datadir));
+        }
         match status? {
             status if status.success() => Ok(()),
             status => Err(LaunchError::ServerFailed(status)),
@@ -278,20 +315,26 @@ fn launch(flags: &Start) -> Result<Launched, LaunchError> {
         path: PathBuf::from("."),
         error,
     })?;
+    let mut ports = PortPicker::new();
+    let listen = match flags.port.fixed() {
+        Some(listen) => listen,
+        None => Listen::Tcp(ports.next()?),
+    };
     let run_dir = make_run_dir(&std::env::temp_dir())?;
     let found = flags
         .datadir
         .as_ref()
         .map_or(Found::Nothing, |dir| look_at(&cwd.join(dir)));
-    let plan = match start::plan(flags, &cwd, &run_dir, found) {
+    let plan = match start::plan(flags, &cwd, &run_dir, found, listen) {
         Ok(plan) => plan,
         Err(error) => {
             let _ = std::fs::remove_dir(&run_dir);
             return Err(LaunchError::Plan(error));
         }
     };
-    match bring_up(&plan, signals) {
-        Ok((text, server)) => Ok(Launched {
+    match bring_up(&plan, signals, &mut ports) {
+        // The plan the server runs on: `--port auto` may have moved it.
+        Ok((plan, text, server)) => Ok(Launched {
             text,
             attached: server.map(|(server, signals)| Attached {
                 plan,
@@ -319,13 +362,17 @@ fn look_at(dir: &Path) -> Found {
     }
 }
 
-/// Action: steps 3-6, for a plan whose run directory exists: what to
-/// print, and with `--foreground` the server and its signals. `signals`
+/// The server `start` brought up: the plan it runs on, what to print, and
+/// with `--foreground` the server and its signals.
+type BroughtUp = (StartPlan, String, Option<(Child, Forwarder)>);
+
+/// Action: steps 3-6, for a plan whose run directory exists. `signals`
 /// (`--foreground`) are forwarded to the server from the moment it exists.
 fn bring_up(
     plan: &StartPlan,
     mut signals: Option<Forwarder>,
-) -> Result<(String, Option<(Child, Forwarder)>), LaunchError> {
+    ports: &mut PortPicker,
+) -> Result<BroughtUp, LaunchError> {
     if let Some(args) = plan.initdb_args() {
         mint(&args)?;
     }
@@ -340,33 +387,118 @@ fn bring_up(
     } else {
         Some(log_path.as_path())
     };
-    let mut server = spawn(plan, log)?;
+    let mut plan = plan.clone();
+    let mut attempts = 1;
+    let mut server = loop {
+        let mut server = spawn(&plan, log)?;
+        match wait_until_ready(&plan, &mut server, signals.as_mut(), log) {
+            Ok(()) => break server,
+            // Reaped already: it exited.
+            Err(LaunchError::ServerExited { .. })
+                if plan.auto_port && port_in_use(plan.listen.port()) =>
+            {
+                if attempts == AUTO_PORT_ATTEMPTS {
+                    return Err(LaunchError::NoFreePort {
+                        attempts,
+                        last: plan.listen.port(),
+                    });
+                }
+                attempts += 1;
+                plan = plan.on_port(ports.next()?).map_err(LaunchError::Plan)?;
+            }
+            Err(error) => {
+                let _ = server.kill();
+                let _ = server.wait();
+                return Err(error);
+            }
+        }
+    };
     let pid = server.id();
-    let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
-    let ready = wait_until_ready(plan, &mut server, signals.as_mut(), log).and_then(|()| {
-        std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
-            what: "write",
-            path: record_path,
-            error,
-        })
-    });
-    if let Err(error) = ready {
+    if let Err(error) = leave_behind(&plan) {
         // No server outlives a failed start: the cleanup that follows
         // removes its socket directory and perhaps its data directory.
         let _ = server.kill();
         let _ = server.wait();
         return Err(error);
     }
-    let text = if plan.json {
-        plan.json(pid)
-    } else {
-        format!(
+    let text = match plan.output {
+        Output::Json => plan.json(pid),
+        Output::Env => plan.env(),
+        Output::Text => format!(
             "uri:     {}\npid:     {pid}\ndatadir: {}\n",
             plan.uri(),
             plan.datadir
-        )
+        ),
     };
-    Ok((text, signals.map(|signals| (server, signals))))
+    Ok((plan, text, signals.map(|signals| (server, signals))))
+}
+
+/// Action: step 6, for a server that is ready: the record for `stop`, then
+/// the pointer for a bare `psql` and `stop`.
+fn leave_behind(plan: &StartPlan) -> Result<(), LaunchError> {
+    let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
+    std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
+        what: "write",
+        path: record_path,
+        error,
+    })?;
+    match current::location() {
+        Some(path) => current::write(&path, &plan.pointer()).map_err(LaunchError::Pointer),
+        None => Ok(()),
+    }
+}
+
+/// `--port auto`'s source of ports: the kernel's choice for a bind to
+/// `127.0.0.1:0`, after (debug builds only) any [`TEST_AUTO_PORTS`] lists.
+struct PortPicker {
+    /// Ports to try first, the next last.
+    queued: Vec<NonZeroU16>,
+}
+
+impl PortPicker {
+    fn new() -> Self {
+        #[cfg(debug_assertions)]
+        let mut queued = std::env::var(TEST_AUTO_PORTS)
+            .map(|list| port_list(&list))
+            .unwrap_or_default();
+        #[cfg(not(debug_assertions))]
+        let mut queued = Vec::new();
+        queued.reverse();
+        Self { queued }
+    }
+
+    /// Action: the next port to try. The listener that found it is closed
+    /// on return, so the server can bind it; until it does, anyone can.
+    fn next(&mut self) -> Result<NonZeroU16, LaunchError> {
+        if let Some(port) = self.queued.pop() {
+            return Ok(port);
+        }
+        let io_error = |error| LaunchError::Io {
+            what: "find a free port on",
+            path: PathBuf::from(start::TCP_HOST),
+            error,
+        };
+        let listener = TcpListener::bind((start::TCP_HOST, 0)).map_err(io_error)?;
+        let port = listener.local_addr().map_err(io_error)?.port();
+        NonZeroU16::new(port).ok_or_else(|| io_error(io::ErrorKind::AddrNotAvailable.into()))
+    }
+}
+
+/// Pure: a comma-separated list of ports; what is not one is skipped.
+#[must_use]
+pub fn port_list(list: &str) -> Vec<NonZeroU16> {
+    list.split(',')
+        .filter_map(|port| port.trim().parse().ok())
+        .collect()
+}
+
+/// Action: whether something listens on `127.0.0.1:port`: a bind to it
+/// fails `EADDRINUSE`.
+fn port_in_use(port: u16) -> bool {
+    matches!(
+        TcpListener::bind((start::TCP_HOST, port)),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse
+    )
 }
 
 /// Action: a fresh `<tmp>/pgdrop-<pid>-<nonce>`, `0700` (the server's
@@ -438,7 +570,12 @@ fn spawn(plan: &StartPlan, log_path: Option<&Path>) -> Result<Child, LaunchError
     let exe = std::env::current_exe().map_err(io_error("find", Path::new("pgdrop")))?;
     let (out, err) = match log_path {
         Some(log_path) => {
-            let log = File::create(log_path).map_err(io_error("create", log_path))?;
+            // Appended: a `--port auto` retry keeps the log of the attempt before.
+            let log = File::options()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .map_err(io_error("create", log_path))?;
             let log_too = log.try_clone().map_err(io_error("open", log_path))?;
             (Stdio::from(log), Stdio::from(log_too))
         }
@@ -486,14 +623,16 @@ fn wait_until_ready(
     let log = || log_path.map(|path| std::fs::read_to_string(path).unwrap_or_default());
     // Nothing from the environment or the service files: the URI is the
     // whole of it, so a PGSSLMODE or PGOPTIONS cannot keep `start` waiting.
-    let conninfo = parse_conninfo(plan.uri().as_bytes())
+    // The socket's, not the TCP port's: whoever took a `--port auto` port
+    // first must not be mistaken for the server.
+    let conninfo = parse_conninfo(plan.socket_uri().as_bytes())
         .and_then(|mut info| {
             info.add_defaults(&Env::empty(), &BTreeMap::new())?;
             Ok(info)
         })
         .map_err(|error| LaunchError::Io {
             what: "parse the connection URI",
-            path: PathBuf::from(plan.uri()),
+            path: PathBuf::from(plan.socket_uri()),
             error: io::Error::other(error.to_string()),
         })?;
     let deadline = Instant::now() + WAIT;
@@ -532,6 +671,28 @@ mod tests {
         assert_eq!(shutdown_signal(SIGTERM), "-INT");
         assert_eq!(shutdown_signal(SIGHUP), "-INT");
         assert_eq!(shutdown_signal(SIGQUIT), "-QUIT");
+    }
+
+    #[test]
+    fn a_port_list_keeps_the_ports_and_skips_the_rest() {
+        let ports: Vec<u16> = port_list("5433, 0,x,65535,65536,")
+            .into_iter()
+            .map(NonZeroU16::get)
+            .collect();
+        assert_eq!(ports, [5433, 65535]);
+    }
+
+    #[test]
+    fn port_auto_gives_up_saying_how_often_it_tried() {
+        assert_eq!(
+            LaunchError::NoFreePort {
+                attempts: 8,
+                last: 40000
+            }
+            .to_string(),
+            "--port auto found no free port: each of the 8 it picked was taken \
+             before the server could listen on it (the last, 40000)"
+        );
     }
 
     #[test]

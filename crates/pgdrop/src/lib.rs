@@ -15,6 +15,8 @@
 //!
 //! [`start`] is `pgdrop start` (NAT-409): its flags and the pure plan they
 //! become; [`launch`] carries the plan out, and [`stop`] is `pgdrop stop`.
+//! [`current`] is the pointer `start` leaves so that a bare `pgdrop psql`
+//! and `pgdrop stop` find the cluster it started last.
 //!
 //! [`measure`] is the pure half of `benches/startup.rs`, which times a
 //! throwaway cluster's life and splits the binary's size (NAT-410).
@@ -27,6 +29,7 @@
 // (`module_name_repetitions`).
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
+pub mod current;
 pub mod dispatch;
 pub mod install;
 pub mod launch;

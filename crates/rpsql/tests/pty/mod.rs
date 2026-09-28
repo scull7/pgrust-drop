@@ -2,8 +2,8 @@
 //! `>pty>` give `BackgroundPsql` (`BackgroundPsql.pm`, `new`).
 //!
 //! The standard library cannot open one, and no crate for it is approved, so
-//! the four C calls it takes are declared here, in the test crate only, as
-//! `rpsql`'s SIGINT handler declares its three (ADR-0009): `posix_openpt`,
+//! the four C calls it takes are declared here, in the test crate only and
+//! never in `rpsql` itself (ADR-0005, 2026-09-27 amendment): `posix_openpt`,
 //! `grantpt`, `unlockpt` and `ptsname`. Their signatures are POSIX and the
 //! same on glibc, musl and Darwin, and so is `O_RDWR`. The child does not
 //! make the terminal its controlling one, so the terminal sends it no

@@ -38,6 +38,7 @@ const RPSQL: &str = env!("CARGO_BIN_EXE_rpsql");
 
 /// Unique among this crate's live gates; each starts its own cluster.
 const TAB_COMPLETION_PORT: u16 = 55_410;
+const PASTE_PORT: u16 = 55_411;
 
 /// `$PostgreSQL::Test::Utils::timeout_default` (`Utils.pm:172`-`:174`).
 const TIMEOUT_DEFAULT_SECS: u64 = 180;
@@ -287,6 +288,49 @@ fn session(cluster: &Cluster, psql: &Path, ours: bool) -> Vec<u8> {
     assert!(status.success(), "{} returned {status}", psql.display());
 
     std::fs::read(&historyfile).expect("psql wrote its history file")
+}
+
+/// Not upstream, and rpsql only: lines pasted in one write, where each line's
+/// first byte may arrive in the same read as the Enter before it. redox_liner's
+/// `Context::read_line` dropped that byte with its per-line key iterator,
+/// which turned `\warn cd` into `warn cd`, a query buffer line (NAT-405).
+/// Lines of odd and even length both come after an Enter here, and the
+/// multi-line statement still waits for its semicolon (`mainloop.c:420`).
+#[test]
+fn a_paste_keeps_the_first_byte_of_every_line() {
+    let Some(cluster) = Cluster::start(PASTE_PORT) else {
+        return;
+    };
+    let historyfile = Path::new(env!("CARGO_TARGET_TMPDIR")).join("010_rpsql_paste_history.txt");
+    let _ = std::fs::remove_file(&historyfile);
+    let rpsql = Path::new(RPSQL);
+    let mut h = interactive_psql(&cluster, rpsql, &historyfile);
+
+    check_completion(
+        &mut h,
+        rpsql,
+        b"\\echo ab\n\\warn cd\n\\echo e\n\\echo fgh\nselect\n4 + 2;\n\\echo end\n",
+        "(?s)\\nab\\r?\\n.*\\ne\\r?\\n.*\\nfgh\\r?\\n.*\\n6\\r?\\n.*\\nend\\r?\\n",
+        "every pasted line keeps its first byte",
+    );
+    // `\warn cd` ran before `\echo end`; its stderr pipe may lag behind.
+    let deadline = Instant::now() + TIMEOUT_DEFAULT;
+    while h.stderr.lock().unwrap().as_slice() != b"cd\n" {
+        assert!(
+            Instant::now() < deadline,
+            "\\warn cd did not reach stderr; it has {:?}",
+            String::from_utf8_lossy(&h.stderr.lock().unwrap())
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = h.quit();
+    assert!(status.success(), "rpsql returned {status}");
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&historyfile).expect("a history file")),
+        "\\echo 'background_psql: ready'\n\\warn 'background_psql: ready'\n\
+         \\echo ab\n\\warn cd\n\\echo e\n\\echo fgh\nselect\u{1}4 + 2;\n\\echo end\n\\q\n",
+        "the history file holds each pasted line whole"
+    );
 }
 
 #[test]

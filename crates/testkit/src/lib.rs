@@ -26,6 +26,7 @@
 #![allow(clippy::doc_markdown, clippy::module_name_repetitions)]
 
 pub mod checks;
+pub mod citation;
 pub mod control;
 pub mod diff;
 pub mod env;

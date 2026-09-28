@@ -11,3 +11,6 @@
 
 # Reference binaries fetched by scripts/fetch-ref-binaries.sh
 /.ref/
+
+# PostgreSQL 18.6 source fetched by scripts/fetch-upstream-src.sh
+/.upstream/

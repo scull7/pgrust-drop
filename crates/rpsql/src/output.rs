@@ -2,8 +2,8 @@
 //! the shell status a closed pipe leaves behind.
 //!
 //! Ports `openQueryOutputFile` and `setQFout` (`common.c:58`, `:146`),
-//! `SetShellResultVariables` (`common.c:518`), and `wait_result_to_str` and
-//! `wait_result_to_exit_code` (`src/common/wait_error.c:33`, `:138`).
+//! `SetShellResultVariables` (`common.c:518`), `wait_result_to_str`
+//! (`src/common/wait_error.c:33`) and `wait_result_to_exit_code` (`:138`).
 //! `popen(command, …)` is `/bin/sh -c command` with one end of a pipe, as
 //! POSIX specifies it, and `pclose` is the wait for that shell.
 //!

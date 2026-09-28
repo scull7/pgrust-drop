@@ -98,14 +98,20 @@ jobs:
       RUSTUP_HOME: /__w/_rust/rustup
       CARGO_HOME: /__w/_rust/cargo
       PGDROP_REF_BIN_MUSL: /usr/libexec/postgresql18
+      # NAT-519: the citation lint (crates/testkit/tests/citations.rs) may not
+      # SKIP here; the step "fetch the pristine PostgreSQL 18.6 source" below
+      # sets PGDROP_UPSTREAM_SRC. The other lanes skip it, flagged: it reads
+      # only text, so one lane is enough, and musl gates every push.
+      PGDROP_REQUIRE_UPSTREAM_SRC: 1
     steps:
       # zstd is for Swatinem/rust-cache, not the build: actions/cache compresses
       # with zstd only if a `zstd` binary is on PATH and otherwise falls back to
       # gzip, which on this ~700 MB cache took 91 s to save and 49 s to unpack
       # (NAT-598). With zstdmt both are a few seconds, as on the other lanes.
+      # bzip2 is for scripts/fetch-upstream-src.sh: GNU tar's -j runs it.
       - name: Install the Alpine toolchain and the PostgreSQL 18 reference
         run: |
-          apk add --no-cache bash build-base curl git libstdc++ linux-headers musl-dev \
+          apk add --no-cache bash build-base bzip2 curl git libstdc++ linux-headers musl-dev \
             perl tar unzip xz zstd postgresql18 postgresql18-client
       - uses: actions/checkout@v4
       # Toolchain in a shared, world-writable prefix (as the official rust
@@ -172,6 +178,17 @@ jobs:
             mv "$d" "$aside/${repo##*/}-${rev##*/}"
           done
           df -P "$CARGO_HOME" "$aside"
+      # NAT-519: the tree every upstream file:line citation is checked against
+      # -- the release tarball, verified against its published sha256, never
+      # pgrust's reference tree (AGENTS.md). 22 MB, fetched and unpacked in
+      # ~4 s; not cached. Outside the workspace and the cached paths; root
+      # unpacks it (modes 644/755) and ci only reads it. No pipeline, so the
+      # script's exit status is the step's.
+      - name: fetch the pristine PostgreSQL 18.6 source (citation lint)
+        run: |
+          set -eu
+          line=$(scripts/fetch-upstream-src.sh --dest /__w/_upstream)
+          echo "${line#export }" >> "$GITHUB_ENV"
       - name: fmt
         run: su -c 'cargo fmt --all --check' ci
       - name: license wall (no pgrust crate reachable from an MIT crate)

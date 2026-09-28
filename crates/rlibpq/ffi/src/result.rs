@@ -245,7 +245,7 @@ impl PGresult {
 /// `pg_tolower` (`src/port/pgstrcasecmp.c:122`) lowers `A`-`Z`, and a
 /// high-bit byte only where the C library's `isupper` says so, which in the
 /// C locale a program starts in is never; this port lowers ASCII only. C's
-/// fast path for a name already all lower case (`:3645`-`:3659`) is the
+/// fast path for a name already all lower case (`fe-exec.c:3645`-`:3659`) is the
 /// same answer, since folding such a name changes nothing.
 fn fold_field_name(field_name: &[u8]) -> Vec<u8> {
     let mut folded = Vec::with_capacity(field_name.len());

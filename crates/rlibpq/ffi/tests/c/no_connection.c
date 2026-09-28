@@ -133,6 +133,21 @@ main(void)
 	printf("PQdescribePrepared %s PQdescribePortal %s\n",
 		   null_or_set(PQdescribePrepared(NULL, "s")),
 		   null_or_set(PQdescribePortal(NULL, "p")));
+	printf("PQsendQuery %d PQsendQueryParams %d PQsendPrepare %d\n",
+		   PQsendQuery(NULL, "select 1"),
+		   PQsendQueryParams(NULL, "select 1", 0, NULL, NULL, NULL, NULL, 0),
+		   PQsendPrepare(NULL, "s", "select 1", 0, NULL));
+	printf("PQsendQueryPrepared %d PQsendDescribePrepared %d PQsendDescribePortal %d\n",
+		   PQsendQueryPrepared(NULL, "s", 0, NULL, NULL, NULL, 0),
+		   PQsendDescribePrepared(NULL, "s"), PQsendDescribePortal(NULL, "p"));
+	printf("PQgetResult %s PQconsumeInput %d PQisBusy %d PQnotifies %s\n",
+		   null_or_set(PQgetResult(NULL)), PQconsumeInput(NULL), PQisBusy(NULL),
+		   null_or_set(PQnotifies(NULL)));
+	printf("PQsetnonblocking %d PQisnonblocking %d PQflush %d\n",
+		   PQsetnonblocking(NULL, 1), PQisnonblocking(NULL), PQflush(NULL));
+	printf("PQsetNoticeReceiver %s PQsetNoticeProcessor %s\n",
+		   PQsetNoticeReceiver(NULL, NULL, NULL) ? "set" : "NULL",
+		   PQsetNoticeProcessor(NULL, NULL, NULL) ? "set" : "NULL");
 	print_accessors(NULL);
 	printf("PQparameterStatus %s PQresetStart %d PQresetPoll %d\n",
 		   null_or_set(PQparameterStatus(NULL, NULL)), PQresetStart(NULL),
@@ -154,6 +169,18 @@ main(void)
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
 	printf("PQdescribePortal %s\n", null_or_set(PQdescribePortal(conn, NULL)));
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	printf("PQsendQuery %d\n", PQsendQuery(conn, NULL));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	/* pqReadData finds no socket, and the error is added to the last */
+	printf("PQconsumeInput %d\n", PQconsumeInput(conn));
+	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	printf("PQgetResult %s PQisBusy %d PQnotifies %s\n", null_or_set(PQgetResult(conn)),
+		   PQisBusy(conn), null_or_set(PQnotifies(conn)));
+	printf("PQsetnonblocking %d PQisnonblocking %d PQflush %d\n",
+		   PQsetnonblocking(conn, 1), PQisnonblocking(conn), PQflush(conn));
+	printf("PQsetNoticeReceiver %s PQsetNoticeProcessor %s\n",
+		   PQsetNoticeReceiver(conn, NULL, NULL) ? "set" : "NULL",
+		   PQsetNoticeProcessor(conn, NULL, NULL) ? "set" : "NULL");
 	print_accessors(conn);
 	printf("PQparameterStatus %s\n", null_or_set(PQparameterStatus(conn, NULL)));
 	/* the options were never valid, so a reset fails with no message */

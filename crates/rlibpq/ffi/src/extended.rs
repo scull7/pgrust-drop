@@ -18,7 +18,7 @@ use crate::result::PGresult;
 
 /// Calculation: `nParams`, checked as `fe-exec.c:1527`, `:1573` and `:1667`
 /// check it.
-fn param_count(n_params: c_int) -> Result<usize, Refused> {
+pub(crate) fn param_count(n_params: c_int) -> Result<usize, Refused> {
     usize::try_from(n_params)
         .ok()
         .filter(|&count| count <= PQ_QUERY_PARAM_MAX_LIMIT)
@@ -41,21 +41,21 @@ fn format(code: c_int) -> Format {
 /// # Safety
 ///
 /// `array` is null or points at `n` readable `T`s that outlive `'a`.
-unsafe fn c_array<'a, T>(array: *const T, n: usize) -> Option<&'a [T]> {
+pub(crate) unsafe fn c_array<'a, T>(array: *const T, n: usize) -> Option<&'a [T]> {
     // SAFETY: the caller's contract; a zero-length slice needs only a
     // non-null, aligned pointer, which a non-null C array is.
     (!array.is_null()).then(|| unsafe { std::slice::from_raw_parts(array, n) })
 }
 
 /// The parameters of one `PQexecParams` or `PQexecPrepared`, read from C.
-struct CParams<'a> {
+pub(crate) struct CParams<'a> {
     values: Vec<Option<&'a [u8]>>,
     formats: Vec<Format>,
     result_format: Format,
 }
 
 impl CParams<'_> {
-    fn params(&self) -> Params<'_> {
+    pub(crate) fn params(&self) -> Params<'_> {
         Params {
             values: &self.values,
             formats: &self.formats,
@@ -81,7 +81,7 @@ impl CParams<'_> {
 /// Each non-null array holds `n` entries; each non-null `paramValues` entry
 /// is a NUL-terminated string when its format is text, and
 /// `paramLengths[i]` readable bytes when binary.
-unsafe fn read_params<'a>(
+pub(crate) unsafe fn read_params<'a>(
     n: usize,
     param_values: *const *const c_char,
     param_lengths: *const c_int,

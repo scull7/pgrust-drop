@@ -53,8 +53,14 @@ fn every_shim_in_the_matrix_links_from_c() {
 /// and `PQexecStart`'s NULL `conn`, `:2365`), then a conninfo that does not
 /// parse: `PQconnectdb` still returns a `PGconn`, `CONNECTION_BAD` with
 /// `conninfo_parse`'s message (`fe-connect.c:6347`), and `PQexec`,
-/// `PQexecParams` and `PQdescribePortal` on it send nothing
-/// (`fe-exec.c:1706`), before any argument is checked. The accessors of
+/// `PQexecParams`, `PQdescribePortal` and `PQsendQuery` on it send nothing
+/// (`fe-exec.c:1706`), before any argument is checked; `PQconsumeInput`
+/// adds `pqReadData`'s "connection not open" (`fe-misc.c:621`) to the
+/// error; and the calls that do not wait answer as for NULL, but for the
+/// notice hooks, which are the defaults (`fe-connect.c:4976`-`:4977`).
+/// For a NULL `conn` every one of them fails at its first check
+/// (`fe-exec.c:1692`, `:2003`, `:2050`, `:2083`, `:2688`, `:3979`, `:4016`,
+/// `:4033`; `fe-connect.c:7806`, `:7823`). The accessors of
 /// that `PGconn` read fields never filled (`fe-connect.c:7472`-`:7680`):
 /// NULL, but `""` for `PQpass`, `PQhost` and `PQtty` and `DEF_PGPORT_STR`
 /// for `PQport`; `PQconninfo` is every row with no value; and `PQreset`
@@ -109,6 +115,11 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQresultErrorField NULL\n\
          PQexecParams NULL PQprepare NULL PQexecPrepared NULL\n\
          PQdescribePrepared NULL PQdescribePortal NULL\n\
+         PQsendQuery 0 PQsendQueryParams 0 PQsendPrepare 0\n\
+         PQsendQueryPrepared 0 PQsendDescribePrepared 0 PQsendDescribePortal 0\n\
+         PQgetResult NULL PQconsumeInput 0 PQisBusy 0 PQnotifies NULL\n\
+         PQsetnonblocking -1 PQisnonblocking 0 PQflush -1\n\
+         PQsetNoticeReceiver NULL PQsetNoticeProcessor NULL\n\
          PQdb NULL PQuser NULL PQoptions NULL\n\
          PQpass NULL PQhost NULL PQport NULL PQtty NULL\n\
          PQtransactionStatus 4 PQparameterStatus NULL PQserverVersion 0\n\
@@ -124,6 +135,14 @@ fn every_shim_answers_as_c_libpq_without_ssl_or_gssapi() {
          PQerrorMessage no connection to the server\n\
          PQdescribePortal NULL\n\
          PQerrorMessage no connection to the server\n\
+         PQsendQuery 0\n\
+         PQerrorMessage no connection to the server\n\
+         PQconsumeInput 0\n\
+         PQerrorMessage no connection to the server\n\
+         connection not open\n\
+         PQgetResult NULL PQisBusy 0 PQnotifies NULL\n\
+         PQsetnonblocking -1 PQisnonblocking 0 PQflush -1\n\
+         PQsetNoticeReceiver set PQsetNoticeProcessor set\n\
          PQdb NULL PQuser NULL PQoptions NULL\n\
          PQpass  PQhost  PQport 5432 PQtty \n\
          PQtransactionStatus 4 PQparameterStatus NULL PQserverVersion 0\n\

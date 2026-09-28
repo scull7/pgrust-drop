@@ -25,7 +25,7 @@ is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because
 by step without waiting and `rlibpq-ffi` makes in one blocking step
 (`docs/divergences.md`).
 
-75 of 210 symbols implemented, 0 stubbed with an error, 135 not yet.
+90 of 210 symbols implemented, 0 stubbed with an error, 120 not yet.
 
 | ordinal | symbol | coverage | follows |
 |--:|---|---|---|
@@ -48,13 +48,13 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 17 | `PQbackendPID` | implemented | fe-connect.c:7674 |
 | 18 | `PQtrace` | not yet |  |
 | 19 | `PQuntrace` | not yet |  |
-| 20 | `PQsetNoticeProcessor` | not yet |  |
+| 20 | `PQsetNoticeProcessor` | implemented | fe-connect.c:7819 |
 | 21 | `PQexec` | implemented | fe-exec.c:2279 |
-| 22 | `PQnotifies` | not yet |  |
-| 23 | `PQsendQuery` | not yet |  |
-| 24 | `PQgetResult` | not yet |  |
-| 25 | `PQisBusy` | not yet |  |
-| 26 | `PQconsumeInput` | not yet |  |
+| 22 | `PQnotifies` | implemented | fe-exec.c:2684 |
+| 23 | `PQsendQuery` | implemented | fe-exec.c:1433 |
+| 24 | `PQgetResult` | implemented | fe-exec.c:2079 |
+| 25 | `PQisBusy` | implemented | fe-exec.c:2048 |
+| 26 | `PQconsumeInput` | implemented | fe-exec.c:2001 |
 | 27 | `PQgetline` | not yet |  |
 | 28 | `PQputline` | not yet |  |
 | 29 | `PQgetlineAsync` | not yet |  |
@@ -109,12 +109,12 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 78 | `PQconninfoFree` | implemented | fe-connect.c:7459 |
 | 79 | `PQconnectPoll` | implemented | fe-connect.c:2908, blocking |
 | 80 | `PQconnectStart` | implemented | fe-connect.c:948, blocking |
-| 81 | `PQflush` | not yet |  |
-| 82 | `PQisnonblocking` | not yet |  |
+| 81 | `PQflush` | implemented | fe-exec.c:4031 |
+| 82 | `PQisnonblocking` | implemented | fe-exec.c:4014 |
 | 83 | `PQresetPoll` | implemented | fe-connect.c:5367, blocking |
 | 84 | `PQresetStart` | implemented | fe-connect.c:5348, blocking |
 | 85 | `PQsetClientEncoding` | not yet |  |
-| 86 | `PQsetnonblocking` | not yet |  |
+| 86 | `PQsetnonblocking` | implemented | fe-exec.c:3975 |
 | 87 | `PQfreeNotify` | implemented | fe-exec.c:4080 |
 | 88 | `PQescapeString` | not yet |  |
 | 89 | `PQescapeBytea` | not yet |  |
@@ -128,9 +128,9 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 97 | `PQparameterStatus` | implemented | fe-connect.c:7593 |
 | 98 | `PQprotocolVersion` | not yet |  |
 | 99 | `PQsetErrorVerbosity` | not yet |  |
-| 100 | `PQsetNoticeReceiver` | not yet |  |
+| 100 | `PQsetNoticeReceiver` | implemented | fe-connect.c:7802 |
 | 101 | `PQexecParams` | implemented | fe-exec.c:2293 |
-| 102 | `PQsendQueryParams` | not yet |  |
+| 102 | `PQsendQueryParams` | implemented | fe-exec.c:1509 |
 | 103 | `PQputCopyData` | not yet |  |
 | 104 | `PQputCopyEnd` | not yet |  |
 | 105 | `PQgetCopyData` | not yet |  |
@@ -139,7 +139,7 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 108 | `PQftablecol` | implemented | fe-exec.c:3728 |
 | 109 | `PQfformat` | implemented | fe-exec.c:3739 |
 | 110 | `PQexecPrepared` | implemented | fe-exec.c:2340 |
-| 111 | `PQsendQueryPrepared` | not yet |  |
+| 111 | `PQsendQueryPrepared` | implemented | fe-exec.c:1650 |
 | 112 | `PQdsplen` | not yet |  |
 | 113 | `PQserverVersion` | implemented | fe-connect.c:7628 |
 | 114 | `PQgetssl` | implemented | fe-secure.c:452, without SSL |
@@ -147,7 +147,7 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 116 | `pg_valid_server_encoding` | not yet |  |
 | 117 | `pqsignal` | not yet |  |
 | 118 | `PQprepare` | implemented | fe-exec.c:2323 |
-| 119 | `PQsendPrepare` | not yet |  |
+| 119 | `PQsendPrepare` | implemented | fe-exec.c:1553 |
 | 120 | `PQgetCancel` | not yet |  |
 | 121 | `PQfreeCancel` | not yet |  |
 | 122 | `PQcancel` | not yet |  |
@@ -163,8 +163,8 @@ by step without waiting and `rlibpq-ffi` makes in one blocking step
 | 132 | `PQparamtype` | implemented | fe-exec.c:3957 |
 | 133 | `PQdescribePrepared` | implemented | fe-exec.c:2472 |
 | 134 | `PQdescribePortal` | implemented | fe-exec.c:2491 |
-| 135 | `PQsendDescribePrepared` | not yet |  |
-| 136 | `PQsendDescribePortal` | not yet |  |
+| 135 | `PQsendDescribePrepared` | implemented | fe-exec.c:2508 |
+| 136 | `PQsendDescribePortal` | implemented | fe-exec.c:2521 |
 | 137 | `lo_truncate` | not yet |  |
 | 138 | `PQconnectionUsedPassword` | not yet |  |
 | 139 | `pg_valid_server_encoding_id` | not yet |  |

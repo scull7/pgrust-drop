@@ -187,12 +187,29 @@ impl Listen {
     }
 }
 
+/// What `--datadir` named before `start` touched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// Nothing there (or no `--datadir`): `initdb` creates the directory.
+    Nothing,
+    /// Something that is not a cluster: an empty directory `initdb` fills,
+    /// or anything else, which `initdb` refuses.
+    Other,
+    /// A directory with a `PG_VERSION`.
+    Cluster,
+}
+
 /// How the data directory came to be, which decides what `stop` removes.
+/// Only a directory `start` created is ever removed, by `stop` or by a
+/// failed `start`: anything that was there before belongs to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// `start` runs `initdb` into it; `stop` removes it unless `--keep`.
-    Minted,
-    /// `--datadir` already held a cluster; `stop` never removes it.
+    /// `initdb` creates it; `stop` removes it unless `--keep`.
+    Created,
+    /// It existed without a cluster; `initdb` runs into it (and refuses it
+    /// unless it is empty). Never removed: the cluster minted in it stays.
+    Filled,
+    /// `--datadir` already held a cluster; never removed.
     Existing,
 }
 
@@ -208,7 +225,7 @@ pub struct StartPlan {
     pub settings: Vec<Setting>,
     pub foreground: bool,
     pub json: bool,
-    /// `stop` leaves the run directory and a minted data directory alone.
+    /// `stop` leaves the run directory and a data directory it created alone.
     pub keep: bool,
 }
 
@@ -225,8 +242,8 @@ pub fn run_dir_name(pid: u32, nonce: u64) -> String {
 ///
 /// `cwd` makes a relative `--datadir` absolute (the URI and `--json` name
 /// it, and a caller may be in another directory); `run_dir` is the fresh
-/// directory the caller created; `datadir_holds_cluster` is whether
-/// `--datadir` already has a `PG_VERSION` (a default datadir never does).
+/// directory the caller created; `found` is what `--datadir` named before
+/// `start` touched it (a default datadir is always [`Found::Nothing`]).
 ///
 /// # Errors
 ///
@@ -237,7 +254,7 @@ pub fn plan(
     flags: &Start,
     cwd: &Path,
     run_dir: &Path,
-    datadir_holds_cluster: bool,
+    found: Found,
 ) -> Result<StartPlan, StartError> {
     let settings = flags
         .set
@@ -254,9 +271,15 @@ pub fn plan(
         });
     }
     let (datadir, origin) = match &flags.datadir {
-        Some(dir) if datadir_holds_cluster => (cwd.join(dir), Origin::Existing),
-        Some(dir) => (cwd.join(dir), Origin::Minted),
-        None => (Path::new(&run_dir).join("data"), Origin::Minted),
+        Some(dir) => (
+            cwd.join(dir),
+            match found {
+                Found::Nothing => Origin::Created,
+                Found::Other => Origin::Filled,
+                Found::Cluster => Origin::Existing,
+            },
+        ),
+        None => (Path::new(&run_dir).join("data"), Origin::Created),
     };
     Ok(StartPlan {
         datadir: utf8(datadir)?,
@@ -291,7 +314,7 @@ impl StartPlan {
     pub fn initdb_args(&self) -> Option<Vec<String>> {
         match self.origin {
             Origin::Existing => None,
-            Origin::Minted => Some(vec![
+            Origin::Created | Origin::Filled => Some(vec![
                 "--no-sync".to_owned(),
                 "--no-instructions".to_owned(),
                 "--auth".to_owned(),
@@ -368,7 +391,7 @@ impl StartPlan {
     /// Whether `stop` removes the data directory.
     #[must_use]
     pub fn removes_datadir(&self) -> bool {
-        self.origin == Origin::Minted && !self.keep
+        self.origin == Origin::Created && !self.keep
     }
 
     /// What `start` leaves in the data directory for `stop`.
@@ -541,7 +564,7 @@ mod tests {
             flags,
             Path::new("/work"),
             Path::new("/tmp/pgdrop-7-1f"),
-            false,
+            Found::Nothing,
         )
         .expect("a plan")
     }
@@ -605,7 +628,7 @@ mod tests {
         let plan = plan_in(&flags());
         assert_eq!(plan.run_dir, "/tmp/pgdrop-7-1f");
         assert_eq!(plan.datadir, "/tmp/pgdrop-7-1f/data");
-        assert_eq!(plan.origin, Origin::Minted);
+        assert_eq!(plan.origin, Origin::Created);
         assert!(plan.removes_datadir());
         let kept = plan_in(&Start {
             keep: true,
@@ -622,13 +645,40 @@ mod tests {
         };
         let minted = plan_in(&named);
         assert_eq!(minted.datadir, "/work/rel/data");
-        assert_eq!(minted.origin, Origin::Minted);
+        assert_eq!(minted.origin, Origin::Created);
         assert!(minted.removes_datadir());
 
-        let existing = plan(&named, Path::new("/work"), Path::new("/tmp/r"), true).unwrap();
+        let existing = plan(
+            &named,
+            Path::new("/work"),
+            Path::new("/tmp/r"),
+            Found::Cluster,
+        )
+        .unwrap();
         assert_eq!(existing.origin, Origin::Existing);
         assert_eq!(existing.initdb_args(), None);
         assert!(!existing.removes_datadir());
+    }
+
+    /// Review of PR #99: a failed `start --datadir DIR` on a directory full
+    /// of someone's files removed it.
+    #[test]
+    fn a_directory_that_was_already_there_is_minted_into_but_never_removed() {
+        let named = Start {
+            datadir: Some("mine".into()),
+            ..flags()
+        };
+        let filled = plan(
+            &named,
+            Path::new("/work"),
+            Path::new("/tmp/r"),
+            Found::Other,
+        )
+        .unwrap();
+        assert_eq!(filled.origin, Origin::Filled);
+        assert!(filled.initdb_args().is_some());
+        assert!(!filled.removes_datadir());
+        assert!(!filled.record().removes_datadir);
     }
 
     #[test]
@@ -694,7 +744,7 @@ mod tests {
             ..flags()
         };
         assert_eq!(
-            plan(&bad, Path::new("/"), Path::new("/tmp/r"), false),
+            plan(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
             Err(StartError::SetWithoutValue("fsync".into()))
         );
     }
@@ -703,9 +753,9 @@ mod tests {
     fn a_socket_path_that_overflows_sun_path_is_refused() {
         // `<dir>/.s.PGSQL.5432` is 14 bytes longer than `<dir>`.
         let fits = format!("/{}", "d".repeat(UNIXSOCK_PATH_BUFLEN - 16));
-        assert!(plan(&flags(), Path::new("/"), Path::new(&fits), false).is_ok());
+        assert!(plan(&flags(), Path::new("/"), Path::new(&fits), Found::Nothing).is_ok());
         let long = format!("{fits}d");
-        match plan(&flags(), Path::new("/"), Path::new(&long), false) {
+        match plan(&flags(), Path::new("/"), Path::new(&long), Found::Nothing) {
             Err(StartError::SocketPathTooLong { path, max }) => {
                 assert_eq!(path.len(), UNIXSOCK_PATH_BUFLEN);
                 assert_eq!(max, UNIXSOCK_PATH_BUFLEN - 1);
@@ -748,7 +798,7 @@ mod tests {
             &flags(),
             Path::new("/"),
             Path::new("/tmp/odd dir:@?#%/pgdrop-1-2"),
-            false,
+            Found::Nothing,
         )
         .unwrap();
         let info = rlibpq::conninfo::parse_conninfo(odd.uri().as_bytes()).expect("a valid URI");
@@ -796,7 +846,7 @@ mod tests {
             },
             Path::new("/work"),
             Path::new("/tmp/r"),
-            true,
+            Found::Cluster,
         )
         .unwrap()
         .record();
@@ -837,7 +887,7 @@ mod tests {
             ..flags()
         };
         assert_eq!(
-            plan(&bad, Path::new("/"), Path::new("/tmp/r"), false),
+            plan(&bad, Path::new("/"), Path::new("/tmp/r"), Found::Nothing),
             Err(StartError::NotUtf8(raw.into()))
         );
     }

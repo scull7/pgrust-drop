@@ -19,6 +19,7 @@ path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+libc = { workspace = true }
 rlibpq = { workspace = true }
 
 [dev-dependencies]

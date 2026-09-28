@@ -25,6 +25,8 @@ thiserror = "2"
 signal-hook = "0.3"
 # rlibpq's readiness wait, `rustix::event::poll` (owner, 2026-09-27; ADR-0010).
 rustix = { version = "1", default-features = false, features = ["event", "std"] }
+# rlibpq-ffi's C-library calls: `free` for `PQfreemem` (owner, 2026-09-27).
+libc = "0.2"
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

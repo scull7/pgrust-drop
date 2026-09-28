@@ -33,16 +33,20 @@ impl Scratch {
         Self(path)
     }
 
-    fn pgdrop(&self, args: &[&str]) -> Output {
-        Command::new(PGDROP)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(PGDROP);
+        command
             .args(args)
             .env("XDG_CACHE_HOME", self.0.join("cache"))
             .env_remove("PGDATA")
             .env_remove("PGRUST_PGSHAREDIR")
             .env_remove("PGRUST_TZDIR")
-            .stdin(Stdio::null())
-            .output()
-            .expect("run pgdrop")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn pgdrop(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("run pgdrop")
     }
 }
 
@@ -102,16 +106,20 @@ fn json_field<'a>(json: &'a str, key: &str) -> &'a str {
 fn start<'a>(scratch: &'a Scratch, extra: &[&str]) -> Running<'a> {
     let mut argv = vec!["start", "--json"];
     argv.extend_from_slice(extra);
-    let output = scratch.pgdrop(&argv);
-    assert_success(&output, "pgdrop start");
-    let json = String::from_utf8(output.stdout).expect("UTF-8");
+    running(scratch, &scratch.pgdrop(&argv))
+}
+
+/// What a successful `start --json` printed, stopped when dropped.
+fn running<'a>(scratch: &'a Scratch, output: &Output) -> Running<'a> {
+    assert_success(output, "pgdrop start");
+    let json = std::str::from_utf8(&output.stdout).expect("UTF-8");
     assert!(json.ends_with("}\n"), "{json:?}");
     Running {
         scratch,
         started: Started {
-            uri: json_field(&json, "uri").to_owned(),
-            pid: json_field(&json, "pid").parse().expect("a PID"),
-            datadir: json_field(&json, "datadir").to_owned(),
+            uri: json_field(json, "uri").to_owned(),
+            pid: json_field(json, "pid").parse().expect("a PID"),
+            datadir: json_field(json, "datadir").to_owned(),
         },
     }
 }
@@ -290,6 +298,54 @@ fn two_concurrent_starts_never_collide() {
         assert_success(&stop, "pgdrop stop");
         assert!(!Path::new(&running.started.run_dir()).exists());
     }
+}
+
+/// NAT-607: the server keeps no descriptor `start` inherited beyond stdin,
+/// stdout and stderr. On macOS a concurrent spawn can hand `start` another
+/// thread's stdout pipe (std has no `pipe2` there); a server that kept it
+/// left that thread's `output()` waiting for an EOF that never came, and
+/// `two_concurrent_starts_never_collide` hung. Here the inheritance is made
+/// on purpose, so the test holds on every platform: the write end of a pipe
+/// is left open across `start`'s exec, and once `start` has exited and ours
+/// is closed, the read end must reach EOF.
+#[test]
+fn the_server_keeps_no_descriptor_start_inherited() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+
+    let scratch = Scratch::new("inherited-fd");
+    let (mut reader, writer) = std::io::pipe().expect("create a pipe");
+    let fd = writer.as_raw_fd();
+    let mut command = scratch.command(&["start", "--json"]);
+    // SAFETY: between fork and exec, `fcntl` is async-signal-safe and only
+    // clears the child's close-on-exec flag on its copy of `fd`.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let output = command.output().expect("run pgdrop");
+    let running = running(&scratch, &output);
+    drop(writer);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = sender.send(reader.read_to_end(&mut rest).map(|_| rest));
+    });
+    let eof = receiver.recv_timeout(Duration::from_secs(10));
+    assert!(
+        matches!(eof, Ok(Ok(ref rest)) if rest.is_empty()),
+        "the server (pid {}) still holds the inherited pipe: {eof:?}",
+        running.started.pid
+    );
+    drop(running);
 }
 
 #[test]

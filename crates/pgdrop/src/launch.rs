@@ -7,7 +7,8 @@
 //! 3. Mint the data directory with rinitdb, in this process.
 //! 4. Spawn `<this binary> postgres <server args>` in a process group of its
 //!    own (a terminal's Ctrl-C at the shell that ran `start` does not reach
-//!    it), stdin from `/dev/null`, stdout and stderr to `<run>/server.log`.
+//!    it), stdin from `/dev/null`, stdout and stderr to `<run>/server.log`,
+//!    and no other descriptor `start` inherited (Linear NAT-607).
 //! 5. Connect with rlibpq until a connection reaches `ReadyForQuery`, as
 //!    long as the server is alive, for at most pg_ctl's 60 seconds.
 //! 6. Write [`crate::start::Record`] into the data directory for `stop`.
@@ -300,8 +301,78 @@ fn spawn(plan: &StartPlan, log_path: &Path) -> Result<Child, LaunchError> {
         .stderr(log_too);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    #[cfg(unix)]
+    close_inherited_fds_on_exec();
     command.spawn().map_err(io_error("run", &exe))
 }
+
+/// Action: mark every descriptor above stderr close-on-exec, so the server
+/// keeps none that `start` inherited (Linear NAT-607). Whoever runs `start`
+/// may have handed it more than stdin, stdout and stderr: on macOS, which
+/// has no `pipe2`, std makes a child's pipes with `pipe` and then sets
+/// `FD_CLOEXEC`, so a thread that spawns `start` inside another thread's
+/// window gives it that thread's pipe. A server holding the write end of
+/// someone's stdout pipe keeps their `Command::output` from ever seeing EOF:
+/// `two_concurrent_starts_never_collide` hung the apple CI job for two
+/// hours. The server is long-lived, so it keeps nothing it was not given on
+/// purpose, as fd.c opens every descriptor it manages `O_CLOEXEC`
+/// (`src/backend/storage/file/fd.c:1617`). `start` is single-threaded here,
+/// so no other thread's descriptor is in flight. `pre_exec` could close
+/// them in the child instead, but it would force std off `posix_spawn`.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn close_inherited_fds_on_exec() {
+    for fd in open_fds() {
+        // SAFETY: `fcntl` with `F_GETFD` and `F_SETFD` takes integers,
+        // touches no memory of ours and changes only whether `exec` keeps
+        // `fd`. A number that is not open is `EBADF`, and is skipped.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// Action: the descriptors above stderr this process has open, from the
+/// kernel's list of them (`/proc/self/fd` on Linux, glibc and musl alike;
+/// `/dev/fd` on macOS). The list is read to the end before it is used, so
+/// the directory's own descriptor is closed by then and fails `F_GETFD`.
+/// Without the list, every number below the soft `RLIMIT_NOFILE`, at most
+/// [`FD_SCAN_CAP`].
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_fds() -> Vec<libc::c_int> {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        return entries
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd > 2)
+            .collect();
+    }
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlim` is a valid, writable `rlimit` for the call's duration.
+    let limit = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) } == 0 {
+        rlim.rlim_cur
+    } else {
+        FD_SCAN_CAP
+    };
+    let end = libc::c_int::try_from(limit.min(FD_SCAN_CAP)).unwrap_or(libc::c_int::MAX);
+    (3..end).collect()
+}
+
+/// The most descriptor numbers [`open_fds`] tries without the kernel's list:
+/// a soft `RLIMIT_NOFILE` may be `RLIM_INFINITY`.
+#[cfg(unix)]
+const FD_SCAN_CAP: libc::rlim_t = 65536;
 
 /// Action: step 5. A refused connection is the server still starting
 /// (no socket yet, or "the database system is starting up"); any failure

@@ -4,11 +4,12 @@
 //! then eats whatever arguments are left over with a warning. This issue
 //! implements the four commands it names — `\q`, `\c`, `\echo` and `\set` —
 //! plus the `\unset`, `\qecho` and `\warn` that share their code;
-//! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, and NAT-404
+//! NAT-400 adds `\pset`, NAT-403 `\timing` and `\errverbose`, NAT-404
 //! `\crosstabview`, `\g`, `\gx`, the extended-query commands `\parse`,
 //! `\bind`, `\bind_named` and `\close_prepared`, and the pipeline commands
 //! `\startpipeline`, `\sendpipeline`, `\syncpipeline`, `\flush`,
-//! `\flushrequest`, `\getresults` and `\endpipeline`. Everything else is
+//! `\flushrequest`, `\getresults` and `\endpipeline`, and NAT-396 the
+//! `\lo_*` commands ([`crate::large_obj`]). Everything else is
 //! [`CommandResult::Unknown`], which renders upstream's `invalid command \%s`;
 //! NAT-401 … NAT-403 fill the table in.
 
@@ -16,6 +17,7 @@ use std::io::Write;
 
 use rlibpq::{ContextVisibility, PipelineStatus, Verbosity};
 
+use crate::common::Executor;
 use crate::crosstab::CtvArgs;
 use crate::logging;
 use crate::scan::{Scanner, VariableSource};
@@ -79,6 +81,8 @@ pub struct CommandContext<'a> {
     /// `PQpipelineStatus(pset.db)`, which `\g`, `\gx` and `\sendpipeline`
     /// read. It only changes while a query is sent, never during a command.
     pub pipeline: PipelineStatus,
+    /// `pset.db`, for the commands that query the server.
+    pub executor: &'a mut dyn Executor,
 }
 
 /// One whole backslash command, from the variable snapshot the lexer reads to
@@ -98,6 +102,7 @@ pub fn dispatch_slash(
     pset: &mut PsqlSettings,
     vars: &mut VariableSpace,
     pipeline: PipelineStatus,
+    executor: &mut dyn Executor,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> CommandResult {
@@ -111,6 +116,7 @@ pub fn dispatch_slash(
             pset: &mut working,
             vars,
             pipeline,
+            executor,
         };
         handle_slash_cmds(scanner, &mut ctx, &VarView(&snapshot), stdout, stderr)
     };
@@ -179,6 +185,8 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "pset" => 2,
         "unset" | "timing" | "parse" | "close_prepared" | "getresults" => 1,
         "g" | "gx" => GArgs::split(options).consumed,
+        // `exec_command_lo` always reads two (`command.c:2378`-`:2381`).
+        _ if cmd.starts_with("lo_") => 2,
         _ => 0,
     };
     options[options.len().min(takes)..]
@@ -301,6 +309,11 @@ fn exec_command(
         "errverbose" => {
             exec_command_errverbose(ctx.pset, stdout, stderr);
             CommandResult::SkipLine
+        }
+        // `exec_command_lo()` (`command.c:2368`), for every `lo_` command
+        // (`command.c:417`).
+        _ if cmd.starts_with("lo_") => {
+            crate::large_obj::exec_command_lo(cmd, options, ctx, stdout, stderr)
         }
         _ => CommandResult::Unknown,
     }
@@ -650,7 +663,26 @@ fn exec_command_errverbose(pset: &PsqlSettings, stdout: &mut dyn Write, stderr: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::ErrorMessage;
     use crate::scan::{NoVariables, ScanResult};
+
+    /// No connection: the commands here never reach the server.
+    struct NoServer;
+
+    impl Executor for NoServer {
+        fn exec(
+            &mut self,
+            _query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<rlibpq::QueryResult>, ErrorMessage> {
+            Err(ErrorMessage::new("no connection"))
+        }
+        fn connected(&self) -> bool {
+            false
+        }
+
+        fn abandon(&mut self) {}
+    }
 
     struct Run {
         result: CommandResult,
@@ -674,6 +706,7 @@ mod tests {
                 pset: &mut pset,
                 vars: &mut vars,
                 pipeline: PipelineStatus::Off,
+                executor: &mut NoServer,
             };
             handle_slash_cmds(
                 &mut scanner,
@@ -836,6 +869,7 @@ mod tests {
             &mut pset,
             &mut vars,
             PipelineStatus::Off,
+            &mut NoServer,
             &mut stdout,
             &mut stderr,
         );
@@ -863,6 +897,7 @@ mod tests {
             &mut pset,
             &mut vars,
             PipelineStatus::Off,
+            &mut NoServer,
             &mut stdout,
             &mut stderr,
         );
@@ -961,6 +996,7 @@ mod tests {
             pset,
             &mut vars,
             pipeline,
+            &mut NoServer,
             &mut stdout,
             &mut stderr,
         );
@@ -1304,6 +1340,7 @@ mod tests {
             &mut pset,
             &mut vars,
             PipelineStatus::Off,
+            &mut NoServer,
             &mut stdout,
             &mut stderr,
         );

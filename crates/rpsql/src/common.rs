@@ -140,6 +140,13 @@ pub trait Executor {
     fn take_notices(&mut self) -> Vec<ResultError> {
         Vec::new()
     }
+
+    /// The connection's large-object calls, for `\lo_*`
+    /// ([`crate::large_obj`]); `None`, the default, when there is no
+    /// connection to make them on.
+    fn large_objects(&mut self) -> Option<&mut dyn crate::large_obj::LargeObjects> {
+        None
+    }
 }
 
 /// What `ECHO` prints before a query runs, or `None`.

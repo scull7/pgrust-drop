@@ -13,3 +13,6 @@ crates/rpsql/tests/regress/psql.sql -text
 crates/rpsql/tests/regress/expected/psql.out -text
 crates/rpsql/tests/regress/psql_crosstab.sql -text
 crates/rpsql/tests/regress/expected/psql_crosstab.out -text
+crates/rpsql/tests/regress/largeobject.sql -text
+crates/rpsql/tests/regress/expected/largeobject.out -text
+crates/rpsql/tests/regress/data/tenk.data -text

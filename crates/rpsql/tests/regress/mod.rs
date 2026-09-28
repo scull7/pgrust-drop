@@ -1,7 +1,8 @@
 //! The harness for the stolen `src/test/regress/sql/psql.sql`,
-//! `psql_crosstab.sql` and `psql_pipeline.sql`: the vendored scripts and
-//! their expected output, the splitter that cuts a script into sections, and
-//! a PostgreSQL 18 cluster to run a section or a whole script against.
+//! `psql_crosstab.sql`, `psql_pipeline.sql` and `largeobject.sql`: the
+//! vendored scripts and their expected output, the splitter that cuts a
+//! script into sections, and a PostgreSQL 18 cluster to run a section or a
+//! whole script against.
 //!
 //! `psql.sql` is one 2,000-line script. Gated whole, one wrong byte anywhere
 //! fails everything and the diff is unreviewable, so it is cut into the
@@ -55,6 +56,24 @@ pub const PSQL_PIPELINE_SQL_SHA256: &str =
 /// See [`PSQL_SQL_SHA256`].
 pub const PSQL_PIPELINE_OUT_SHA256: &str =
     "6b73b8e27cb811d7ca8c8f5d603b456f3db9d07c727b9a82ab20dd74556f24d5";
+
+/// `src/test/regress/sql/largeobject.sql` at `REL_18_6`, byte for byte.
+pub const LARGEOBJECT_SQL: &str = include_str!("largeobject.sql");
+/// `src/test/regress/expected/largeobject.out` at `REL_18_6`, byte for byte.
+pub const LARGEOBJECT_OUT: &str = include_str!("expected/largeobject.out");
+/// See [`PSQL_SQL_SHA256`].
+pub const LARGEOBJECT_SQL_SHA256: &str =
+    "31587d0c4006c12df38f6c2717ae1f021ae794de51bc9471467242ade3f0be14";
+/// See [`PSQL_SQL_SHA256`].
+pub const LARGEOBJECT_OUT_SHA256: &str =
+    "f124af7792de62956ddd82b919095c292c348e1a747b06a34a03bd04d519d5e4";
+/// `src/test/regress/data/tenk.data` at `REL_18_6`, which `largeobject.sql`
+/// imports from `abs_srcdir`. Read at run time: at 670,800 bytes it is not
+/// worth compiling into every test crate that uses this module.
+pub const TENK_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/regress/data/tenk.data");
+/// See [`PSQL_SQL_SHA256`].
+pub const TENK_DATA_SHA256: &str =
+    "d62f34bdc0a25a5ba36f2dbe62a35479d9e51a7326d482e418091ea2ed40e484";
 
 /// Lower-case hex of `bytes`' SHA-256, to hold a vendored file to its digest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -302,11 +321,33 @@ impl Cluster {
     /// # Panics
     /// When `psql` cannot be started or its output read.
     pub fn run_script(&self, psql: &Path, script: &str) -> Vec<u8> {
+        self.run_script_with(psql, "postgres", &[], script)
+    }
+
+    /// Action: [`Cluster::run_script`] in database `dbname`, with each of
+    /// `vars` set by `-v name=value` as well.
+    ///
+    /// # Panics
+    /// As [`Cluster::run_script`].
+    pub fn run_script_with(
+        &self,
+        psql: &Path,
+        dbname: &str,
+        vars: &[(&str, &str)],
+        script: &str,
+    ) -> Vec<u8> {
         let (mut reader, writer) = std::io::pipe().expect("a pipe for 2>&1");
         let mut command = Command::new(psql);
+        command.args(["-X", "-a", "-q", "-d", dbname]).args([
+            "-v",
+            "HIDE_TABLEAM=on",
+            "-v",
+            "HIDE_TOAST_COMPRESSION=on",
+        ]);
+        for (name, value) in vars {
+            command.arg("-v").arg(format!("{name}={value}"));
+        }
         command
-            .args(["-X", "-a", "-q", "-d", "postgres"])
-            .args(["-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"])
             // `pg_regress` names the server through the environment, too.
             .env("PGHOST", &self.dir)
             .env("PGPORT", self.port.to_string())

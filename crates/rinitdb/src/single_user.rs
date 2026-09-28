@@ -8,19 +8,22 @@
 //! this command line — [`fixup_script`] — and the one session that applies
 //! it, started the way C starts it ([`BACKEND_OPTIONS`], [`run`]).
 //!
-//! What the script covers so far: the superuser's name (`-U`). The password,
-//! collation stamping and the template databases' freeze are NAT-383's later
-//! slices; until they land, a script is empty exactly when `-U` names the
-//! template's own superuser, and no server is looked for or run then
+//! What the script covers so far: the superuser's name (`-U`) and password
+//! (`--pwfile`; `-W` is still refused, [`crate::cluster`]). Collation
+//! stamping and the template databases' freeze are NAT-383's later slices;
+//! until they land, a session is needed exactly when `-U` names another
+//! superuser than the template's or a password is asked for
+//! ([`needs_session`]), and no server is looked for or run otherwise
 //! (`docs/divergences.md`).
 //!
-//! Data / Calculations / Actions: [`SqlStatement`] and [`Server`] are data;
-//! [`fixup_script`], [`resolve_server`] (over a [`ServerProbe`]) and
-//! [`wait_result_to_str`] are pure; [`find_server`] and [`run`] are the
-//! Actions.
+//! Data / Calculations / Actions: [`SqlStatement`], [`SuperuserPassword`]
+//! and [`Server`] are data; [`needs_session`], [`fixup_script`],
+//! [`password_from_file`], [`resolve_server`] (over a [`ServerProbe`]) and
+//! [`wait_result_to_str`] are pure; [`get_su_pwd`], [`find_server`] and
+//! [`run`] are the Actions.
 
 use std::ffi::OsString;
-use std::io::Write as _;
+use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -28,7 +31,7 @@ use crate::cluster::TEMPLATE_SUPERUSER;
 use crate::error::InitdbError;
 use crate::help::{PG_VERSION, PROGNAME};
 use crate::strerror::strerror;
-use crate::validate::CreatePlan;
+use crate::validate::{CreatePlan, PasswordSource};
 
 /// `backend_options` (`initdb.c:226`), word by word.
 pub const BACKEND_OPTIONS: [&str; 10] = [
@@ -55,39 +58,82 @@ pub const BOOTSTRAP_SUPERUSERID: u32 = 10;
 /// upstream variable: C `initdb` only ever looks beside itself.
 pub const SERVER_ENV: &str = "PGDROP_POSTGRES";
 
-/// One statement for the session, without its terminator.
+/// One statement for the session, without its terminator. Bytes, not text:
+/// C writes the password as it read it, whatever its encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqlStatement(String);
+pub struct SqlStatement(Vec<u8>);
 
 impl SqlStatement {
-    /// The statement's text.
+    /// The statement's bytes.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
     /// What `PG_CMD_PUTS` writes for it (`initdb.c:334`): under `-j` a
     /// statement ends at a semicolon followed by an empty line.
     #[must_use]
-    pub fn to_input(&self) -> String {
-        format!("{};\n\n", self.0)
+    pub fn to_input(&self) -> Vec<u8> {
+        [self.0.as_slice(), b";\n\n"].concat()
     }
 }
 
 /// Pure: `escape_quotes` (`initdb.c:406`), which is
 /// `escape_single_quotes_ascii` (`src/port/quotes.c:33`) with
 /// `SQL_STR_DOUBLE(ch, true)` (`src/include/c.h:1152`): every `'` and `\`
-/// doubled, for an `E''` literal.
+/// byte doubled, for an `E''` literal. Byte by byte, as C: neither byte
+/// occurs inside a UTF-8 multibyte sequence.
 #[must_use]
-pub fn escape_quotes(src: &str) -> String {
-    let mut out = String::with_capacity(src.len() * 2);
-    for ch in src.chars() {
-        if matches!(ch, '\'' | '\\') {
-            out.push(ch);
+pub fn escape_quotes(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() * 2);
+    for &byte in src {
+        if matches!(byte, b'\'' | b'\\') {
+            out.push(byte);
         }
-        out.push(ch);
+        out.push(byte);
     }
     out
+}
+
+/// The superuser's password, as `get_su_pwd` (`initdb.c:1657`) leaves
+/// `superuser_password`: bytes, without its line end.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SuperuserPassword(Vec<u8>);
+
+impl SuperuserPassword {
+    /// A password of exactly these bytes.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// The password's bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Not the password itself: a `{:?}` in a panic or a log must not print it.
+impl std::fmt::Debug for SuperuserPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SuperuserPassword({} bytes)", self.0.len())
+    }
+}
+
+/// Pure: whether `plan` needs a single-user session at all, known before
+/// the password is read — C looks for the server (`setup_bin_paths`,
+/// `initdb.c:3472`) before it reads one (`get_su_pwd`, `:3502`). True
+/// exactly when [`fixup_script`] will not be empty.
+#[must_use]
+pub fn needs_session(plan: &CreatePlan) -> bool {
+    plan.password.is_some() || superuser(plan) != TEMPLATE_SUPERUSER
+}
+
+/// The superuser's name: `-U`'s, or the effective user's; the template's
+/// when neither settled it.
+fn superuser(plan: &CreatePlan) -> &str {
+    plan.username.as_deref().unwrap_or(TEMPLATE_SUPERUSER)
 }
 
 /// Pure: the statements that make the expanded template the cluster `plan`
@@ -105,20 +151,97 @@ pub fn escape_quotes(src: &str) -> String {
 /// one row is the whole rename. The `pg_` prefix was refused before this
 /// (`initdb.c:3478`, [`crate::validate`]); the literal is escaped as
 /// `setup_auth` escapes the password (`initdb.c:1649`).
+///
+/// `--pwfile`: `setup_auth`'s statement (`initdb.c:1649`), word for word and
+/// after the rename, so it names the new superuser as C's does. The name
+/// goes between double quotes unescaped, as in C. `setup_auth`'s other
+/// statement, `REVOKE ALL ON pg_authid FROM public` (`:1646`), is already in
+/// the template.
 #[must_use]
-pub fn fixup_script(plan: &CreatePlan) -> Vec<SqlStatement> {
+pub fn fixup_script(plan: &CreatePlan, password: Option<&SuperuserPassword>) -> Vec<SqlStatement> {
     let mut script = Vec::new();
-    if let Some(name) = plan
-        .username
-        .as_deref()
-        .filter(|name| *name != TEMPLATE_SUPERUSER)
-    {
-        script.push(SqlStatement(format!(
-            "UPDATE pg_authid SET rolname = E'{}' WHERE oid = {BOOTSTRAP_SUPERUSERID}",
-            escape_quotes(name)
-        )));
+    let name = superuser(plan);
+    if name != TEMPLATE_SUPERUSER {
+        script.push(SqlStatement(
+            [
+                b"UPDATE pg_authid SET rolname = E'".as_slice(),
+                &escape_quotes(name.as_bytes()),
+                format!("' WHERE oid = {BOOTSTRAP_SUPERUSERID}").as_bytes(),
+            ]
+            .concat(),
+        ));
+    }
+    if let Some(password) = password {
+        script.push(SqlStatement(
+            [
+                format!("ALTER USER \"{name}\" WITH PASSWORD E'").as_bytes(),
+                &escape_quotes(password.as_bytes()),
+                b"'",
+            ]
+            .concat(),
+        ));
     }
     script
+}
+
+/// Pure: `get_su_pwd`'s file branch (`initdb.c:1689`-`:1706`) over what
+/// reading the file gave: its first line, newline included, as
+/// `pg_get_line` returns it (`src/common/pg_get_line.c:59`), or an empty
+/// read at end of file. `None` is `password file "…" is empty`; otherwise
+/// `pg_strip_crlf` (`src/common/string.c:154`) takes every `\r` and `\n`
+/// off its end. A line of nothing but a newline is the empty password, as
+/// in C.
+///
+/// C then handles the password as a C string, which ends at a NUL byte;
+/// the bytes after one are dropped here too.
+#[must_use]
+pub fn password_from_file(first_line: &[u8]) -> Option<SuperuserPassword> {
+    if first_line.is_empty() {
+        return None;
+    }
+    let line = first_line
+        .iter()
+        .position(|&byte| byte == 0)
+        .map_or(first_line, |nul| &first_line[..nul]);
+    let end = line
+        .iter()
+        .rposition(|&byte| !matches!(byte, b'\r' | b'\n'))
+        .map_or(0, |last| last + 1);
+    Some(SuperuserPassword(line[..end].to_vec()))
+}
+
+/// Action: `get_su_pwd` (`initdb.c:1657`) for `source`.
+///
+/// `--pwfile`: the file's first line, read as `pg_get_line` reads it — only
+/// that line, so a file that never ends is not read to its end. Like C, the
+/// file's permissions are not checked (`:1684`).
+///
+/// `-W` reads nothing and gives `None`: the prompt is refused
+/// ([`crate::cluster::check_template_can_make`]) before any session runs.
+///
+/// # Errors
+/// C's three `pg_fatal`s: the file could not be opened (`:1692`), reading
+/// it failed (`:1698`), or it is empty (`:1701`).
+pub fn get_su_pwd(source: &PasswordSource) -> Result<Option<SuperuserPassword>, InitdbError> {
+    let PasswordSource::File(path) = source else {
+        return Ok(None);
+    };
+    let shown = || path.display().to_string();
+    let file =
+        std::fs::File::open(path).map_err(|err| InitdbError::CouldNotOpenFileForReading {
+            path: shown(),
+            reason: strerror(&err),
+        })?;
+    let mut line = Vec::new();
+    std::io::BufReader::new(file)
+        .read_until(b'\n', &mut line)
+        .map_err(|err| InitdbError::CouldNotReadPasswordFile {
+            path: shown(),
+            reason: strerror(&err),
+        })?;
+    password_from_file(&line)
+        .map(Some)
+        .ok_or_else(|| InitdbError::PasswordFileEmpty { path: shown() })
 }
 
 /// A `postgres` to run the session with.
@@ -375,7 +498,7 @@ pub fn run(server: &Server, pgdata: &Path, script: &[SqlStatement]) -> Result<()
     let mut output_failed = None;
     if let Some(mut stdin) = child.stdin.take() {
         for statement in script {
-            if let Err(err) = stdin.write_all(statement.to_input().as_bytes()) {
+            if let Err(err) = stdin.write_all(&statement.to_input()) {
                 output_failed = Some(err);
                 break;
             }
@@ -432,35 +555,141 @@ mod tests {
         }
     }
 
+    fn plan_with_password(username: &str, pwfile: &str) -> CreatePlan {
+        CreatePlan {
+            password: Some(PasswordSource::File(PathBuf::from(pwfile))),
+            ..plan_for(Some(username))
+        }
+    }
+
+    fn input(script: &[SqlStatement]) -> Vec<u8> {
+        script.iter().flat_map(SqlStatement::to_input).collect()
+    }
+
     #[test]
     fn the_templates_own_superuser_needs_no_session() {
-        assert_eq!(fixup_script(&plan_for(Some("postgres"))), []);
-        assert_eq!(fixup_script(&plan_for(None)), []);
+        for plan in [plan_for(Some("postgres")), plan_for(None)] {
+            assert!(!needs_session(&plan));
+            assert_eq!(fixup_script(&plan, None), []);
+        }
     }
 
     #[test]
     fn another_superuser_is_the_bootstrap_superuser_renamed() {
-        let script = fixup_script(&plan_for(Some("alice")));
+        let plan = plan_for(Some("alice"));
+        assert!(needs_session(&plan));
         assert_eq!(
-            script
-                .iter()
-                .map(SqlStatement::to_input)
-                .collect::<String>(),
-            "UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n"
+            input(&fixup_script(&plan, None)),
+            b"UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n"
         );
         // escape_quotes doubles both, as for C's E'' password literal.
-        let script = fixup_script(&plan_for(Some("o'brien\\x")));
+        let script = fixup_script(&plan_for(Some("o'brien\\x")), None);
         assert_eq!(
-            script[0].as_str(),
-            "UPDATE pg_authid SET rolname = E'o''brien\\\\x' WHERE oid = 10"
+            script[0].as_bytes(),
+            b"UPDATE pg_authid SET rolname = E'o''brien\\\\x' WHERE oid = 10"
         );
     }
 
     #[test]
+    fn a_password_is_setup_auths_alter_user_after_the_rename() {
+        // initdb.c:1649, naming the superuser as renamed.
+        let password = SuperuserPassword::new(b"s3'cr\\t".to_vec());
+        let plan = plan_with_password("alice", "/tmp/pw");
+        assert!(needs_session(&plan));
+        assert_eq!(
+            input(&fixup_script(&plan, Some(&password))),
+            b"UPDATE pg_authid SET rolname = E'alice' WHERE oid = 10;\n\n\
+              ALTER USER \"alice\" WITH PASSWORD E's3''cr\\\\t';\n\n"
+        );
+        // The template's own superuser: a session for the password alone.
+        let plan = plan_with_password("postgres", "/tmp/pw");
+        assert!(needs_session(&plan));
+        assert_eq!(
+            input(&fixup_script(&plan, Some(&password))),
+            b"ALTER USER \"postgres\" WITH PASSWORD E's3''cr\\\\t';\n\n"
+        );
+        // Bytes that are not UTF-8 are written as read, as C writes them.
+        let latin1 = SuperuserPassword::new(b"caf\xe9".to_vec());
+        assert_eq!(
+            fixup_script(&plan, Some(&latin1))[0].as_bytes(),
+            b"ALTER USER \"postgres\" WITH PASSWORD E'caf\xe9'"
+        );
+        // A prompt needs a session too, though it is refused before one runs.
+        let prompt = CreatePlan {
+            password: Some(PasswordSource::Prompt),
+            ..plan_for(Some("postgres"))
+        };
+        assert!(needs_session(&prompt));
+    }
+
+    #[test]
+    fn a_password_file_is_its_first_line_without_its_line_end() {
+        let read = |line: &[u8]| password_from_file(line).map(|pw| pw.as_bytes().to_vec());
+        // pg_get_line found nothing: "password file ... is empty".
+        assert_eq!(read(b""), None);
+        assert_eq!(read(b"secret\n"), Some(b"secret".to_vec()));
+        assert_eq!(read(b"secret"), Some(b"secret".to_vec()));
+        // pg_strip_crlf takes every trailing \r and \n, nothing else.
+        assert_eq!(read(b"secret\r\n"), Some(b"secret".to_vec()));
+        assert_eq!(read(b" sp ace \r\r\n"), Some(b" sp ace ".to_vec()));
+        // A lone newline is the empty password, not an empty file.
+        assert_eq!(read(b"\n"), Some(Vec::new()));
+        // The C string ends at a NUL.
+        assert_eq!(read(b"ab\0cd\n"), Some(b"ab".to_vec()));
+        // The Debug form never shows the password.
+        assert_eq!(
+            format!("{:?}", SuperuserPassword::new(b"secret".to_vec())),
+            "SuperuserPassword(6 bytes)"
+        );
+    }
+
+    #[test]
+    fn get_su_pwd_reads_the_first_line_and_reports_cs_errors() {
+        let dir = std::env::temp_dir().join(format!("rinitdb-pwfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let file = |name: &str, contents: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).expect("write a password file");
+            PasswordSource::File(path)
+        };
+        let got = get_su_pwd(&file("two-lines", b"first\nsecond\n")).expect("read");
+        assert_eq!(
+            got.map(|pw| pw.as_bytes().to_vec()),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            get_su_pwd(&file("empty", b"")).map_err(|err| err.render()),
+            Err(format!(
+                "initdb: error: password file \"{}\" is empty",
+                dir.join("empty").display()
+            ))
+        );
+        let missing = PasswordSource::File(dir.join("missing"));
+        assert_eq!(
+            get_su_pwd(&missing).map_err(|err| err.render()),
+            Err(format!(
+                "initdb: error: could not open file \"{}\" for reading: No such file or directory",
+                dir.join("missing").display()
+            ))
+        );
+        // A directory opens, as fopen(…, "r") opens one, and fails to read.
+        assert_eq!(
+            get_su_pwd(&PasswordSource::File(dir.clone())).map_err(|err| err.render()),
+            Err(format!(
+                "initdb: error: could not read password from file \"{}\": Is a directory",
+                dir.display()
+            ))
+        );
+        assert_eq!(get_su_pwd(&PasswordSource::Prompt), Ok(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn escape_quotes_doubles_quotes_and_backslashes_only() {
-        assert_eq!(escape_quotes("plain"), "plain");
-        assert_eq!(escape_quotes("a'b\\c\"d"), "a''b\\\\c\"d");
-        assert_eq!(escape_quotes("ünï'"), "ünï''");
+        assert_eq!(escape_quotes(b"plain"), b"plain");
+        assert_eq!(escape_quotes(b"a'b\\c\"d"), b"a''b\\\\c\"d");
+        assert_eq!(escape_quotes("ünï'".as_bytes()), "ünï''".as_bytes());
     }
 
     #[test]

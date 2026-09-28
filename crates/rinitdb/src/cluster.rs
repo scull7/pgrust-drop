@@ -52,10 +52,11 @@ pub const C_TEXT_SEARCH_CONFIG: &str = "english";
 ///   C writes them to `postgresql.conf` only (`initdb.c:1315`-`:1325`) and
 ///   never into the catalogs, so [`settings`] writes them too;
 /// - `--wal-segsize` other than 16;
-/// - `-W` and `--pwfile`: setting the superuser's password happens after
-///   expansion, in single-user mode, and is NAT-383's next slice. Another
-///   superuser name is not refused: [`crate::single_user`] renames the
-///   template's.
+/// - `-W`: `simple_prompt` reads the password from the terminal with echo
+///   off, which needs `termios` this crate does not reach yet (NAT-383).
+///   Another superuser name and `--pwfile` are not refused:
+///   [`crate::single_user`] renames the template's superuser and sets the
+///   password.
 ///
 /// # Errors
 /// [`InitdbError::NotSupportedYet`] for the first of those found.
@@ -97,10 +98,7 @@ pub fn check_template_can_make(options: &Options, plan: &CreatePlan) -> Result<(
         return refuse(format!("--wal-segsize={size}"), Unsupported::WalSegmentSize);
     }
     if options.pwprompt {
-        return refuse("--pwprompt".to_owned(), Unsupported::Password);
-    }
-    if options.pwfile.is_some() {
-        return refuse("--pwfile".to_owned(), Unsupported::Password);
+        return refuse("--pwprompt".to_owned(), Unsupported::PasswordPrompt);
     }
     Ok(())
 }
@@ -246,7 +244,7 @@ pub fn musl_setlocale_name(name: &str) -> &str {
 /// and C's line would name it as `setlocale` canonicalizes it and compare
 /// `-T` with whatever `find_matching_ts_config` makes of it, neither of
 /// which this crate reaches. Every other refusal — `-E`, `--locale-provider`,
-/// `--lc-collate`, `-W`, `--pwfile`, `--wal-segsize` — leaves
+/// `--lc-collate`, `-W`, `--wal-segsize` — leaves
 /// `lc_ctype` alone, so the line is C's whatever else is refused.
 #[must_use]
 pub fn text_search_warning(options: &Options) -> Option<String> {
@@ -427,22 +425,23 @@ mod tests {
     }
 
     #[test]
-    fn any_superuser_name_is_made_but_a_password_is_refused() {
+    fn any_superuser_name_and_a_password_file_are_made_but_a_prompt_is_refused() {
         // single_user::fixup_script renames the template's superuser.
         assert_eq!(verdict(&["-U", "alice"]), Ok(()));
         // No -U: validate's `username = effective_user` (initdb.c:3475).
         let (options, plan) = parsed_as("alice", &[]);
         assert_eq!(plan.username.as_deref(), Some("alice"));
         assert_eq!(check_template_can_make(&options, &plan), Ok(()));
-        assert!(
-            verdict(&["--pwfile=/nonexistent"])
-                .unwrap_err()
-                .starts_with("initdb: error: --pwfile is not supported yet")
-        );
-        assert!(
-            verdict(&["-W"])
-                .unwrap_err()
-                .starts_with("initdb: error: --pwprompt is not supported yet")
+        // single_user::fixup_script sets the password read from the file.
+        assert_eq!(verdict(&["--pwfile=/nonexistent"]), Ok(()));
+        assert_eq!(
+            verdict(&["-W"]),
+            Err(
+                "initdb: error: --pwprompt is not supported yet: reading the superuser's \
+                 password from the terminal is not implemented\n\
+                 initdb: hint: Give the password in a file with --pwfile."
+                    .to_owned()
+            )
         );
     }
 

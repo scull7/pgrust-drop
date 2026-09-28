@@ -99,8 +99,8 @@ pub enum Unsupported {
     EncodingOrLocale,
     /// Any WAL segment size but 16 MB.
     WalSegmentSize,
-    /// `-W` / `--pwfile` (NAT-383).
-    Password,
+    /// `-W`: reading the password from the terminal (NAT-383).
+    PasswordPrompt,
 }
 
 impl Unsupported {
@@ -112,7 +112,9 @@ impl Unsupported {
                 "the embedded template cluster has encoding \"UTF8\" and locale \"C\""
             }
             Unsupported::WalSegmentSize => "the embedded template cluster has 16 MB WAL segments",
-            Unsupported::Password => "setting the superuser's password is not implemented",
+            Unsupported::PasswordPrompt => {
+                "reading the superuser's password from the terminal is not implemented"
+            }
         }
     }
 
@@ -124,9 +126,7 @@ impl Unsupported {
                 "Clusters with another encoding, locale or WAL segment size need bootstrap \
                  mode, which this initdb does not have yet."
             }
-            Unsupported::Password => {
-                "Create the cluster without a password and set one with ALTER ROLE."
-            }
+            Unsupported::PasswordPrompt => "Give the password in a file with --pwfile.",
         }
     }
 }
@@ -361,6 +361,18 @@ pub enum InitdbError {
     /// backend failed. `reason` is `wait_result_to_str`'s.
     #[error("{reason}")]
     ChildProcessFailed { reason: String },
+
+    /// `initdb.c:1692` (`get_su_pwd`): `--pwfile` could not be opened.
+    #[error("could not open file \"{path}\" for reading: {reason}")]
+    CouldNotOpenFileForReading { path: String, reason: String },
+
+    /// `initdb.c:1698` (`get_su_pwd`): reading its first line failed.
+    #[error("could not read password from file \"{path}\": {reason}")]
+    CouldNotReadPasswordFile { path: String, reason: String },
+
+    /// `initdb.c:1701` (`get_su_pwd`): the file has no line at all.
+    #[error("password file \"{path}\" is empty")]
+    PasswordFileEmpty { path: String },
 
     /// `initdb.c:2119` (`check_ok`), which C prints on stdout without a
     /// prefix, where its progress line is; this port prints it on stderr

@@ -177,6 +177,15 @@ pub struct SyncPlan {
     pub sync_data_files: bool,
 }
 
+/// Where `get_su_pwd` (`initdb.c:1657`) reads the superuser's password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordSource {
+    /// `-W`/`--pwprompt`: `simple_prompt` on the terminal (`initdb.c:1670`).
+    Prompt,
+    /// `--pwfile=FILE`: its first line (`initdb.c:1689`).
+    File(PathBuf),
+}
+
 /// A validated request to create a cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePlan {
@@ -197,6 +206,8 @@ pub struct CreatePlan {
     /// The superuser name, `None` when neither `--username` nor the
     /// environment settled it.
     pub username: Option<String>,
+    /// `-W` or `--pwfile`; never both (`initdb.c:3454`).
+    pub password: Option<PasswordSource>,
     /// `-c NAME=VALUE`, split and kept in command-line order (`initdb.c:3278`).
     pub gucs: Vec<(String, String)>,
     /// `do_sync` (`initdb.c:164`): false under `--no-sync`, which prints the
@@ -279,10 +290,18 @@ pub fn validate(
     if options.pwprompt && options.pwfile.is_some() {
         return Err(InitdbError::PasswordPromptAndFile);
     }
+    let password = if options.pwprompt {
+        Some(PasswordSource::Prompt)
+    } else {
+        options
+            .pwfile
+            .as_deref()
+            .map(|file| PasswordSource::File(PathBuf::from(file)))
+    };
 
     // initdb.c:3457-:3463: check_authmethod_unspecified (the `trust`
     // default), check_authmethod_valid and check_need_password.
-    AuthMethods::resolve(options).check(options.pwprompt || options.pwfile.is_some())?;
+    AuthMethods::resolve(options).check(password.is_some())?;
 
     // initdb.c:3465.
     if !is_valid_wal_seg_size_mb(wal_segment_size_mb) {
@@ -335,6 +354,7 @@ pub fn validate(
         datlocale,
         encoding,
         username,
+        password,
         gucs,
         do_sync: !options.no_sync,
         sync_method,
@@ -891,6 +911,20 @@ mod tests {
             failure(&["--pwprompt", "--pwfile", "/tmp/pw"], &FakeFs::empty()),
             InitdbError::PasswordPromptAndFile
         );
+    }
+
+    #[test]
+    fn the_plan_carries_where_the_password_comes_from() {
+        // get_su_pwd (initdb.c:1657): -W prompts, --pwfile reads the file.
+        assert_eq!(
+            created(&["--pwfile", "/tmp/pw", "-D", "/tmp/x"], &FakeFs::empty()).password,
+            Some(PasswordSource::File(PathBuf::from("/tmp/pw")))
+        );
+        assert_eq!(
+            created(&["-W", "-D", "/tmp/x"], &FakeFs::empty()).password,
+            Some(PasswordSource::Prompt)
+        );
+        assert_eq!(created(&["-D", "/tmp/x"], &FakeFs::empty()).password, None);
     }
 
     #[test]

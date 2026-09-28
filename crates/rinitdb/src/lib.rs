@@ -260,7 +260,9 @@ struct Run<'a> {
 /// Ahead of all of that, as `setup_bin_paths` (`initdb.c:3472`) is ahead of
 /// the preamble, the `--waldir` failure and the warning in C, the `postgres`
 /// for the single-user session is found — but only when there is a session
-/// to run ([`single_user::fixup_script`] is not empty; `docs/divergences.md`).
+/// to run ([`single_user::needs_session`]; `docs/divergences.md`). The
+/// password is read after the preamble's checksum line and before the blank
+/// line that follows it, where `get_su_pwd` (`initdb.c:3502`) runs.
 fn create_cluster(
     plan: &CreatePlan,
     run: &Run<'_>,
@@ -268,10 +270,7 @@ fn create_cluster(
     stderr: &mut impl Write,
 ) -> ExitCode {
     let options = run.options;
-    let script = single_user::fixup_script(plan);
-    let server = if script.is_empty() {
-        None
-    } else {
+    let server = if single_user::needs_session(plan) {
         match single_user::find_server(run.embedded) {
             Ok(server) => Some(server),
             Err(err) => {
@@ -279,8 +278,9 @@ fn create_cluster(
                 return ExitCode::from(EXIT_FAILURE);
             }
         }
+    } else {
+        None
     };
-    let session = server.as_ref().map(|server| (server, script.as_slice()));
     let waldir_will_fail = classify_waldir(plan.waldir.as_deref(), &RealFs).is_err();
     if let Err(err) = cluster::check_template_can_make(options, plan)
         && !waldir_will_fail
@@ -293,6 +293,21 @@ fn create_cluster(
     let default_timezone = RealTzSource::from_env().and_then(|src| select_default_timezone(&src));
     let settings = cluster::settings(options, plan, default_timezone);
     preamble(plan, run, &settings, stdout, stderr);
+    // initdb.c:3501, after the checksum line and before the first mkdir: a
+    // failure here is pg_fatal with nothing made yet to take back.
+    let password = match plan.password.as_ref().map(single_user::get_su_pwd) {
+        None => None,
+        Some(Ok(password)) => password,
+        Some(Err(err)) => {
+            let _ = stdout.flush();
+            let _ = writeln!(stderr, "{}", err.render());
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    // initdb.c:3504.
+    let _ = stdout.write_all(b"\n");
+    let script = single_user::fixup_script(plan, password.as_ref());
+    let session = server.as_ref().map(|server| (server, script.as_slice()));
 
     let mut progress = Progress::default();
     let created =
@@ -343,7 +358,7 @@ fn clean_up_and_fail(progress: &Progress, options: &Options, stderr: &mut impl W
 /// Action: what `main` prints between the `pg_` check and
 /// `initialize_data_directory` — the ownership lines (`initdb.c:3481`),
 /// `setup_locale_encoding`'s report (`:2689`, `:2765`), `setup_text_search`
-/// (`:2850`-`:2865`) and the checksum line (`:3494`-`:3504`).
+/// (`:2850`-`:2865`) and the checksum line (`:3494`-`:3499`).
 ///
 /// The ownership lines need the effective user, which this port reads from
 /// `USER`/`LOGNAME`; when neither is set they are left out rather than name

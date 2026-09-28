@@ -136,14 +136,14 @@ pub fn text_search_configuration(name: &str) -> String {
     format!("The default text search configuration will be set to \"{name}\".\n")
 }
 
-/// `initdb.c:3494`-`:3504`: the blank line after the text search line, the
-/// checksum line, and the blank line after it (`get_su_pwd` would come
-/// between those two, but the template refuses `-W` and `--pwfile`).
+/// `initdb.c:3494`-`:3499`: the blank line after the text search line and
+/// the checksum line. The blank line after it (`:3504`) comes after
+/// `get_su_pwd`, so the caller writes it.
 #[must_use]
 pub fn data_checksums(checksums: DataChecksums) -> &'static str {
     match checksums {
-        DataChecksums::Enabled => "\nData page checksums are enabled.\n\n",
-        DataChecksums::Disabled => "\nData page checksums are disabled.\n\n",
+        DataChecksums::Enabled => "\nData page checksums are enabled.\n",
+        DataChecksums::Disabled => "\nData page checksums are disabled.\n",
     }
 }
 
@@ -317,11 +317,11 @@ mod tests {
         );
         assert_eq!(
             data_checksums(DataChecksums::Enabled),
-            "\nData page checksums are enabled.\n\n"
+            "\nData page checksums are enabled.\n"
         );
         assert_eq!(
             data_checksums(DataChecksums::Disabled),
-            "\nData page checksums are disabled.\n\n"
+            "\nData page checksums are disabled.\n"
         );
     }
 

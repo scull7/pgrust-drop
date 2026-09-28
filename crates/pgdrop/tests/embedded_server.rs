@@ -50,10 +50,14 @@ fn server_env(scratch: &Path) -> Environment {
         .with("XDG_CACHE_HOME", scratch.join("cache"))
 }
 
-/// `pgdrop initdb -U postgres --no-sync <pgdata>`: exit 0, nothing on stderr.
+/// `pgdrop initdb -A trust -U postgres --no-sync <pgdata>`: exit 0, nothing
+/// on stderr (an explicit `-A` is what spares C initdb's `trust` warning,
+/// `check_authmethod_unspecified`, `src/bin/initdb/initdb.c:2572`).
 fn pgdrop_initdb(pgdata: &Path) {
     let argv = [
         OsString::from("initdb"),
+        OsString::from("-A"),
+        OsString::from("trust"),
         OsString::from("-U"),
         OsString::from("postgres"),
         OsString::from("--no-sync"),

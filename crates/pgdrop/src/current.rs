@@ -4,9 +4,12 @@
 //! arguments.
 //!
 //! Every successful `start` writes a [`Pointer`] to one per-user file,
-//! `$XDG_RUNTIME_DIR/pgdrop/current`, else `$HOME/.cache/pgdrop/current`
+//! `$XDG_RUNTIME_DIR/pgdrop/current`, else `$HOME/.cache/pgdrop/run/current`
 //! ([`pointer_path`]), atomically: a temporary file in the same directory,
-//! renamed over it. Two concurrent starts both succeed and the pointer
+//! renamed over it. That directory is `0700` however it came to exist; the
+//! fallback's `run` leaf is one the share cache (`crate::share`), which may
+//! own `$HOME/.cache/pgdrop` at `0755`, never creates. A pointer that cannot
+//! be written is a warning, not a failed `start`. Two concurrent starts both succeed and the pointer
 //! names whichever renamed last; neither cluster is touched by it.
 //!
 //! A bare command is one that names no cluster itself: `pgdrop stop` with
@@ -33,6 +36,10 @@ use crate::stop::{self, Owner, PIDFILE};
 
 /// The pointer's directory under the runtime or cache directory.
 pub const POINTER_DIR: &str = "pgdrop";
+
+/// The pointer's own leaf under `$HOME/.cache/pgdrop`, the share cache's
+/// directory, whose mode is not the pointer's to choose.
+pub const CACHE_LEAF: &str = "run";
 
 /// The pointer's file name.
 pub const POINTER_FILE: &str = "current";
@@ -112,13 +119,17 @@ fn absolute(value: Option<&OsStr>) -> Option<&Path> {
 }
 
 /// Pure: where the pointer lives, `$XDG_RUNTIME_DIR/pgdrop/current`, else
-/// `$HOME/.cache/pgdrop/current`; `None` for a process with neither.
+/// `$HOME/.cache/pgdrop/run/current`; `None` for a process with neither.
 #[must_use]
 pub fn pointer_path(xdg_runtime_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    absolute(xdg_runtime_dir)
-        .map(Path::to_path_buf)
-        .or_else(|| absolute(home).map(|home| home.join(".cache")))
-        .map(|dir| dir.join(POINTER_DIR).join(POINTER_FILE))
+    let dir = match absolute(xdg_runtime_dir) {
+        Some(runtime) => runtime.join(POINTER_DIR),
+        None => absolute(home)?
+            .join(".cache")
+            .join(POINTER_DIR)
+            .join(CACHE_LEAF),
+    };
+    Some(dir.join(POINTER_FILE))
 }
 
 /// Pure: the first of [`EXPLICIT_ENV`] that `get` says is set, non-empty.
@@ -208,8 +219,8 @@ pub fn read(path: &Path) -> Result<Option<Pointer>, PointerError> {
     }
 }
 
-/// Action: make `pointer` the current cluster: its directory created `0700`
-/// if missing, the text written to a temporary file there, renamed over
+/// Action: make `pointer` the current cluster: its directory created if
+/// missing and made `0700` either way, the text written to a temporary file there, renamed over
 /// `path`. A reader sees the old pointer or the new, never part of one.
 ///
 /// # Errors
@@ -233,13 +244,16 @@ pub fn write(path: &Path, pointer: &Pointer) -> Result<(), PointerError> {
     written
 }
 
+/// Action: `dir` and its missing parents, created `0700`; `dir` itself made
+/// `0700` if it was there already.
 #[cfg(unix)]
 fn create_private_dirs(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
@@ -247,22 +261,36 @@ fn create_private_dirs(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// Action: whether `pointer` names the cluster in `datadir`, by path
+/// components ([`Pointer::names`]) or, through symbolic links, as the same
+/// directory once both resolve. Only a directory that is still there
+/// resolves, so a caller clears the pointer before removing anything.
+fn names_resolved(pointer: &Pointer, datadir: &Path) -> bool {
+    pointer.names(datadir)
+        || matches!(
+            (std::fs::canonicalize(&pointer.datadir), std::fs::canonicalize(datadir)),
+            (Ok(named), Ok(given)) if named == given
+        )
+}
+
 /// Action: remove the pointer at `path` if it names the cluster in
-/// `datadir`; anything else there is left alone.
+/// `datadir` ([`names_resolved`]); anything else there is left alone.
 ///
 /// # Errors
 ///
 /// It cannot be read or removed.
 pub fn clear_if_names(path: &Path, datadir: &Path) -> Result<(), PointerError> {
     match read(path) {
-        Ok(Some(pointer)) if pointer.names(datadir) => match std::fs::remove_file(path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(PointerError::Io {
-                what: "remove",
-                path: path.to_path_buf(),
-                error,
-            }),
-            _ => Ok(()),
-        },
+        Ok(Some(pointer)) if names_resolved(&pointer, datadir) => {
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(PointerError::Io {
+                    what: "remove",
+                    path: path.to_path_buf(),
+                    error,
+                }),
+                _ => Ok(()),
+            }
+        }
         Ok(_) | Err(PointerError::Bad(_)) => Ok(()),
         Err(error) => Err(error),
     }
@@ -348,13 +376,13 @@ mod tests {
         );
         assert_eq!(
             pointer_path(None, os("/home/me")),
-            Some(PathBuf::from("/home/me/.cache/pgdrop/current"))
+            Some(PathBuf::from("/home/me/.cache/pgdrop/run/current"))
         );
         // Relative or empty values are ignored, as the XDG specification says.
         for runtime in [os(""), os("run"), None] {
             assert_eq!(
                 pointer_path(runtime, os("/home/me")),
-                Some(PathBuf::from("/home/me/.cache/pgdrop/current")),
+                Some(PathBuf::from("/home/me/.cache/pgdrop/run/current")),
                 "{runtime:?}"
             );
         }
@@ -393,6 +421,34 @@ mod tests {
         assert!(pointer().names(Path::new("/tmp/pgdrop-1-2/data")));
         assert!(pointer().names(Path::new("/tmp/./pgdrop-1-2/data/")));
         assert!(!pointer().names(Path::new("/tmp/pgdrop-1-2")));
+    }
+
+    /// A `stop` through a symbolic link to the pointer's data directory
+    /// clears it; one to another directory does not.
+    #[cfg(unix)]
+    #[test]
+    fn the_pointer_is_cleared_through_a_symbolic_link() {
+        let scratch =
+            std::env::temp_dir().join(format!("pgdrop-current-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let (data, other) = (scratch.join("data"), scratch.join("other"));
+        for dir in [&data, &other] {
+            std::fs::create_dir_all(dir).expect("create a directory");
+        }
+        let (link, elsewhere) = (scratch.join("link"), scratch.join("elsewhere"));
+        std::os::unix::fs::symlink(&data, &link).expect("symlink");
+        std::os::unix::fs::symlink(&other, &elsewhere).expect("symlink");
+        let path = scratch.join("pgdrop").join(POINTER_FILE);
+        let pointer = Pointer {
+            datadir: data.to_str().expect("UTF-8").to_owned(),
+            ..pointer()
+        };
+        write(&path, &pointer).expect("write the pointer");
+        clear_if_names(&path, &elsewhere).expect("clear");
+        assert!(path.exists(), "another directory leaves it");
+        clear_if_names(&path, &link).expect("clear");
+        assert!(!path.exists(), "the same directory clears it");
+        std::fs::remove_dir_all(&scratch).expect("remove the scratch directory");
     }
 
     #[test]

@@ -19,7 +19,8 @@
 //! 6. Write [`crate::start::Record`] into the data directory for `stop`.
 //!    Only now: until the server holds the data directory's lock, a record
 //!    written there could overwrite the one of a server already running in it.
-//!    Then make it the current cluster ([`crate::current`]).
+//!    Then make it the current cluster ([`crate::current`]); a pointer that
+//!    cannot be written is a warning on stderr, and `start` goes on.
 //! 7. Print the URI, PID and data directory, or `--json`, or `--env`, and
 //!    leave the server running.
 //!
@@ -114,8 +115,6 @@ pub enum LaunchError {
         attempts: u32,
         last: u16,
     },
-    /// The current-cluster pointer could not be written.
-    Pointer(current::PointerError),
 }
 
 /// `"; its log:\n…"`, or where it went instead.
@@ -158,7 +157,6 @@ impl fmt::Display for LaunchError {
                 "--port auto found no free port: each of the {attempts} it picked was taken \
                  before the server could listen on it (the last, {last})"
             ),
-            LaunchError::Pointer(error) => error.fmt(f),
         }
     }
 }
@@ -168,6 +166,12 @@ impl std::error::Error for LaunchError {}
 /// Action: `pgdrop start`.
 pub fn run(flags: &Start, stdout: &mut impl Write, stderr: &mut impl Write) -> ExitCode {
     let result = launch(flags).and_then(|launched| {
+        if let Some(error) = &launched.pointer {
+            let _ = writeln!(
+                stderr,
+                "pgdrop: warning: {error}; a bare pgdrop psql or pgdrop stop will not find this cluster"
+            );
+        }
         let _ = stdout.write_all(launched.text.as_bytes());
         let _ = stdout.flush();
         launched.attached.map_or(Ok(()), Attached::wait)
@@ -185,6 +189,8 @@ pub fn run(flags: &Start, stdout: &mut impl Write, stderr: &mut impl Write) -> E
 /// to wait for.
 struct Launched {
     text: String,
+    /// Why the pointer could not be written, if it could not.
+    pointer: Option<current::PointerError>,
     attached: Option<Attached>,
 }
 
@@ -209,10 +215,10 @@ impl Attached {
                 path: PathBuf::from(&self.plan.datadir),
                 error,
             });
-        remove_what_stop_removes(&self.plan, true);
         if let Some(path) = current::location() {
             let _ = current::clear_if_names(&path, Path::new(&self.plan.datadir));
         }
+        remove_what_stop_removes(&self.plan, true);
         match status? {
             status if status.success() => Ok(()),
             status => Err(LaunchError::ServerFailed(status)),
@@ -336,6 +342,8 @@ fn launch(flags: &Start) -> Result<Launched, LaunchError> {
         // The plan the server runs on: `--port auto` may have moved it.
         Ok((plan, text, server)) => Ok(Launched {
             text,
+            pointer: current::location()
+                .and_then(|path| current::write(&path, &plan.pointer()).err()),
             attached: server.map(|(server, signals)| Attached {
                 plan,
                 server,
@@ -433,19 +441,15 @@ fn bring_up(
     Ok((plan, text, signals.map(|signals| (server, signals))))
 }
 
-/// Action: step 6, for a server that is ready: the record for `stop`, then
-/// the pointer for a bare `psql` and `stop`.
+/// Action: step 6, for a server that is ready: the record for `stop`. The
+/// pointer, which may fail without failing `start`, is [`launch`]'s.
 fn leave_behind(plan: &StartPlan) -> Result<(), LaunchError> {
     let record_path = Path::new(&plan.datadir).join(RECORD_FILE);
     std::fs::write(&record_path, plan.record().render()).map_err(|error| LaunchError::Io {
         what: "write",
         path: record_path,
         error,
-    })?;
-    match current::location() {
-        Some(path) => current::write(&path, &plan.pointer()).map_err(LaunchError::Pointer),
-        None => Ok(()),
-    }
+    })
 }
 
 /// `--port auto`'s source of ports: the kernel's choice for a bind to

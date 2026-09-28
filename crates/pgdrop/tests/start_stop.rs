@@ -573,6 +573,92 @@ fn env_is_eval_able_and_names_the_cluster() {
     );
 }
 
+/// With no `XDG_RUNTIME_DIR` and no `XDG_CACHE_HOME`, the pointer and the
+/// share files both land under `$HOME/.cache/pgdrop`: the share cache's
+/// directory is the server's, made first and `0755`, while the pointer's is
+/// its own `run` leaf, `0700` even when it was there already at `0755`.
+#[test]
+fn the_home_fallback_pointer_directory_is_private() {
+    let scratch = Scratch::new("home-pointer");
+    let cache = scratch.0.join("home").join(".cache").join("pgdrop");
+    let leaf = cache.join("run");
+    std::fs::create_dir_all(&leaf).expect("create the leaf");
+    let open = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    std::fs::set_permissions(&leaf, open).expect("chmod 0755");
+    let fallback = |command: &mut Command| {
+        command
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("XDG_CACHE_HOME");
+    };
+    let mut command = scratch.command(&["start", "--json"]);
+    fallback(&mut command);
+    let output = command.output().expect("run pgdrop start");
+    assert_success(&output, "pgdrop start");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let started = parse_started(&String::from_utf8(output.stdout).expect("UTF-8"));
+    let _running = Running {
+        scratch: &scratch,
+        started: started.clone(),
+    };
+    let shared = std::fs::read_dir(&cache)
+        .expect("the share cache")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() != "run" && entry.path().join("share").is_dir());
+    assert!(shared, "the share files are extracted beside the leaf");
+    let mode = std::fs::metadata(&leaf).expect("the pointer's directory");
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+        0o700
+    );
+    let pointer = std::fs::read_to_string(leaf.join("current")).expect("the pointer");
+    assert!(
+        pointer.ends_with(&format!("\ndatadir={}\n", started.datadir)),
+        "{pointer}"
+    );
+    let mut stop = scratch.command(&["stop"]);
+    fallback(&mut stop);
+    assert_success(&stop.output().expect("run pgdrop stop"), "bare pgdrop stop");
+    assert!(!Path::new(&started.datadir).exists());
+    assert!(!leaf.join("current").exists());
+}
+
+/// A pointer that cannot be written does not fail `start`: with no
+/// `XDG_RUNTIME_DIR` and a `HOME` that is not a directory (a service user,
+/// a build sandbox), `start` warns, the cluster runs, and `stop --datadir`
+/// stops it.
+#[test]
+fn start_warns_when_the_pointer_cannot_be_written() {
+    let scratch = Scratch::new("no-pointer");
+    let home = scratch.0.join("home-file");
+    std::fs::write(&home, "").expect("a HOME that is a file");
+    let output = scratch
+        .command(&["start", "--json"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("HOME", &home)
+        .output()
+        .expect("run pgdrop start");
+    assert_success(&output, "pgdrop start with an unwritable HOME");
+    let started = parse_started(&String::from_utf8(output.stdout).expect("UTF-8"));
+    let running = Running {
+        scratch: &scratch,
+        started,
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = format!(
+        "pgdrop: warning: could not create directory \"{}\": ",
+        home.join(".cache/pgdrop/run").display()
+    );
+    assert!(stderr.starts_with(&expected), "{stderr}");
+    assert!(
+        stderr.ends_with("; a bare pgdrop psql or pgdrop stop will not find this cluster\n"),
+        "{stderr}"
+    );
+    select_1(&scratch, &running.started);
+    let stop = scratch.pgdrop(&["stop", "--datadir", &running.started.datadir]);
+    assert_success(&stop, "pgdrop stop --datadir");
+    assert!(!Path::new(&running.started.datadir).exists());
+}
+
 /// Two concurrent starts leave a whole pointer naming one of them, and a
 /// bare psql reaches that one; neither cluster is disturbed. A start after
 /// both is the one the pointer names.
@@ -714,6 +800,10 @@ fn explicit_datadir_pgdata_and_pg_variables_override_the_pointer() {
         .output()
         .expect("run pgdrop stop");
     assert_eq!(stop.status.code(), Some(1), "{stop:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&stop.stderr),
+        "pgdrop: error: no database directory specified and environment variable PGDATA unset\n"
+    );
     assert!(Path::new(&three.started.datadir).exists());
 
     // psql: a flag or a variable naming a server, user or database wins.
@@ -823,20 +913,22 @@ fn start_refuses_a_bad_command_line() {
 }
 
 /// With nowhere a pointer could be (no `XDG_RUNTIME_DIR`, no `HOME`), or
-/// with a variable naming a server, a bare stop has no cluster: pg_ctl's
-/// complaint (`pg_ctl.c:2442`).
+/// with a variable naming a server (`PGHOST`), a bare stop has no cluster:
+/// pg_ctl's complaint (`pg_ctl.c:2442`).
 #[test]
 fn stop_without_a_datadir_says_so() {
     let scratch = Scratch::new("no-datadir");
-    let output = scratch
-        .command(&["stop"])
-        .env_remove("XDG_RUNTIME_DIR")
-        .env_remove("HOME")
-        .output()
-        .expect("run pgdrop stop");
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "pgdrop: error: no database directory specified and environment variable PGDATA unset\n"
-    );
+    let mut nowhere = scratch.command(&["stop"]);
+    nowhere.env_remove("XDG_RUNTIME_DIR").env_remove("HOME");
+    let mut pghost = scratch.command(&["stop"]);
+    pghost.env("PGHOST", scratch.0.join("nowhere"));
+    for (what, mut command) in [("nowhere", nowhere), ("PGHOST", pghost)] {
+        let output = command.output().expect("run pgdrop stop");
+        assert_eq!(output.status.code(), Some(1), "{what}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "pgdrop: error: no database directory specified and environment variable PGDATA unset\n",
+            "{what}"
+        );
+    }
 }

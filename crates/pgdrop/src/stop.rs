@@ -315,11 +315,14 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
             Err(detail) => return Err(StopError::Signal { pid, detail }),
         }
     }
-    remove_all(&plan)?;
-    match &location {
+    // Before the removal: a pointer through a symbolic link is matched by
+    // resolving both, and only what is still there resolves.
+    let cleared = match &location {
         Some(path) => current::clear_if_names(path, &datadir).map_err(StopError::Pointer),
         None => Ok(()),
-    }
+    };
+    remove_all(&plan)?;
+    cleared
 }
 
 /// Pure: whether the `kill` utility's complaint is `ESRCH`, the process is

@@ -538,7 +538,7 @@ impl PipelineInsertStep {
 /// proves is that a pipeline can send while it receives: non-blocking mode,
 /// `PQsocket`, and a `select()` on both directions, here
 /// [`rlibpq::poll::socket_poll`], which is `poll(2)` as `PQsocketPoll` calls
-/// it. A `select()` that fails ends the C test (`:1096`); here it panics.
+/// it. A `select()` that fails ends the C test (`libpq_pipeline.c:1096`); here it panics.
 #[test]
 fn test_pipelined_insert() {
     const N_ROWS: usize = 700;

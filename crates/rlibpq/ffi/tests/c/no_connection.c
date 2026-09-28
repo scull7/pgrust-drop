@@ -30,6 +30,45 @@ null_or_set(const void *ptr)
 	return ptr ? "set" : "NULL";
 }
 
+/* How many rows a PQconninfoOption array has, and how many hold a value. */
+static void
+print_conninfo(PQconninfoOption *options)
+{
+	int			rows = 0;
+	int			set = 0;
+
+	if (!options)
+	{
+		printf("PQconninfo NULL\n");
+		return;
+	}
+	for (PQconninfoOption *option = options; option->keyword; option++)
+	{
+		rows++;
+		if (option->val)
+			set++;
+	}
+	printf("PQconninfo %d rows, %d set\n", rows, set);
+	PQconninfoFree(options);
+}
+
+static void
+print_accessors(PGconn *conn)
+{
+	printf("PQdb %s PQuser %s PQoptions %s\n", null_or_set(PQdb(conn)),
+		   null_or_set(PQuser(conn)), null_or_set(PQoptions(conn)));
+	printf("PQpass %s PQhost %s PQport %s PQtty %s\n", PQpass(conn) ? PQpass(conn) : "NULL",
+		   PQhost(conn) ? PQhost(conn) : "NULL", PQport(conn) ? PQport(conn) : "NULL",
+		   PQtty(conn) ? PQtty(conn) : "NULL");
+	printf("PQtransactionStatus %d PQparameterStatus %s PQserverVersion %d\n",
+		   PQtransactionStatus(conn),
+		   null_or_set(PQparameterStatus(conn, "server_version")),
+		   PQserverVersion(conn));
+	printf("PQsocket %d PQbackendPID %d PQconnectPoll %d\n", PQsocket(conn),
+		   PQbackendPID(conn), PQconnectPoll(conn));
+	print_conninfo(PQconninfo(conn));
+}
+
 int
 main(void)
 {
@@ -94,6 +133,11 @@ main(void)
 	printf("PQdescribePrepared %s PQdescribePortal %s\n",
 		   null_or_set(PQdescribePrepared(NULL, "s")),
 		   null_or_set(PQdescribePortal(NULL, "p")));
+	print_accessors(NULL);
+	printf("PQparameterStatus %s PQresetStart %d PQresetPoll %d\n",
+		   null_or_set(PQparameterStatus(NULL, NULL)), PQresetStart(NULL),
+		   PQresetPoll(NULL));
+	PQreset(NULL);
 	PQclear(NULL);
 	PQfinish(NULL);
 
@@ -110,6 +154,41 @@ main(void)
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
 	printf("PQdescribePortal %s\n", null_or_set(PQdescribePortal(conn, NULL)));
 	printf("PQerrorMessage %s", PQerrorMessage(conn));
+	print_accessors(conn);
+	printf("PQparameterStatus %s\n", null_or_set(PQparameterStatus(conn, NULL)));
+	/* the options were never valid, so a reset fails with no message */
+	PQreset(conn);
+	printf("PQreset PQstatus %d PQerrorMessage \"%s\"\n", PQstatus(conn),
+		   PQerrorMessage(conn));
+	printf("PQresetStart %d PQresetPoll %d\n", PQresetStart(conn), PQresetPoll(conn));
+	PQfinish(conn);
+
+	/* the other ways in, with options that do not parse */
+	conn = PQconnectStart("bogus");
+	printf("PQconnectStart PQstatus %d PQconnectPoll %d PQerrorMessage %s",
+		   PQstatus(conn), PQconnectPoll(conn), PQerrorMessage(conn));
+	PQfinish(conn);
+	{
+		const char *const keywords[] = {"port", "bogus", NULL};
+		const char *const values[] = {"1", "x", NULL};
+
+		conn = PQconnectdbParams(keywords, values, 0);
+		printf("PQconnectdbParams PQstatus %d PQerrorMessage %s", PQstatus(conn),
+			   PQerrorMessage(conn));
+		PQfinish(conn);
+	}
+	{
+		const char *const keywords[] = {"dbname", NULL};
+		const char *const values[] = {"port=1 bogus=x", NULL};
+
+		conn = PQconnectStartParams(keywords, values, 1);
+		printf("PQconnectStartParams PQstatus %d PQerrorMessage %s",
+			   PQstatus(conn), PQerrorMessage(conn));
+		PQfinish(conn);
+	}
+	conn = PQsetdbLogin(NULL, NULL, NULL, NULL, "host=h bogus=x", NULL, NULL);
+	printf("PQsetdbLogin PQstatus %d PQerrorMessage %s", PQstatus(conn),
+		   PQerrorMessage(conn));
 	PQfinish(conn);
 	return 0;
 }

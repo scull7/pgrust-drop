@@ -22,6 +22,10 @@
 //! Then the extended-query calls — `PQexecParams`, `PQprepare`,
 //! `PQexecPrepared`, `PQdescribePrepared`, `PQdescribePortal` — and the rest
 //! of a result's metadata, enough for `src/test/examples/testlibpq3.c`.
+//! Then the other ways to open a connection — `PQconnectdbParams`,
+//! `PQsetdbLogin`, `PQconnectStart`, `PQconnectPoll` — and to reopen one,
+//! `PQreset`, and the `PGconn` accessors, `PQdb` through `PQconninfo`,
+//! enough for `src/test/examples/testlibpq4.c`.
 //! The rest follows in later slices of NAT-395.
 //!
 //! This is the one crate in the workspace that allows `unsafe`: a C ABI is
@@ -34,6 +38,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod abi;
+mod accessors;
 mod alloc;
 mod conn;
 mod conninfo;

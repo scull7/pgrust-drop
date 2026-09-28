@@ -788,6 +788,63 @@ pub fn parse_conninfo(conninfo: &[u8]) -> Result<ConnInfo, ConnError> {
     }
 }
 
+/// `conninfo_array_parse` (`fe-connect.c:6466`) with `use_defaults` false:
+/// the keyword/value pairs of `PQconnectdbParams`, a `None` value being C's
+/// NULL.
+///
+/// A pair with a NULL or empty value is skipped before its keyword is even
+/// looked up (`:6518`). With `expand_dbname`, the first `dbname` whose value
+/// is not NULL is parsed as a connection string when it looks like one
+/// (`:6479`-`:6497`), and where that `dbname` falls in the list, every option
+/// the string set overrides what came before it (`:6541`-`:6575`); a later
+/// `dbname`, or a later keyword, overrides it in turn.
+///
+/// Unlike `conninfo_parse`, the keyword is looked up in the table itself
+/// (`:6521`-`:6533`), so the `requiressl` spelling `conninfo_storeval`
+/// rewrites is an invalid option here.
+///
+/// # Errors
+/// The expanded `dbname`'s [`parse_conninfo`] error, or
+/// [`ConnError::InvalidConnectionOption`] for a keyword not in the table.
+pub fn conninfo_array_parse(
+    params: &[(&[u8], Option<&[u8]>)],
+    expand_dbname: bool,
+) -> Result<ConnInfo, ConnError> {
+    let mut dbname_options = None;
+    if expand_dbname
+        && let Some(value) = params
+            .iter()
+            .find_map(|&(keyword, value)| (keyword == b"dbname").then_some(value).flatten())
+        && recognized_connection_string(value)
+    {
+        dbname_options = Some(parse_conninfo(value)?);
+    }
+
+    let mut options = ConnInfo::new();
+    for &(keyword, value) in params {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(index) = ConnInfo::index_of(keyword) else {
+            return Err(ConnError::InvalidConnectionOption(keyword.into()));
+        };
+        match dbname_options.take() {
+            Some(expanded) if keyword == b"dbname" => {
+                for (row, option) in expanded.values.into_iter().enumerate() {
+                    if option.is_some() {
+                        options.values[row] = option;
+                    }
+                }
+            }
+            pending => {
+                dbname_options = pending;
+                options.values[index] = Some(value.into());
+            }
+        }
+    }
+    Ok(options)
+}
+
 /// `conninfo_parse` (`fe-connect.c:6290`) with `use_defaults` false: a string
 /// of `key = value` pairs, where a value may be `'`-quoted and `\` escapes the
 /// next byte in either form.
@@ -1294,5 +1351,75 @@ mod tests {
         assert_eq!(defaults.get("service"), Some(b"somewhere".as_slice()));
         assert_eq!(defaults.get("port"), Some(b"1".as_slice()));
         assert_eq!(defaults.get("host"), None);
+    }
+
+    fn params<'a>(pairs: &'a [(&'a str, Option<&'a str>)]) -> Vec<(&'a [u8], Option<&'a [u8]>)> {
+        pairs
+            .iter()
+            .map(|&(keyword, value)| (keyword.as_bytes(), value.map(str::as_bytes)))
+            .collect()
+    }
+
+    /// `fe-connect.c:6518`: a NULL or empty value is skipped before its
+    /// keyword is looked up; a later pair overrides an earlier one.
+    #[test]
+    fn conninfo_array_parse_skips_empty_values_and_keeps_the_last() {
+        let options = conninfo_array_parse(
+            &params(&[
+                ("host", Some("a")),
+                ("bogus", Some("")),
+                ("nothing", None),
+                ("host", Some("b")),
+                ("port", Some("")),
+            ]),
+            false,
+        )
+        .expect("parses");
+        assert_eq!(options.get("host"), Some(b"b".as_slice()));
+        assert_eq!(options.get("port"), None);
+    }
+
+    /// `fe-connect.c:6528`: the table is searched directly, so `requiressl`,
+    /// which `conninfo_storeval` would rewrite, is invalid here.
+    #[test]
+    fn conninfo_array_parse_refuses_a_keyword_not_in_the_table() {
+        assert_eq!(
+            conninfo_array_parse(&params(&[("requiressl", Some("1"))]), false),
+            Err(ConnError::InvalidConnectionOption("requiressl".into()))
+        );
+    }
+
+    /// `fe-connect.c:6479`-`:6497`, `:6541`-`:6575`: the first non-NULL
+    /// `dbname` is expanded where it stands, so what precedes it is
+    /// overridden and what follows overrides it; a second `dbname` is taken
+    /// literally.
+    #[test]
+    fn conninfo_array_parse_expands_the_first_dbname_in_place() {
+        let pairs = params(&[
+            ("dbname", None),
+            ("port", Some("1")),
+            ("host", Some("before")),
+            ("dbname", Some("host=inner dbname=d")),
+            ("port", Some("2")),
+            ("dbname", Some("port=3")),
+        ]);
+        let expanded = conninfo_array_parse(&pairs, true).expect("parses");
+        assert_eq!(expanded.get("host"), Some(b"inner".as_slice()));
+        assert_eq!(expanded.get("port"), Some(b"2".as_slice()));
+        assert_eq!(expanded.get("dbname"), Some(b"port=3".as_slice()));
+
+        let literal = conninfo_array_parse(&pairs, false).expect("parses");
+        assert_eq!(literal.get("host"), Some(b"before".as_slice()));
+
+        assert_eq!(
+            conninfo_array_parse(&params(&[("dbname", Some("host"))]), true)
+                .expect("not a connection string")
+                .get("dbname"),
+            Some(b"host".as_slice())
+        );
+        assert_eq!(
+            conninfo_array_parse(&params(&[("dbname", Some("x=1"))]), true),
+            Err(ConnError::InvalidConnectionOption("x".into()))
+        );
     }
 }

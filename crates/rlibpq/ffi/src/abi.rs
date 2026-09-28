@@ -143,12 +143,23 @@ const fn implemented(name: &'static str, follows: &'static str) -> Shim {
 }
 
 /// Every symbol this crate exports, in `exports.txt` order.
-pub const SHIMS: [Shim; 54] = [
+pub const SHIMS: [Shim; 75] = [
     implemented("PQconnectdb", "fe-connect.c:820"),
+    implemented("PQsetdbLogin", "fe-connect.c:2231"),
     implemented("PQconndefaults", "fe-connect.c:2193"),
     implemented("PQfinish", "fe-connect.c:5301"),
+    implemented("PQreset", "fe-connect.c:5315"),
+    implemented("PQdb", "fe-connect.c:7472"),
+    implemented("PQuser", "fe-connect.c:7480"),
+    implemented("PQpass", "fe-connect.c:7488"),
+    implemented("PQhost", "fe-connect.c:7505"),
+    implemented("PQport", "fe-connect.c:7541"),
+    implemented("PQtty", "fe-connect.c:7559"),
+    implemented("PQoptions", "fe-connect.c:7567"),
     implemented("PQstatus", "fe-connect.c:7575"),
     implemented("PQerrorMessage", "fe-connect.c:7638"),
+    implemented("PQsocket", "fe-connect.c:7664"),
+    implemented("PQbackendPID", "fe-connect.c:7674"),
     implemented("PQexec", "fe-exec.c:2279"),
     implemented("PQresultStatus", "fe-exec.c:3442"),
     implemented("PQntuples", "fe-exec.c:3512"),
@@ -170,14 +181,21 @@ pub const SHIMS: [Shim; 54] = [
     implemented("PQresStatus", "fe-exec.c:3450"),
     implemented("PQoidValue", "fe-exec.c:3824"),
     implemented("PQconninfoFree", "fe-connect.c:7459"),
+    implemented("PQconnectPoll", "fe-connect.c:2908, blocking"),
+    implemented("PQconnectStart", "fe-connect.c:948, blocking"),
+    implemented("PQresetPoll", "fe-connect.c:5367, blocking"),
+    implemented("PQresetStart", "fe-connect.c:5348, blocking"),
     implemented("PQfreeNotify", "fe-exec.c:4080"),
     implemented("PQfreemem", "fe-exec.c:4063"),
+    implemented("PQtransactionStatus", "fe-connect.c:7583"),
+    implemented("PQparameterStatus", "fe-connect.c:7593"),
     implemented("PQexecParams", "fe-exec.c:2293"),
     implemented("PQresultErrorField", "fe-exec.c:3497"),
     implemented("PQftable", "fe-exec.c:3717"),
     implemented("PQftablecol", "fe-exec.c:3728"),
     implemented("PQfformat", "fe-exec.c:3739"),
     implemented("PQexecPrepared", "fe-exec.c:2340"),
+    implemented("PQserverVersion", "fe-connect.c:7628"),
     implemented("PQgetssl", "fe-secure.c:452, without SSL"),
     implemented("PQprepare", "fe-exec.c:2323"),
     implemented("PQinitSSL", "fe-secure.c:117"),
@@ -188,7 +206,10 @@ pub const SHIMS: [Shim; 54] = [
     implemented("PQdescribePortal", "fe-exec.c:2491"),
     implemented("PQconninfoParse", "fe-connect.c:6175"),
     implemented("PQinitOpenSSL", "fe-secure.c:129"),
+    implemented("PQconnectdbParams", "fe-connect.c:765"),
+    implemented("PQconnectStartParams", "fe-connect.c:867, blocking"),
     implemented("PQlibVersion", "fe-misc.c:65"),
+    implemented("PQconninfo", "fe-connect.c:7415"),
     implemented("PQsslInUse", "fe-secure.c:103, without SSL"),
     implemented("PQsslStruct", "fe-secure.c:458, without SSL"),
     implemented("PQsslAttributeNames", "fe-secure.c:470, without SSL"),
@@ -250,7 +271,9 @@ pub fn render_matrix(exports: &[Export<'_>]) -> String {
          \"Follows\" is the C definition at `REL_18_6`, relative to\n\
          `src/interfaces/libpq/`. Where C picks an arm by build configuration, the arm\n\
          is the one a libpq built without SSL, OpenSSL or GSSAPI takes, because\n\
-         `rlibpq` has none of the three yet.\n\
+         `rlibpq` has none of the three yet. \"blocking\" marks a call C makes step\n\
+         by step without waiting and `rlibpq-ffi` makes in one blocking step\n\
+         (`docs/divergences.md`).\n\
          \n",
     );
     let _ = writeln!(
@@ -366,6 +389,7 @@ mod tests {
     #[test]
     fn every_no_mangle_function_is_a_shim_and_every_shim_is_one() {
         let mut exported: Vec<&str> = [
+            include_str!("accessors.rs"),
             include_str!("conn.rs"),
             include_str!("conninfo.rs"),
             include_str!("extended.rs"),
@@ -409,7 +433,7 @@ mod tests {
     fn render_matrix_counts_and_lists_every_symbol() {
         let exports = [
             Export {
-                name: "PQreset",
+                name: "PQping",
                 ordinal: 1,
             },
             Export {
@@ -421,7 +445,7 @@ mod tests {
         assert!(
             matrix.contains("1 of 2 symbols implemented, 0 stubbed with an error, 1 not yet.\n")
         );
-        assert!(matrix.contains("| 1 | `PQreset` | not yet |  |\n"));
+        assert!(matrix.contains("| 1 | `PQping` | not yet |  |\n"));
         assert!(matrix.contains("| 2 | `PQfreemem` | implemented | fe-exec.c:4063 |\n"));
     }
 }

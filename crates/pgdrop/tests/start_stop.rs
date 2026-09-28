@@ -202,7 +202,7 @@ fn start_attached<'a>(scratch: &'a Scratch, tag: &str, extra: &[&str]) -> Attach
     }
 }
 
-/// Action: the POSIX `kill` utility, as `pgdrop stop` signals.
+/// Action: the POSIX `kill` utility, as a user or a supervisor signals.
 fn send(signal: &str, pid: u32) {
     let status = Command::new("kill")
         .arg(signal)

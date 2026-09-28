@@ -24,6 +24,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultError};
@@ -613,7 +614,7 @@ pub fn psql_exec_watch(
             .write_all(timing_line(processed.elapsed_msec).as_bytes());
     }
     // `common.c:2311`-`:2314`.
-    if processed.return_early {
+    if session.cancel_pressed.load(Ordering::SeqCst) || processed.return_early {
         0
     } else if processed.success {
         1
@@ -1063,7 +1064,11 @@ impl Write for ReadOnly {
 /// passed: print the rows — to `\g`'s stream or `pset.queryFout` — and the
 /// status line to `pset.queryFout` (`printStatusFout`, `common.c:1038`), or
 /// pivot the last result for `\crosstabview`, which prints to
-/// `pset.queryFout` (`crosstabview.c:422`).
+/// `pset.queryFout` (`crosstabview.c:422`). `opt` is `pset.popt`, or
+/// `\watch`'s own print options (`common.c:1044`).
+// Upstream's arguments, plus the one-shot request and the streams its
+// globals hold.
+#[allow(clippy::too_many_arguments)]
 fn print_query_result(
     result: &QueryResult,
     last: bool,

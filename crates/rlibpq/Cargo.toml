@@ -17,6 +17,7 @@ name = "libpq_uri_regress"
 path = "src/bin/libpq_uri_regress.rs"
 
 [dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

@@ -117,7 +117,8 @@ container does not change that.
   `ring` (rustls crypto provider) and `webpki-roots` (root store) — owner,
   2026-09-17; pgrust (`main_main`, rev-pinned git dependency, ADR-0001) and
   its whole transitive dependency tree, **in `pgdrop` only** — owner,
-  2026-09-23. `anyhow` is not approved. `ring` needs a musl C toolchain:
+  2026-09-23; `rustix` (rlibpq's readiness wait, `event` + `std` features
+  only, ADR-0010) — owner, 2026-09-27. `anyhow` is not approved. `ring` needs a musl C toolchain:
   `musl-tools` plus `CC_x86_64_unknown_linux_musl=musl-gcc`. pgrust's tree
   needs a C compiler, `perl` and `make` (vendored OpenSSL), and for a release
   build libre2 plus a C++ compiler; see ADR-0001's 2026-09-23 amendment.

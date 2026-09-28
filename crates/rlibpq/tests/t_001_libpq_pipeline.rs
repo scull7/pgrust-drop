@@ -10,12 +10,13 @@
 //! `main` sets it up before tracing (`libpq_pipeline.c:2332`-`:2354`), and
 //! ends as `PQfinish` ends it, whose Terminate is each trace's last line.
 //!
-//! All nine traces upstream ships are compared here. Not here yet:
-//! `test_pipelined_insert` and `test_uniqviol`, which have no trace to compare,
+//! All nine traces upstream ships are compared here, and
+//! `test_pipelined_insert`, which has none, runs as upstream runs it. Not here
+//! yet: `test_uniqviol`, which has no trace to compare either,
 //! `test_protocol_version`, which needs protocol 3.2 (NAT-391), and the second
 //! half of `test_cancel`, which drives `PQcancelStart` and `PQcancelPoll`
-//! with `select()` and waits for NAT-520's readiness wait; its blocking half
-//! is `test_cancel_blocking`.
+//! with `select()`; those two are not ported yet. Its blocking half is
+//! `test_cancel_blocking`.
 //!
 //! Without the reference tools every test prints `SKIP (flagged, not silent)`
 //! and passes; with `PGDROP_REQUIRE_REF=1` a missing reference fails instead.
@@ -25,27 +26,30 @@
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
 use rlibpq::{
-    Connection, ExecStatus, Format, Params, PipelineStatus, QueryResult, ResultError, result::diag,
+    Connection, ExecStatus, Flush, Format, Params, PipelineStatus, QueryResult, ResultError,
+    result::diag,
 };
 
 mod common;
 
 use common::{
-    Cluster, confirm_query_canceled, finish_and_compare_trace, send_cancellable_query,
-    traced_like_libpq_pipeline,
+    Cluster, confirm_query_canceled, finish_and_compare_trace, like_libpq_pipeline,
+    send_cancellable_query, traced_like_libpq_pipeline,
 };
 
-/// `INT4OID`, `pg_type_d.h`.
+/// `INT4OID`, `INT8OID`, …, `pg_type_d.h`.
 const INT4OID: u32 = 23;
+const INT8OID: u32 = 20;
 const TEXTOID: u32 = 25;
 const NUMERICOID: u32 = 1700;
 const INTERVALOID: u32 = 1186;
 
-/// `drop_table_sql`, `create_table_sql`, `insert_sql`
-/// (`libpq_pipeline.c:44`-`:50`).
+/// `drop_table_sql`, `create_table_sql`, `insert_sql`, `insert_sql2`
+/// (`libpq_pipeline.c:44`-`:52`).
 const DROP_TABLE_SQL: &[u8] = b"DROP TABLE IF EXISTS pq_pipeline_demo";
 const CREATE_TABLE_SQL: &[u8] = b"CREATE UNLOGGED TABLE pq_pipeline_demo(id serial primary key, itemno integer,int8filler int8);";
 const INSERT_SQL: &[u8] = b"INSERT INTO pq_pipeline_demo(itemno) VALUES ($1)";
+const INSERT_SQL2: &[u8] = b"INSERT INTO pq_pipeline_demo(itemno,int8filler) VALUES ($1, $2)";
 
 /// `PQgetResult`, with a broken connection a test failure.
 fn get(conn: &mut Connection) -> Option<QueryResult> {
@@ -85,7 +89,8 @@ fn test_disallowed_in_pipeline() {
     };
     let (mut conn, sink) = traced_like_libpq_pipeline(&cluster);
 
-    // :414 — PQisnonblocking: this crate has no non-blocking mode.
+    // :414
+    assert!(!conn.is_nonblocking(), "Expected blocking connection mode");
     conn.enter_pipeline_mode()
         .expect("Unable to enter pipeline mode");
     assert_ne!(
@@ -497,6 +502,204 @@ fn test_pipeline_abort() {
     finish_and_compare_trace(conn, &sink, "pipeline_abort.trace");
 }
 
+/// `enum PipelineInsertStep`, `libpq_pipeline.c:994`, in its order: the
+/// derived `Ord` is C's enum arithmetic (`recv_step < BI_DONE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PipelineInsertStep {
+    BeginTx,
+    DropTable,
+    CreateTable,
+    Prepare,
+    InsertRows,
+    CommitTx,
+    Sync,
+    Done,
+}
+
+impl PipelineInsertStep {
+    /// `step++`.
+    fn next(self) -> Self {
+        match self {
+            Self::BeginTx => Self::DropTable,
+            Self::DropTable => Self::CreateTable,
+            Self::CreateTable => Self::Prepare,
+            Self::Prepare => Self::InsertRows,
+            Self::InsertRows => Self::CommitTx,
+            Self::CommitTx => Self::Sync,
+            Self::Sync | Self::Done => Self::Done,
+        }
+    }
+}
+
+/// `test_pipelined_insert`, `libpq_pipeline.c:1007`, with the `n_rows`
+/// `001_libpq_pipeline.pl` passes (`-r 700`, `:28`).
+///
+/// No trace is compared: upstream ships none for it (`001_libpq_pipeline.pl:39`-`:42`). What it
+/// proves is that a pipeline can send while it receives: non-blocking mode,
+/// `PQsocket`, and a `select()` on both directions, here
+/// [`rlibpq::poll::socket_poll`], which is `poll(2)` as `PQsocketPoll` calls
+/// it. A `select()` that fails ends the C test (`:1096`); here it panics.
+#[test]
+fn test_pipelined_insert() {
+    const N_ROWS: usize = 700;
+    let Some(cluster) = Cluster::start("trust", 55_475) else {
+        return;
+    };
+    let mut conn = like_libpq_pipeline(&cluster);
+
+    let insert_param_oids = [INT4OID, INT8OID];
+    let mut send_step = PipelineInsertStep::BeginTx;
+    let mut recv_step = PipelineInsertStep::BeginTx;
+    let mut rows_to_send = N_ROWS;
+    let mut rows_to_receive = N_ROWS;
+
+    // :1024 — "Do a pipelined insert into a table created at the start of
+    // the pipeline".
+    if let Err(err) = conn.enter_pipeline_mode() {
+        panic!("failed to enter pipeline mode: {err}");
+    }
+
+    // :1029
+    while send_step != PipelineInsertStep::Prepare {
+        let sql = match send_step {
+            PipelineInsertStep::BeginTx => &b"BEGIN TRANSACTION"[..],
+            PipelineInsertStep::DropTable => DROP_TABLE_SQL,
+            PipelineInsertStep::CreateTable => CREATE_TABLE_SQL,
+            _ => panic!("invalid state"),
+        };
+        send_step = send_step.next();
+        if let Err(err) = conn.send_query_params(sql, &[], &Params::text(&[])) {
+            panic!("dispatching {} failed: {err}", String::from_utf8_lossy(sql));
+        }
+    }
+
+    // :1061
+    assert_eq!(send_step, PipelineInsertStep::Prepare);
+    if let Err(err) = conn.send_prepare(b"my_insert", INSERT_SQL2, &insert_param_oids) {
+        panic!("dispatching PREPARE failed: {err}");
+    }
+    send_step = PipelineInsertStep::InsertRows;
+
+    // :1068 — "We'll be sending enough data that we could fill our output
+    // buffer, so to avoid deadlocking we need to enter nonblocking mode and
+    // consume input while we send more output."
+    if let Err(err) = conn.set_nonblocking(true) {
+        panic!("failed to set nonblocking mode: {err}");
+    }
+
+    // :1078
+    while recv_step != PipelineInsertStep::Done {
+        // :1084 — PQsocket, then select() on input and output.
+        let ready = rlibpq::poll::socket_poll(conn.socket(), true, true, None)
+            .unwrap_or_else(|err| panic!("select() failed: {err}"));
+
+        // :1101 — "Process any results, so we keep the server's output
+        // buffer free flowing and it can continue to process input".
+        if ready.read {
+            // C ignores what PQconsumeInput returns.
+            let _ = conn.consume_input();
+
+            // :1108 — "Read until we'd block if we tried to read".
+            while !conn.is_busy().expect("PQisBusy") && recv_step < PipelineInsertStep::Done {
+                // :1117 — "If no more results from this query, advance to
+                // the next query".
+                let Some(res) = get(&mut conn) else {
+                    continue;
+                };
+
+                let mut expected = ExecStatus::CommandOk;
+                let (cmdtag, description) = match recv_step {
+                    PipelineInsertStep::BeginTx => ("BEGIN", ""),
+                    PipelineInsertStep::DropTable => ("DROP TABLE", ""),
+                    PipelineInsertStep::CreateTable => ("CREATE TABLE", ""),
+                    PipelineInsertStep::Prepare => ("", "PREPARE"),
+                    PipelineInsertStep::InsertRows => ("INSERT", ""),
+                    PipelineInsertStep::CommitTx => ("COMMIT", ""),
+                    PipelineInsertStep::Sync => {
+                        expected = ExecStatus::PipelineSync;
+                        ("", "SYNC")
+                    }
+                    PipelineInsertStep::Done => panic!("unreachable state"),
+                };
+                if recv_step == PipelineInsertStep::InsertRows {
+                    rows_to_receive -= 1;
+                    if rows_to_receive == 0 {
+                        recv_step = recv_step.next();
+                    }
+                } else {
+                    recv_step = recv_step.next();
+                }
+
+                // :1165
+                assert_eq!(
+                    res.status(),
+                    expected,
+                    "{description} reported status {}, expected {}\nError message: \"{}\"",
+                    res.status().as_str(),
+                    expected.as_str(),
+                    String::from_utf8_lossy(&res.error_message())
+                );
+
+                // :1171 — strncmp over the expected tag's length.
+                assert!(
+                    res.command_status().starts_with(cmdtag.as_bytes()),
+                    "{description} expected command tag '{cmdtag}', got '{}'",
+                    String::from_utf8_lossy(res.command_status())
+                );
+            }
+        }
+
+        // :1181 — "Write more rows and/or the end pipeline message, if
+        // needed".
+        if ready.write {
+            // C ignores what PQflush returns; a flush that fails here has
+            // broken the connection, which the next call would report.
+            let _ = conn.flush();
+
+            if send_step == PipelineInsertStep::InsertRows {
+                let insert_param_0 = rows_to_send.to_string();
+                // "use up some buffer space with a wide value"
+                let insert_param_1 = (1_i64 << 62).to_string();
+                let values = [
+                    Some(insert_param_0.as_bytes()),
+                    Some(insert_param_1.as_bytes()),
+                ];
+                match conn.send_query_prepared(b"my_insert", &Params::text(&values)) {
+                    Ok(()) => {
+                        rows_to_send -= 1;
+                        if rows_to_send == 0 {
+                            send_step = send_step.next();
+                        }
+                    }
+                    // :1204 — "in nonblocking mode, so it's OK for an
+                    // insert to fail to send".
+                    Err(err) => eprintln!("WARNING: failed to send insert #{rows_to_send}: {err}"),
+                }
+            } else if send_step == PipelineInsertStep::CommitTx {
+                match conn.send_query_params(b"COMMIT", &[], &Params::text(&[])) {
+                    Ok(()) => send_step = send_step.next(),
+                    Err(err) => eprintln!("WARNING: failed to send commit: {err}"),
+                }
+            } else if send_step == PipelineInsertStep::Sync {
+                match conn.pipeline_sync() {
+                    // :1229 — fprintf(stdout, "pipeline sync sent\n").
+                    Ok(()) => send_step = send_step.next(),
+                    Err(err) => eprintln!("WARNING: pipeline sync failed: {err}"),
+                }
+            }
+        }
+    }
+
+    // :1241 — "We've got the sync message and the pipeline should be done".
+    if let Err(err) = conn.exit_pipeline_mode() {
+        panic!("attempt to exit pipeline mode failed when it should've succeeded: {err}");
+    }
+
+    if let Err(err) = conn.set_nonblocking(false) {
+        panic!("failed to clear nonblocking mode: {err}");
+    }
+}
+
 /// `test_prepared`, `libpq_pipeline.c:1253`.
 #[test]
 fn test_prepared() {
@@ -698,7 +901,8 @@ fn test_simple_pipeline() {
     let (mut conn, sink) = traced_like_libpq_pipeline(&cluster);
     let dummy_params: [Option<&[u8]>; 1] = [Some(b"1")];
 
-    // :1609 — PQisnonblocking: this crate has no non-blocking mode.
+    // :1609
+    assert!(!conn.is_nonblocking(), "Expected blocking connection mode");
     conn.enter_pipeline_mode()
         .expect("failed to enter pipeline mode");
     conn.send_query_params(b"SELECT $1", &[INT4OID], &Params::text(&dummy_params))
@@ -1048,22 +1252,208 @@ fn test_transaction() {
     finish_and_compare_trace(conn, &sink, "transaction.trace");
 }
 
+/// `test_uniqviol`, `libpq_pipeline.c:2024`: "we send a stream of queries,
+/// with one in the middle causing an error. Verify that we can still send
+/// some more after the error and have libpq work properly" (`:2019`).
+///
+/// It writes until a non-blocking `PQflush` answers `1` — the socket is
+/// full — and only then reads, so it runs only if a flush can come back with
+/// output still pending. No trace is compared: upstream ships none for it.
+/// The C test's progress marks on stderr (`.`, `E`, `result …`) are left
+/// out; they are not checked upstream either.
+#[test]
+fn test_uniqviol() {
+    let Some(cluster) = Cluster::start("trust", 55_476) else {
+        return;
+    };
+    let mut conn = like_libpq_pipeline(&cluster);
+
+    let param_types = [INT8OID, INT8OID];
+    let param_value_1 = b"42";
+    let mut ctr: i64 = 0;
+    let mut numsent: i64 = 0;
+    let mut results: i64 = 0;
+    let mut read_done = false;
+    let mut write_done = false;
+    let mut error_sent = false;
+    let mut got_error = false;
+    let mut switched = 0;
+    let mut socketful: i64 = 0;
+
+    // :2046 — C ignores what PQsetnonblocking returns.
+    let _ = conn.set_nonblocking(true);
+
+    // :2052
+    let res = exec(
+        &mut conn,
+        b"drop table if exists ppln_uniqviol;create table ppln_uniqviol(id bigint primary key, idata bigint)",
+    );
+    assert_eq!(
+        status(res.as_ref()),
+        ExecStatus::CommandOk,
+        "failed to create table: {res:?}"
+    );
+
+    let res = exec(&mut conn, b"begin");
+    assert_eq!(
+        status(res.as_ref()),
+        ExecStatus::CommandOk,
+        "failed to begin transaction: {res:?}"
+    );
+
+    let res = conn
+        .prepare(
+            b"insertion",
+            b"insert into ppln_uniqviol values ($1, $2) returning id",
+            &param_types,
+        )
+        .expect("PQprepare")
+        .pop();
+    assert_eq!(
+        status(res.as_ref()),
+        ExecStatus::CommandOk,
+        "failed to prepare query: {res:?}"
+    );
+
+    conn.enter_pipeline_mode()
+        .expect("failed to enter pipeline mode");
+
+    // :2070
+    while !read_done {
+        // :2073 — "Avoid deadlocks by reading everything the server has sent
+        // before sending anything. (Special precaution is needed here to
+        // process PQisBusy before testing the socket for read-readiness,
+        // because the socket does not turn read-ready after "sending"
+        // queries in aborted pipeline mode.)"
+        while !conn.is_busy().expect("PQisBusy") {
+            if results >= numsent {
+                if write_done {
+                    read_done = true;
+                }
+                break;
+            }
+
+            let res = get(&mut conn);
+            let new_error = process_result(&mut conn, res);
+            assert!(!(new_error && got_error), "got two errors");
+            got_error |= new_error;
+            let last = results >= numsent - 1;
+            results += 1;
+            if last {
+                if write_done {
+                    read_done = true;
+                }
+                break;
+            }
+        }
+
+        if read_done {
+            break;
+        }
+
+        // :2112 — select() on input, and on output until done writing.
+        let ready = match rlibpq::poll::socket_poll(conn.socket(), true, !write_done, None) {
+            Ok(ready) => ready,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => panic!("select() failed: {err}"),
+        };
+
+        if ready.read
+            && let Err(err) = conn.consume_input()
+        {
+            panic!("PQconsumeInput failed: {err}");
+        }
+
+        // :2123 — "If the socket is writable and we haven't finished
+        // sending queries, send some."
+        if !write_done && ready.write {
+            loop {
+                // :2133 — "provoke uniqueness violation exactly once after
+                // having switched to read mode."
+                let param_value_0 =
+                    if switched >= 1 && !error_sent && ctr % socketful >= socketful / 2 {
+                        error_sent = true;
+                        (numsent / 2).to_string()
+                    } else {
+                        let value = ctr.to_string();
+                        ctr += 1;
+                        value
+                    };
+
+                let values = [Some(param_value_0.as_bytes()), Some(&param_value_1[..])];
+                if let Err(err) = conn.send_query_prepared(b"insertion", &Params::text(&values)) {
+                    panic!("failed to execute prepared query: {err}");
+                }
+                numsent += 1;
+
+                // :2152 — "Are we done writing?"
+                if socketful != 0 && numsent % socketful == 42 && error_sent {
+                    conn.send_flush_request()
+                        .expect("failed to send flush request");
+                    write_done = true;
+                    // C ignores what this PQflush returns.
+                    let _ = conn.flush();
+                    break;
+                }
+
+                // :2163 — "is the outgoing socket full?"
+                let flush = conn
+                    .flush()
+                    .unwrap_or_else(|err| panic!("failed to flush: {err}"));
+                if flush == Flush::Pending {
+                    if socketful == 0 {
+                        socketful = numsent;
+                    }
+                    switched += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    // :2179
+    assert!(got_error, "did not get expected error");
+}
+
+/// `process_result`, `libpq_pipeline.c:2192`: check one result of
+/// `test_uniqviol` and consume the NULL that must follow it; `true` for the
+/// expected unique violation.
+fn process_result(conn: &mut Connection, res: Option<QueryResult>) -> bool {
+    let Some(res) = res else {
+        panic!("got unexpected NULL");
+    };
+
+    let got_error = match res.status() {
+        ExecStatus::FatalError => true,
+        ExecStatus::TuplesOk | ExecStatus::PipelineAborted => false,
+        other => panic!("got unexpected {}", other.as_str()),
+    };
+    if let Some(res2) = get(conn) {
+        panic!("expected NULL, got {}", res2.status().as_str());
+    }
+    got_error
+}
+
 /// `test_cancel`, `libpq_pipeline.c:244`, up to `:290`: the blocking calls —
 /// `PQcancel` twice with one `PGcancel`, `PQrequestCancel`, and
 /// `PQcancelBlocking` — each against a running `pg_sleep`, each confirmed by
 /// the query failing with 57014. From `:292` the C test polls with
-/// `PQcancelStart`/`PQcancelPoll` and `select()`, which wait for NAT-520.
+/// `PQcancelStart`/`PQcancelPoll` and `select()`; those two are not ported
+/// yet.
 ///
 /// It runs under protocol 3.0, the one this crate speaks, which is
 /// `001_libpq_pipeline.pl:78`'s "libpq_pipeline cancel with protocol 3.0".
-/// `PQsetnonblocking(conn, 1)` (`libpq_pipeline.c:253`) has no counterpart: this crate's
-/// sends always block, and every send here is one short message.
 #[test]
 fn test_cancel_blocking() {
     let Some(cluster) = Cluster::start("trust", 55_469) else {
         return;
     };
     let mut conn = cluster.connect();
+
+    // :253
+    if let Err(err) = conn.set_nonblocking(true) {
+        panic!("failed to set nonblocking mode: {err}");
+    }
 
     // :260 — "a separate connection to the database to monitor the query".
     let mut monitor = cluster.connect();

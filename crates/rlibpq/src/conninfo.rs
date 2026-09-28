@@ -721,9 +721,10 @@ impl Env {
     /// `pg_fe_getusername(geteuid())` (`fe-auth.c:1349`) and so a `getpwuid`
     /// lookup.
     ///
-    /// Neither call is reachable from the standard library, this crate is
-    /// `#![deny(unsafe_code)]` and no libc dependency is approved (AGENTS.md),
-    /// so the name comes from `USER`/`LOGNAME` — the same substitution
+    /// The standard library reaches neither call, nor does `rustix`, the one
+    /// system-call crate approved here (ADR-0010: it has `geteuid` but no
+    /// passwd lookup), and this crate is `#![deny(unsafe_code)]` with no libc
+    /// dependency, so the name comes from `USER`/`LOGNAME` — the same substitution
     /// `rinitdb::validate` makes for `get_id()`. See `docs/divergences.md`.
     /// An exported but empty variable is not a user name, so `USER=""` falls
     /// through to `LOGNAME` rather than answering "nobody".

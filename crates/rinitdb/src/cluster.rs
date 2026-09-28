@@ -114,6 +114,44 @@ fn is_c_locale(name: &str) -> bool {
     matches!(name, "C" | "POSIX")
 }
 
+/// Whether this build's `setlocale` keeps the name `POSIX`. glibc's and
+/// musl's return `C` for it; Darwin's records the name as given, and the
+/// apple lane's reference initdb reports `LC_MESSAGES: POSIX` and writes
+/// `POSIX` for `--lc-messages POSIX`.
+const SETLOCALE_KEEPS_POSIX: bool = cfg!(target_os = "macos");
+
+/// Pure: the name `setlocale` returns for `name`, one of [`is_c_locale`]'s
+/// spellings.
+fn c_locale_name(name: &str) -> &'static str {
+    if name == "POSIX" && SETLOCALE_KEEPS_POSIX {
+        "POSIX"
+    } else {
+        "C"
+    }
+}
+
+/// Pure: `lc_collate` and `lc_ctype` as `setlocales` leaves them
+/// (`initdb.c:2432`-`:2443`) and `check_locale_name` names them (`:2202`):
+/// the category's own switch, else `--locale`; an empty or absent one is the
+/// environment's, which this port takes to be C (`docs/divergences.md`).
+///
+/// Only the C locale is named: anything else is refused
+/// ([`check_template_can_make`]) before the name is printed, except behind
+/// a failing `--waldir`, where `C` stands in for it.
+#[must_use]
+pub fn catalog_locales(options: &Options) -> (&'static str, &'static str) {
+    let name = |category: Option<&str>| {
+        category
+            .or(options.locale.as_deref())
+            .filter(|name| !name.is_empty())
+            .map_or("C", c_locale_name)
+    };
+    (
+        name(options.lc_collate.as_deref()),
+        name(options.lc_ctype.as_deref()),
+    )
+}
+
 /// Pure: what `setup_config` (`initdb.c:1283`) writes the configuration files
 /// from, for a cluster made from the template.
 ///
@@ -157,7 +195,8 @@ pub fn settings(
 /// then `check_locale_name` (`:2202`) canonicalizes it through `setlocale`.
 /// That call is out of reach (`#![deny(unsafe_code)]`, no libc dependency),
 /// so the name is written as given, except that `POSIX` is written `C`, as
-/// musl's and glibc's `setlocale` return it, and on musl every name
+/// musl's and glibc's `setlocale` return it (not Darwin's,
+/// [`SETLOCALE_KEEPS_POSIX`]), and on musl every name
 /// [`musl_setlocale_name`] folds to `C` is written `C`. Nothing given —
 /// where C asks the environment — is `C` (`docs/divergences.md`).
 fn conf_locale(category: Option<&str>, options: &Options) -> String {
@@ -165,7 +204,8 @@ fn conf_locale(category: Option<&str>, options: &Options) -> String {
         .filter(|name| !name.is_empty())
         .or_else(|| options.locale.as_deref().filter(|name| !name.is_empty()));
     match given {
-        None | Some("POSIX") => "C".to_owned(),
+        None => "C".to_owned(),
+        Some(name @ "POSIX") => c_locale_name(name).to_owned(),
         Some(name) if cfg!(target_env = "musl") => musl_setlocale_name(name).to_owned(),
         Some(name) => name.to_owned(),
     }
@@ -201,7 +241,8 @@ pub fn musl_setlocale_name(name: &str) -> &str {
 /// `--no-locale` is `locale = "C"`, `:3338`, and never overrides either);
 /// an empty or absent one is the environment's (`check_locale_name`,
 /// `:2202`), which this port takes to be C (`docs/divergences.md`), and
-/// `setlocale` names `POSIX` `C`. For C, `find_matching_ts_config` finds
+/// `setlocale` names `POSIX` `C` (except on Darwin, [`c_locale_name`]). For
+/// C, `find_matching_ts_config` finds
 /// [`C_TEXT_SEARCH_CONFIG`], so the `is unknown` branch (`:2854`) cannot be
 /// taken; the name is compared as C compares it, with `strcmp` as given.
 ///
@@ -218,10 +259,11 @@ pub fn text_search_warning(options: &Options) -> Option<String> {
     if !lc_ctype.is_none_or(|name| name.is_empty() || is_c_locale(name)) {
         return None;
     }
+    let (_, lc_ctype) = catalog_locales(options);
     (given != C_TEXT_SEARCH_CONFIG).then(|| {
         format!(
             "{}: warning: specified text search configuration \"{given}\" might not match \
-             locale \"C\"",
+             locale \"{lc_ctype}\"",
             crate::help::PROGNAME
         )
     })
@@ -495,9 +537,14 @@ mod tests {
         }
 
         // --locale fills the ones not given (initdb.c:2432-:2443), and
-        // setlocale returns POSIX as C.
+        // setlocale returns POSIX as C, except on Darwin.
         let (options, plan) = parsed(&["--locale=POSIX", "--lc-time=de_DE"]);
         let settings = super::settings(&options, &plan, None);
+        let posix = if cfg!(target_os = "macos") {
+            "POSIX"
+        } else {
+            "C"
+        };
         assert_eq!(
             [
                 settings.lc_messages.as_str(),
@@ -505,7 +552,7 @@ mod tests {
                 &settings.lc_numeric,
                 &settings.lc_time,
             ],
-            ["C", "C", "C", "de_DE"]
+            [posix, posix, posix, "de_DE"]
         );
 
         // On musl, setlocale names what it folds to the C locale "C", and
@@ -599,12 +646,27 @@ mod tests {
             &["-E", "LATIN1"],
             &["--locale-provider", "builtin", "--builtin-locale", "C"],
             &["--locale", "de_DE", "--lc-ctype", "C"],
-            &["--lc-ctype", "POSIX"],
-            &["--locale", "POSIX"],
             &["--wal-segsize", "32"],
         ] {
             let argv = [&["--no-locale", "-T", "simple"][..], extra].concat();
             assert_eq!(text_search_warning(&parsed(&argv).0), warning, "{extra:?}");
+        }
+        // Darwin's setlocale keeps the name POSIX, and C's line names it so.
+        let posix = if cfg!(target_os = "macos") {
+            "POSIX"
+        } else {
+            "C"
+        };
+        for extra in [&["--lc-ctype", "POSIX"][..], &["--locale", "POSIX"]] {
+            let argv = [&["--no-locale", "-T", "simple"][..], extra].concat();
+            assert_eq!(
+                text_search_warning(&parsed(&argv).0),
+                Some(format!(
+                    "initdb: warning: specified text search configuration \"simple\" might \
+                     not match locale \"{posix}\""
+                )),
+                "{extra:?}"
+            );
         }
         // lc_ctype is not C: the refusal follows, and C's line would name it.
         for extra in [

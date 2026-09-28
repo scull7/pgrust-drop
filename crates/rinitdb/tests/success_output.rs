@@ -234,12 +234,11 @@ fn an_existing_empty_directory_matches_reference_initdb() {
 
 /// `--lc-messages` feeds the locale report (`initdb.c:2689`): a category
 /// that differs from `lc_ctype` turns the one line into the table (`:2699`).
-/// `POSIX` is the one other spelling every lane's `setlocale` knows, and it
-/// names it `C`, so both print the one line; the table itself is pinned by
-/// the unit test
-/// `report::tests::one_locale_line_when_all_six_agree_and_the_table_otherwise`.
+/// `POSIX` is the one other spelling of the C locale every lane knows:
+/// glibc's and musl's `setlocale` name it `C`, so the report is the one
+/// line, and Darwin's keeps `POSIX`, so it is the table.
 #[test]
-fn a_posix_lc_messages_is_reported_as_c_like_reference_initdb() {
+fn a_posix_lc_messages_is_reported_like_reference_initdb() {
     gate(
         "success-lc-messages",
         &[&TEMPLATE_ARGS[..], &["--no-sync", "--lc-messages", "POSIX"]].concat(),

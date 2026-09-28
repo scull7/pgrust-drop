@@ -9,15 +9,16 @@
 //! A [`PGresult`] is built once from an `rlibpq` [`QueryResult`], with every
 //! string C will read already NUL-terminated, so each accessor is a lookup.
 //! The range checks are calculations that return the notice C would raise;
-//! the shims print it, as the default notice processor does.
+//! the shims raise it through the hooks the result carries
+//! (`pqInternalNotice`, `fe-exec.c:944`).
 
 use std::ffi::{CStr, c_char, c_int};
-use std::io::Write as _;
 use std::ptr::null_mut;
 
 use rlibpq::{ExecStatus, QueryResult};
 
 use crate::ctext::CText;
+use crate::notice::{NoticeHooks, internal_notice};
 
 /// `pgresStatus[]`, `fe-exec.c:33`-`:47`: what `PQresStatus` answers,
 /// indexed by `ExecStatusType` (`libpq-fe.h:122`).
@@ -110,11 +111,14 @@ pub struct PGresult {
     error_message: Option<CText>,
     /// `errFields`, in the order the server sent them.
     error_fields: Vec<(u8, CText)>,
+    /// `noticeHooks`: the connection's when the result was made.
+    pub(crate) hooks: NoticeHooks,
 }
 
 impl PGresult {
-    /// Calculation: `result` laid out for C.
-    pub(crate) fn from_result(result: &QueryResult) -> Self {
+    /// Calculation: `result` laid out for C, reporting its notices to
+    /// `hooks`.
+    pub(crate) fn from_result(result: &QueryResult, hooks: NoticeHooks) -> Self {
         let copy = matches!(
             result.status(),
             ExecStatus::CopyIn | ExecStatus::CopyOut | ExecStatus::CopyBoth
@@ -159,6 +163,7 @@ impl PGresult {
                         .collect()
                 })
                 .unwrap_or_default(),
+            hooks,
         }
     }
 
@@ -166,7 +171,7 @@ impl PGresult {
     /// (`fe-exec.c:857`) makes from `conn->errorMessage` when a query ends
     /// with no result from the server, such as a lost connection. It has a
     /// message but no fields.
-    pub(crate) fn fatal_error(message: &[u8]) -> Self {
+    pub(crate) fn fatal_error(message: &[u8], hooks: NoticeHooks) -> Self {
         PGresult {
             status: ExecStatus::FatalError,
             attrs: Vec::new(),
@@ -178,7 +183,30 @@ impl PGresult {
             oid_status: CText::default(),
             error_message: Some(CText::new(message)),
             error_fields: Vec::new(),
+            hooks,
         }
+    }
+
+    /// Calculation: the notice `pqInternalNotice` (`fe-exec.c:944`) makes of
+    /// `text`: `PGRES_NONFATAL_ERROR`, the text as the primary message with
+    /// severity `NOTICE` (`:968`-`:970`), and the text and a newline as the
+    /// message (`:977`-`:979`).
+    pub(crate) fn internal_notice(text: &[u8], hooks: NoticeHooks) -> Self {
+        PGresult {
+            status: ExecStatus::NonfatalError,
+            error_message: Some(CText::new(&[text, b"\n"].concat())),
+            error_fields: vec![
+                (b'M', CText::new(text)),
+                (b'S', CText::new(b"NOTICE")),
+                (b'V', CText::new(b"NOTICE")),
+            ],
+            ..PGresult::fatal_error(b"", hooks)
+        }
+    }
+
+    /// Is it `PGRES_FATAL_ERROR`?
+    pub(crate) fn is_fatal_error(&self) -> bool {
+        self.status == ExecStatus::FatalError
     }
 
     fn ntuples(&self) -> c_int {
@@ -362,18 +390,6 @@ fn cannot_interpret(cmd_status: &[u8]) -> Vec<u8> {
     notice
 }
 
-/// Action: raise `notice` through the result's notice hooks.
-///
-/// `pqInternalNotice` (`fe-exec.c:944`) makes the text the primary message
-/// plus a newline (`:979`); with no `PQsetNoticeReceiver` or
-/// `PQsetNoticeProcessor` exported yet, the hooks are always the defaults,
-/// which print it to stderr (`defaultNoticeProcessor`, `fe-connect.c:7857`).
-fn internal_notice(notice: &[u8]) {
-    let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(notice);
-    let _ = stderr.write_all(b"\n");
-}
-
 /// The `PGresult` behind `res`, or `None` for NULL.
 ///
 /// # Safety
@@ -454,7 +470,7 @@ pub unsafe extern "C" fn PQfname(res: *const PGresult, field_num: c_int) -> *mut
     match res.field(field_num) {
         Ok(attr) => attr.name.as_ref().map_or(null_mut(), CText::as_ptr),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             null_mut()
         }
     }
@@ -491,7 +507,7 @@ pub unsafe extern "C" fn PQgetvalue(
     match res.cell(tup_num, field_num) {
         Ok(value) => value.unwrap_or(&res.null_field).as_ptr(),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             null_mut()
         }
     }
@@ -516,7 +532,7 @@ pub unsafe extern "C" fn PQgetlength(
     match res.cell(tup_num, field_num) {
         Ok(value) => value.map_or(0, |value| c_count(value.bytes().len())),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             0
         }
     }
@@ -541,7 +557,7 @@ pub unsafe extern "C" fn PQgetisnull(
     match res.cell(tup_num, field_num) {
         Ok(value) => c_int::from(value.is_none()),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             1
         }
     }
@@ -599,7 +615,7 @@ unsafe fn attr_member<T>(
     match res.field(field_num) {
         Ok(attr) => member(attr),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             default
         }
     }
@@ -721,7 +737,7 @@ pub unsafe extern "C" fn PQcmdTuples(res: *mut PGresult) -> *mut c_char {
         Ok(Some(start)) => unsafe { res.cmd_status.as_ptr().add(start) },
         Ok(None) => c"".as_ptr().cast_mut(),
         Err(notice) => {
-            internal_notice(&notice);
+            internal_notice(&res.hooks, &notice);
             c"".as_ptr().cast_mut()
         }
     }
@@ -753,7 +769,7 @@ pub unsafe extern "C" fn PQparamtype(res: *const PGresult, param_num: c_int) -> 
         return 0;
     };
     res.param(param_num).unwrap_or_else(|notice| {
-        internal_notice(&notice);
+        internal_notice(&res.hooks, &notice);
         0
     })
 }
@@ -830,7 +846,7 @@ mod tests {
 
     #[test]
     fn a_range_check_names_the_row_before_the_column() {
-        let res = PGresult::fatal_error(b"boom\n");
+        let res = PGresult::fatal_error(b"boom\n", NoticeHooks::NONE);
         assert_eq!(
             res.cell(0, 0),
             Err(b"row number 0 is out of range 0..-1".to_vec())
@@ -846,7 +862,7 @@ mod tests {
     }
 
     fn named(names: &[&[u8]]) -> PGresult {
-        let mut res = PGresult::fatal_error(b"");
+        let mut res = PGresult::fatal_error(b"", NoticeHooks::NONE);
         res.attrs = names
             .iter()
             .map(|name| Attr {
@@ -933,7 +949,7 @@ mod tests {
 
     #[test]
     fn a_parameter_out_of_range_raises_c_s_notice() {
-        let mut res = PGresult::fatal_error(b"");
+        let mut res = PGresult::fatal_error(b"", NoticeHooks::NONE);
         res.params = vec![23, 25];
         assert_eq!(res.param(1), Ok(25));
         assert_eq!(

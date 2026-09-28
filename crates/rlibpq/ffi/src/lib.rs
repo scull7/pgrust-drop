@@ -26,6 +26,11 @@
 //! `PQsetdbLogin`, `PQconnectStart`, `PQconnectPoll` — and to reopen one,
 //! `PQreset`, and the `PGconn` accessors, `PQdb` through `PQconninfo`,
 //! enough for `src/test/examples/testlibpq4.c`.
+//! Then the calls that do not wait — `PQsendQuery` and its extended-query
+//! siblings, `PQgetResult`, `PQconsumeInput`, `PQisBusy`, `PQnotifies`,
+//! `PQsetnonblocking`, `PQflush` — and the notice hooks,
+//! `PQsetNoticeReceiver` and `PQsetNoticeProcessor`, enough for
+//! `src/test/examples/testlibpq2.c`.
 //! The rest follows in later slices of NAT-395.
 //!
 //! This is the one crate in the workspace that allows `unsafe`: a C ABI is
@@ -40,15 +45,19 @@
 pub mod abi;
 mod accessors;
 mod alloc;
+mod asynchronous;
 mod conn;
 mod conninfo;
 mod ctext;
 mod extended;
 mod misc;
+mod notice;
 mod result;
 mod secure;
 
+pub use asynchronous::PGnotify;
 pub use conn::PGconn;
 pub use conninfo::PQconninfoOption;
 pub use misc::PG_VERSION_NUM;
+pub use notice::{PQnoticeProcessor, PQnoticeReceiver};
 pub use result::PGresult;

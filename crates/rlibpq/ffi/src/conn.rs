@@ -2,33 +2,36 @@
 //! reset and close one: `PQconnectdb` and its siblings `PQconnectdbParams`,
 //! `PQsetdbLogin`, `PQconnectStart`, `PQconnectStartParams` and
 //! `PQconnectPoll`; `PQreset`, `PQresetStart` and `PQresetPoll`; `PQstatus`,
-//! `PQerrorMessage`, `PQexec` and `PQfinish`; and [`exec_with`], the
+//! `PQerrorMessage`, `PQexec` and `PQfinish`; [`exec_with`], the
 //! `PQexecStart` / `PQexecFinish` frame the extended-query calls share with
-//! `PQexec`.
+//! `PQexec`; and [`PGconn::send_with`], the `PQsendQueryStart` frame of the
+//! calls that send a command without waiting for it.
 //!
 //! The connection itself is an `rlibpq` [`Connection`]; this module keeps
 //! what C reads beside it — the status, `conn->errorMessage` as a C string,
 //! the option fields `fillPGconn` and `pqConnectOptions2` fill, the host it
-//! reached and the parameters the server reported — and turns what a call
-//! returned into what C's `PGconn` would then hold.
+//! reached, the parameters the server reported, the notice hooks and the
+//! notifications not yet collected — and turns what a call returned into
+//! what C's `PGconn` would then hold.
 //!
 //! Every connection is made blocking, `rlibpq`'s [`Connection::connect`].
 //! `PQconnectStart` and `PQresetStart` therefore return with the attempt
 //! already over, and `PQconnectPoll` answers from where it ended; see
 //! `docs/divergences.md`.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int};
-use std::io::Write as _;
 use std::ptr::null_mut;
 
 use rlibpq::pg_config::DEF_PGPORT_STR;
 use rlibpq::{
-    ConnHost, ConnInfo, Connection, ConnectionError, ContextVisibility, Env, ExecStatus,
-    Filesystem, QueryResult, Verbosity, conn_hosts, conninfo_array_parse, parse_conninfo,
+    AsyncStatus, ConnHost, ConnInfo, Connection, ConnectionError, Env, ExecStatus, Filesystem,
+    PipelineStatus, QueryResult, conn_hosts, conninfo_array_parse, parse_conninfo,
     recognized_connection_string,
 };
 
 use crate::ctext::CText;
+use crate::notice::{NoticeHooks, receive};
 use crate::result::PGresult;
 
 /// `ConnStatusType`, `libpq-fe.h:82`, as far as a blocking connection ever
@@ -138,10 +141,30 @@ pub struct PGconn {
     pub(crate) connection: Option<Connection>,
     pub(crate) status: ConnStatus,
     /// `conn->errorMessage`.
-    error_message: CText,
+    pub(crate) error_message: CText,
     /// How many of the connection's notices have been handed to the notice
-    /// processor already.
+    /// receiver already.
     notices_reported: usize,
+    /// How many of the connection's notifications have been moved to
+    /// [`PGconn::notifies`] already.
+    notifies_taken: usize,
+    /// `conn->notifyHead` … `notifyTail`: pid, channel and payload of each
+    /// notification not yet handed out by `PQnotifies`. They outlive a lost
+    /// connection, as C's list does until `pqClosePGconn`.
+    pub(crate) notifies: VecDeque<(i32, Vec<u8>, Vec<u8>)>,
+    /// `conn->noticeHooks`.
+    pub(crate) hooks: NoticeHooks,
+    /// `conn->errorReported`: how much of `conn->errorMessage` a result has
+    /// carried to the caller already (`pqPrepareAsyncResult`,
+    /// `fe-exec.c:870`, `:902`).
+    error_reported: usize,
+    /// Results the connection had complete when it was lost, which
+    /// `PQgetResult` still hands out, as C's `conn->result` outlives
+    /// `pqDropConnection`.
+    stashed: VecDeque<PGresult>,
+    /// The connection was lost while a command was running, and the next
+    /// `PQgetResult` owes an error result for it.
+    error_result: Option<AfterLoss>,
     /// The option fields; `None` while they are all NULL, as a conninfo
     /// that did not parse leaves them.
     pub(crate) options: Option<Options>,
@@ -172,6 +195,12 @@ impl PGconn {
             status: ConnStatus::Bad,
             error_message: CText::new(&error_message),
             notices_reported: 0,
+            notifies_taken: 0,
+            notifies: VecDeque::new(),
+            hooks: NoticeHooks::DEFAULT,
+            error_reported: 0,
+            stashed: VecDeque::new(),
+            error_result: None,
             options,
             host: CText::default(),
             port: CText::default(),
@@ -202,20 +231,20 @@ impl PGconn {
 
     /// Action: `pqConnectDBStart` and `pqConnectDBComplete`
     /// (`fe-connect.c:2704`, `:2782`), blocking: nothing when the options
-    /// are not valid (`:2709`), otherwise the attempt, the `PGconn` it
-    /// leaves, and the startup's notices handed to the notice processor.
+    /// are not valid (`:2709`), otherwise the attempt and the `PGconn` it
+    /// leaves; the startup's notices are returned, to be delivered.
     ///
     /// After a failed attempt `PQhost` names the last host in the list,
     /// where C names the one the attempt stopped at; see
     /// `docs/divergences.md`.
-    fn connect(&mut self) {
+    fn connect(&mut self) -> Notices {
         let Some(Options {
             info,
             hosts: Ok(hosts),
             ..
         }) = &self.options
         else {
-            return;
+            return Notices::default();
         };
         match Connection::connect(info) {
             Ok(connection) => {
@@ -224,20 +253,20 @@ impl PGconn {
                 self.status = ConnStatus::Ok;
                 self.error_message = CText::default();
                 self.set_host(host.as_ref());
-                self.sync_parameters();
-                self.report_notices();
+                self.collect()
             }
             Err(err) => {
                 let last = hosts.last().cloned();
                 self.error_message = CText::new(&with_newline(err.message()));
                 self.set_host(last.as_ref());
+                Notices::default()
             }
         }
     }
 
     /// Action: `pqClosePGconn` (`fe-connect.c:5254`): Terminate if the
     /// connection is up, close it, and forget the error and everything the
-    /// server said; the options stay.
+    /// server said; the options and the notice hooks stay.
     fn close(&mut self) {
         if let Some(mut connection) = self.connection.take() {
             // "Ignore any error" (`:5236`-`:5237`).
@@ -246,6 +275,11 @@ impl PGconn {
         self.status = ConnStatus::Bad;
         self.error_message = CText::default();
         self.notices_reported = 0;
+        self.notifies_taken = 0;
+        self.notifies.clear();
+        self.error_reported = 0;
+        self.stashed.clear();
+        self.error_result = None;
         self.parameters.clear();
     }
 
@@ -271,33 +305,194 @@ impl PGconn {
             .collect();
     }
 
-    /// Action: hand every notice the server sent since the last call to the
-    /// notice processor. With no `PQsetNoticeReceiver` or
-    /// `PQsetNoticeProcessor` exported yet it is always the default, which
-    /// prints `PQresultErrorMessage` of the notice to stderr
-    /// (`defaultNoticeReceiver`, `fe-connect.c:7842`; `defaultNoticeProcessor`,
-    /// `:7857`).
-    fn report_notices(&mut self) {
+    /// Bring the `PGconn` up to date with what the connection has parsed
+    /// since the last call: the parameters, the notifications, which join
+    /// [`PGconn::notifies`], and the notices, returned as `PGresult`s
+    /// carrying the hooks, for [`Notices::deliver`].
+    pub(crate) fn collect(&mut self) -> Notices {
+        self.sync_parameters();
         let Some(connection) = &self.connection else {
-            return;
+            return Notices::default();
         };
+        let notifications = &connection.notifications()[self.notifies_taken..];
+        self.notifies.extend(notifications.iter().cloned());
+        self.notifies_taken += notifications.len();
         let notices = &connection.notices()[self.notices_reported..];
-        let mut stderr = std::io::stderr().lock();
-        for notice in notices {
-            let _ = stderr.write_all(&notice.message(
-                ExecStatus::NonfatalError,
-                Verbosity::default(),
-                ContextVisibility::default(),
-            ));
-        }
         self.notices_reported += notices.len();
+        Notices(
+            notices
+                .iter()
+                .map(|notice| {
+                    let notice = QueryResult::with_error(ExecStatus::NonfatalError, notice.clone());
+                    PGresult::from_result(&notice, self.hooks)
+                })
+                .collect(),
+        )
+    }
+
+    /// `libpq_append_conn_error` and its kin: add `message`, which ends in
+    /// its newline, to `conn->errorMessage`.
+    pub(crate) fn append_error(&mut self, message: &[u8]) {
+        self.error_message = CText::new(&[self.error_message.bytes(), message].concat());
+    }
+
+    /// `pqClearConnErrorState`, `libpq-int.h:927`: a new query cycle
+    /// starts with no error, none of it reported.
+    pub(crate) fn clear_error(&mut self) {
+        self.error_message = CText::default();
+        self.error_reported = 0;
+    }
+
+    /// Action: what a failed read or parse leaves (`pqReadData`,
+    /// `fe-misc.c:833`-`:842`; `handleSyncLoss`, `fe-protocol3.c:504`): the
+    /// error added to `conn->errorMessage`, the connection dropped and
+    /// `CONNECTION_BAD`, and — when a command was running — an error result
+    /// owed to the next `PQgetResult`, which `then` says how C comes to.
+    ///
+    /// Results already complete are kept for `PQgetResult` first.
+    pub(crate) fn lose(&mut self, err: &ConnectionError, then: AfterLoss) {
+        while let Some(connection) = self.connection.as_mut()
+            && matches!(
+                connection.async_status(),
+                AsyncStatus::Ready | AsyncStatus::ReadyMore
+            )
+        {
+            // A complete result is handed over without a read.
+            let Ok(Some(result)) = connection.get_result() else {
+                break;
+            };
+            if result.status() == ExecStatus::FatalError {
+                self.append_error(&result.error_message());
+            }
+            self.stashed
+                .push_back(PGresult::from_result(&result, self.hooks));
+        }
+        self.append_error(&with_newline(err.message()));
+        if self
+            .connection
+            .take()
+            .is_some_and(|connection| connection.async_status() != AsyncStatus::Idle)
+        {
+            self.error_result = Some(then);
+        }
+        self.status = ConnStatus::Bad;
+    }
+
+    /// Action: what a lost connection still owes `PQgetResult`: each result
+    /// [`PGconn::lose`] kept, then the error result, once
+    /// (`pqPrepareAsyncResult`, `fe-exec.c:857`, with no result from the
+    /// server) — the error text no result has carried yet, which is then
+    /// reported (`:901`-`:902`).
+    pub(crate) fn take_error_result(&mut self) -> Option<PGresult> {
+        if let Some(result) = self.stashed.pop_front() {
+            if result.is_fatal_error() {
+                self.error_reported = self.error_message.bytes().len();
+            }
+            return Some(result);
+        }
+        if self.error_result.take()? == AfterLoss::Wait {
+            // `pqSocketCheck`, `fe-misc.c:1242`-`:1245`.
+            self.append_error(b"invalid socket\n");
+        }
+        let unreported = self
+            .error_message
+            .bytes()
+            .get(self.error_reported..)
+            .unwrap_or_default();
+        let result = PGresult::fatal_error(unreported, self.hooks);
+        self.error_reported = self.error_message.bytes().len();
+        Some(result)
+    }
+
+    /// An error result from the server: its message joins
+    /// `conn->errorMessage` (`pqGetErrorNotice3`, `fe-protocol3.c:995`),
+    /// and returning it reports all of that (`fe-exec.c:870`).
+    pub(crate) fn report_error(&mut self, message: &[u8]) {
+        self.append_error(message);
+        self.error_reported = self.error_message.bytes().len();
+    }
+
+    /// Action: `PQsendQueryStart` (`fe-exec.c:1690`) and the call's own
+    /// sending, for the calls that return without waiting: 1 when the
+    /// command went out, else 0 with the reason added to
+    /// `conn->errorMessage`.
+    ///
+    /// The error is cleared first unless a command is still running
+    /// (`:1700`, "the error buffer belongs to that command"); then a
+    /// connection that is not up (`:1704`) and one busy with another
+    /// command (`:1711`) are refused before `send` checks the call's own
+    /// arguments, as C checks them after `PQsendQueryStart`.
+    pub(crate) fn send_with(
+        &mut self,
+        send: impl FnOnce(&mut Connection) -> Result<Result<(), ConnectionError>, Refused>,
+    ) -> c_int {
+        let running = self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.async_status() != AsyncStatus::Idle);
+        if !running {
+            self.clear_error();
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            self.append_error(b"no connection to the server\n");
+            return 0;
+        };
+        if running && connection.pipeline_status() == PipelineStatus::Off {
+            self.append_error(b"another command is already in progress\n");
+            return 0;
+        }
+        match send(connection) {
+            Ok(Ok(())) => 1,
+            Ok(Err(err)) => {
+                self.append_error(&with_newline(err.message()));
+                0
+            }
+            Err(Refused(message)) => {
+                self.append_error(&with_newline(message));
+                0
+            }
+        }
+    }
+}
+
+/// How C comes to owe the error result of a connection lost while a
+/// command was running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterLoss {
+    /// `pqSaveErrorResult` (`fe-exec.c:809`): a parse failure
+    /// (`handleSyncLoss`, `fe-protocol3.c:504`) or a read `PQgetResult`
+    /// made itself (`fe-exec.c:2114`-`:2121`).
+    ErrorResult,
+    /// A read `PQconsumeInput` made: the command is still `PGASYNC_BUSY`,
+    /// so the next `PQgetResult` waits on the closed socket, which fails
+    /// with "invalid socket" before the error result is made
+    /// (`fe-exec.c:2114`-`:2121`, `fe-misc.c:1242`-`:1245`).
+    Wait,
+}
+
+/// Notices [`PGconn::collect`] took from the connection, not yet handed to
+/// the receiver.
+///
+/// They are delivered once the shim no longer holds the `PGconn`, because a
+/// receiver is C code that may call back into the library with it.
+#[derive(Debug, Default)]
+#[must_use]
+pub(crate) struct Notices(Vec<PGresult>);
+
+impl Notices {
+    /// Action: hand each notice to the receiver it carries, oldest first, as
+    /// `pqGetErrorNotice3` does as it parses one (`fe-protocol3.c:1012`).
+    pub(crate) fn deliver(self) {
+        for notice in &self.0 {
+            receive(notice);
+        }
     }
 }
 
 /// Calculation: `message` as `libpq_append_conn_error` leaves it in
 /// `conn->errorMessage`, ending in the newline it adds (`fe-misc.c:1539`).
 /// `rlibpq`'s messages carry that newline for some errors and not others.
-fn with_newline(mut message: Vec<u8>) -> Vec<u8> {
+pub(crate) fn with_newline(mut message: Vec<u8>) -> Vec<u8> {
     if !message.ends_with(b"\n") {
         message.push(b'\n');
     }
@@ -325,7 +520,10 @@ struct ExecOutcome {
 /// other failure lost the connection: C then returns the `PGRES_FATAL_ERROR`
 /// result `pqPrepareAsyncResult` (`fe-exec.c:857`) builds from the error
 /// message, and the connection is `CONNECTION_BAD`.
-fn exec_outcome(outcome: Result<Vec<QueryResult>, ConnectionError>) -> ExecOutcome {
+fn exec_outcome(
+    outcome: Result<Vec<QueryResult>, ConnectionError>,
+    hooks: NoticeHooks,
+) -> ExecOutcome {
     match outcome {
         Ok(results) => ExecOutcome {
             error_message: results
@@ -333,7 +531,9 @@ fn exec_outcome(outcome: Result<Vec<QueryResult>, ConnectionError>) -> ExecOutco
                 .filter(|result| result.status() == ExecStatus::FatalError)
                 .flat_map(QueryResult::error_message)
                 .collect(),
-            result: results.last().map(PGresult::from_result),
+            result: results
+                .last()
+                .map(|result| PGresult::from_result(result, hooks)),
             lost: false,
         },
         Err(err @ (ConnectionError::Pipeline(_) | ConnectionError::Argument(_))) => ExecOutcome {
@@ -344,7 +544,7 @@ fn exec_outcome(outcome: Result<Vec<QueryResult>, ConnectionError>) -> ExecOutco
         Err(err) => {
             let message = with_newline(err.message());
             ExecOutcome {
-                result: Some(PGresult::fatal_error(&message)),
+                result: Some(PGresult::fatal_error(&message, hooks)),
                 error_message: message,
                 lost: true,
             }
@@ -425,8 +625,10 @@ impl SetdbLogin<'_> {
 /// to C.
 fn connect_with(options: Result<ConnInfo, Vec<u8>>) -> *mut PGconn {
     let mut conn = PGconn::new(options);
-    conn.connect();
-    Box::into_raw(Box::new(conn))
+    let notices = conn.connect();
+    let conn = Box::into_raw(Box::new(conn));
+    notices.deliver();
+    conn
 }
 
 /// `PQconnectdb`, `fe-connect.c:820`: connect, blocking, and return the
@@ -583,7 +785,7 @@ pub unsafe extern "C" fn PQreset(conn: *mut PGconn) {
     // SAFETY: the caller's contract.
     if let Some(conn) = unsafe { conn.as_mut() } {
         conn.close();
-        conn.connect();
+        conn.connect().deliver();
     }
 }
 
@@ -601,8 +803,10 @@ pub unsafe extern "C" fn PQresetStart(conn: *mut PGconn) -> c_int {
         return 0;
     };
     conn.close();
-    conn.connect();
-    c_int::from(conn.status == ConnStatus::Ok)
+    let notices = conn.connect();
+    let up = conn.status == ConnStatus::Ok;
+    notices.deliver();
+    c_int::from(up)
 }
 
 /// `PQresetPoll`, `fe-connect.c:5367`: [`PQconnectPoll`].
@@ -698,26 +902,31 @@ pub(crate) unsafe fn exec_with(
     let Some(conn) = (unsafe { conn.as_mut() }) else {
         return null_mut();
     };
-    // `PQexecStart`, `fe-exec.c:2374`: a new query cycle clears the error.
-    conn.error_message = CText::default();
+    // `PQexecStart`, `fe-exec.c:2374`: a new query cycle clears the error,
+    // and the results left over — a lost connection's error result among
+    // them — are discarded (`:2386`).
+    conn.clear_error();
+    conn.stashed.clear();
+    conn.error_result = None;
     let Some(connection) = conn.connection.as_mut() else {
         conn.error_message = CText::new(b"no connection to the server\n");
         return null_mut();
     };
     let outcome = match send(connection) {
-        Ok(outcome) => exec_outcome(outcome),
+        Ok(outcome) => exec_outcome(outcome, conn.hooks),
         Err(Refused(message)) => {
             conn.error_message = CText::new(&with_newline(message));
             return null_mut();
         }
     };
-    conn.sync_parameters();
-    conn.report_notices();
+    let notices = conn.collect();
     conn.error_message = CText::new(&outcome.error_message);
+    conn.error_reported = outcome.error_message.len();
     if outcome.lost {
         conn.connection = None;
         conn.status = ConnStatus::Bad;
     }
+    notices.deliver();
     outcome
         .result
         .map_or(null_mut(), |result| Box::into_raw(Box::new(result)))
@@ -774,10 +983,13 @@ mod tests {
 
     #[test]
     fn exec_returns_the_last_result_and_every_error_message() {
-        let outcome = exec_outcome(Ok(vec![
-            QueryResult::new(ExecStatus::TuplesOk),
-            error_result(b"division by zero"),
-        ]));
+        let outcome = exec_outcome(
+            Ok(vec![
+                QueryResult::new(ExecStatus::TuplesOk),
+                error_result(b"division by zero"),
+            ]),
+            NoticeHooks::NONE,
+        );
         assert!(!outcome.lost);
         assert_eq!(outcome.error_message, b"ERROR:  division by zero\n");
         let result = outcome.result.expect("the last result");
@@ -787,18 +999,27 @@ mod tests {
             7
         );
 
-        let fine = exec_outcome(Ok(vec![QueryResult::new(ExecStatus::CommandOk)]));
+        let fine = exec_outcome(
+            Ok(vec![QueryResult::new(ExecStatus::CommandOk)]),
+            NoticeHooks::NONE,
+        );
         assert_eq!(fine.error_message, b"");
     }
 
     #[test]
     fn a_refusal_sends_nothing_and_a_broken_connection_is_lost() {
-        let refused = exec_outcome(Err(PipelineError::ExecDuringCopyBoth.into()));
+        let refused = exec_outcome(
+            Err(PipelineError::ExecDuringCopyBoth.into()),
+            NoticeHooks::NONE,
+        );
         assert!(refused.result.is_none());
         assert!(!refused.lost);
         assert!(refused.error_message.ends_with(b"\n"));
 
-        let lost = exec_outcome(Err(ConnectionError::ServerClosedConnection));
+        let lost = exec_outcome(
+            Err(ConnectionError::ServerClosedConnection),
+            NoticeHooks::NONE,
+        );
         assert!(lost.lost);
         assert_eq!(
             lost.error_message,
@@ -812,7 +1033,7 @@ mod tests {
     #[test]
     fn options_that_do_not_parse_leave_a_bad_conn_with_no_fields() {
         let mut conn = PGconn::new(Err(b"no\n".to_vec()));
-        conn.connect();
+        conn.connect().deliver();
         assert_eq!(conn.status.code(), 1);
         assert_eq!(conn.error_message.bytes(), b"no\n");
         assert!(conn.options.is_none());

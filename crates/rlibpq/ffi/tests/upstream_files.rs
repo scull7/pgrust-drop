@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use rlibpq::sha256::sha256;
 
 /// `(vendored path, bytes, upstream path, upstream sha256)`.
-const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 10] = [
+const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 12] = [
     (
         "include/libpq-fe.h",
         include_bytes!("../include/libpq-fe.h"),
@@ -58,6 +58,12 @@ const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 10] = [
         "453993625e892e5d0740f7cddc1aa2632330c0bd80ddd5c40a18b48d3b830530",
     ),
     (
+        "tests/c/testlibpq2.c",
+        include_bytes!("c/testlibpq2.c"),
+        "src/test/examples/testlibpq2.c",
+        "be8abcdb570d1c033f944a91389b98998ae514a64c54c3238e66ec17091b595d",
+    ),
+    (
         "tests/c/testlibpq3.c",
         include_bytes!("c/testlibpq3.c"),
         "src/test/examples/testlibpq3.c",
@@ -68,6 +74,12 @@ const UPSTREAM_FILES: [(&str, &[u8], &str, &str); 10] = [
         include_bytes!("c/testlibpq4.c"),
         "src/test/examples/testlibpq4.c",
         "78ef0137141d3875d77387d8a8cc06764a12579e36dba1f67faf8166ce50067b",
+    ),
+    (
+        "tests/c/testlibpq2.sql",
+        include_bytes!("c/testlibpq2.sql"),
+        "src/test/examples/testlibpq2.sql",
+        "0058499d3873aea204f6f26685ba1782f736db140044b931fbce82957687d01d",
     ),
     (
         "tests/c/testlibpq3.sql",

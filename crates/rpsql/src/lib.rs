@@ -18,8 +18,8 @@
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
 //! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
 //! `\errverbose`, `\cd`, and `\i` and `\ir` over `path.c`'s file-name
-//! calculations ([`path`]) and a nested [`mainloop::process_file`]. NAT-404 adds `\crosstabview` ([`crosstab`],
-//! `crosstabview.c`), and `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
+//! calculations ([`path`]) and a nested [`mainloop::process_file`]. NAT-404
+//! adds `\crosstabview` ([`crosstab`], `crosstabview.c`), and `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
 //! ([`settings::SendMode`]). NAT-405 adds Ctrl-C ([`cancel`],
 //! `fe_utils/cancel.c`): a SIGINT cancels the running query. `\d` is

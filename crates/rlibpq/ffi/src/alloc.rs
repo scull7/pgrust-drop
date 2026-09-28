@@ -4,13 +4,12 @@
 //! or plain `free()`, so each buffer must be one `malloc` returned; Rust's
 //! allocator is never used for memory that crosses the ABI.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
 
-unsafe extern "C" {
-    pub(crate) fn malloc(size: usize) -> *mut c_void;
-    pub(crate) fn calloc(count: usize, size: usize) -> *mut c_void;
-    pub(crate) fn free(ptr: *mut c_void);
-}
+// The C library's `malloc`, `calloc` and `free` through the `libc` crate
+// (approved for rlibpq-ffi, owner 2026-09-27; musl is a priority target), not
+// hand-declared imports.
+pub(crate) use libc::{calloc, free, malloc};
 
 /// Calculation: the bytes a C string holding `bytes` would keep — everything
 /// before the first NUL, which is where `strdup` would have stopped.

@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::FromRawFd as _;
 use std::os::raw::{c_char, c_int};
+use std::sync::Mutex;
 
 unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
@@ -24,8 +25,12 @@ unsafe extern "C" {
     fn ptsname(fd: c_int) -> *mut c_char;
 }
 
-/// `O_RDWR`, 2 on every target (ADR-0007).
+/// `O_RDWR`, 2 in glibc's, musl's and Darwin's `fcntl.h`.
 const O_RDWR: c_int = 2;
+
+/// Held from `ptsname` until its static buffer has been copied out: the
+/// tests of one binary run in parallel, and each may open a terminal.
+static PTSNAME: Mutex<()> = Mutex::new(());
 
 /// A terminal pair: the side the test types into and reads from, and the
 /// side the program under test gets as stdin and stdout.
@@ -50,8 +55,12 @@ pub fn open() -> io::Result<Pty> {
     if unsafe { grantpt(fd) } != 0 || unsafe { unlockpt(fd) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let guard = PTSNAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // SAFETY: `ptsname` returns NULL or a NUL-terminated string in static
-    // storage, copied out at once; the tests that call it do not race it.
+    // storage; `guard` keeps every other caller in this binary out until it
+    // has been copied.
     let name = unsafe { ptsname(fd) };
     if name.is_null() {
         return Err(io::Error::last_os_error());
@@ -60,6 +69,7 @@ pub fn open() -> io::Result<Pty> {
     let path = unsafe { CStr::from_ptr(name) }
         .to_string_lossy()
         .into_owned();
+    drop(guard);
     let slave = OpenOptions::new().read(true).write(true).open(path)?;
     Ok(Pty { master, slave })
 }

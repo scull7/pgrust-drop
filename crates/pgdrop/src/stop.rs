@@ -21,7 +21,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use usage::Args;
@@ -47,11 +47,6 @@ pub const WAIT: Duration = Duration::from_mins(1);
 /// (`WAITS_PER_SEC`, `pg_ctl.c:73`); a test suite's setup and teardown are
 /// measured in milliseconds, so these look every one.
 pub const POLL: Duration = Duration::from_millis(1);
-
-/// How often, in polls, `stop` asks whether the server is still alive
-/// (`kill -0`), as `wait_for_postmaster_stop` does every time it looks
-/// (`pg_ctl.c:728`). Once per pg_ctl interval: each ask spawns a process.
-pub const LIVENESS_EVERY: u32 = 100;
 
 /// What `postmaster.pid`'s first line names (`pidfile.h:37`). A standalone
 /// backend writes its PID negated (`miscinit.c:1436`, `CreateLockFile`), which
@@ -144,7 +139,7 @@ pub fn plan(
 }
 
 /// Pure: the data directory to stop: `--datadir`, else `PGDATA`, as
-/// pg_ctl falls back (`pg_ctl.c:2005`), made absolute against `cwd`.
+/// pg_ctl falls back (`pg_ctl.c:2427`), made absolute against `cwd`.
 ///
 /// # Errors
 ///
@@ -171,8 +166,8 @@ pub enum StopError {
     SingleUser(u32),
     /// `pgdrop.start` is not what `start` writes.
     BadRecord,
-    /// `kill -INT` failed (`pg_ctl.c:1050`).
-    Signal { pid: u32, detail: String },
+    /// `kill(pid, SIGINT)` failed other than `ESRCH` (`pg_ctl.c:1050`).
+    Signal { pid: u32, error: io::Error },
     /// The server did not go within [`WAIT`], or died leaving its
     /// `postmaster.pid` behind (`pg_ctl.c:1067`).
     DoesNotShutDown,
@@ -202,8 +197,8 @@ impl fmt::Display for StopError {
                 "\"{}\" was not written by pgdrop start",
                 crate::start::RECORD_FILE
             ),
-            StopError::Signal { pid, detail } => {
-                write!(f, "could not send stop signal (PID: {pid}): {detail}")
+            StopError::Signal { pid, error } => {
+                write!(f, "could not send stop signal (PID: {pid}): {error}")
             }
             StopError::DoesNotShutDown => write!(f, "server does not shut down"),
             StopError::Io { what, path, error } => {
@@ -238,24 +233,14 @@ fn stop(flags: &Stop) -> Result<(), StopError> {
     let record = read_if_exists(&datadir.join(crate::start::RECORD_FILE))?;
     let plan = plan(&datadir, pidfile.as_deref(), record.as_deref())?;
     if let Some(pid) = plan.signal {
-        match signal(pid, "-INT") {
+        match signal(pid, Some(libc::SIGINT)) {
             Ok(()) => wait_for_postmaster_stop(&pidfile_path, pid)?,
             // A crashed server's `postmaster.pid`: already stopped.
-            Err(detail) if no_such_process(&detail) => {}
-            Err(detail) => return Err(StopError::Signal { pid, detail }),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => return Err(StopError::Signal { pid, error }),
         }
     }
     remove_all(&plan)
-}
-
-/// Pure: whether the `kill` utility's complaint is `ESRCH`, the process is
-/// gone. Every `kill` this runs on (util-linux, procps, busybox, BSD) prints
-/// `strerror(ESRCH)`, which is this in the C locale [`signal`] sets on the
-/// three C libraries of ADR-0007. Anything else, `EPERM` above all (a
-/// process that is there), is not.
-#[must_use]
-pub fn no_such_process(detail: &str) -> bool {
-    detail.contains("No such process")
 }
 
 /// Action: the plan's removals, in order.
@@ -294,21 +279,28 @@ fn remove(result: io::Result<()>, path: &Path) -> Result<(), StopError> {
     }
 }
 
-/// Action: `kill(pid, sig)` through the POSIX `kill` utility. pgdrop binds
-/// no libc and forbids `unsafe`, and std can send nothing but `SIGKILL`.
-/// `Err` carries the utility's complaint.
-pub(crate) fn signal(pid: u32, sig: &str) -> Result<(), String> {
-    let output = Command::new("kill")
-        .env("LC_ALL", "C")
-        .arg(sig)
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run kill: {error}"))?;
-    if output.status.success() {
+/// Action: `kill(pid, sig)`, as pg_ctl sends it (`pg_ctl.c:1048`, `:728`);
+/// `None` is signal 0, which only asks whether `pid` is alive. std can send
+/// no signal but `SIGKILL`. A PID that does not fit `pid_t` is `ESRCH`: no
+/// process has it.
+///
+/// # Errors
+///
+/// `kill`'s `errno`: `ESRCH` when the process is gone, `EPERM` when it is
+/// someone else's.
+#[allow(unsafe_code)]
+pub(crate) fn signal(pid: u32, sig: Option<libc::c_int>) -> io::Result<()> {
+    // `plan` never hands over 0, and `try_from` refuses what would be
+    // negative: `kill` would signal a process group instead of one process.
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|&pid| pid > 0)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))?;
+    // SAFETY: `kill` takes two integers and touches no memory of ours.
+    if unsafe { libc::kill(pid, sig.unwrap_or(0)) } == 0 {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -317,13 +309,11 @@ pub(crate) fn signal(pid: u32, sig: &str) -> Result<(), String> {
 /// still there, or after [`WAIT`].
 fn wait_for_postmaster_stop(pidfile: &Path, pid: u32) -> Result<(), StopError> {
     let deadline = Instant::now() + WAIT;
-    let mut polls = 0u32;
     loop {
         if !pidfile.exists() {
             return Ok(());
         }
-        polls = polls.wrapping_add(1);
-        if polls.is_multiple_of(LIVENESS_EVERY) && signal(pid, "-0").is_err() {
+        if signal(pid, None).is_err() {
             // `:730`-`:735`: look once more, to avoid a race with the exit.
             return if pidfile.exists() {
                 Err(StopError::DoesNotShutDown)
@@ -449,25 +439,6 @@ mod tests {
             plan(Path::new("/d"), None, Some("remove everything\n")),
             Err(StopError::BadRecord)
         ));
-    }
-
-    #[test]
-    fn only_a_process_that_is_gone_is_already_stopped() {
-        for gone in [
-            "kill: (4242): No such process",
-            "kill: sending signal to 4242 failed: No such process",
-            "kill: can't kill pid 4242: No such process",
-            "kill: 4242: No such process",
-        ] {
-            assert!(no_such_process(gone), "{gone}");
-        }
-        for there in [
-            "kill: (1): Operation not permitted",
-            "could not run kill: No such file or directory (os error 2)",
-            "",
-        ] {
-            assert!(!no_such_process(there), "{there}");
-        }
     }
 
     #[test]

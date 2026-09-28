@@ -55,6 +55,7 @@ follow-up to send upstream), replacing the editor, termios through libc or
 Bracketed paste is a later, optional slice.
 
 The pty the interactive gates type into (`crates/rpsql/tests/pty/mod.rs`)
-still declares `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` itself:
-test code only, never linked into `rpsql`, because the standard library
-cannot open a pseudo-terminal and no crate for it is approved.
+opens it through `rustix::pty`'s safe API (`openpt`, `grantpt`, `unlockpt`,
+`ptsname`), a dev-dependency of `rpsql`'s tests only, never linked into
+`rpsql` (owner, 2026-09-28, NAT-405; ADR-0010's amendment). It declares no
+foreign function and holds no `unsafe` code.

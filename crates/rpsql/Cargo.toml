@@ -23,6 +23,7 @@ termion = { workspace = true }
 usage = { workspace = true }
 
 [dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }
 testkit = { workspace = true }
 
 [lints]

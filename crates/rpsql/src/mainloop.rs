@@ -2,21 +2,24 @@
 //!
 //! `MainLoop()` (`mainloop.c:33`) reads lines, feeds them to the lexer, and
 //! sends a statement whenever the lexer finds a semicolon. This port keeps the
-//! same shape: lines come from a [`CommandSource`], which a `COPY … FROM
-//! STDIN` reads its inlined data from as well, one `gets_fromFile` per line so
-//! that a script on a pipe runs statement by statement while the pipe is
-//! still open (`020_cancel.pl` never closes psql's stdin), and queries go to
-//! a [`crate::common::Executor`]. A Ctrl-C stops a script (`mainloop.c:88`,
-//! through [`Session::cancel_pressed`]); readline history and the SIGINT
-//! `siglongjmp` out of waiting for input are interactive mode's (NAT-405) and
-//! are absent, not stubbed.
+//! same shape with two additions: lines come from a [`CommandSource`], which
+//! a `COPY … FROM STDIN` reads its inlined data from as well, one
+//! `gets_fromFile` per line so that a script on a pipe runs statement by
+//! statement while the pipe is still open (`020_cancel.pl` never closes
+//! psql's stdin), or, at a terminal, from a [`crate::input::LineEditor`]; and
+//! queries go to a [`crate::common::Executor`]. A Ctrl-C stops a script
+//! (`mainloop.c:88`, through [`Session::cancel_pressed`]); at the prompt it
+//! arrives from the editor as [`Fetched::Interrupted`] instead of as a
+//! `siglongjmp`.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{CommandSource, Executor, send_query};
+use crate::input::{Fetched, HistoryBuf, LineEditor};
 use crate::output::Output;
+use crate::prompt::get_prompt;
 use crate::scan::{PromptStatus, ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
 use crate::variables::{VarView, VariableSpace};
@@ -54,6 +57,7 @@ pub struct Session<'a> {
 #[allow(clippy::too_many_lines)]
 pub fn main_loop(
     source: &mut CommandSource<'_>,
+    mut editor: Option<&mut (dyn LineEditor + '_)>,
     session: &mut Session<'_>,
     executor: &mut dyn Executor,
     out: &mut Output<'_>,
@@ -62,11 +66,20 @@ pub fn main_loop(
     let mut scanner = Scanner::new();
     let mut query_buf: Vec<u8> = Vec::new();
     let mut previous_buf: Vec<u8> = Vec::new();
+    let mut history_buf = HistoryBuf::default();
     let mut success_result = EXIT_SUCCESS;
     let mut slash_status = CommandResult::Unknown;
+    let mut prompt_status = PromptStatus::Ready;
+    let mut count_eof = 0;
     let mut die_on_error = false;
     let mut success;
+    let mut line_saved_in_history;
 
+    // Establish the new source (`mainloop.c:58`-`:66`), putting the prior
+    // one's back on the way out.
+    let prev_cmd_interactive = session.pset.cur_cmd_interactive;
+    let prev_lineno = session.pset.lineno;
+    session.pset.cur_cmd_interactive = editor.is_some();
     session.pset.lineno = 0;
     session.pset.stmt_lineno = 1;
 
@@ -81,24 +94,80 @@ pub fn main_loop(
             session.cancel_pressed.store(false, Ordering::SeqCst);
         }
 
-        let line = match gets_from_file(source.reader) {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            // `input.c:215`, then `mainloop.c:173`: logged, and the end of
-            // input with a failure.
-            Err(err) => {
-                crate::logging::error(
-                    session.pset,
-                    format!(
-                        "could not read from input file: {}",
-                        crate::copy::strerror(&err)
-                    ),
-                    stderr,
-                );
-                success_result = crate::settings::EXIT_FAILURE;
+        let _ = out.stdout.flush();
+
+        // Get another line (`mainloop.c:147`-`:173`).
+        let fetched = if let Some(editor) = editor.as_deref_mut() {
+            // May need to reset prompt, eg after \r command.
+            if query_buf.is_empty() {
+                prompt_status = PromptStatus::Ready;
+            }
+            let prompt = get_prompt(prompt_status, session.pset, &executor.prompt_facts(), true);
+            editor.read_line(&prompt)
+        } else {
+            match gets_from_file(source.reader) {
+                Ok(Some(line)) => Fetched::Line(line),
+                Ok(None) => Fetched::Eof,
+                // `input.c:215`, then `mainloop.c:173`: logged, and the end
+                // of input with a failure.
+                Err(err) => {
+                    crate::logging::error(
+                        session.pset,
+                        format!(
+                            "could not read from input file: {}",
+                            crate::copy::strerror(&err)
+                        ),
+                        stderr,
+                    );
+                    success_result = crate::settings::EXIT_FAILURE;
+                    break;
+                }
+            }
+        };
+
+        let line = match fetched {
+            Fetched::Line(line) => line,
+            // Control-C at the prompt: what the `siglongjmp` lands on
+            // (`mainloop.c:108`-`:136`). There is no `\if` stack yet
+            // (NAT-402), so no `\if: escaped`.
+            Fetched::Interrupted => {
+                scanner.finish();
+                scanner.reset();
+                query_buf.clear();
+                history_buf.reset();
+                count_eof = 0;
+                slash_status = CommandResult::Unknown;
+                prompt_status = PromptStatus::Ready;
+                session.pset.stmt_lineno = 1;
+                session.cancel_pressed.store(false, Ordering::SeqCst);
+                continue;
+            }
+            // No more input. Time to quit, or \i done (`mainloop.c:182`).
+            Fetched::Eof => {
+                if session.pset.cur_cmd_interactive {
+                    // This tries to mimic bash's IGNOREEOF feature.
+                    count_eof += 1;
+                    if count_eof < session.pset.ignoreeof {
+                        if !session.pset.quiet {
+                            let _ = writeln!(
+                                out.stdout,
+                                "Use \"\\q\" to leave {}.",
+                                session.pset.progname
+                            );
+                        }
+                        continue;
+                    }
+                    let _ = writeln!(
+                        out.stdout,
+                        "{}",
+                        if session.pset.quiet { "" } else { "\\q" }
+                    );
+                }
                 break;
             }
         };
+
+        count_eof = 0;
         session.pset.lineno += 1;
 
         // Detect attempts to run custom-format dumps as SQL (`mainloop.c:209`).
@@ -117,6 +186,46 @@ pub fn main_loop(
         // No further processing of empty lines, unless within a literal.
         if line.is_empty() && !scanner.in_quote() {
             continue;
+        }
+
+        // Recognize "help", "quit", "exit" only in interactive mode
+        // (`mainloop.c:228`-`:340`).
+        if session.pset.cur_cmd_interactive {
+            match assistance_word(&line) {
+                Some(Assistance::Help) if query_buf.is_empty() => {
+                    let _ = out.stdout.write_all(HELP_TEXT.as_bytes());
+                    let _ = out.stdout.flush();
+                    continue;
+                }
+                Some(Assistance::Help) => {
+                    let _ = writeln!(
+                        out.stdout,
+                        "Use \\? for help or press control-C to clear the input buffer."
+                    );
+                }
+                Some(Assistance::ExitOrQuit) if query_buf.is_empty() => {
+                    let _ = out.stdout.flush();
+                    success_result = EXIT_SUCCESS;
+                    break;
+                }
+                Some(Assistance::ExitOrQuit) => {
+                    let _ = writeln!(
+                        out.stdout,
+                        "{}",
+                        if backslash_q_is_active(prompt_status) {
+                            "Use \\q to quit."
+                        } else {
+                            "Use control-D to quit."
+                        }
+                    );
+                }
+                Some(Assistance::BackslashQ)
+                    if !query_buf.is_empty() && !backslash_q_is_active(prompt_status) =>
+                {
+                    let _ = writeln!(out.stdout, "Use control-D to quit.");
+                }
+                _ => {}
+            }
         }
 
         // ECHO=all echoes the input line, unless interactive (`mainloop.c:360`).
@@ -138,9 +247,11 @@ pub fn main_loop(
 
         scanner.setup(&line, true);
         success = true;
+        line_saved_in_history = false;
 
         while success || !die_on_error {
-            let scan_result = scanner.scan(&mut query_buf, &VarView(session.vars)).0;
+            let (scan_result, prompt_tmp) = scanner.scan(&mut query_buf, &VarView(session.vars));
+            prompt_status = prompt_tmp;
             if scan_result == ScanResult::Eol {
                 session.pset.stmt_lineno += 1;
             }
@@ -148,6 +259,13 @@ pub fn main_loop(
             if scan_result == ScanResult::Semicolon
                 || (scan_result == ScanResult::Eol && session.pset.singleline)
             {
+                // Save line in history (`mainloop.c:429`).
+                if session.pset.cur_cmd_interactive && !line_saved_in_history {
+                    history_buf.append(&line);
+                    send_history(&mut history_buf, editor.as_deref_mut(), session.pset);
+                    line_saved_in_history = true;
+                }
+
                 // `mainloop.c:439`: "count_copy_from_stdin should be
                 // reliable here".
                 let copies = copy_count(&mut scanner);
@@ -174,11 +292,20 @@ pub fn main_loop(
                 added_nl_pos = None;
             } else if scan_result == ScanResult::Backslash {
                 // A line holding only a backslash command leaves the query
-                // buffer untouched (`mainloop.c:475`).
+                // buffer untouched, and forces out any previous lines as a
+                // history entry of their own (`mainloop.c:475`).
                 if Some(query_buf.len()) == added_nl_pos {
                     query_buf.pop();
+                    send_history(&mut history_buf, editor.as_deref_mut(), session.pset);
                 }
                 added_nl_pos = None;
+
+                // Save backslash command in history (`mainloop.c:491`).
+                if session.pset.cur_cmd_interactive && !line_saved_in_history {
+                    history_buf.append(&line);
+                    send_history(&mut history_buf, editor.as_deref_mut(), session.pset);
+                    line_saved_in_history = true;
+                }
 
                 slash_status = dispatch_slash(
                     &mut scanner,
@@ -226,6 +353,17 @@ pub fn main_loop(
             }
         }
 
+        // Add line to pending history if we didn't do so already; flush it
+        // out while the query buffer is empty (`mainloop.c:570`).
+        if session.pset.cur_cmd_interactive {
+            if !line_saved_in_history {
+                history_buf.append(&line);
+            }
+            if query_buf.is_empty() {
+                send_history(&mut history_buf, editor.as_deref_mut(), session.pset);
+            }
+        }
+
         scanner.finish();
 
         if slash_status == CommandResult::Terminate {
@@ -263,6 +401,10 @@ pub fn main_loop(
         }
     }
 
+    // Restore the prior command source (`mainloop.c:660`-`:662`).
+    session.pset.cur_cmd_interactive = prev_cmd_interactive;
+    session.pset.lineno = prev_lineno;
+
     success_result
 }
 
@@ -271,13 +413,77 @@ fn copy_count(scanner: &mut Scanner) -> usize {
     usize::try_from(scanner.count_copy_from_stdin()).unwrap_or(0)
 }
 
-/// The prompt the loop would show, for the interactive mode NAT-405 adds.
-#[must_use]
-pub fn prompt_status_for(result: ScanResult) -> PromptStatus {
-    match result {
-        ScanResult::Semicolon | ScanResult::Backslash => PromptStatus::Ready,
-        _ => PromptStatus::Continue,
+/// `pg_send_history(history_buf)` (`input.c:135`): hand the entry to the
+/// editor. A script has no editor, and upstream's `useHistory` is false.
+fn send_history(
+    history_buf: &mut HistoryBuf,
+    editor: Option<&mut (dyn LineEditor + '_)>,
+    pset: &PsqlSettings,
+) {
+    if let Some(entry) = history_buf.send(pset.histcontrol)
+        && let Some(editor) = editor
+    {
+        editor.add_history(&entry);
     }
+}
+
+/// What `help` prints on an empty query buffer (`mainloop.c:298`-`:303`).
+const HELP_TEXT: &str = "You are using psql, the command-line interface to PostgreSQL.\n\
+Type:  \\copyright for distribution terms\n       \
+\\h for help with SQL commands\n       \
+\\? for help with psql commands\n       \
+\\g or terminate with semicolon to execute query\n       \
+\\q to quit\n";
+
+/// One of the words `MainLoop` answers only at a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Assistance {
+    /// `help`
+    Help,
+    /// `exit` or `quit`
+    ExitOrQuit,
+    /// `\q`, reported only where it is not a command.
+    BackslashQ,
+}
+
+/// Calculation: `mainloop.c:230`-`:282`. The word must start the line, in
+/// any case; `help`, `exit` and `quit` count only when nothing but white
+/// space and at most one semicolon follow, while `\q` counts regardless.
+#[must_use]
+pub fn assistance_word(line: &[u8]) -> Option<Assistance> {
+    let prefix =
+        |word: &[u8]| line.len() >= word.len() && line[..word.len()].eq_ignore_ascii_case(word);
+    let (found, rest) = if prefix(b"help") {
+        (Assistance::Help, &line[4..])
+    } else if prefix(b"exit") || prefix(b"quit") {
+        (Assistance::ExitOrQuit, &line[4..])
+    } else if line.starts_with(b"\\q") {
+        return Some(Assistance::BackslashQ);
+    } else {
+        return None;
+    };
+    // C's `isspace` in the C locale.
+    let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    let mut rest = rest;
+    while rest.first().is_some_and(space) {
+        rest = &rest[1..];
+    }
+    if rest.first() == Some(&b';') {
+        rest = &rest[1..];
+    }
+    while rest.first().is_some_and(space) {
+        rest = &rest[1..];
+    }
+    rest.is_empty().then_some(found)
+}
+
+/// Whether `\q` would be read as a command in this prompt state
+/// (`mainloop.c:314`-`:316`, `:335`-`:337`): not inside a quote or comment.
+fn backslash_q_is_active(status: PromptStatus) -> bool {
+    matches!(
+        status,
+        PromptStatus::Ready | PromptStatus::Continue | PromptStatus::Paren
+    )
 }
 
 #[cfg(test)]
@@ -364,6 +570,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = main_loop(
             &mut CommandSource::file(&mut input.as_bytes()),
+            None,
             &mut session,
             &mut executor,
             &mut Output::new(&mut stdout),
@@ -443,6 +650,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = main_loop(
             &mut CommandSource::file(&mut &b"select 1;\nselect 2;\nselect 3;\n"[..]),
+            None,
             &mut session,
             &mut executor,
             &mut Output::new(&mut stdout),
@@ -471,6 +679,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = main_loop(
             &mut CommandSource::file(&mut &b"select 1;\nselect 2;\n"[..]),
+            None,
             &mut session,
             &mut executor,
             &mut Output::new(&mut stdout),
@@ -539,6 +748,7 @@ mod tests {
         let mut executor = Recorder::new();
         let code = main_loop(
             &mut CommandSource::file(&mut &b"select 1;\nselect 2"[..]),
+            None,
             &mut session,
             &mut executor,
             &mut Output::new(&mut Vec::new()),
@@ -556,31 +766,253 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_interactive_session_forgets_a_control_c_and_reads_on() {
-        // `mainloop.c:99`.
-        let mut pset = PsqlSettings {
-            cur_cmd_interactive: true,
-            ..PsqlSettings::default()
-        };
+    /// A terminal: the lines to type, and what the loop showed and kept.
+    struct Keyboard {
+        keys: std::collections::VecDeque<Fetched>,
+        prompts: Vec<String>,
+        history: Vec<String>,
+    }
+
+    impl Keyboard {
+        fn new(keys: Vec<Fetched>) -> Self {
+            Self {
+                keys: keys.into(),
+                prompts: Vec::new(),
+                history: Vec::new(),
+            }
+        }
+    }
+
+    impl LineEditor for Keyboard {
+        fn read_line(&mut self, prompt: &str) -> Fetched {
+            self.prompts.push(prompt.to_string());
+            self.keys.pop_front().unwrap_or(Fetched::Eof)
+        }
+
+        fn add_history(&mut self, entry: &[u8]) {
+            self.history
+                .push(String::from_utf8_lossy(entry).into_owned());
+        }
+    }
+
+    fn line(text: &str) -> Fetched {
+        Fetched::Line(text.as_bytes().to_vec())
+    }
+
+    /// A superuser connected to `postgres`, so PROMPT1 is `postgres=# `.
+    struct Connected(Recorder);
+
+    impl Executor for Connected {
+        fn exec(
+            &mut self,
+            query: &[u8],
+            mode: &crate::settings::SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            self.0.exec(query, mode)
+        }
+
+        fn connected(&self) -> bool {
+            self.0.connected()
+        }
+
+        fn abandon(&mut self) {
+            self.0.abandon();
+        }
+
+        fn prompt_facts(&self) -> crate::prompt::PromptFacts {
+            crate::prompt::PromptFacts {
+                dbname: Some("postgres".to_string()),
+                superuser: true,
+                ..crate::prompt::PromptFacts::default()
+            }
+        }
+    }
+
+    struct Typed {
+        code: u8,
+        stdout: String,
+        seen: Vec<String>,
+        keyboard: Keyboard,
+        cancel_pressed: bool,
+    }
+
+    fn type_in(keys: Vec<Fetched>, pset: PsqlSettings, cancel_pressed: bool) -> Typed {
+        let mut pset = pset;
         let mut vars = VariableSpace::new();
-        let cancel_pressed = AtomicBool::new(true);
+        let flag = AtomicBool::new(cancel_pressed);
         let mut session = Session {
             pset: &mut pset,
             vars: &mut vars,
-            cancel_pressed: &cancel_pressed,
+            cancel_pressed: &flag,
         };
-        let mut executor = Recorder::new();
+        let mut keyboard = Keyboard::new(keys);
+        let mut executor = Connected(Recorder::new());
+        let mut stdout = Vec::new();
         let code = main_loop(
-            &mut CommandSource::file(&mut &b"select 1;\n"[..]),
+            &mut CommandSource::file(&mut &b""[..]),
+            Some(&mut keyboard),
             &mut session,
             &mut executor,
-            &mut Output::new(&mut Vec::new()),
+            &mut Output::new(&mut stdout),
             &mut Vec::new(),
         );
-        assert_eq!(code, EXIT_SUCCESS);
-        assert_eq!(executor.seen, ["select 1;"]);
-        assert!(!cancel_pressed.load(Ordering::SeqCst));
+        assert!(!pset.cur_cmd_interactive, "the prior source is restored");
+        Typed {
+            code,
+            stdout: String::from_utf8(stdout).unwrap(),
+            seen: executor.0.seen,
+            keyboard,
+            cancel_pressed: flag.load(Ordering::SeqCst),
+        }
+    }
+
+    #[test]
+    fn an_interactive_session_forgets_a_control_c_and_reads_on() {
+        // `mainloop.c:99`.
+        let typed = type_in(vec![line("select 1;")], PsqlSettings::default(), true);
+        assert_eq!(typed.code, EXIT_SUCCESS);
+        assert_eq!(typed.seen, ["select 1;"]);
+        assert!(!typed.cancel_pressed);
+    }
+
+    #[test]
+    fn the_prompt_follows_the_lexer() {
+        // `mainloop.c:151`-`:167`: PROMPT1 on an empty buffer, PROMPT2 while
+        // a statement or a literal is open.
+        let typed = type_in(
+            vec![line("select"), line("'a"), line("';"), line("select 2;")],
+            PsqlSettings::default(),
+            false,
+        );
+        assert_eq!(
+            typed.keyboard.prompts,
+            [
+                "postgres=# ",
+                "postgres-# ",
+                "postgres'# ",
+                "postgres=# ",
+                "postgres=# "
+            ]
+        );
+        assert_eq!(typed.seen, ["select\n'a\n';", "select 2;"]);
+    }
+
+    #[test]
+    fn control_c_at_the_prompt_throws_the_query_away() {
+        // `mainloop.c:108`-`:122`: the buffer, the lexer and the pending
+        // history entry are reset, and the session reads on.
+        let typed = type_in(
+            vec![line("select"), Fetched::Interrupted, line("select 2;")],
+            PsqlSettings::default(),
+            false,
+        );
+        assert_eq!(typed.seen, ["select 2;"]);
+        assert_eq!(
+            typed.keyboard.prompts,
+            ["postgres=# ", "postgres-# ", "postgres=# ", "postgres=# "]
+        );
+        assert_eq!(typed.keyboard.history, ["select 2;"]);
+        assert_eq!(typed.code, EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn end_of_input_at_a_terminal_prints_backslash_q() {
+        // `mainloop.c:184`-`:197`.
+        let typed = type_in(vec![], PsqlSettings::default(), false);
+        assert_eq!(typed.stdout, "\\q\n");
+        let quiet = PsqlSettings {
+            quiet: true,
+            ..PsqlSettings::default()
+        };
+        assert_eq!(type_in(vec![], quiet, false).stdout, "\n");
+    }
+
+    #[test]
+    fn ignoreeof_needs_that_many_control_ds() {
+        // `mainloop.c:187`-`:193`.
+        let pset = PsqlSettings {
+            ignoreeof: 2,
+            ..PsqlSettings::default()
+        };
+        let typed = type_in(vec![Fetched::Eof], pset, false);
+        assert_eq!(typed.stdout, "Use \"\\q\" to leave psql.\n\\q\n");
+        assert_eq!(typed.keyboard.prompts.len(), 2);
+    }
+
+    #[test]
+    fn an_interactive_session_does_not_send_what_is_left_at_the_end() {
+        // `mainloop.c:598`-`:602`.
+        let typed = type_in(vec![line("select 1")], PsqlSettings::default(), false);
+        assert!(typed.seen.is_empty());
+    }
+
+    #[test]
+    fn history_keeps_statements_and_backslash_commands_apart() {
+        // `mainloop.c:429`, `:484`-`:496`, `:570`-`:576`.
+        let typed = type_in(
+            vec![
+                line("select 1"),
+                line("+ 1;"),
+                line("select"),
+                line("\\echo hi"),
+                line("2;"),
+                line(""),
+                line("\\q"),
+            ],
+            PsqlSettings::default(),
+            false,
+        );
+        assert_eq!(
+            typed.keyboard.history,
+            ["select 1\n+ 1;", "select", "\\echo hi", "2;", "\\q"]
+        );
+        assert_eq!(typed.seen, ["select 1\n+ 1;", "select\n2;"]);
+    }
+
+    #[test]
+    fn help_quit_and_exit_are_words_only_at_a_terminal() {
+        // `mainloop.c:228`-`:340`.
+        let typed = type_in(
+            vec![line("help"), line("quit")],
+            PsqlSettings::default(),
+            false,
+        );
+        assert_eq!(typed.stdout, HELP_TEXT);
+        assert_eq!(typed.keyboard.prompts.len(), 2, "quit ends the session");
+
+        let typed = type_in(
+            vec![
+                line("select"),
+                line("help"),
+                line("exit;"),
+                line("'"),
+                line("quit"),
+            ],
+            PsqlSettings::default(),
+            false,
+        );
+        assert_eq!(
+            typed.stdout,
+            "Use \\? for help or press control-C to clear the input buffer.\n\
+             Use \\q to quit.\n\
+             OK\n\
+             Use control-D to quit.\n\
+             \\q\n"
+        );
+        assert_eq!(typed.seen, ["select\nhelp\nexit;"]);
+    }
+
+    #[test]
+    fn the_assistance_words_are_read_as_upstream_reads_them() {
+        assert_eq!(assistance_word(b"HELP"), Some(Assistance::Help));
+        assert_eq!(assistance_word(b"help ; "), Some(Assistance::Help));
+        assert_eq!(assistance_word(b"help;;"), None);
+        assert_eq!(assistance_word(b" help"), None);
+        assert_eq!(assistance_word(b"helpme"), None);
+        assert_eq!(assistance_word(b"Quit"), Some(Assistance::ExitOrQuit));
+        assert_eq!(assistance_word(b"exit;"), Some(Assistance::ExitOrQuit));
+        assert_eq!(assistance_word(b"\\q extra"), Some(Assistance::BackslashQ));
+        assert_eq!(assistance_word(b"select"), None);
     }
 
     #[test]
@@ -657,6 +1089,7 @@ mod tests {
         let mut reader = std::io::BufReader::new(Broken(true));
         let code = main_loop(
             &mut CommandSource::file(&mut reader),
+            None,
             &mut session,
             &mut executor,
             &mut Output::new(&mut Vec::new()),

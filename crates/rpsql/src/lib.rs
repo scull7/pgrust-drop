@@ -16,9 +16,11 @@
 //! `prompt.c`), enough of `print.c` to render the default aligned output, and
 //! `help.c`'s three help texts ([`help`], NAT-399). NAT-400 adds `\pset`
 //! ([`pset`], `command.c`'s `do_pset`) and grows [`print`] toward the whole of
-//! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`
-//! and `\errverbose`. NAT-404 adds `\crosstabview` ([`crosstab`],
-//! `crosstabview.c`), `\g`, `\gx`, `\parse`, `\bind`, `\bind_named` and
+//! `print.c`. NAT-403 adds `logging.c`'s prefixes ([`logging`]), `\timing`,
+//! `\errverbose`, `\cd`, and `\i` and `\ir` over `path.c`'s file-name
+//! calculations ([`path`]) and a nested [`mainloop::process_file`]. NAT-404
+//! adds `\crosstabview` ([`crosstab`], `crosstabview.c`), `\g`, `\gx`,
+//! `\parse`, `\bind`, `\bind_named` and
 //! `\close_prepared` over the extended query protocol
 //! ([`settings::SendMode`]), and the pipeline commands `\startpipeline`,
 //! `\sendpipeline`, `\syncpipeline`, `\flush`, `\flushrequest`,
@@ -46,6 +48,7 @@ pub mod crosstab;
 pub mod help;
 pub mod logging;
 pub mod mainloop;
+pub mod path;
 pub mod print;
 pub mod prompt;
 pub mod pset;
@@ -66,7 +69,7 @@ use rlibpq::{
 
 use crate::command::{CommandResult, dispatch_slash};
 use crate::common::{ErrorMessage, Executor, send_query};
-use crate::mainloop::{LineSource, Lines, ReadLines, Session as LoopSession, main_loop};
+use crate::mainloop::Session as LoopSession;
 use crate::scan::{ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, SendMode};
 use crate::startup::{Action, HelpTopic, Invocation, Session};
@@ -496,6 +499,17 @@ fn run_action(
             } else {
                 CommandResult::Error
             };
+            let status = match &status {
+                CommandResult::Include(request) => {
+                    let mut loop_session = LoopSession {
+                        pset: &mut session.pset,
+                        vars: &mut session.vars,
+                        cancel_pressed: &cancel::CANCEL_PRESSED,
+                    };
+                    mainloop::include(request, &mut loop_session, executor, stdout, stderr)
+                }
+                _ => status,
+            };
             if status == CommandResult::Error {
                 EXIT_FAILURE
             } else {
@@ -507,96 +521,10 @@ fn run_action(
     }
 }
 
-/// Where `process_file()` reads from, and what it calls the input in
-/// messages (`command.c:4927`-`:4966`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputFile<'a> {
-    /// No `-f` at all: stdin, and no locus, so messages are terse.
-    Stdin,
-    /// `-f -`: stdin, called `<stdin>` "for future error messages".
-    StdinNamed,
-    /// `-f NAME`.
-    Path(&'a str),
-}
-
-impl<'a> InputFile<'a> {
-    /// Calculation: the `filename` argument's three cases.
-    #[must_use]
-    pub fn from_arg(name: Option<&'a str>) -> Self {
-        match name {
-            None => InputFile::Stdin,
-            Some("-") => InputFile::StdinNamed,
-            Some(path) => InputFile::Path(path),
-        }
-    }
-
-    /// The name `pset.inputfile` takes while the file is read.
-    #[must_use]
-    pub fn inputfile(&self) -> Option<&'a str> {
-        match self {
-            InputFile::Stdin => None,
-            InputFile::StdinNamed => Some("<stdin>"),
-            InputFile::Path(path) => Some(path),
-        }
-    }
-}
-
-/// `process_file()` (`command.c:4920`): read the input, run it through
-/// `MainLoop` with `pset.inputfile` naming it, then restore the name and the
-/// logging mode that goes with it.
+/// `process_file()` (`command.c:4920`) for `-f` and for stdin, in this
+/// session with the process's `cancel_pressed`.
 fn process_file(
     name: Option<&str>,
-    session: &mut Session,
-    executor: &mut LiveExecutor,
-    stdout: &mut impl Write,
-    stderr: &mut impl Write,
-) -> u8 {
-    let input = InputFile::from_arg(name);
-    // A file is read whole; stdin is read a line at a time as `MainLoop`
-    // asks for it, so a statement runs as soon as it arrives on a pipe that
-    // stays open.
-    let bytes = match input {
-        InputFile::Path(path) => match std::fs::read(path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) => {
-                logging::error(&session.pset, format!("{path}: {err}"), stderr);
-                return EXIT_FAILURE;
-            }
-        },
-        InputFile::Stdin | InputFile::StdinNamed => None,
-    };
-
-    let old = std::mem::replace(
-        &mut session.pset.inputfile,
-        input.inputfile().map(str::to_owned),
-    );
-    // `command.c:4970`.
-    session.pset.log_terse = session.pset.inputfile.is_none();
-    let result = if let Some(bytes) = bytes {
-        run_main_loop(&mut Lines::new(&bytes), session, executor, stdout, stderr)
-    } else {
-        let mut source = ReadLines::new(std::io::stdin().lock());
-        let code = run_main_loop(&mut source, session, executor, stdout, stderr);
-        if let Some(err) = source.take_error() {
-            // `input.c:215`, inside `MainLoop`, so under this input's name.
-            logging::error(
-                &session.pset,
-                format!("could not read from input file: {err}"),
-                stderr,
-            );
-        }
-        code
-    };
-    session.pset.inputfile = old;
-    // `command.c:4979`.
-    session.pset.log_terse = session.pset.inputfile.is_none();
-    result
-}
-
-/// `MainLoop` over `source` in this session, with the process's
-/// `cancel_pressed`.
-fn run_main_loop(
-    source: &mut dyn LineSource,
     session: &mut Session,
     executor: &mut LiveExecutor,
     stdout: &mut impl Write,
@@ -607,7 +535,7 @@ fn run_main_loop(
         vars: &mut session.vars,
         cancel_pressed: &cancel::CANCEL_PRESSED,
     };
-    main_loop(source, &mut loop_session, executor, stdout, stderr)
+    mainloop::process_file(name, false, &mut loop_session, executor, stdout, stderr)
 }
 
 #[cfg(test)]
@@ -706,23 +634,5 @@ mod tests {
             panic!("expected a session");
         };
         assert!(session.single_txn);
-    }
-
-    #[test]
-    fn process_file_names_its_input_the_way_upstream_does() {
-        // `command.c:4927`-`:4966`: no `-f` reads stdin with no name, and so
-        // logs tersely; `-f -` reads stdin as `<stdin>`.
-        assert_eq!(InputFile::from_arg(None).inputfile(), None);
-        assert_eq!(InputFile::from_arg(Some("-")), InputFile::StdinNamed);
-        assert_eq!(InputFile::from_arg(Some("-")).inputfile(), Some("<stdin>"));
-        assert_eq!(
-            InputFile::from_arg(Some("a.sql")).inputfile(),
-            Some("a.sql")
-        );
-        // Not canonicalized yet (`command.c:4934`; docs/divergences.md).
-        assert_eq!(
-            InputFile::from_arg(Some("./a.sql")).inputfile(),
-            Some("./a.sql")
-        );
     }
 }

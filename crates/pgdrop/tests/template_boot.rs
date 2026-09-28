@@ -390,3 +390,132 @@ fn another_superuser_is_the_templates_renamed_under_pgrust() {
         (vec!["alice".to_owned(), "alice".to_owned()], Vec::new())
     );
 }
+
+/// pgrust serving `pgdata` on a Unix socket in its own directory, stopped
+/// with SIGINT (fast shutdown) when dropped.
+struct Server {
+    child: std::process::Child,
+    socket_dir: PathBuf,
+    port: u16,
+}
+
+impl Server {
+    /// `<postgres> -D <pgdata> -k <dir> -p <port> -c listen_addresses=`.
+    /// The socket directory is under the system's temporary directory, not
+    /// the scratch one, so its path stays short of `sun_path`'s limit.
+    fn start(postgres: &Path, pgdata: &Path, env: &Environment, port: u16) -> Self {
+        let socket_dir =
+            std::env::temp_dir().join(format!("pgdrop-sock-{}-{port}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&socket_dir);
+        std::fs::create_dir_all(&socket_dir).expect("create the socket directory");
+        let mut command = std::process::Command::new(postgres);
+        command
+            .arg("-D")
+            .arg(pgdata)
+            .arg("-k")
+            .arg(&socket_dir)
+            .args(["-p", &port.to_string(), "-c", "listen_addresses="])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        env.apply(&mut command);
+        let child = command.spawn().expect("start pgrust");
+        Self {
+            child,
+            socket_dir,
+            port,
+        }
+    }
+
+    /// `PQconnectdb` as `user` with `password`, retried while the server
+    /// is still starting (up to a minute): the connection, or the last
+    /// error's message.
+    fn connect(&mut self, user: &str, password: &str) -> Result<rlibpq::Connection, String> {
+        // conninfo_parse (fe-connect.c:6290): `\` escapes the next byte.
+        let quote = |value: &str| value.replace('\\', "\\\\").replace('\'', "\\'");
+        let conninfo = format!(
+            "host='{}' port={} dbname=postgres user='{}' password='{}'",
+            quote(&self.socket_dir.display().to_string()),
+            self.port,
+            quote(user),
+            quote(password)
+        );
+        let mut info = rlibpq::parse_conninfo(conninfo.as_bytes()).expect("conninfo parses");
+        info.add_defaults(&rlibpq::Env::empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            match rlibpq::Connection::connect(&info) {
+                Ok(conn) => return Ok(conn),
+                Err(err) => {
+                    let message = err.to_string();
+                    let starting = message.contains("No such file or directory")
+                        || message.contains("Connection refused")
+                        || message.contains("the database system is starting up");
+                    let exited = self.child.try_wait().ok().flatten().is_some();
+                    if !starting || exited || std::time::Instant::now() > deadline {
+                        return Err(message);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // SIGINT to this child's PID only: a fast shutdown.
+        let _ = std::process::Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
+    }
+}
+
+/// NAT-383 acceptance: after `initdb -U alice --pwfile f`, connecting as
+/// alice with the password works against pgrust, and with another password
+/// does not. `-A scram-sha-256` puts password authentication on both sides
+/// (`check_need_password`, `initdb.c:2597`), so the login is the password's
+/// doing; rlibpq is the client, over SCRAM-SHA-256.
+#[test]
+fn a_password_file_sets_the_password_alice_logs_in_with_under_pgrust() {
+    let scratch = Scratch::new("password");
+    let pgrust = install(&scratch.0);
+    let pwfile = scratch.0.join("pwfile");
+    std::fs::write(&pwfile, "s3cret'pw\n").expect("write the password file");
+    let pgdata = scratch.0.join("data");
+    let argv = [
+        OsString::from("-U"),
+        OsString::from("alice"),
+        OsString::from("-A"),
+        OsString::from("scram-sha-256"),
+        OsString::from("--pwfile"),
+        pwfile.into(),
+        OsString::from("--no-sync"),
+        pgdata.clone().into(),
+    ];
+    let env = server_env(&scratch.0).without(rinitdb::single_user::SERVER_ENV);
+    let initdb = link_pgdrop(&scratch.0, "initdb");
+    let outcome = testkit::run_in(&initdb, &argv, &[], &env).expect("run initdb");
+    let stderr = outcome.stderr_text();
+    assert_eq!(outcome.status, Some(0), "stderr: {stderr}");
+    for line in stderr.lines() {
+        assert!(line.contains(" LOG:  "), "stderr: {stderr}");
+    }
+
+    let mut server = Server::start(&pgrust, &pgdata, &server_env(&scratch.0), 55_683);
+    let mut conn = server
+        .connect("alice", "s3cret'pw")
+        .expect("alice logs in with the password");
+    let results = conn.exec(b"select current_user").expect("select");
+    assert_eq!(results[0].value(0, 0), Some(&b"alice"[..]));
+    drop(conn);
+    let Err(refused) = server.connect("alice", "wrong") else {
+        panic!("another password was accepted");
+    };
+    assert!(
+        refused.contains("password authentication failed for user \"alice\""),
+        "{refused}"
+    );
+}

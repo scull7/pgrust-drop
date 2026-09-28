@@ -73,9 +73,11 @@ that tree (ADR-0001's second amendment) does not cover it. `pgdrop` now
 names it directly, and `Cargo.lock` gains only the `pgdrop → signal-hook`
 edge. This ADR's approval (owner, 2026-09-27) is scoped to `rpsql`.
 
-**Owner approval of the direct `pgdrop` edge: pending** (requested on
-NAT-409, 2026-09-27). Until it is recorded here, PR #101 does not merge.
-If it is refused, `--foreground` loses its signal forwarding.
+**Owner approval of the direct `pgdrop` edge:** approved 2026-09-28 by
+Pete (Chief of Staff) under Nathan's standing rules, as the ADR-0009
+precedent applied to `pgdrop start --foreground` (Linear NAT-409): the same
+crate, safe API only, one `Cargo.lock` edge, and `pgdrop` stays
+`#![deny(unsafe_code)]`.
 
 The forwarding is single-threaded: the thread that reaps the server is the
 one that signals it, so a signal never reaches a PID the server has given

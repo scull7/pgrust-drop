@@ -17,6 +17,7 @@
 //! for in the shell script, but doesn't need any regexp stuff".
 
 use crate::cli::Options;
+use crate::error::InitdbError;
 use crate::file_perm::{DataDirPerm, PG_DIR_MODE_GROUP};
 use crate::pg_config;
 
@@ -92,6 +93,35 @@ pub struct AuthMethods {
     pub host: String,
 }
 
+/// `auth_methods_host` (`initdb.c:96`) as a stock build compiles it.
+///
+/// The array's tail is conditional: `gss` (`ENABLE_GSS`), `sspi`
+/// (`ENABLE_SSPI`), `pam` (`USE_PAM`), `bsd` (`USE_BSD_AUTH`), `ldap`
+/// (`USE_LDAP`) and `cert` (`USE_SSL`). Each is a `configure` option that is
+/// off by default (`sspi` is Windows-only), and this port is a stock build
+/// (`crate::pg_config`), so none is here — see `docs/divergences.md`.
+pub const AUTH_METHODS_HOST: &[&str] = &[
+    "trust",
+    "reject",
+    "scram-sha-256",
+    "md5",
+    "password",
+    "ident",
+    "radius",
+];
+
+/// `auth_methods_local` (`initdb.c:118`) as a stock build compiles it; its
+/// conditional tail is `pam`, `bsd` and `ldap`, as for [`AUTH_METHODS_HOST`].
+pub const AUTH_METHODS_LOCAL: &[&str] = &[
+    "trust",
+    "reject",
+    "scram-sha-256",
+    "md5",
+    "password",
+    "peer",
+    "radius",
+];
+
 impl Default for AuthMethods {
     /// Both unspecified, so both `trust` (`check_authmethod_unspecified`,
     /// `initdb.c:2572`).
@@ -153,6 +183,34 @@ impl AuthMethods {
     pub fn forces_md5_password_encryption(&self) -> bool {
         (self.local == "md5" && self.host != "scram-sha-256")
             || (self.host == "md5" && self.local != "scram-sha-256")
+    }
+
+    /// `check_authmethod_valid` for each side (`initdb.c:3460`-`:3461`),
+    /// then `check_need_password` (`:3463`).
+    ///
+    /// # Errors
+    /// [`InitdbError::InvalidAuthMethod`] for the first side whose method its
+    /// list lacks, local first; [`InitdbError::PasswordRequired`] when both
+    /// sides need a password and `have_password` (`pwprompt || pwfilename`)
+    /// is false.
+    pub fn check(&self, have_password: bool) -> Result<(), InitdbError> {
+        for (method, valid, conntype) in [
+            (&self.local, AUTH_METHODS_LOCAL, "local"),
+            (&self.host, AUTH_METHODS_HOST, "host"),
+        ] {
+            if !valid.contains(&method.as_str()) {
+                return Err(InitdbError::InvalidAuthMethod {
+                    method: method.clone(),
+                    conntype,
+                });
+            }
+        }
+        // initdb.c:2599-:2605.
+        let needs = |method: &str| matches!(method, "md5" | "password" | "scram-sha-256");
+        if needs(&self.local) && needs(&self.host) && !have_password {
+            return Err(InitdbError::PasswordRequired);
+        }
+        Ok(())
     }
 }
 

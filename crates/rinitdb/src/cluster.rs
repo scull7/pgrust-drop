@@ -91,7 +91,7 @@ pub fn check_template_can_make(options: &Options, plan: &CreatePlan) -> Result<(
         }
     }
     if let Some(size) = options.wal_segsize.as_deref()
-        && size.parse::<u32>().ok() != Some(pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB)
+        && plan.wal_segment_size_mb != pg_config::DEFAULT_WAL_SEGMENT_SIZE_MB
     {
         return refuse(format!("--wal-segsize={size}"), Unsupported::WalSegmentSize);
     }
@@ -372,6 +372,9 @@ mod tests {
             &["--lc-time=de_DE", "--locale=C"],
             &["--locale-provider=libc"],
             &["--wal-segsize=16"],
+            // strtol's spellings of 16 (option_utils.c:50).
+            &["--wal-segsize=+16"],
+            &["--wal-segsize= 16 "],
             &["-U", "postgres"],
             &["-T", "simple", "-k", "-g"],
             // Empty is the environment's (check_locale_name, initdb.c:2202),
@@ -485,7 +488,7 @@ mod tests {
 
     #[test]
     fn settings_carry_the_command_line_and_locale_c() {
-        let (options, plan) = parsed(&["-g", "-A", "md5", "-c", "work_mem=8MB"]);
+        let (options, plan) = parsed(&["-g", "--auth-local", "md5", "-c", "work_mem=8MB"]);
         let settings = settings(&options, &plan, Some("UTC".to_owned()));
         assert_eq!(settings.default_text_search_config, "english");
         assert_eq!(settings.default_timezone.as_deref(), Some("UTC"));

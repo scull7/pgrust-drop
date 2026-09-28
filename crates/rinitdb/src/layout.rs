@@ -416,6 +416,7 @@ mod tests {
             do_sync: true,
             sync_method: crate::sync::SyncMethod::Fsync,
             sync_data_files: true,
+            wal_segment_size_mb: 16,
         }
     }
 

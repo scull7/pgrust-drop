@@ -22,6 +22,8 @@ usage = { package = "usage-rs", version = "6" }
 thiserror = "2"
 # rpsql's SIGINT handler (owner, 2026-09-27; ADR-0009).
 signal-hook = "0.3"
+# rlibpq's readiness wait, `rustix::event::poll` (owner, 2026-09-27; ADR-0010).
+rustix = { version = "1", default-features = false, features = ["event", "std"] }
 
 testkit = { path = "crates/testkit" }
 rinitdb = { path = "crates/rinitdb" }

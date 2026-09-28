@@ -30,14 +30,19 @@
 //! server reports, proved against `test_escape.c`; and the fast-path
 //! function call (`PQfn`) with the large object interface of `fe-lobj.c`
 //! over it (`lo_open` … `lo_import`, `lo_export`), proved against
-//! `src/test/examples/testlo.c` and `testlo64.c`; and the host list —
+//! `src/test/examples/testlo.c` and `testlo64.c`; the host list —
 //! `host`, `hostaddr` and `port` lists walked in order or shuffled by
 //! `load_balance_hosts=random` over `pg_prng`'s generator, each server
-//! checked against `target_session_attrs`. The
+//! checked against `target_session_attrs`; and the socket I/O of
+//! `fe-misc.c` — a flush that reads while it waits to write, non-blocking
+//! mode (`PQsetnonblocking`) and `PQsocketPoll` — proved against
+//! `test_pipelined_insert` and `test_uniqviol`. The
 //! rest is tracked in Linear NAT-390 … NAT-396.
 //!
 //! The C ABI layer will need `unsafe`; the pure-Rust core must not, so the
-//! crate denies it until that layer exists as its own module.
+//! crate denies it until that layer exists as its own module, with no
+//! exception: the readiness wait the standard library does not offer is
+//! `rustix::event::poll`, a safe API (ADR-0010).
 
 #![deny(unsafe_code)]
 // Pedantic clippy is on (CI passes `-W clippy::pedantic`). Two style lints are
@@ -65,6 +70,7 @@ pub mod message;
 pub mod negotiate;
 pub mod pg_config;
 pub mod pipeline;
+pub mod poll;
 pub mod print;
 pub mod regress;
 pub mod result;
@@ -80,7 +86,8 @@ pub mod wcwidth;
 pub use auth::{AuthError, AuthRequest, AuthStep, Authenticator, ChannelBinding};
 pub use cancel::{Cancel, CancelConn, CancelError, CancelStatus, CancelStep, Peer};
 pub use connection::{
-    Address, Connection, ConnectionError, CopyRead, FnResult, Stream, Tracer, socket_address,
+    Address, Connection, ConnectionError, CopyRead, Flush, FnResult, Socket, Stream, Tracer,
+    socket_address,
 };
 pub use conninfo::{
     CONNINFO_OPTIONS, ConnInfo, ConnOption, ConnOptionDef, Dispchar, Env, UnknownKeyword,

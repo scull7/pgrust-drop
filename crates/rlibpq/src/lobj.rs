@@ -17,7 +17,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::connection::{Connection, ConnectionError, FnResult};
+use crate::connection::{Connection, ConnectionError, FnResult, Socket};
 use crate::message::ProtocolError;
 use crate::result::{ExecStatus, QueryResult};
 
@@ -309,7 +309,7 @@ fn filename_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_encoded_bytes().to_vec()
 }
 
-impl<S: Read + Write> Connection<S> {
+impl<S: Socket> Connection<S> {
     /// `lo_initialize`, `fe-lobj.c:843`: the function OIDs, looked up on the
     /// first call and kept for the connection's life.
     fn lo_initialize(&mut self) -> Result<LoFuncs, LoError> {

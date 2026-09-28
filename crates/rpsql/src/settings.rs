@@ -9,7 +9,7 @@
 //! dead weight here. `\crosstabview`'s, `\g`'s and the pipeline's are
 //! (NAT-404).
 
-use rlibpq::{ContextVisibility, QueryResult, Verbosity};
+use rlibpq::{ContextVisibility, Encoding, QueryResult, Verbosity};
 
 /// `DEFAULT_CSV_FIELD_SEP` (`settings.h:14`).
 pub const DEFAULT_CSV_FIELD_SEP: char = ',';
@@ -484,6 +484,10 @@ pub struct PsqlSettings {
     pub cur_cmd_interactive: bool,
     /// `sversion`: backend server version.
     pub sversion: i32,
+    /// `encoding`: the client encoding, `PQclientEncoding` as `SyncVariables`,
+    /// `\encoding` and `SendQuery` last read it (`command.c:4580`, `:1624`,
+    /// `common.c:1296`).
+    pub encoding: Encoding,
     /// `progname`: in case you renamed psql.
     pub progname: String,
     /// `inputfile`: file being currently processed, if any.
@@ -575,6 +579,8 @@ impl Default for PsqlSettings {
             get_password: Trivalue::Default,
             cur_cmd_interactive: false,
             sversion: 0,
+            // `pset.encoding` is zero, PG_SQL_ASCII, until `SyncVariables`.
+            encoding: Encoding::SqlAscii,
             progname: "psql".to_string(),
             inputfile: None,
             lineno: 0,

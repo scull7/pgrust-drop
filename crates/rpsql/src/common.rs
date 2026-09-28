@@ -15,7 +15,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use rlibpq::{ConnectionError, ExecStatus, PipelineStatus, QueryResult, ResultError};
+use rlibpq::{ConnectionError, Encoding, ExecStatus, PipelineStatus, QueryResult, ResultError};
 
 use crate::crosstab::{CtvArgs, print_result_in_crosstab};
 use crate::logging;
@@ -139,6 +139,102 @@ pub trait Executor {
     /// hands to psql's `NoticeProcessor` (`common.c:281`) as it parses them.
     fn take_notices(&mut self) -> Vec<ResultError> {
         Vec::new()
+    }
+
+    /// `PQclientEncoding`: the encoding the server last reported as
+    /// `client_encoding`.
+    fn client_encoding(&self) -> Encoding {
+        Encoding::SqlAscii
+    }
+
+    /// `PQsetClientEncoding`: `set client_encoding to '…'`, and whether it
+    /// worked; `false` is C's `-1`.
+    fn set_client_encoding(&mut self, encoding: &[u8]) -> bool {
+        let _ = encoding;
+        false
+    }
+
+    /// `PQconsumeInput`, then `PQnotifies` until it returns NULL
+    /// (`common.c:750`-`:762`): every notification received so far, oldest
+    /// first, each handed out once.
+    fn take_notifications(&mut self) -> Vec<Notification> {
+        Vec::new()
+    }
+}
+
+/// `PGnotify` (`libpq-fe.h:228`): one asynchronous notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    /// `relname`: the channel.
+    pub relname: Vec<u8>,
+    /// `be_pid`: the notifying backend's process ID.
+    pub be_pid: i32,
+    /// `extra`: the payload, empty when there is none.
+    pub extra: Vec<u8>,
+}
+
+/// The line `PrintNotifications()` prints for one notification
+/// (`common.c:753`-`:758`). The payload is shown only when non-empty, "for
+/// backward compatibility". Channel and payload are the server's bytes, as
+/// `%s` writes them.
+#[must_use]
+pub fn notification_line(notify: &Notification) -> Vec<u8> {
+    let mut line = b"Asynchronous notification \"".to_vec();
+    line.extend_from_slice(&notify.relname);
+    if !notify.extra.is_empty() {
+        line.extend_from_slice(b"\" with payload \"");
+        line.extend_from_slice(&notify.extra);
+    }
+    line.extend_from_slice(
+        format!(
+            "\" received from server process with PID {}.\n",
+            notify.be_pid
+        )
+        .as_bytes(),
+    );
+    line
+}
+
+/// Action: `PrintNotifications()` (`common.c:746`), to `pset.queryFout`.
+fn print_notifications(executor: &mut dyn Executor, query_fout: &mut dyn Write) {
+    for notify in executor.take_notifications() {
+        let _ = query_fout.write_all(&notification_line(&notify));
+        let _ = query_fout.flush();
+    }
+}
+
+/// Action: `pset.encoding` and `ENCODING` from `PQclientEncoding`, as
+/// `SyncVariables` (`command.c:4580`, `:4590`) and a successful `\encoding`
+/// (`command.c:1624`-`:1628`) set them. `ENCODING` has no hook, so setting
+/// it cannot fail.
+///
+/// `setFmtEncoding` (`command.c:4584`) has nothing to set: the printer
+/// measures every cell as UTF-8 (see `docs/divergences.md`).
+pub fn sync_encoding(executor: &dyn Executor, pset: &mut PsqlSettings, vars: &mut VariableSpace) {
+    pset.encoding = executor.client_encoding();
+    let _ = vars.set("ENCODING", Some(pset.encoding.name()));
+}
+
+/// The rest of `exec_command_encoding()` (`command.c:1618`-`:1631`), which
+/// needs the connection: set the client encoding `\encoding` named, or say
+/// why not. Returns whether it worked.
+pub fn set_client_encoding(
+    executor: &mut dyn Executor,
+    encoding: &str,
+    pset: &mut PsqlSettings,
+    vars: &mut VariableSpace,
+    stderr: &mut dyn Write,
+) -> bool {
+    if executor.set_client_encoding(encoding.as_bytes()) {
+        sync_encoding(executor, pset, vars);
+        true
+    } else {
+        logging::error(
+            pset,
+            format!("{encoding}: invalid encoding name or conversion procedure not found"),
+            stderr,
+        );
+        false
     }
 }
 
@@ -333,6 +429,15 @@ pub fn send_query(
             stderr,
         )
     };
+
+    // `common.c:1292`-`:1302`: events that may occur during the query. A
+    // `SET client_encoding` changes the encoding psql tracks, and any
+    // notification that arrived is printed.
+    if pset.encoding != executor.client_encoding() {
+        sync_encoding(executor, pset, vars);
+    }
+    print_notifications(executor, stdout);
+
     // `restorePsetInfo` (`common.c:1319`).
     if let Some(saved) = pset.gsavepopt.take() {
         pset.popt = saved;
@@ -1644,6 +1749,142 @@ mod tests {
             "COPY in a pipeline is not supported, aborting connection\n"
         );
         assert!(!executor.connected());
+    }
+
+    #[test]
+    fn a_notification_shows_its_payload_only_when_there_is_one() {
+        // `common.c:753`-`:758`.
+        let mut notify = Notification {
+            relname: b"foo".to_vec(),
+            be_pid: 4242,
+            extra: Vec::new(),
+        };
+        assert_eq!(
+            notification_line(&notify),
+            b"Asynchronous notification \"foo\" received from server process with PID 4242.\n"
+        );
+        notify.extra = b"b\xe9r".to_vec();
+        assert_eq!(
+            notification_line(&notify),
+            b"Asynchronous notification \"foo\" with payload \"b\xe9r\" received from server process with PID 4242.\n"
+        );
+    }
+
+    /// An executor whose client encoding a query can change, and which has
+    /// notifications waiting: what `SendQuery` looks at after a query
+    /// (`common.c:1292`-`:1302`).
+    struct Eventful {
+        encoding: rlibpq::Encoding,
+        after_query: rlibpq::Encoding,
+        notifications: Vec<Notification>,
+        accept_encoding: bool,
+    }
+
+    impl Executor for Eventful {
+        fn exec(
+            &mut self,
+            _query: &[u8],
+            _mode: &SendMode,
+        ) -> Result<Vec<QueryResult>, ErrorMessage> {
+            self.encoding = self.after_query;
+            Ok(vec![QueryResult::new(ExecStatus::CommandOk)])
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+        fn abandon(&mut self) {}
+        fn client_encoding(&self) -> rlibpq::Encoding {
+            self.encoding
+        }
+        fn set_client_encoding(&mut self, encoding: &[u8]) -> bool {
+            if self.accept_encoding {
+                self.encoding = rlibpq::Encoding::from_name(encoding).unwrap();
+            }
+            self.accept_encoding
+        }
+        fn take_notifications(&mut self) -> Vec<Notification> {
+            std::mem::take(&mut self.notifications)
+        }
+    }
+
+    fn eventful() -> Eventful {
+        Eventful {
+            encoding: rlibpq::Encoding::Utf8,
+            after_query: rlibpq::Encoding::Latin1,
+            notifications: vec![Notification {
+                relname: b"foo".to_vec(),
+                be_pid: 7,
+                extra: Vec::new(),
+            }],
+            accept_encoding: true,
+        }
+    }
+
+    #[test]
+    fn a_query_that_changes_the_client_encoding_updates_encoding_and_prints_notifications() {
+        let mut executor = eventful();
+        let mut pset = PsqlSettings {
+            quiet: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        sync_encoding(&executor, &mut pset, &mut vars);
+        assert_eq!(vars.get("ENCODING"), Some("UTF8"));
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(send_query(
+            &mut executor,
+            b"set client_encoding = latin1",
+            &mut pset,
+            &mut vars,
+            &mut out,
+            &mut err
+        ));
+        assert_eq!(pset.encoding, rlibpq::Encoding::Latin1);
+        assert_eq!(vars.get("ENCODING"), Some("LATIN1"));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Asynchronous notification \"foo\" received from server process with PID 7.\n"
+        );
+        assert!(err.is_empty());
+        assert!(executor.notifications.is_empty(), "each is printed once");
+    }
+
+    #[test]
+    fn encoding_sets_the_client_encoding_or_says_why_not() {
+        // `command.c:1620`-`:1628`.
+        let mut executor = eventful();
+        let mut pset = PsqlSettings {
+            log_terse: true,
+            ..PsqlSettings::default()
+        };
+        let mut vars = VariableSpace::new();
+        let mut err = Vec::new();
+        assert!(set_client_encoding(
+            &mut executor,
+            "win1252",
+            &mut pset,
+            &mut vars,
+            &mut err
+        ));
+        assert_eq!(pset.encoding, rlibpq::Encoding::Win1252);
+        assert_eq!(vars.get("ENCODING"), Some("WIN1252"));
+        assert!(err.is_empty());
+
+        executor.accept_encoding = false;
+        assert!(!set_client_encoding(
+            &mut executor,
+            "klingon",
+            &mut pset,
+            &mut vars,
+            &mut err
+        ));
+        assert_eq!(pset.encoding, rlibpq::Encoding::Win1252);
+        assert_eq!(vars.get("ENCODING"), Some("WIN1252"));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "klingon: invalid encoding name or conversion procedure not found\n"
+        );
     }
 
     #[test]

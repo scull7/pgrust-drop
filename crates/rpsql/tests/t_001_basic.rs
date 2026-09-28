@@ -6,11 +6,11 @@
 //! stolen assertion through rpsql and, when the lane has one, through C psql
 //! too; without the tools they print `SKIP (flagged, not silent)`, and CI's
 //! `PGDROP_REQUIRE_REF=1` turns that into a failure. Ported so far: `\timing`
-//! (lines 86-108), `\errverbose with no previous error` (159-164) and
+//! (lines 86-108), `ENCODING` (110-119), the two notification cases
+//! (121-134), `\errverbose with no previous error` (159-164) and
 //! `\errverbose after normal query with error` (170-181). The
-//! `\copyright`, `\help`, `ENCODING`, notification, crash and remaining
-//! `\errverbose` cases, and the rest of the file, land with Linear
-//! NAT-400 … NAT-405.
+//! `\copyright`, `\help`, crash and remaining `\errverbose` cases, and the
+//! rest of the file, land with Linear NAT-400 … NAT-405.
 //!
 //! The byte-diff gate NAT-398's Acceptance names —
 //! `psql -X -c 'select 1'` through C psql and through rpsql — needs both the
@@ -80,6 +80,9 @@ const TIMING_WITH_SUCCESSFUL_QUERY_PORT: u16 = 55_401;
 const TIMING_WITH_QUERY_ERROR_PORT: u16 = 55_402;
 const ERRVERBOSE_WITH_NO_PREVIOUS_ERROR_PORT: u16 = 55_403;
 const ERRVERBOSE_AFTER_NORMAL_QUERY_WITH_ERROR_PORT: u16 = 55_404;
+const ENCODING_VARIABLE_PORT: u16 = 55_413;
+const NOTIFICATION_PORT: u16 = 55_414;
+const NOTIFICATION_WITH_PAYLOAD_PORT: u16 = 55_415;
 
 /// The psql binaries a cluster case runs against: rpsql, and C psql when the
 /// lane's reference installation has one (the skip is flagged otherwise).
@@ -156,6 +159,49 @@ fn timing_with_query_error() {
             &name("timing was updated"),
         );
     }
+}
+
+/// `# test that ENCODING variable is set and that it is updated when client
+/// encoding is changed` — 001_basic.pl:110-119.
+#[test]
+fn encoding_variable_is_set_and_updated() {
+    let Some(cluster) = Cluster::start(ENCODING_VARIABLE_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "\\echo :ENCODING\nset client_encoding = LATIN1;\n\\echo :ENCODING",
+        "(?m)^UTF8$\n^LATIN1$",
+        "ENCODING variable is set and updated",
+    );
+}
+
+/// `# test LISTEN/NOTIFY`, its first case — 001_basic.pl:121-127.
+#[test]
+fn notification() {
+    let Some(cluster) = Cluster::start(NOTIFICATION_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "LISTEN foo;\nNOTIFY foo;",
+        "^Asynchronous notification \"foo\" received from server process with PID \\d+\\.$",
+        "notification",
+    );
+}
+
+/// `# test LISTEN/NOTIFY`, its second case — 001_basic.pl:129-134.
+#[test]
+fn notification_with_payload() {
+    let Some(cluster) = Cluster::start(NOTIFICATION_WITH_PAYLOAD_PORT) else {
+        return;
+    };
+    psql_like(
+        &cluster,
+        "LISTEN foo;\nNOTIFY foo, 'bar';",
+        "^Asynchronous notification \"foo\" with payload \"bar\" received from server process with PID \\d+\\.$",
+        "notification with payload",
+    );
 }
 
 /// `# test \errverbose`, its first case — 001_basic.pl:153-164.

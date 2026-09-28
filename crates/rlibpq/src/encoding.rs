@@ -167,6 +167,56 @@ impl Encoding {
             .map(|index| ENCNAME_TBL[index].1)
     }
 
+    /// `pg_encoding_to_char`, `encnames.c:590`: the encoding's canonical
+    /// name, its row of `pg_enc2name_tbl` (`encnames.c:311`-`:354`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoding::SqlAscii => "SQL_ASCII",
+            Encoding::EucJp => "EUC_JP",
+            Encoding::EucCn => "EUC_CN",
+            Encoding::EucKr => "EUC_KR",
+            Encoding::EucTw => "EUC_TW",
+            Encoding::EucJis2004 => "EUC_JIS_2004",
+            Encoding::Utf8 => "UTF8",
+            Encoding::MuleInternal => "MULE_INTERNAL",
+            Encoding::Latin1 => "LATIN1",
+            Encoding::Latin2 => "LATIN2",
+            Encoding::Latin3 => "LATIN3",
+            Encoding::Latin4 => "LATIN4",
+            Encoding::Latin5 => "LATIN5",
+            Encoding::Latin6 => "LATIN6",
+            Encoding::Latin7 => "LATIN7",
+            Encoding::Latin8 => "LATIN8",
+            Encoding::Latin9 => "LATIN9",
+            Encoding::Latin10 => "LATIN10",
+            Encoding::Win1256 => "WIN1256",
+            Encoding::Win1258 => "WIN1258",
+            Encoding::Win866 => "WIN866",
+            Encoding::Win874 => "WIN874",
+            Encoding::Koi8R => "KOI8R",
+            Encoding::Win1251 => "WIN1251",
+            Encoding::Win1252 => "WIN1252",
+            Encoding::Iso8859_5 => "ISO_8859_5",
+            Encoding::Iso8859_6 => "ISO_8859_6",
+            Encoding::Iso8859_7 => "ISO_8859_7",
+            Encoding::Iso8859_8 => "ISO_8859_8",
+            Encoding::Win1250 => "WIN1250",
+            Encoding::Win1253 => "WIN1253",
+            Encoding::Win1254 => "WIN1254",
+            Encoding::Win1255 => "WIN1255",
+            Encoding::Win1257 => "WIN1257",
+            Encoding::Koi8U => "KOI8U",
+            Encoding::Sjis => "SJIS",
+            Encoding::Big5 => "BIG5",
+            Encoding::Gbk => "GBK",
+            Encoding::Uhc => "UHC",
+            Encoding::Gb18030 => "GB18030",
+            Encoding::Johab => "JOHAB",
+            Encoding::ShiftJis2004 => "SHIFT_JIS_2004",
+        }
+    }
+
     /// `PG_ENCODING_IS_CLIENT_ONLY`, `pg_wchar.h:300`.
     #[must_use]
     pub fn is_client_only(self) -> bool {
@@ -685,6 +735,25 @@ mod tests {
         assert_eq!(Encoding::from_name(b"klingon"), None);
         assert_eq!(Encoding::from_name(b""), None);
         assert_eq!(Encoding::from_name(&[b'u'; NAMEDATALEN]), None);
+    }
+
+    #[test]
+    fn every_canonical_name_spells_its_own_encoding() {
+        // Every encoding appears in the name table, and its canonical name
+        // (`pg_enc2name_tbl`) looks it up again.
+        let mut seen: Vec<Encoding> = ENCNAME_TBL.iter().map(|(_, e)| *e).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), Encoding::ShiftJis2004 as usize + 1);
+        for encoding in seen {
+            assert_eq!(
+                Encoding::from_name(encoding.name().as_bytes()),
+                Some(encoding),
+                "{encoding}"
+            );
+        }
+        assert_eq!(Encoding::Utf8.name(), "UTF8");
+        assert_eq!(Encoding::default().name(), "SQL_ASCII");
     }
 
     #[test]

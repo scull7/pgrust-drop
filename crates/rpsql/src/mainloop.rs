@@ -12,7 +12,7 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::command::{CommandResult, IncludeRequest, dispatch_slash};
-use crate::common::{Executor, send_query};
+use crate::common::{Executor, send_query, set_client_encoding};
 use crate::logging;
 use crate::scan::{PromptStatus, ScanResult, Scanner};
 use crate::settings::{EXIT_BADCONN, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USER, PsqlSettings};
@@ -273,9 +273,7 @@ pub fn main_loop(
                     stdout,
                     stderr,
                 );
-                if let CommandResult::Include(request) = &slash_status {
-                    slash_status = include(request, session, executor, stdout, stderr);
-                }
+                slash_status = perform(slash_status, session, executor, stdout, stderr);
                 success = slash_status != CommandResult::Error;
                 session.pset.stmt_lineno = 1;
 
@@ -439,6 +437,28 @@ pub fn process_file(
     // `command.c:4979`.
     session.pset.log_terse = session.pset.inputfile.is_none();
     result
+}
+
+/// The part of a backslash command that needs the connection, which
+/// [`dispatch_slash`] leaves to its caller: `\i`'s file and `\encoding`'s
+/// `PQsetClientEncoding`. Every other result passes through.
+pub fn perform(
+    status: CommandResult,
+    session: &mut Session<'_>,
+    executor: &mut dyn Executor,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> CommandResult {
+    match status {
+        CommandResult::Include(request) => include(&request, session, executor, stdout, stderr),
+        // `exec_command_encoding` returns PSQL_CMD_SKIP_LINE whether or not
+        // the encoding was set (`command.c:1636`).
+        CommandResult::SetEncoding(encoding) => {
+            set_client_encoding(executor, &encoding, session.pset, session.vars, stderr);
+            CommandResult::SkipLine
+        }
+        status => status,
+    }
 }
 
 /// The rest of `exec_command_include()` (`command.c:2084`): run the file

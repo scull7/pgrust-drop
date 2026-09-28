@@ -44,6 +44,10 @@ pub enum CommandResult {
     /// [`CommandResult::SkipLine`] when the file's `MainLoop` exits
     /// successfully and [`CommandResult::Error`] otherwise.
     Include(IncludeRequest),
+    /// `\encoding`'s `PQsetClientEncoding` (`command.c:1619`), which needs
+    /// the connection and so is the caller's to perform: it answers
+    /// [`CommandResult::SkipLine`] either way, as upstream does.
+    SetEncoding(String),
 }
 
 /// The file `\i` or `\ir` names, and which of the two it was.
@@ -194,7 +198,7 @@ fn extra_arguments<'a>(cmd: &str, options: &'a [SlashOption]) -> Vec<&'a str> {
         "c" | "connect" | "crosstabview" => 4,
         "pset" => 2,
         "unset" | "timing" | "parse" | "close_prepared" | "getresults" | "cd" | "i" | "include"
-        | "ir" | "include_relative" => 1,
+        | "ir" | "include_relative" | "encoding" => 1,
         "g" | "gx" => GArgs::split(options).consumed,
         _ => 0,
     };
@@ -331,6 +335,15 @@ fn exec_command(
                 use_relative_path: matches!(cmd, "ir" | "include_relative"),
             })
         }
+        // `exec_command_encoding()` (`command.c:1604`): with no argument,
+        // `puts` the encoding psql tracks, to stdout rather than queryFout.
+        "encoding" => match options.first() {
+            None => {
+                let _ = writeln!(stdout, "{}", ctx.pset.encoding.name());
+                CommandResult::SkipLine
+            }
+            Some(encoding) => CommandResult::SetEncoding(encoding.value.clone()),
+        },
         _ => CommandResult::Unknown,
     }
 }
@@ -767,6 +780,22 @@ mod tests {
     fn quit_terminates() {
         assert_eq!(run("\\q").result, CommandResult::Terminate);
         assert_eq!(run("\\quit").result, CommandResult::Terminate);
+    }
+
+    #[test]
+    fn encoding_shows_the_tracked_encoding_or_asks_for_a_new_one() {
+        // `command.c:1611`-`:1620`: `pset.encoding` is SQL_ASCII until
+        // `SyncVariables`, and setting one is the caller's.
+        let shown = run("\\encoding");
+        assert_eq!(shown.result, CommandResult::SkipLine);
+        assert_eq!(shown.stdout, "SQL_ASCII\n");
+        let set = run("\\encoding 'LATIN1' extra");
+        assert_eq!(set.result, CommandResult::SetEncoding("LATIN1".to_string()));
+        assert_eq!(set.stdout, "");
+        assert_eq!(
+            set.stderr,
+            "psql: warning: \\encoding: extra argument \"extra\" ignored\n"
+        );
     }
 
     #[test]
